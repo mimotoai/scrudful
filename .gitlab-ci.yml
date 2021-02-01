@@ -1,9 +1,9 @@
 image: continuumio/miniconda3:latest
 
 before_script:
-  - conda env create -f environment.yml
-  - source activate sphinx-doc
-  - conda install -c conda-forge make
+  # - conda env create -f environment.yml
+  # - source activate sphinx-doc
+  - conda install -c conda-forge make sphinx
 
 pages:
   script:
