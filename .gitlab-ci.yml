@@ -1,0 +1,18 @@
+image: continuumio/miniconda3:latest
+
+before_script:
+  - conda install -c conda-forge make sphinx django sphinx_rtd_theme
+
+pages:
+  script:
+  - mkdir -p public
+  - cd docs
+  - make clean
+  - make html
+  - cp -r build/html/* ../public/.
+  artifacts:
+    paths:
+      - public
+  only:
+    - master
+    - merge_requests
