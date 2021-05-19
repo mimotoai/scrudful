@@ -24,6 +24,7 @@ publish:
     - git config --global user.email "CICD@gitlab.com"
 
   script:
+    - poetry config http-basic.pypi "__token__" "${POETRY_PYPI_ACCESS_TOKEN}"
     - poetry version patch
     - poetry build
     - poetry publish
