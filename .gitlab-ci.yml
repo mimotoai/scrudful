@@ -16,3 +16,23 @@ pages:
   only:
     - master
     - merge_requests
+
+publish:
+  before_script:
+    - conda install -c conda-forge poetry
+    - git config --global user.name "Gitlab CI/CD"
+    - git config --global user.email "CICD@gitlab.com"
+
+  script:
+    - poetry version patch
+    - poetry build
+    - poetry publish
+    - git status
+    - git add .
+    - git commit -m "[ci skip] updated to $(poetry version)"
+    - git push -o ci-skip http://root:$PROJECT_ACCESS_TOKEN@gitlab.com/openteams/scrudful HEAD:master
+  only:
+  - master
+  - merge_requests
+
+
