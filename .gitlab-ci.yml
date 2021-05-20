@@ -14,8 +14,11 @@ pages:
     paths:
       - public
   only:
+    refs:
     - master
     - merge_requests
+    changes:
+    - docs
 
 publish:
   before_script:
