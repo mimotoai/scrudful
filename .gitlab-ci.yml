@@ -32,8 +32,13 @@ publish:
     - git add .
     - git commit -m "[ci skip] updated to $(poetry version)"
     - git push -o ci-skip http://root:$PROJECT_ACCESS_TOKEN@gitlab.com/openteams/scrudful HEAD:master
+  artifacts:
+    paths:
+    - dist
   only:
-  - master
-  - merge_requests
-
+    refs:
+    - master
+    - merge_requests
+    changes:
+    - scrudful
 
