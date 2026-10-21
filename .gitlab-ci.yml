@@ -21,19 +21,20 @@ pages:
     - docs
 
 publish:
+  image: ghcr.io/astral-sh/uv:0.9.0-python3.12-bookworm
+  variables:
+    UV_PUBLISH_TOKEN: $POETRY_PYPI_ACCESS_TOKEN
   before_script:
-    - conda install -c conda-forge poetry
     - git config --global user.name "Gitlab CI/CD"
     - git config --global user.email "CICD@gitlab.com"
 
   script:
-    - poetry config http-basic.pypi "__token__" "${POETRY_PYPI_ACCESS_TOKEN}"
-    - poetry version patch
-    - poetry build
-    - poetry publish
+    - uv version --bump patch --no-sync
+    - uv build
+    - uv publish
     - git status
     - git add .
-    - git commit -m "[ci skip] updated to $(poetry version)"
+    - git commit -m "[ci skip] updated to $(uv version)"
     - git push -o ci-skip http://root:$PROJECT_ACCESS_TOKEN@gitlab.com/openteams/scrudful HEAD:master
   artifacts:
     paths:
