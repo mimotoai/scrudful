@@ -52,8 +52,4 @@ module-root = ""
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-# TODO(task-3): tests/examples/fastapi/test_api.py is a stateful sequence (later
-# tests rely on records created/updated by earlier ones), so random ordering
-# breaks it. Remove this once those tests are rewritten to be independent.
-addopts = "-p no:randomly"
 filterwarnings = ["error"]
