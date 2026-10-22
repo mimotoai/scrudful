@@ -61,12 +61,13 @@ publish:
   # on the bump.
   resource_group: publish
   variables:
-    UV_PUBLISH_TOKEN: $POETRY_PYPI_ACCESS_TOKEN
+    UV_PUBLISH_TOKEN: $UV_PYPI_ACCESS_TOKEN
   before_script:
     - git config --global user.name "Gitlab CI/CD"
     - git config --global user.email "CICD@gitlab.com"
   script:
-    - ': "${PROJECT_ACCESS_TOKEN:?}"'
+    # Fail before building if either token is missing.
+    - ': "${PROJECT_ACCESS_TOKEN:?}" "${UV_PYPI_ACCESS_TOKEN:?}"'
     - git fetch -q "https://oauth2:${PROJECT_ACCESS_TOKEN}@${CI_SERVER_FQDN}/${CI_PROJECT_PATH}.git" "${CI_DEFAULT_BRANCH}"
     - |
       if [ "$(git rev-parse FETCH_HEAD)" != "$CI_COMMIT_SHA" ]; then
