@@ -9,13 +9,15 @@ from __future__ import annotations
 import functools
 import inspect
 import sys
+import types
 from collections.abc import Callable, Mapping
 from typing import Annotated, Any, TypeVar, get_args, get_origin
 
 from fastapi import Request, Response
+from fastapi.datastructures import DefaultPlaceholder
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
-from starlette.datastructures import MutableHeaders
+from starlette.datastructures import Headers, MutableHeaders
 
 from scrudful.conditional import (
     SAFE_METHODS,
@@ -78,6 +80,7 @@ _PRECONDITION_FIELDS = (
     "if-unmodified-since",
 )
 _FRESH_VALIDATOR_METHODS = frozenset({"PUT", "PATCH"})
+_BODY_HEADERS = frozenset({"content-length", "content-type"})
 
 Endpoint = TypeVar("Endpoint", bound=Callable[..., Any])
 
@@ -212,13 +215,14 @@ def scrudful(
     has_validators = etag_func is not None or last_modified_func is not None
 
     async def validators(kwargs: Mapping[str, Any]) -> tuple[str | None, int | None]:
-        etag = None
+        funcs = [f for f in (etag_func, last_modified_func) if f is not None]
+        values = iter(await _call_all(funcs, kwargs))
+        etag = last_modified = None
         if etag_func is not None:
-            value = await _call(etag_func, kwargs)
+            value = next(values)
             etag = None if value is None else quote_etag(value)
-        last_modified = None
         if last_modified_func is not None:
-            last_modified = http_timestamp(await _call(last_modified_func, kwargs))
+            last_modified = http_timestamp(next(values))
         return etag, last_modified
 
     async def links(kwargs: Mapping[str, Any]) -> str | None:
@@ -263,7 +267,7 @@ def scrudful(
                     require_precondition=True,
                 )
                 if result is not None:
-                    return _conditional_response(result)
+                    return _conditional_response(result, response.headers)
 
             content = await _call(endpoint, kwargs)
 
@@ -300,6 +304,37 @@ async def _call(func: Callable[..., Any], kwargs: Mapping[str, Any]) -> Any:
     return result
 
 
+async def _call_all(
+    funcs: list[Callable[..., Any]], kwargs: Mapping[str, Any]
+) -> list[Any]:
+    """Call ``funcs`` one after the other, in order, and return the results.
+
+    Consecutive sync callables share one threadpool hop. They are never run
+    concurrently: they typically share a database session.
+    """
+    results: list[Any] = []
+    sync: list[Callable[..., Any]] = []
+
+    async def flush() -> None:
+        if sync:
+            batch = list(sync)
+            sync.clear()
+            raw = await run_in_threadpool(lambda: [f(**kwargs) for f in batch])
+            for result in raw:
+                if inspect.isawaitable(result):
+                    result = await result
+                results.append(result)
+
+    for func in funcs:
+        if inspect.iscoroutinefunction(func):
+            await flush()
+            results.append(await func(**kwargs))
+        else:
+            sync.append(func)
+    await flush()
+    return results
+
+
 async def _link(
     kwargs: Mapping[str, Any],
     values_or_funcs: tuple[Any, Any, Any],
@@ -332,14 +367,33 @@ def _precondition_headers(request: Request) -> dict[str, str]:
     return headers
 
 
-def _conditional_response(result: ConditionalResult) -> Response:
+def _conditional_response(result: ConditionalResult, injected: Headers) -> Response:
+    """Build the early response, keeping headers set on the injected Response.
+
+    FastAPI only merges the injected response's headers into responses it
+    builds itself, so dependency headers (``Cache-Control``, ``Vary``,
+    ``Set-Cookie``, ...) would be lost; a 304 must carry the ones a 200 would.
+    """
     if result.body is None:
         response = Response(status_code=result.status, headers=result.headers)
     else:
         response = JSONResponse(
             result.body, status_code=result.status, headers=result.headers
         )
-    _expose_headers(response.headers)
+    headers = response.headers
+    for name, value in injected.raw:
+        key = name.decode("latin-1")
+        if key in _BODY_HEADERS:
+            continue
+        if key == "set-cookie":
+            headers.append("set-cookie", value.decode("latin-1"))
+        elif key == "access-control-expose-headers":
+            headers[key] = merge_expose_headers(
+                headers.get(key), value.decode("latin-1").split(",")
+            )
+        elif key not in headers:
+            headers.append(key, value.decode("latin-1"))
+    _expose_headers(headers)
     return response
 
 
@@ -356,7 +410,18 @@ def _status_code(request: Request, response: Response) -> int:
     if response.status_code:
         return response.status_code
     route = request.scope.get("route")
-    return getattr(route, "status_code", None) or 200
+    status = getattr(route, "status_code", None)
+    if status:
+        return status
+    # Neither is set: FastAPI lets the response class pick (RedirectResponse: 307).
+    response_class = getattr(route, "response_class", None)
+    if isinstance(response_class, DefaultPlaceholder):
+        response_class = response_class.value
+    try:
+        default = inspect.signature(response_class).parameters["status_code"].default
+    except (KeyError, TypeError, ValueError):
+        return 200
+    return default if isinstance(default, int) else 200
 
 
 def _wrapper_signature(
@@ -441,4 +506,10 @@ def _annotation_is(annotation: Any, cls: type, globalns: dict[str, Any]) -> bool
             return False
     if get_origin(annotation) is Annotated:
         annotation = get_args(annotation)[0]
-    return isinstance(annotation, type) and issubclass(annotation, cls)
+    # ``list[int]`` is a ``type`` instance on Python 3.10 but not a class.
+    if not inspect.isclass(annotation) or isinstance(annotation, types.GenericAlias):
+        return False
+    try:
+        return issubclass(annotation, cls)
+    except TypeError:
+        return False

@@ -158,6 +158,16 @@ Fixes
   annotations``) in the endpoint's module: FastAPI before 0.124 evaluated them
   in the wrapper's module, so body models became required query parameters
   (422).
+* ``scrudful.fastapi``: endpoints with generic-alias parameters (``list[int]``,
+  ``dict[str, int]``) no longer fail at decoration on Python 3.10.
+* ``scrudful.fastapi``: the 304/400/412/428 responses now carry the headers
+  dependencies set on the injected ``Response`` (``Cache-Control``, ``Vary``,
+  ``Set-Cookie``, ...), as RFC 9110 §15.4.5 requires for a 304.
+* ``scrudful.fastapi``: a route without ``status_code`` uses its response class's
+  default status (e.g. 307 for ``RedirectResponse``) to decide whether validators
+  are added.
+* ``scrudful.fastapi``: sync validator callbacks run in a single threadpool call
+  (still sequentially, ETag first) instead of one per callback.
 * The example projects: the DRF validator callbacks look items up in
   ``view.get_queryset()``, so items the view hides are a 404 whatever the
   preconditions; the FastAPI README example uses timezone-aware datetimes.
