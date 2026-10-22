@@ -1,4 +1,6 @@
 import pytest
+from django.utils.functional import lazy
+from starlette.datastructures import URL
 
 from scrudful.utils import (
     EXPOSABLE_HEADERS,
@@ -93,6 +95,57 @@ def test_link_content_rejects_ctl_in_rel(value):
 def test_link_content_rejects_ctl_in_type(value):
     with pytest.raises(ValueError):
         link_content("u", "r", value)
+
+
+@pytest.mark.parametrize("value", ["€", "aĀb", "\U0001f600"])
+def test_link_content_rejects_non_latin1_params(value):
+    with pytest.raises(ValueError, match="outside Latin-1"):
+        link_content("u", value, "t")
+    with pytest.raises(ValueError, match="outside Latin-1"):
+        link_content("u", "r", value)
+
+
+def test_link_content_allows_latin1_params():
+    assert link_content("u", "café", "t") == '<u>; rel="café"; type="t"'
+
+
+class _Stringy:
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return self.value
+
+
+def test_link_content_accepts_starlette_url():
+    url = URL("http://x/a b")
+    assert (
+        link_content(url, "describedby", "application/json")
+        == '<http://x/a%20b>; rel="describedby"; type="application/json"'
+    )
+
+
+@pytest.mark.parametrize(
+    "url, rel, content_type, expected",
+    [
+        (_Stringy("http://x/<y>"), "r", "t", '<http://x/%3Cy%3E>; rel="r"; type="t"'),
+        (5, "r", "t", '<5>; rel="r"; type="t"'),
+        ("u", _Stringy('a"b'), _Stringy("t"), r'<u>; rel="a\"b"; type="t"'),
+        (
+            "u",
+            lazy(lambda: "describedby", str)(),
+            lazy(lambda: "application/json", str)(),
+            '<u>; rel="describedby"; type="application/json"',
+        ),
+    ],
+)
+def test_link_content_stringifies_arguments(url, rel, content_type, expected):
+    assert link_content(url, rel, content_type) == expected
+
+
+def test_link_content_rejects_ctl_in_non_str_rel():
+    with pytest.raises(ValueError):
+        link_content("u", _Stringy("a\r\nb"), "t")
 
 
 @pytest.mark.parametrize("content_type", [None, ""])
