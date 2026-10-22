@@ -1250,7 +1250,7 @@ wheels = [
 
 [[package]]
 name = "scrudful"
-version = "0.1.0"
+version = "0.3.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1300,7 +1300,7 @@ dev = [
     { name = "black", specifier = ">=24" },
     { name = "flake8", specifier = ">=7" },
     { name = "freezegun", specifier = ">=1.5" },
-    { name = "httpx2" },
+    { name = "httpx2", specifier = ">=2.14" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-cov", specifier = ">=5" },
     { name = "pytest-django", specifier = ">=4.8" },

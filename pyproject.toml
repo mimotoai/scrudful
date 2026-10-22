@@ -1,6 +1,6 @@
 [project]
 name = "scrudful"
-version = "0.1.0"
+version = "0.3.0"
 description = "HTTP conditional-request and Link-header helpers for SCRUDful REST APIs (Django REST Framework, FastAPI)"
 authors = [{ name = "David Charboneau", email = "david@openteams.com" }]
 requires-python = ">=3.10"
@@ -20,6 +20,10 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Source = "https://gitlab.com/openteams/scrudful"
+Changelog = "https://gitlab.com/openteams/scrudful/-/blob/master/CHANGELOG.rst"
+
 [project.optional-dependencies]
 drf = ["django>=4.2", "djangorestframework>=3.15"]
 fastapi = ["fastapi>=0.100"]
@@ -32,7 +36,8 @@ dev = [
     "pytest-django>=4.8",
     "pytest-randomly>=3.15",
     "freezegun>=1.5",
-    "httpx2",
+    # Starlette's TestClient: Starlette 1.x deprecates httpx in favour of httpx2.
+    "httpx2>=2.14",
     "black>=24",
     "flake8>=7",
     "uvicorn>=0.30",
@@ -49,6 +54,10 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-root = ""
+# The sdist also carries the changelog and the tests, with the example apps
+# they exercise (pyproject.toml, README, licenses and the package are always
+# included).
+source-include = ["CHANGELOG.rst", "tests/**", "examples/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

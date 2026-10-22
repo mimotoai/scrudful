@@ -1,6 +1,15 @@
-# Stage ordering (rather than `needs:`) makes publish wait for the test matrix:
-# `needs:` requires the needed job to exist in the same pipeline, which is not
-# guaranteed when the two jobs have different `only: changes` rules.
+# Pipelines run for merge requests and for the default branch only (no
+# duplicate branch + MR pipelines). `test` runs in both; `pages` and `publish`
+# deploy, so they run only on the default branch.
+#
+# Stage ordering (rather than `needs:`) makes the deploy jobs wait for the
+# whole test matrix: with stages, a deploy job starts only after every job of
+# the earlier stage has succeeded.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 stages:
   - test
   - deploy
@@ -13,31 +22,29 @@ test:
       - PYTHON: ["3.10", "3.11", "3.12", "3.13", "3.14"]
   script:
     - uv run --locked -p "$PYTHON" pytest -q
-  only:
-    refs:
-    - master
-    - merge_requests
 
 pages:
   stage: deploy
   image: ghcr.io/astral-sh/uv:0.9.0-python3.12-bookworm
   script:
-  - uv sync --locked --group docs
-  - uv run --locked make -C docs html BUILDDIR=build
-  - mkdir -p public
-  - cp -r docs/build/html/* public/
+    - uv sync --locked --group docs
+    - uv run --locked make -C docs html BUILDDIR=build SPHINXOPTS="-W --keep-going"
+    - mkdir -p public
+    - cp -r docs/build/html/* public/
   artifacts:
     paths:
       - public
-  only:
-    refs:
-    - master
-    - merge_requests
-    changes:
-    - docs/**/*
-    - scrudful/**/*
-    - pyproject.toml
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - docs/**/*
+        - scrudful/**/*
+        - pyproject.toml
+        - README.rst
+        - CHANGELOG.rst
 
+# Publishes the version in pyproject.toml, then bumps the patch version and
+# pushes it, so the default branch always holds the next unreleased version.
 publish:
   stage: deploy
   image: ghcr.io/astral-sh/uv:0.9.0-python3.12-bookworm
@@ -46,22 +53,18 @@ publish:
   before_script:
     - git config --global user.name "Gitlab CI/CD"
     - git config --global user.email "CICD@gitlab.com"
-
   script:
-    - uv version --bump patch --no-sync
     - uv build
     - uv publish
-    - git status
-    - git add .
-    - git commit -m "[ci skip] updated to $(uv version)"
+    - uv version --bump patch --no-sync
+    - git add pyproject.toml uv.lock
+    - git commit -m "[ci skip] bump to $(uv version --short)"
     - git push -o ci-skip http://root:$PROJECT_ACCESS_TOKEN@gitlab.com/openteams/scrudful HEAD:master
   artifacts:
     paths:
-    - dist
-  only:
-    refs:
-    - master
-    - merge_requests
-    changes:
-    - scrudful
-
+      - dist
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - scrudful/**/*
+        - pyproject.toml
