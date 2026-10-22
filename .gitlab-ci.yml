@@ -45,21 +45,33 @@ pages:
 
 # Publishes the version in pyproject.toml, then bumps the patch version and
 # pushes it, so the default branch always holds the next unreleased version.
+#
+# Re-runnable: if a previous run published but failed to push its bump (e.g.
+# the branch moved meanwhile), the version is already on PyPI; it is bumped
+# first, so this run publishes the next one instead of failing on the upload.
 publish:
   stage: deploy
   image: ghcr.io/astral-sh/uv:0.9.0-python3.12-bookworm
+  # Serialises publish jobs: concurrent pipelines would race on the upload and
+  # on the bump.
+  resource_group: publish
   variables:
     UV_PUBLISH_TOKEN: $POETRY_PYPI_ACCESS_TOKEN
   before_script:
     - git config --global user.name "Gitlab CI/CD"
     - git config --global user.email "CICD@gitlab.com"
   script:
+    - |
+      if curl -sfo /dev/null "https://pypi.org/pypi/scrudful/$(uv version --short)/json"; then
+        echo "scrudful $(uv version --short) is already on PyPI; bumping first"
+        uv version --bump patch --no-sync
+      fi
     - uv build
     - uv publish
     - uv version --bump patch --no-sync
     - git add pyproject.toml uv.lock
     - git commit -m "[ci skip] bump to $(uv version --short)"
-    - git push -o ci-skip http://root:$PROJECT_ACCESS_TOKEN@gitlab.com/openteams/scrudful HEAD:master
+    - git push -o ci-skip "https://oauth2:${PROJECT_ACCESS_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
   artifacts:
     paths:
       - dist
