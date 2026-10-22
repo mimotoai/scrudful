@@ -1,5 +1,61 @@
-def link_content(url, rel, content_type):
-    return f"<{url}>; rel=\"{rel}\"; type=\"{content_type}\""
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable
+from urllib.parse import quote
+
+# Response headers a browser client may need to read (CORS).
+EXPOSABLE_HEADERS = ("ETag", "Link", "Location")
+
+# RFC 3986 reserved characters plus '%' (unreserved characters are always kept
+# by ``urllib.parse.quote``).
+_URI_SAFE = ":/?#[]@!$&'()*+,;=%"
+_CTL_RE = re.compile("[\x00-\x1f\x7f]")
+
+
+def _quoted_string(value: str) -> str:
+    if _CTL_RE.search(value):
+        raise ValueError(f"{value!r} contains control characters")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def link_content(url: str, rel: str, content_type: str | None = None) -> str:
+    """Return one RFC 8288 link-value: ``<url>; rel="rel"; type="type"``.
+
+    Characters outside the RFC 3986 reserved/unreserved set (and ``%``) are
+    percent-encoded in ``url`` (non-ASCII as UTF-8). ``rel`` and
+    ``content_type`` are emitted as quoted-strings; ``ValueError`` is raised if
+    they contain control characters. The ``type`` parameter is omitted when
+    ``content_type`` is empty.
+    """
+    value = f"<{quote(url, safe=_URI_SAFE)}>; rel={_quoted_string(rel)}"
+    if content_type:
+        value += f"; type={_quoted_string(content_type)}"
+    return value
+
+
+def join_links(*values: str | None) -> str | None:
+    """Join link-values into one Link field value, skipping empty ones."""
+    return ", ".join(value for value in values if value) or None
+
+
+def merge_expose_headers(existing: str | None, names: Iterable[str]) -> str | None:
+    """Merge header ``names`` into an Access-Control-Expose-Headers value.
+
+    Names are compared case-insensitively; the existing order is kept and new
+    names are appended in the given order. Return ``None`` if the result is
+    empty.
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    candidates = (existing or "").split(",")
+    for name in (*candidates, *names):
+        name = name.strip()
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            merged.append(name)
+    return ", ".join(merged) or None
 
 
 def get_string_or_evaluate(string_or_func, *args, **kwargs):

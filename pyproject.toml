@@ -5,7 +5,7 @@ description = ""
 authors = [{ name = "David Charboneau", email = "david@openteams.com" }]
 requires-python = ">=3.10"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "LICENSES/Django-BSD-3-Clause.txt"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Framework :: Django",
