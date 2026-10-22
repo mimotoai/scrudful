@@ -1,10 +1,11 @@
 [project]
 name = "scrudful"
 version = "0.1.0"
-description = ""
+description = "HTTP conditional-request and Link-header helpers for SCRUDful REST APIs (Django REST Framework, FastAPI)"
 authors = [{ name = "David Charboneau", email = "david@openteams.com" }]
 requires-python = ">=3.10"
-license = "MIT"
+readme = "README.rst"
+license = "MIT AND BSD-3-Clause"
 license-files = ["LICENSE", "LICENSES/Django-BSD-3-Clause.txt"]
 classifiers = [
     "Development Status :: 3 - Alpha",

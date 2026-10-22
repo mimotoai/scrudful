@@ -459,6 +459,22 @@ def scrudful_viewset(cls: type) -> type:
 
     Callbacks are called as ``func(view, request, **url_kwargs)``; callables
     stored on ``Meta`` are plain functions (``staticmethod`` works too).
+
+    .. warning::
+
+       The item link callbacks (``schema_link_or_func`` and friends) also run
+       for ``create`` and for OPTIONS and POST on the list route, where there
+       is no ``pk``. Accept ``**kwargs`` (``def schema_url(view, request,
+       **kwargs)``) so they work for both.
+
+    .. warning::
+
+       When a class is decorated with :func:`scrudful_viewset`, an explicit
+       ``@scrudful`` on ``update`` does not apply to PATCH: DRF's
+       ``partial_update`` calls ``update``, and the wrapper that ``Meta``
+       configures for ``partial_update`` handles the request first. Decorate
+       ``partial_update`` explicitly as well to override it.
+
     ::
 
         @scrudful_viewset
