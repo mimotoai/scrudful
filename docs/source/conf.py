@@ -12,6 +12,7 @@
 
 import os
 import sys
+from importlib.metadata import version as _dist_version
 import django
 sys.path.insert(0, os.path.abspath('../..'))
 sys.path.insert(1, os.path.abspath('../../examples/scrudful_rest_framework'))
@@ -25,7 +26,7 @@ copyright = '2021, OpenTeams, Inc'
 author = 'OpenTeams, Inc'
 
 # The full version, including alpha/beta/rc tags
-release = '0.1.0'
+release = _dist_version('scrudful')
 
 
 # -- General configuration ---------------------------------------------------

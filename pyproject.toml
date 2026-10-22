@@ -4,26 +4,42 @@ version = "0.1.0"
 description = ""
 authors = [{ name = "David Charboneau", email = "david@openteams.com" }]
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: Django",
+    "Framework :: FastAPI",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
 dependencies = []
+
+[project.optional-dependencies]
+drf = ["django>=4.2", "djangorestframework>=3.15"]
+fastapi = ["fastapi>=0.100"]
 
 [dependency-groups]
 dev = [
-    "black==19.3b0",
-    "coverage>=5.3.1,<6",
-    "django==4.2.5",
-    "djangorestframework>=3.11.0,<4",
-    "flake8>=3.8.4,<4",
-    "pytest>=6.2.5,<7",
-    "pytest-cov>=2.10.1,<3",
-    "pytest-django>=4.1.0,<5",
-    "safetydance-django>=0.0.5,<0.0.6",
-    "sphinx>=2.3.1,<3",
-    "sphinx-autobuild>=2020.9.1,<2021",
-    "sphinx-rtd-theme>=0.5.0,<0.6",
-    "sphinxcontrib-django>=0.5.1,<0.6",
-    "fastapi>=0.65.1,<0.66",
-    "uvicorn>=0.14.0,<0.15",
-    "pytest-freezegun>=0.4.2,<0.5",
+    "scrudful[drf,fastapi]",
+    "pytest>=8",
+    "pytest-cov>=5",
+    "pytest-django>=4.8",
+    "pytest-randomly>=3.15",
+    "freezegun>=1.5",
+    "httpx2",
+    "black>=24",
+    "flake8>=7",
+    "uvicorn>=0.30",
+]
+docs = [
+    "sphinx>=7",
+    "sphinx-rtd-theme>=2",
+    "sphinx-autobuild>=2024.2.4",
 ]
 
 [build-system]
@@ -32,3 +48,12 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-root = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# TODO(task-3): tests/examples/fastapi/test_api.py is a stateful sequence (later
+# tests rely on records created/updated by earlier ones), so random ordering
+# breaks it. Remove this once those tests are rewritten to be independent.
+addopts = "-p no:randomly"
+filterwarnings = ["error"]

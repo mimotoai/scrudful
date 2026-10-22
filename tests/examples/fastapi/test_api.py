@@ -1,6 +1,5 @@
 from fastapi.testclient import TestClient
 from freezegun import freeze_time
-import json
 
 from examples.fastapi.api import app
 
@@ -68,7 +67,7 @@ class TestPostRequestForCreatingRecord():
             "name": "Lisa",
             "age": 23
         }
-        response = test_client.post("/user", data=json.dumps(data))
+        response = test_client.post("/user", json=data)
         resp_data = response.json()['payload']
 
         assert response.status_code == 200
@@ -104,7 +103,7 @@ class TestPutRequest():
         data = {"age": 34}
         response = test_client.put(
             "/user/4",
-            data=json.dumps(data),
+            json=data,
             headers={}
         )
         resp_data = response.json()
@@ -119,7 +118,7 @@ class TestPutRequest():
         data = {"age": 34}
         response = test_client.put(
             "/user/4",
-            data=json.dumps(data),
+            json=data,
             headers={
                 "If-Match": '"USER_2_0.1.0"',
                 "If-Unmodified-Since": "Tue, 24 May 2021 00:00:00 GMT"
@@ -135,7 +134,7 @@ class TestPutRequest():
         data = {"age": 34}
         response = test_client.put(
             "/user/4",
-            data=json.dumps(data),
+            json=data,
             headers={
                 "If-Match": '"USER_4_0.1.0"',
                 "If-Unmodified-Since": "Tue, 24 May 2021 00:00:00 GMT"
