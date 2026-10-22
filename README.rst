@@ -281,6 +281,22 @@ Development
     $ uv run pytest
     $ uv run --group docs make -C docs html
 
+Releasing
+---------
+
+A merge request that changes the package (``scrudful/``, or the published parts
+of ``pyproject.toml``) sets the version to release; the ``version-check`` job
+fails until it does. Pick the bump and commit ``pyproject.toml`` and
+``uv.lock``:
+
+.. code-block:: console
+
+    $ uv version --bump minor    # or --bump patch / --bump major, or: uv version 1.0.0
+
+Merging to ``master`` publishes that version to PyPI and creates the
+``vX.Y.Z`` tag and GitLab release. Merges that leave the version unchanged (docs,
+tests, CI) publish nothing.
+
 License
 =======
 
