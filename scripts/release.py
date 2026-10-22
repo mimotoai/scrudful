@@ -117,7 +117,7 @@ def check_bump(base: str, target: str) -> int:
     old, new = pyproject_at(base), pyproject_at(None)
     version = version_of(new)
     if not bump_required(changed, old, new):
-        print(f"No package changes since {base[:12]}; no version bump needed.")
+        print(f"No package changes since {base}; no version bump needed.")
         return 0
     error = bump_error(version, version_of(pyproject_at(target)), released_versions())
     if error:
