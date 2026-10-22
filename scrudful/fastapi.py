@@ -80,7 +80,11 @@ _PRECONDITION_FIELDS = (
     "if-unmodified-since",
 )
 _FRESH_VALIDATOR_METHODS = frozenset({"PUT", "PATCH"})
-_BODY_HEADERS = frozenset({"content-length", "content-type"})
+# Representation metadata: not for the body-less (or differently typed) early
+# response (RFC 9110 §15.4.5).
+_BODY_HEADERS = frozenset(
+    {"content-length", "content-type", "content-encoding", "content-range"}
+)
 
 Endpoint = TypeVar("Endpoint", bound=Callable[..., Any])
 
@@ -145,7 +149,9 @@ def scrudful(
         answered with 400, a failed precondition with 412 and a matching
         GET/HEAD with 304 carrying the validators. These responses are JSON
         responses (304 without a body) returned without calling the endpoint,
-        so ``response_model`` does not apply to them; document them with
+        so ``response_model`` does not apply to them. Headers dependencies set
+        on the injected ``Response`` are kept: all of them on a 304 (except
+        ``Content-*`` metadata), only ``Set-Cookie`` on the others; document them with
         :data:`CONDITIONAL_READ_RESPONSES` and
         :data:`CONDITIONAL_WRITE_RESPONSES`.
 
@@ -309,29 +315,29 @@ async def _call_all(
 ) -> list[Any]:
     """Call ``funcs`` one after the other, in order, and return the results.
 
-    Consecutive sync callables share one threadpool hop. They are never run
-    concurrently: they typically share a database session.
+    Consecutive sync callables share one threadpool hop, which ends after a
+    callable returning an awaitable (awaited before the next one runs). They
+    are never run concurrently: they typically share a database session.
     """
     results: list[Any] = []
-    sync: list[Callable[..., Any]] = []
+    pending = list(funcs)
 
-    async def flush() -> None:
-        if sync:
-            batch = list(sync)
-            sync.clear()
-            raw = await run_in_threadpool(lambda: [f(**kwargs) for f in batch])
-            for result in raw:
-                if inspect.isawaitable(result):
-                    result = await result
-                results.append(result)
+    def run_sync() -> list[Any]:
+        out: list[Any] = []
+        while pending and not inspect.iscoroutinefunction(pending[0]):
+            out.append(pending.pop(0)(**kwargs))
+            if inspect.isawaitable(out[-1]):
+                break
+        return out
 
-    for func in funcs:
-        if inspect.iscoroutinefunction(func):
-            await flush()
-            results.append(await func(**kwargs))
-        else:
-            sync.append(func)
-    await flush()
+    while pending:
+        if inspect.iscoroutinefunction(pending[0]):
+            results.append(await pending.pop(0)(**kwargs))
+            continue
+        out = await run_in_threadpool(run_sync)
+        if inspect.isawaitable(out[-1]):
+            out[-1] = await out[-1]
+        results.extend(out)
     return results
 
 
@@ -371,8 +377,11 @@ def _conditional_response(result: ConditionalResult, injected: Headers) -> Respo
     """Build the early response, keeping headers set on the injected Response.
 
     FastAPI only merges the injected response's headers into responses it
-    builds itself, so dependency headers (``Cache-Control``, ``Vary``,
-    ``Set-Cookie``, ...) would be lost; a 304 must carry the ones a 200 would.
+    builds itself, so dependency headers would be lost. A 304 gets all of them
+    (``Cache-Control``, ``Vary``, ... as a 200 would carry, RFC 9110 §15.4.5),
+    except representation metadata and those it already has. Error responses
+    get only the cookies: other headers (e.g. a ``public`` Cache-Control) must
+    not apply to them.
     """
     if result.body is None:
         response = Response(status_code=result.status, headers=result.headers)
@@ -381,18 +390,20 @@ def _conditional_response(result: ConditionalResult, injected: Headers) -> Respo
             result.body, status_code=result.status, headers=result.headers
         )
     headers = response.headers
-    for name, value in injected.raw:
-        key = name.decode("latin-1")
-        if key in _BODY_HEADERS:
-            continue
-        if key == "set-cookie":
-            headers.append("set-cookie", value.decode("latin-1"))
-        elif key == "access-control-expose-headers":
-            headers[key] = merge_expose_headers(
-                headers.get(key), value.decode("latin-1").split(",")
-            )
-        elif key not in headers:
-            headers.append(key, value.decode("latin-1"))
+    own = {name for name, _ in headers.raw}
+    for raw_name, raw_value in injected.raw:
+        name = raw_name.decode("latin-1").lower()
+        value = raw_value.decode("latin-1")
+        if name == "set-cookie":
+            headers.append(name, value)
+        elif name == "access-control-expose-headers":
+            headers[name] = merge_expose_headers(headers.get(name), value.split(","))
+        elif (
+            result.status == 304
+            and name not in _BODY_HEADERS
+            and name.encode("latin-1") not in own
+        ):
+            headers.append(name, value)
     _expose_headers(headers)
     return response
 
@@ -414,9 +425,25 @@ def _status_code(request: Request, response: Response) -> int:
     if status:
         return status
     # Neither is set: FastAPI lets the response class pick (RedirectResponse: 307).
-    response_class = getattr(route, "response_class", None)
+    return _default_status(_response_class(request))
+
+
+def _response_class(request: Request) -> Any:
+    """The response class FastAPI uses for the matched route."""
+    # Routes added with ``include_router(default_response_class=...)`` keep their
+    # own placeholder on newer FastAPI; the effective class is in the scope.
+    context = request.scope.get("fastapi", {}).get("effective_route_context")
+    response_class = getattr(context, "response_class", None)
+    if response_class is None:
+        response_class = getattr(request.scope.get("route"), "response_class", None)
     if isinstance(response_class, DefaultPlaceholder):
         response_class = response_class.value
+    return response_class
+
+
+@functools.lru_cache(maxsize=None)
+def _default_status(response_class: Any) -> int:
+    """Default ``status_code`` of ``response_class``, or 200 if unknown."""
     try:
         default = inspect.signature(response_class).parameters["status_code"].default
     except (KeyError, TypeError, ValueError):

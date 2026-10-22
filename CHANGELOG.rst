@@ -170,9 +170,10 @@ Fixes
   (422).
 * ``scrudful.fastapi``: endpoints with generic-alias parameters (``list[int]``,
   ``dict[str, int]``) no longer fail at decoration on Python 3.10.
-* ``scrudful.fastapi``: the 304/400/412/428 responses now carry the headers
-  dependencies set on the injected ``Response`` (``Cache-Control``, ``Vary``,
-  ``Set-Cookie``, ...), as RFC 9110 §15.4.5 requires for a 304.
+* ``scrudful.fastapi``: the 304 response now carries the headers dependencies set
+  on the injected ``Response`` (``Cache-Control``, ``Vary``, ``Set-Cookie``, ...,
+  but not ``Content-*`` metadata), as RFC 9110 §15.4.5 requires; the 400/412/428
+  responses carry its ``Set-Cookie`` lines only.
 * ``scrudful.fastapi``: a route without ``status_code`` uses its response class's
   default status (e.g. 307 for ``RedirectResponse``) to decide whether validators
   are added.

@@ -7,19 +7,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 import pytest
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
+from scrudful import fastapi as fastapi_module
 from scrudful.fastapi import (
     CONDITIONAL_READ_RESPONSES,
     CONDITIONAL_WRITE_RESPONSES,
+    _annotation_is,
     scrudful,
 )
-from scrudful import fastapi as fastapi_module
-from scrudful.fastapi import _annotation_is
 from tests import fastapi_future_annotations as future_endpoints
 
 # Non-zero microseconds: the header is floored to whole seconds and conditional
@@ -1107,12 +1107,16 @@ def _header_app(store):
     app = FastAPI()
 
     def set_headers(response: Response):
-        response.headers["Cache-Control"] = "max-age=60"
-        response.headers["Vary"] = "Accept"
+        response.headers.append("Cache-Control", "max-age=60")
+        response.headers.append("Cache-Control", "must-revalidate")
+        response.headers.append("Vary", "Accept")
+        response.headers.append("Vary", "Origin")
         response.headers["Access-Control-Expose-Headers"] = "X-Custom"
         response.headers["ETag"] = '"dependency"'
+        response.headers["Content-Type"] = "text/plain"
+        response.headers["Content-Encoding"] = "gzip"
         response.set_cookie("session", "abc")
-        response.set_cookie("other", "def")
+        response.raw_headers.append((b"Set-Cookie", b"raw=1"))
 
     @app.get("/item", dependencies=[Depends(set_headers)])
     @scrudful(etag_func=store.etag)
@@ -1131,24 +1135,36 @@ def test_304_carries_dependency_headers(make_client, store):
     client = make_client(_header_app(store))
     response = client.get("/item", headers={"If-None-Match": '"v1"'})
     assert response.status_code == 304
-    assert response.headers["cache-control"] == "max-age=60"
-    assert response.headers["vary"] == "Accept"
-    assert response.headers["etag"] == '"v1"'
+    assert response.headers.get_list("cache-control") == [
+        "max-age=60",
+        "must-revalidate",
+    ]
+    assert response.headers.get_list("vary") == ["Accept", "Origin"]
+    assert response.headers.get_list("etag") == ['"v1"']
     assert response.headers.get_list("set-cookie") == [
         "session=abc; Path=/; SameSite=lax",
-        "other=def; Path=/; SameSite=lax",
+        "raw=1",
     ]
     assert response.headers["access-control-expose-headers"] == "X-Custom, ETag"
     assert "content-type" not in response.headers
+    assert "content-encoding" not in response.headers
     assert response.content == b""
 
 
-def test_412_carries_dependency_cookie(make_client, store):
+def test_412_carries_only_dependency_cookies(make_client, store):
     client = make_client(_header_app(store))
     response = client.put("/item", headers={"If-Match": '"other"'})
     assert response.status_code == 412
-    assert response.headers.get_list("set-cookie")
+    assert response.headers.get_list("set-cookie") == [
+        "session=abc; Path=/; SameSite=lax",
+        "raw=1",
+    ]
     assert response.headers["content-type"].startswith("application/json")
+    assert "content-encoding" not in response.headers
+    assert "cache-control" not in response.headers
+    assert "vary" not in response.headers
+    assert "etag" not in response.headers
+    assert response.headers["access-control-expose-headers"] == "X-Custom"
 
 
 # --- default status of the response class --------------------------------------
@@ -1180,6 +1196,22 @@ def test_response_class_default_status_decides_validators(make_client, store):
     response = client.get("/created")
     assert response.status_code == 201
     assert response.headers["etag"] == '"v1"'
+
+
+def test_included_router_default_response_class(make_client, store):
+    router = APIRouter()
+
+    @router.get("/r")
+    @scrudful(etag_func=store.etag)
+    def redirect():
+        return "http://example.com/"
+
+    app = FastAPI()
+    app.include_router(router, default_response_class=RedirectResponse)
+
+    response = make_client(app).get("/r", follow_redirects=False)
+    assert response.status_code == 307
+    assert "etag" not in response.headers
 
 
 # --- one threadpool hop for sync validator callbacks ---------------------------
@@ -1243,3 +1275,70 @@ def test_mixed_validators_keep_order_and_await_results(make_client):
     assert order == ["etag", "last_modified"]
     assert response.headers["etag"] == '"v1"'
     assert response.headers["last-modified"] == MODIFIED_HTTP
+
+
+def test_sync_then_async_validators_keep_order(make_client):
+    app = FastAPI()
+    order = []
+
+    def etag(**kwargs):
+        order.append("etag")
+        return "v1"
+
+    async def modified(**kwargs):
+        order.append("last_modified")
+        return MODIFIED
+
+    @app.get("/item")
+    @scrudful(etag_func=etag, last_modified_func=modified)
+    async def get_item():
+        return {}
+
+    response = make_client(app).get("/item")
+    assert order == ["etag", "last_modified"]
+    assert response.headers["last-modified"] == MODIFIED_HTTP
+
+
+def test_sync_awaitable_runs_before_the_next_callback(make_client):
+    app = FastAPI()
+    order = []
+
+    def etag(**kwargs):
+        async def body():
+            order.append("etag")
+            return "v1"
+
+        return body()
+
+    def modified(**kwargs):
+        order.append("last_modified")
+        return MODIFIED
+
+    @app.get("/item")
+    @scrudful(etag_func=etag, last_modified_func=modified)
+    async def get_item():
+        return {}
+
+    make_client(app).get("/item")
+    assert order == ["etag", "last_modified"]
+
+
+def test_unawaited_validator_coroutine_is_closed_on_error(make_client):
+    app = FastAPI()
+
+    def etag(**kwargs):
+        async def body():
+            return "v1"  # pragma: no cover
+
+        return body()
+
+    def modified(**kwargs):
+        raise RuntimeError("boom")
+
+    @app.get("/item")
+    @scrudful(etag_func=etag, last_modified_func=modified)
+    async def get_item():
+        return {}
+
+    with pytest.raises(RuntimeError, match="boom"):
+        make_client(app).get("/item")
