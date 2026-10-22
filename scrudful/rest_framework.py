@@ -454,8 +454,7 @@ def scrudful_api_view(
         scrudful_handler = decorate(handler)
         for method in http_method_names:
             setattr(view.cls, method.lower(), scrudful_handler)
-        if hasattr(func, "metadata_class"):
-            view.cls.metadata_class = func.metadata_class
+        # api_view already copies func.metadata_class onto the view class.
         _install_metadata(view.cls)
         return view
 
@@ -496,7 +495,9 @@ def scrudful_viewset(cls: type) -> type:
 
        An explicit ``@scrudful`` on ``update`` applies to PATCH when
        ``partial_update`` is DRF's stock ``UpdateModelMixin.partial_update``
-       (it is then not wrapped). With a user-defined ``partial_update`` that
+       (it is then not wrapped; a subclass of a decorated viewset inherits the
+       parent's wrapper, so decorate the subclass with :func:`scrudful_viewset`
+       too). With a user-defined ``partial_update`` that
        calls ``update``, the wrapper that ``Meta`` configures for
        ``partial_update`` handles the request first and the explicit
        ``update`` decorator is a pass-through for PATCH. Decorate

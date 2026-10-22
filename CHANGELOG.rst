@@ -18,7 +18,8 @@ Packaging and tooling
 * Modernised the stack: current Django, Django REST Framework, FastAPI
   (pydantic v2) and Sphinx; pytest with pytest-randomly (order-independent
   tests); dropped pytest-freezegun and safetydance-django.
-* ``scrudful.__version__`` is read from the installed package metadata.
+* ``scrudful.__version__`` is read from the installed package metadata, or is
+  ``"0+unknown"`` when scrudful is not installed (a vendored source tree).
 * The README is now the package's long description; the CI pipeline uses uv and
   publishes only after the tests pass.
 * The CI pipeline runs for merge requests and the default branch; the docs
@@ -115,9 +116,11 @@ Both adapters
   or a project-wide ``DEFAULT_METADATA_CLASS`` is kept; subclass or mix in
   ``ScrudfulMetadata`` to combine it with your own). It no
   longer adds methods the class lacks (read-only viewsets answer 405 instead of
-  500), wraps ``partial_update``, leaves explicit ``@scrudful`` methods alone and
-  gives ``create`` the link configuration only. Re-decorating a subclass replaces
-  inherited wrappers.
+  500), wraps ``partial_update`` (unless it is DRF's stock one and ``update`` is
+  decorated explicitly), leaves explicit ``@scrudful`` methods alone and
+  gives ``create`` the link configuration only; an explicit ``@scrudful`` on
+  ``update`` also applies to PATCH when ``partial_update`` is DRF's stock one. Re-decorating a subclass
+  replaces inherited wrappers.
 * ``ScrudfulMetadata``: ``determine_metadata_for_detail`` and
   ``determine_metadata_for_list`` are removed;
   ``determine_metadata_for_get/post/put/delete`` take ``(handler, args, kwargs)``
@@ -157,10 +160,6 @@ Fixes
 * ``scrudful_viewset`` / ``scrudful_api_view`` no longer override a project's
   ``DEFAULT_METADATA_CLASS`` (including ``None``, which disables OPTIONS
   metadata); only DRF's default ``SimpleMetadata`` is replaced.
-* An explicit ``@scrudful`` on ``update`` in a ``scrudful_viewset`` now applies to
-  PATCH when ``partial_update`` is DRF's stock one (before it was ignored).
-* ``import scrudful`` works from an uninstalled source tree
-  (``__version__`` is ``"0+unknown"`` there).
 * The OPTIONS description is correct for list, detail, nested and ``@action``
   routes, and mutating it no longer changes later responses (the response
   descriptions were shared module-level dictionaries).

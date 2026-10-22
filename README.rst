@@ -181,7 +181,8 @@ Caveats of ``scrudful_viewset``:
   list route, where there is no ``pk``. Accept ``**kwargs``, as
   ``item_schema_url`` does above.
 * An explicit ``@scrudful`` on ``update`` applies to PATCH when
-  ``partial_update`` is DRF's stock one. With a user-defined ``partial_update``
+  ``partial_update`` is DRF's stock one (decorate a subclass of a decorated
+  viewset with ``scrudful_viewset`` too, or it inherits the parent's wrapper). With a user-defined ``partial_update``
   that calls ``update``, the ``Meta``-configured wrapper of ``partial_update``
   wins: decorate ``partial_update`` explicitly to override it.
 * OPTIONS uses ``ScrudfulMetadata`` only when the viewset's ``metadata_class``

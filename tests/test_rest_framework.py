@@ -12,6 +12,7 @@ import pytest
 from django.http import HttpResponse
 from django.test import override_settings
 from django.urls import include, path
+from rest_framework import views as drf_views
 from rest_framework import viewsets
 from rest_framework.authentication import BasicAuthentication
 from rest_framework.decorators import (
@@ -22,7 +23,6 @@ from rest_framework.decorators import (
     renderer_classes,
     throttle_classes,
 )
-from rest_framework import views as drf_views
 from rest_framework.metadata import SimpleMetadata
 from rest_framework.mixins import UpdateModelMixin
 from rest_framework.permissions import IsAuthenticated
@@ -1159,11 +1159,9 @@ def test_user_defined_partial_update_keeps_the_meta_configuration(client):
 # --- metadata_class -----------------------------------------------------------
 
 
-def _options(view_or_cls, path_prefix="/"):
+def _options(view_or_cls):
     factory = APIRequestFactory()
-    return view_or_cls.as_view({"get": "retrieve"})(
-        factory.options(path_prefix), pk="1"
-    )
+    return view_or_cls.as_view({"get": "retrieve"})(factory.options("/"), pk="1")
 
 
 class DefaultMetadataViewSet(ThingViewSetBase):
