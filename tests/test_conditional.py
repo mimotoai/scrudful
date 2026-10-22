@@ -94,6 +94,8 @@ def test_quote_etag_invalid(value):
         ("   ", []),
         ("*", ["*"]),
         ("  *  ", ["*"]),
+        ("*,", ["*"]),  # e.g. "*" and an empty field line, joined
+        (", * ,", ["*"]),
         ('"a"', ['"a"']),
         ('"a", "b"', ['"a"', '"b"']),
         ('"a","b"', ['"a"', '"b"']),
@@ -122,6 +124,7 @@ def test_parse_etag_list(value, expected):
         '"a b"',
         '*, "a"',
         '"a", *',
+        "*, *",
         "**",
         '"a"x',
         "garbage!!",

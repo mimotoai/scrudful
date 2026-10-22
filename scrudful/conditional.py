@@ -96,7 +96,8 @@ def parse_etag_list(value: str | None) -> list[str] | None:
     if value is None:
         return []
     value = value.strip(_OWS)
-    if value == "*":
+    # Empty list elements don't count (RFC 9110 §5.6.1.2), so "*," is "*".
+    if value.strip(_OWS + ",") == "*":
         return ["*"]
     tags: list[str] = []
     pos, end = 0, len(value)
