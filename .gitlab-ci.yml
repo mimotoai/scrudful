@@ -1,47 +1,94 @@
-image: continuumio/miniconda3:latest
+# Pipelines run for merge requests and for the default branch only (no
+# duplicate branch + MR pipelines). `test` runs in both; `pages` and `publish`
+# deploy, so they run only on the default branch.
+#
+# Stage ordering (rather than `needs:`) makes the deploy jobs wait for the
+# whole test matrix: with stages, a deploy job starts only after every job of
+# the earlier stage has succeeded.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
-before_script:
-  - conda install -c conda-forge make sphinx django sphinx_rtd_theme
+stages:
+  - test
+  - deploy
+
+test:
+  stage: test
+  image: ghcr.io/astral-sh/uv:0.9.0-python3.12-bookworm
+  parallel:
+    matrix:
+      - PYTHON: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+  script:
+    - uv run --locked -p "$PYTHON" pytest -q
 
 pages:
+  stage: deploy
+  image: ghcr.io/astral-sh/uv:0.9.0-python3.12-bookworm
   script:
-  - mkdir -p public
-  - cd docs
-  - make clean
-  - make html
-  - cp -r build/html/* ../public/.
+    - uv sync --locked --group docs
+    - uv run --locked make -C docs html BUILDDIR=build SPHINXOPTS="-W --keep-going"
+    - mkdir -p public
+    - cp -r docs/build/html/* public/
   artifacts:
     paths:
       - public
-  only:
-    refs:
-    - master
-    - merge_requests
-    changes:
-    - docs
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - docs/**/*
+        - scrudful/**/*
+        - pyproject.toml
+        - README.rst
+        - CHANGELOG.rst
 
+# Publishes the version in pyproject.toml, then bumps the patch version and
+# pushes it, so the default branch always holds the next unreleased version.
+#
+# Only the tip of the default branch publishes: a job for a superseded commit
+# (a late or retried pipeline) exits without publishing, so older code is never
+# released under a newer version. If a previous run published but failed to push
+# its bump, the version is already on PyPI; it is bumped until it is free, so
+# this run publishes the next one instead of failing on the upload. If the push
+# failed because the branch moved, the next pipeline (or a retry while this
+# commit is still the tip) recovers. A partial upload (e.g. only the sdist)
+# leaves that version incomplete: the next run skips it.
 publish:
+  stage: deploy
+  image: ghcr.io/astral-sh/uv:0.9.0-python3.12-bookworm
+  # Serialises publish jobs: concurrent pipelines would race on the upload and
+  # on the bump.
+  resource_group: publish
+  variables:
+    UV_PUBLISH_TOKEN: $POETRY_PYPI_ACCESS_TOKEN
   before_script:
-    - conda install -c conda-forge poetry
     - git config --global user.name "Gitlab CI/CD"
     - git config --global user.email "CICD@gitlab.com"
-
   script:
-    - poetry config http-basic.pypi "__token__" "${POETRY_PYPI_ACCESS_TOKEN}"
-    - poetry version patch
-    - poetry build
-    - poetry publish
-    - git status
-    - git add .
-    - git commit -m "[ci skip] updated to $(poetry version)"
-    - git push -o ci-skip http://root:$PROJECT_ACCESS_TOKEN@gitlab.com/openteams/scrudful HEAD:master
+    - ': "${PROJECT_ACCESS_TOKEN:?}"'
+    - git fetch -q "https://oauth2:${PROJECT_ACCESS_TOKEN}@${CI_SERVER_FQDN}/${CI_PROJECT_PATH}.git" "${CI_DEFAULT_BRANCH}"
+    - |
+      if [ "$(git rev-parse FETCH_HEAD)" != "$CI_COMMIT_SHA" ]; then
+        echo "$CI_COMMIT_SHA is no longer the tip of ${CI_DEFAULT_BRANCH}; skipping"
+        exit 0
+      fi
+    - |
+      while curl -sfo /dev/null "https://pypi.org/pypi/scrudful/$(uv version --short)/json"; do
+        echo "scrudful $(uv version --short) is already on PyPI; bumping first"
+        uv version --bump patch --no-sync
+      done
+    - uv build
+    - uv publish
+    - uv version --bump patch --no-sync
+    - git add pyproject.toml uv.lock
+    - git commit -m "[ci skip] bump to $(uv version --short)"
+    - git push -o ci-skip "https://oauth2:${PROJECT_ACCESS_TOKEN}@${CI_SERVER_FQDN}/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
   artifacts:
     paths:
-    - dist
-  only:
-    refs:
-    - master
-    - merge_requests
-    changes:
-    - scrudful
-
+      - dist
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - scrudful/**/*
+        - pyproject.toml

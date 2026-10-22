@@ -1,210 +1,392 @@
+"""Tests of the example FastAPI app (``examples/fastapi/api.py``)."""
+
+import os
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+import pytest
 from fastapi.testclient import TestClient
-from freezegun import freeze_time
-import json
 
-from examples.fastapi.api import app
+from examples.fastapi import api
 
-test_client = TestClient(app)
-
-
-class TestGetRequestForExistingRecord():
-    def test_get_req_200_response_data(self):
-        # GET Request to fetch the user record
-        # Testing success data response
-        # Record was modified since the time requested in the headers
-        response = test_client.get("/user/1", headers={
-            "If-Match": '"USER_1_0.1.0"',
-            "If-Modified-Since": "Tue, 24 May 2021 22:00:53 GMT"
-        })
-        resp_data = response.json()['payload']
-
-        assert response.status_code == 200
-        assert resp_data['id'] == 1
-        assert resp_data['name'] == "John"
-        assert resp_data['age'] == 22
-
-    def test_get_req_200_response_headers(self):
-        # GET Request to fetch the user record
-        # Testing success header response
-        # Record was modified since the time requested in the headers
-        response = test_client.get("/user/1", headers={
-            "If-Match": '"USER_1_0.1.0"',
-            "If-Modified-Since": "Tue, 24 May 2021 22:00:53 GMT"
-        })
-        headers = response.headers
-
-        assert response.status_code == 200
-        assert headers['etag'] == '"USER_1_0.1.0"'
-        assert headers['access-control-expose-headers'] == "Link"
-
-    def test_get_req_304_response(self):
-        # GET Request to fetch the user record
-        # Testing the not modified status response
-        # Record was not modified since the time requested in the headers
-        response = test_client.get("/user/1", headers={
-            "If-Match": '"USER_1_0.1.0"',
-            "If-Modified-Since": "Tue, 25 May 2021 22:00:53 GMT"
-        })
-
-        assert response.status_code == 304
-
-    def test_get_req_412_response(self):
-        # GET Request to fetch the existing user record
-        # Testing Precondition Failed response
-        # Validation of mismatch in e-tag value
-        response = test_client.get("/user/1", headers={
-            "If-Match": '"USER_2_0.1.0"',
-            "If-Modified-Since": "Tue, 25 May 2021 22:00:53 GMT"
-        })
-
-        assert response.status_code == 412
+BASE = "http://testserver"
+SCHEMA_LINK = (
+    f'<{BASE}/schemas/user.json>; rel="describedBy"; type="application/schema+json"'
+)
+CONTEXT_LINK = (
+    f'<{BASE}/contexts/user.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; '
+    'type="application/ld+json"'
+)
+LINKS = f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+# The seed data has sub-second timestamps; the header is floored to seconds.
+SEED_MODIFIED = "Tue, 25 May 2021 14:45:30 GMT"
+BEFORE_SEED_MODIFIED = "Tue, 25 May 2021 14:45:29 GMT"
+JOHN = {
+    "id": 1,
+    "name": "John",
+    "age": 22,
+    "created_at": "2021-05-24T09:30:15.250000Z",
+    "updated_at": "2021-05-25T14:45:30.750000Z",
+}
 
 
-class TestPostRequestForCreatingRecord():
-    def test_post_req_200_response_data(self):
-        # POST Request to create a new user record
-        # Testing success data response
-        data = {
-            "name": "Lisa",
-            "age": 23
-        }
-        response = test_client.post("/user", data=json.dumps(data))
-        resp_data = response.json()['payload']
-
-        assert response.status_code == 200
-        assert resp_data['id'] == 4
-        assert resp_data['name'] == "Lisa"
-        assert resp_data['age'] == 23
-
-    def test_get_req_200_response_data(self):
-        # GET Request to fetch the new user record created by POST method
-        # Testing the response data of the latest created record
-        response = test_client.get("/user/4", headers={})
-        resp_data = response.json()['payload']
-
-        assert response.status_code == 200
-        assert resp_data['id'] == 4
-        assert resp_data['name'] == "Lisa"
-
-    def test_get_req_200_response_headers(self):
-        # GET Request to fetch the new user record created by POST method
-        # Testing the response headers of the latest created record
-        response = test_client.get("/user/4", headers={})
-        headers = response.headers
-
-        assert response.status_code == 200
-        assert headers['etag'] == '"USER_4_0.1.0"'
-        assert headers['access-control-expose-headers'] == "Link"
+@pytest.fixture(autouse=True)
+def fresh_data():
+    api.reset_data()
+    yield
+    api.reset_data()
 
 
-class TestPutRequest():
-    def test_put_req_400_response(self):
-        # PUT Request to update the user record
-        # Testing the 400 (Bad Request) response | Due to missing required headers
-        data = {"age": 34}
-        response = test_client.put(
-            "/user/4",
-            data=json.dumps(data),
-            headers={}
+@pytest.fixture
+def client():
+    with TestClient(api.app) as client:
+        yield client
+
+
+def assert_unchanged(client, user_id=2):
+    response = client.get(f"/users/{user_id}")
+    assert response.status_code == 200
+    assert response.headers["etag"] == f'"user-{user_id}-v1"'
+
+
+# --- GET ---------------------------------------------------------------------------
+
+
+def test_get_user(client):
+    response = client.get("/users/1")
+    assert response.status_code == 200
+    assert response.json() == JOHN
+    assert response.headers["etag"] == '"user-1-v1"'
+    assert response.headers["last-modified"] == SEED_MODIFIED
+    assert response.headers["link"] == LINKS
+    assert response.headers["access-control-expose-headers"] == "ETag, Link"
+
+
+def test_links_resolve(client):
+    schema = client.get("/schemas/user.json").json()
+    assert schema["title"] == "User"
+    assert set(schema["properties"]) == set(JOHN)
+    context = client.get("/contexts/user.jsonld").json()
+    assert context["@context"]["updated_at"] == "dateModified"
+
+
+@pytest.mark.parametrize("headers", [{}, {"If-None-Match": "*"}])
+def test_get_missing_user(client, headers):
+    response = client.get("/users/99", headers=headers)
+    assert response.status_code == 404
+    assert response.json() == {"detail": "User not found"}
+    assert "etag" not in response.headers
+    assert "last-modified" not in response.headers
+
+
+@pytest.mark.parametrize(
+    "if_none_match",
+    ['"user-1-v1"', 'W/"user-1-v1"', "*", '"user-2-v1", "user-1-v1"'],
+)
+def test_if_none_match_gives_304(client, if_none_match):
+    response = client.get("/users/1", headers={"If-None-Match": if_none_match})
+    assert response.status_code == 304
+    assert response.content == b""
+    assert response.headers["etag"] == '"user-1-v1"'
+    assert response.headers["last-modified"] == SEED_MODIFIED
+
+
+def test_if_none_match_of_another_user_gives_200(client):
+    response = client.get("/users/1", headers={"If-None-Match": '"user-2-v1"'})
+    assert response.status_code == 200
+
+
+def test_if_modified_since_echo_gives_304(client):
+    last_modified = client.get("/users/1").headers["last-modified"]
+    response = client.get("/users/1", headers={"If-Modified-Since": last_modified})
+    assert response.status_code == 304
+    response = client.get("/users/1", headers={"If-Modified-Since": "not a date"})
+    assert response.status_code == 200
+    earlier = {"If-Modified-Since": BEFORE_SEED_MODIFIED}
+    assert client.get("/users/1", headers=earlier).status_code == 200
+
+
+def test_head_is_not_routed_to_get(client):
+    """Current FastAPI behaviour: HEAD on a GET-only route is 405."""
+    response = client.head("/users/1")
+    assert response.status_code == 405
+
+
+# --- POST --------------------------------------------------------------------------
+
+
+def test_create_user(client):
+    response = client.post("/users", json={"name": "Lisa", "age": 23})
+    assert response.status_code == 201
+    body = response.json()
+    assert (body["id"], body["name"], body["age"]) == (4, "Lisa", 23)
+    assert body["created_at"] == body["updated_at"]
+    assert response.headers["location"] == f"{BASE}/users/4"
+    assert response.headers["link"] == LINKS
+    assert response.headers["access-control-expose-headers"] == "Link, Location"
+    assert "etag" not in response.headers
+    assert "last-modified" not in response.headers
+
+    created = client.get(response.headers["location"])
+    assert created.status_code == 200
+    assert created.json() == body
+    assert created.headers["etag"] == '"user-4-v1"'
+
+
+def test_create_user_ignores_preconditions(client):
+    """POST /users has no validators, so precondition headers don't apply."""
+    headers = {
+        "If-Match": '"nothing"',
+        "If-Unmodified-Since": "Thu, 01 Jan 1970 00:00:00 GMT",
+    }
+    response = client.post("/users", json={"name": "Lisa", "age": 23}, headers=headers)
+    assert response.status_code == 201
+
+
+@pytest.mark.parametrize(
+    "body", [{"name": "", "age": 1}, {"name": "Lisa", "age": -1}, {"name": "Lisa"}]
+)
+def test_create_user_validates_input(client, body):
+    assert client.post("/users", json=body).status_code == 422
+    assert client.get("/users/4").status_code == 404
+
+
+def test_created_ids_never_collide(client):
+    deleted = client.delete("/users/2", headers={"If-Match": '"user-2-v1"'})
+    assert deleted.status_code == 204
+    first = client.post("/users", json={"name": "Lisa", "age": 23}).json()
+    second = client.post("/users", json={"name": "Mo", "age": 30}).json()
+    assert (first["id"], second["id"]) == (4, 5)
+    assert client.get("/users/3").json()["name"] == "Bob"
+
+
+# --- PUT / PATCH -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH"])
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"If-Unmodified-Since": "yesterday"}, {"If-None-Match": '"user-2-v0"'}],
+)
+def test_write_without_precondition_gives_428(client, method, headers):
+    response = client.request(
+        method, "/users/2", json={"name": "Eve", "age": 99}, headers=headers
+    )
+    assert response.status_code == 428
+    assert response.json() == {
+        "detail": "This request must be conditional.",
+        "accepted-precondition-headers": ["If-Match", "If-Unmodified-Since"],
+    }
+    assert_unchanged(client)
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH"])
+@pytest.mark.parametrize("if_match", ["user-2-v1", "not-the-etag", '"user-2-v1'])
+def test_write_with_malformed_if_match_gives_400(client, method, if_match):
+    response = client.request(
+        method,
+        "/users/2",
+        json={"name": "Eve", "age": 99},
+        headers={"If-Match": if_match, "If-Unmodified-Since": "yesterday"},
+    )
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Malformed If-Match header."}
+    assert_unchanged(client)
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH"])
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"If-Match": '"user-1-v1"'},
+        {"If-Match": 'W/"user-2-v1"'},
+        {"If-Unmodified-Since": BEFORE_SEED_MODIFIED},
+        {"If-Match": '"user-2-v1"', "If-None-Match": '"user-2-v1"'},
+    ],
+)
+def test_write_with_failed_precondition_gives_412(client, method, headers):
+    response = client.request(
+        method, "/users/2", json={"name": "Eve", "age": 99}, headers=headers
+    )
+    assert response.status_code == 412
+    assert response.json() == {"detail": "Precondition failed."}
+    assert_unchanged(client)
+
+
+def test_put_replaces_user_and_returns_fresh_validators(client):
+    before = datetime.now(timezone.utc).replace(microsecond=0)
+    response = client.put(
+        "/users/2",
+        json={"id": 1, "name": "Alicia", "age": 25},
+        headers={"If-Match": '"user-2-v1"'},
+    )
+    after = datetime.now(timezone.utc)
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["id"], body["name"], body["age"]) == (2, "Alicia", 25)
+    assert response.headers["etag"] == '"user-2-v2"'
+    assert response.headers["link"] == LINKS
+    assert response.headers["access-control-expose-headers"] == "ETag, Link"
+    last_modified = parsedate_to_datetime(response.headers["last-modified"])
+    assert before <= last_modified <= after
+    assert client.get("/users/1").json() == JOHN
+
+    current = client.get("/users/2")
+    assert current.json() == body
+    assert current.headers["etag"] == '"user-2-v2"'
+    assert current.headers["last-modified"] == response.headers["last-modified"]
+
+
+def test_validators_change_after_an_update(client):
+    old = client.get("/users/2").headers
+    put = client.put(
+        "/users/2",
+        json={"name": "Alicia", "age": 25},
+        headers={"If-Match": old["etag"]},
+    )
+    new = put.headers
+
+    assert client.get("/users/2", headers={"If-None-Match": old["etag"]}).json() == (
+        put.json()
+    )
+    matching = {"If-None-Match": new["etag"]}
+    assert client.get("/users/2", headers=matching).status_code == 304
+    stale = {"If-Modified-Since": old["last-modified"]}
+    assert client.get("/users/2", headers=stale).status_code == 200
+    # Real (sub-second) timestamps still round-trip.
+    fresh = {"If-Modified-Since": new["last-modified"]}
+    assert client.get("/users/2", headers=fresh).status_code == 304
+    lost_update = client.put(
+        "/users/2", json={"name": "Eve", "age": 99}, headers={"If-Match": old["etag"]}
+    )
+    assert lost_update.status_code == 412
+    assert client.get("/users/2").json()["name"] == "Alicia"
+
+
+def test_put_with_if_unmodified_since(client):
+    response = client.put(
+        "/users/2",
+        json={"name": "Alicia", "age": 25},
+        headers={"If-Unmodified-Since": SEED_MODIFIED},
+    )
+    assert response.status_code == 200
+    assert response.headers["etag"] == '"user-2-v2"'
+
+
+def test_put_missing_user(client):
+    body = {"name": "Eve", "age": 99}
+    assert client.put("/users/99", json=body).status_code == 404
+    response = client.put("/users/99", json=body, headers={"If-Match": '"user-99-v1"'})
+    assert response.status_code == 412
+
+
+def test_patch_updates_only_the_given_fields(client):
+    response = client.patch(
+        "/users/2", json={"age": 30}, headers={"If-Match": '"user-2-v1"'}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["name"], body["age"]) == ("Alice", 30)
+    assert response.headers["etag"] == '"user-2-v2"'
+    assert response.headers["last-modified"] != SEED_MODIFIED
+    assert (
+        client.patch(
+            "/users/2", json={"age": 31}, headers={"If-Match": '"user-2-v1"'}
+        ).status_code
+        == 412
+    )
+
+
+@pytest.mark.parametrize("body", [{"name": None}, {"age": None}, {"name": ""}])
+def test_patch_rejects_invalid_values(client, body):
+    response = client.patch("/users/2", json=body, headers={"If-Match": '"user-2-v1"'})
+    assert response.status_code == 422
+    assert_unchanged(client)
+    assert client.get("/users/2").json()["name"] == "Alice"
+
+
+def test_put_under_a_non_utc_local_timezone(client):
+    """Last-Modified is real UTC whatever the server's local timezone."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is not available on this platform")
+    saved = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Kolkata"
+    time.tzset()
+    try:
+        before = datetime.now(timezone.utc).replace(microsecond=0)
+        response = client.put(
+            "/users/2",
+            json={"name": "Alicia", "age": 25},
+            headers={"If-Match": '"user-2-v1"'},
         )
-        resp_data = response.json()
-
-        assert response.status_code == 400
-        assert resp_data["missing-required-headers"] == ["If-Match", "If-Unmodified-Since"]  # noqa
-
-    def test_put_req_412_response(self):
-        # PUT Request to update the user record
-        # Testing the 412 (Precondition Failed) response
-        # Validation of mismatch in e-tag & last-modified value
-        data = {"age": 34}
-        response = test_client.put(
-            "/user/4",
-            data=json.dumps(data),
-            headers={
-                "If-Match": '"USER_2_0.1.0"',
-                "If-Unmodified-Since": "Tue, 24 May 2021 00:00:00 GMT"
-            }
-        )
-
-        assert response.status_code == 412
-
-    @freeze_time("2021-05-25")
-    def test_put_req_200_response_data(self):
-        # PUT Request to update the user record
-        # Testing the success 200 response data
-        data = {"age": 34}
-        response = test_client.put(
-            "/user/4",
-            data=json.dumps(data),
-            headers={
-                "If-Match": '"USER_4_0.1.0"',
-                "If-Unmodified-Since": "Tue, 24 May 2021 00:00:00 GMT"
-            }
-        )
-        resp_data = response.json()['payload']
-
-        assert response.status_code == 200
-        assert resp_data['id'] == 4
-        assert resp_data['age'] == 34
-
-    def test_get_req_200_response_headers(self):
-        # GET Request to check the user record updated by PUT method
-        # Testing the last-modified headers of the latest updated data
-        response = test_client.get("/user/4", headers={
-            "If-Match": '"USER_4_0.1.0"',
-            "If-Modified-Since": "Tue, 24 May 2021 00:00:00 GMT"
-        })
-        headers = response.headers
-
-        assert response.status_code == 200
-        assert headers['last-modified'] == "Tue, 25 May 2021 00:00:00 GMT"
-
-    def test_get_req_304_response(self):
-        # GET Request to check the user record updated by PUT method
-        # Testing if the records has some update since it was last updated
-        response = test_client.get("/user/4", headers={
-            "If-Match": '"USER_4_0.1.0"',
-            "If-Modified-Since": "Tue, 25 May 2021 22:00:53 GMT"
-        })
-
-        assert response.status_code == 304
+        after = datetime.now(timezone.utc)
+    finally:
+        if saved is None:
+            del os.environ["TZ"]
+        else:
+            os.environ["TZ"] = saved
+        time.tzset()
+    last_modified = parsedate_to_datetime(response.headers["last-modified"])
+    assert before <= last_modified <= after
 
 
-class TestDeleteRequest():
-    def test_delete_req_400_response(self):
-        # DELETE Request to remove the user record
-        # Testing the 400 (Bad Request) response | Due to missing required headers
-        response = test_client.delete(
-            "/user/4",
-            headers={}
-        )
-        resp_data = response.json()
+# --- DELETE ------------------------------------------------------------------------
 
-        assert response.status_code == 400
-        assert resp_data["missing-required-headers"] == ["If-Match", "If-Unmodified-Since"]  # noqa
 
-    def test_delete_req_412_response(self):
-        # DELETE Request to update the user record
-        # Testing the 412 (Precondition Failed) response
-        # Validation of mismatch in e-tag & last-modified value
-        response = test_client.delete(
-            "/user/4",
-            headers={
-                "If-Match": '"USER_2_0.1.0"',
-                "If-Unmodified-Since": "Tue, 24 May 2021 00:00:00 GMT"
-            }
-        )
+def test_delete_user(client):
+    response = client.delete("/users/2", headers={"If-Match": '"user-2-v1"'})
+    assert response.status_code == 204
+    assert response.content == b""
+    assert "etag" not in response.headers
+    assert "link" not in response.headers
+    assert client.get("/users/2").status_code == 404
+    assert client.delete("/users/2").status_code == 404
+    again = client.delete("/users/2", headers={"If-Match": '"user-2-v1"'})
+    assert again.status_code == 404
+    assert [client.get(f"/users/{i}").status_code for i in (1, 3)] == [200, 200]
 
-        assert response.status_code == 412
 
-    def test_put_req_200_response_data(self):
-        # Delete a record using the DELETE request
-        response = test_client.delete(
-            "/user/4",
-            headers={
-                "If-Match": '"USER_4_0.1.0"',
-                "If-Unmodified-Since": "Tue, 24 May 2021 00:00:00 GMT"
-            }
-        )
+@pytest.mark.parametrize(
+    "headers, status",
+    [
+        ({}, 428),
+        ({"If-Match": "user-2-v1"}, 400),
+        ({"If-Match": '"user-2-v0"'}, 412),
+        ({"If-Match": '"user-2-v1"', "If-None-Match": "*"}, 412),
+        ({"If-Unmodified-Since": BEFORE_SEED_MODIFIED}, 412),
+    ],
+)
+def test_delete_preconditions(client, headers, status):
+    assert client.delete("/users/2", headers=headers).status_code == status
+    assert_unchanged(client)
 
-        assert response.status_code == 200
+
+def test_delete_with_if_unmodified_since(client):
+    response = client.delete("/users/2", headers={"If-Unmodified-Since": SEED_MODIFIED})
+    assert response.status_code == 204
+
+
+def test_delete_missing_user_with_precondition(client):
+    response = client.delete("/users/99", headers={"If-Match": '"user-99-v1"'})
+    assert response.status_code == 404
+
+
+# --- OpenAPI -----------------------------------------------------------------------
+
+
+def test_openapi_documents_conditional_responses(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    get = paths["/users/{user_id}"]["get"]
+    assert set(get["responses"]) == {"200", "304", "400", "404", "412", "422"}
+    assert [p["name"] for p in get["parameters"]] == ["user_id"]
+    for method, success in [("put", "200"), ("patch", "200"), ("delete", "204")]:
+        operation = paths["/users/{user_id}"][method]
+        expected = {success, "400", "404", "412", "422", "428"}
+        assert set(operation["responses"]) == expected
+        assert [p["name"] for p in operation["parameters"]] == ["user_id"]
+    patch = client.get("/openapi.json").json()["components"]["schemas"]["UserPatch"]
+    assert patch["properties"]["name"]["type"] == "string"  # not nullable
+    post = paths["/users"]["post"]
+    assert "parameters" not in post
+    assert set(post["responses"]) == {"201", "422"}
