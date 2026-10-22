@@ -51,5 +51,6 @@ module-root = ""
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = [".", "examples/scrudful_rest_framework"]
+DJANGO_SETTINGS_MODULE = "scrudful_rest_framework.settings"
 filterwarnings = ["error"]
