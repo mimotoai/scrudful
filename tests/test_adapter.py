@@ -86,10 +86,11 @@ def test_precondition_headers_joins_repeated_lines():
     }
 
 
-def test_precondition_headers_keeps_empty_field_lines():
-    # A present but empty field is not the same as a missing one.
-    assert precondition_headers(lambda name: [""] if name == "if-match" else []) == {
-        "if-match": ""
+def test_precondition_headers_drops_empty_field_lines():
+    # An empty (or blank) field is the same as an absent one, as in the core.
+    values = {"if-match": ["", " \t"], "if-none-match": ["", '"a"', ""]}
+    assert precondition_headers(lambda name: values.get(name, [])) == {
+        "if-none-match": '"a"'
     }
 
 

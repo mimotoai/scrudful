@@ -17,7 +17,7 @@ from fastapi import Request, Response
 from fastapi.datastructures import DefaultPlaceholder
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
-from starlette.datastructures import Headers
+from starlette.datastructures import Headers, MutableHeaders
 
 from scrudful._adapter import (
     DEFAULT_CONTEXT_REL,
@@ -64,7 +64,13 @@ CONDITIONAL_WRITE_RESPONSES: dict[int | str, dict[str, Any]] = {
 # Representation metadata: not for the body-less (or differently typed) early
 # response (RFC 9110 §15.4.5).
 _BODY_HEADERS = frozenset(
-    {"content-length", "content-type", "content-encoding", "content-range"}
+    {
+        "content-length",
+        "content-type",
+        "content-encoding",
+        "content-range",
+        "content-language",
+    }
 )
 
 Endpoint = TypeVar("Endpoint", bound=Callable[..., Any])
@@ -266,6 +272,7 @@ def scrudful(
             link = join_links(", ".join(headers.getlist("link")), await links(kwargs))
             if link is not None:
                 headers["Link"] = link
+            _join_expose_lines(headers)
             expose_headers(headers)
             return content
 
@@ -293,6 +300,9 @@ async def _call_all(
     Consecutive sync callables share one threadpool hop, which ends after a
     callable returning an awaitable (awaited before the next one runs). They
     are never run concurrently: they typically share a database session.
+    Because an awaitable is awaited before the next callback is called, a
+    later callback that raises never leaves an un-awaited coroutine behind, so
+    nothing needs closing.
     """
     results: list[Any] = []
     pending = list(funcs)
@@ -361,7 +371,9 @@ def _conditional_response(result: ConditionalResult, injected: Headers) -> Respo
         if name == "set-cookie":
             headers.append(name, value)
         elif name == "access-control-expose-headers":
-            headers[name] = merge_expose_headers(headers.get(name), value.split(","))
+            merged = merge_expose_headers(headers.get(name), value.split(","))
+            if merged:
+                headers[name] = merged
         elif (
             result.status == 304
             and name not in _BODY_HEADERS
@@ -370,6 +382,17 @@ def _conditional_response(result: ConditionalResult, injected: Headers) -> Respo
             headers.append(name, value)
     expose_headers(headers)
     return response
+
+
+def _join_expose_lines(headers: MutableHeaders) -> None:
+    """Join repeated Access-Control-Expose-Headers lines into one.
+
+    ``expose_headers`` reads and replaces a single value, so names on later
+    lines would be lost.
+    """
+    lines = headers.getlist("access-control-expose-headers")
+    if len(lines) > 1:
+        headers["Access-Control-Expose-Headers"] = ", ".join(lines)
 
 
 def _status_code(request: Request, response: Response) -> int:

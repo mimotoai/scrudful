@@ -490,11 +490,11 @@ def scrudful_viewset(cls: type) -> type:
        ``partial_update`` is DRF's stock ``UpdateModelMixin.partial_update``
        (it is then not wrapped; a subclass of a decorated viewset inherits the
        parent's wrapper, so decorate the subclass with :func:`scrudful_viewset`
-       too). With a user-defined ``partial_update`` that
-       calls ``update``, the wrapper that ``Meta`` configures for
-       ``partial_update`` handles the request first and the explicit
-       ``update`` decorator is a pass-through for PATCH. Decorate
-       ``partial_update`` explicitly as well to override it.
+       too). With a user-defined ``partial_update`` that calls ``update``, the
+       wrapper that ``Meta`` configures for ``partial_update`` handles the
+       request first and the explicit ``update`` decorator is a pass-through
+       for PATCH. Decorate ``partial_update`` explicitly as well to override
+       it.
 
     ::
 
@@ -769,10 +769,10 @@ def _callback_arguments(
 
 def _precondition_headers(request: HttpRequest | Request) -> dict[str, str]:
     # WSGI/ASGI servers already combine repeated field lines with ",", so each
-    # field has at most one (non-empty) value.
+    # field has at most one value.
     def getlist(name: str) -> list[str]:
         value = request.headers.get(name)
-        return [value] if value else []
+        return [] if value is None else [value]
 
     return precondition_headers(getlist)
 

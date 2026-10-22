@@ -1384,7 +1384,7 @@ def test_sync_awaitable_runs_before_the_next_callback(make_client):
     assert order == ["etag", "last_modified"]
 
 
-def test_unawaited_validator_coroutine_is_closed_on_error(make_client):
+def test_awaitable_is_awaited_before_a_failing_callback(make_client):
     app = FastAPI()
 
     def etag(**kwargs):
@@ -1403,3 +1403,78 @@ def test_unawaited_validator_coroutine_is_closed_on_error(make_client):
 
     with pytest.raises(RuntimeError, match="boom"):
         make_client(app).get("/item")
+
+
+# --- empty and repeated header lines -----------------------------------------
+
+
+def test_empty_dependency_expose_header_on_early_responses(make_client, store):
+    app = FastAPI()
+
+    def empty(response: Response):
+        response.headers["Access-Control-Expose-Headers"] = " , "
+
+    @app.put("/item", dependencies=[Depends(empty)])
+    @scrudful(etag_func=store.etag)
+    def put_item():
+        return {}
+
+    client = make_client(app)
+    response = client.put("/item", headers={"If-Match": '"other"'})
+    assert response.status_code == 412
+    assert "access-control-expose-headers" not in response.headers
+    response = client.put("/item")
+    assert response.status_code == 428
+    assert "access-control-expose-headers" not in response.headers
+
+
+def test_empty_if_match_is_absent(make_client, store):
+    app = FastAPI()
+
+    @app.get("/item")
+    @scrudful(etag_func=store.etag)
+    def get_item():
+        return {}
+
+    @app.put("/item")
+    @scrudful(etag_func=store.etag)
+    def put_item():
+        return {}
+
+    client = make_client(app)
+    assert client.get("/item", headers={"If-Match": ""}).status_code == 200
+    assert client.put("/item", headers={"If-Match": ""}).status_code == 428
+
+
+def test_304_drops_content_language(make_client, store):
+    app = FastAPI()
+
+    def language(response: Response):
+        response.headers["Content-Language"] = "en"
+
+    @app.get("/item", dependencies=[Depends(language)])
+    @scrudful(etag_func=store.etag)
+    def get_item():
+        return {}
+
+    client = make_client(app)
+    assert client.get("/item").headers["content-language"] == "en"
+    response = client.get("/item", headers={"If-None-Match": '"v1"'})
+    assert response.status_code == 304
+    assert "content-language" not in response.headers
+
+
+def test_repeated_expose_header_lines_are_all_kept(make_client, store):
+    app = FastAPI()
+
+    @app.get("/item")
+    @scrudful(etag_func=store.etag)
+    def get_item(response: Response):
+        response.headers.append("Access-Control-Expose-Headers", "X-One")
+        response.headers.append("Access-Control-Expose-Headers", "X-Two")
+        return {}
+
+    response = make_client(app).get("/item")
+    assert response.headers.get_list("access-control-expose-headers") == [
+        "X-One, X-Two, ETag"
+    ]

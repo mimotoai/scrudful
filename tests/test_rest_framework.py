@@ -551,6 +551,11 @@ def test_missing_resource_is_left_to_the_view(client):
 # --- Conditional writes -------------------------------------------------------
 
 
+def test_empty_if_match_is_absent(client):
+    assert client.get("/things/1/", headers={"If-Match": ""}).status_code == 200
+    assert client.put("/things/1/", headers={"If-Match": ""}).status_code == 428
+
+
 @pytest.mark.parametrize("method", ["put", "patch", "delete"])
 def test_unconditional_write_gives_428(client, method):
     response = getattr(client, method)("/things/1/")

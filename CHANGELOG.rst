@@ -57,7 +57,9 @@ Both adapters
   so previously issued ETags no longer match. ``str()`` of the callback's value
   is used; valid entity-tags are sent unchanged, other values are quoted, and
   values that cannot be an entity-tag raise ``ValueError``.
-* Validators are set on 2xx GET/HEAD responses, freshly recomputed on 2xx
+* Validators are set on 2xx GET/HEAD responses (2xx is judged by the status
+  FastAPI will send, including the response class's default, e.g. 307 for
+  ``RedirectResponse``), freshly recomputed on 2xx
   PUT/PATCH responses, and not set on POST, DELETE or non-2xx responses. 304
   responses now carry ``ETag`` and ``Last-Modified``. Validators set by the view
   are not overwritten.
@@ -92,7 +94,8 @@ Both adapters
   no longer receive them positionally; they get them only if they declare
   parameters annotated ``Request`` / ``Response`` (also ``Annotated[...]``).
 * Callbacks receive the endpoint's keyword arguments only. Sync endpoints and
-  callbacks run in the threadpool, async callbacks are awaited.
+  callbacks run in the threadpool (the validator callbacks share one call and
+  run in order), async callbacks are awaited.
 * Headers are applied to a ``Response`` returned by the endpoint (before: dropped).
   Generator endpoints raise ``TypeError`` when decorated.
 * Routes with a validator now apply preconditions to POST as well.
@@ -157,7 +160,7 @@ Fixes
 * The DRF adapter no longer fails on PATCH, no longer passes ``partial`` to
   callbacks, handles ``@action`` methods and function views, and keeps
   ``partial_update`` / ``update`` from being evaluated twice.
-* ``scrudful_viewset`` / ``scrudful_api_view`` no longer override a project's
+* ``scrudful_api_view`` no longer replaces a project's
   ``DEFAULT_METADATA_CLASS`` (including ``None``, which disables OPTIONS
   metadata); only DRF's default ``SimpleMetadata`` is replaced.
 * The OPTIONS description is correct for list, detail, nested and ``@action``
@@ -167,17 +170,10 @@ Fixes
   annotations``) in the endpoint's module: FastAPI before 0.124 evaluated them
   in the wrapper's module, so body models became required query parameters
   (422).
-* ``scrudful.fastapi``: endpoints with generic-alias parameters (``list[int]``,
-  ``dict[str, int]``) no longer fail at decoration on Python 3.10.
 * ``scrudful.fastapi``: the 304 response now carries the headers dependencies set
   on the injected ``Response`` (``Cache-Control``, ``Vary``, ``Set-Cookie``, ...,
   but not ``Content-*`` metadata), as RFC 9110 §15.4.5 requires; the 400/412/428
   responses carry its ``Set-Cookie`` lines only.
-* ``scrudful.fastapi``: a route without ``status_code`` uses its response class's
-  default status (e.g. 307 for ``RedirectResponse``) to decide whether validators
-  are added.
-* ``scrudful.fastapi``: sync validator callbacks run in a single threadpool call
-  (still sequentially, ETag first) instead of one per callback.
 * The example projects: the DRF validator callbacks look items up in
   ``view.get_queryset()``, so items the view hides are a 404 whatever the
   preconditions; the FastAPI README example uses timezone-aware datetimes.

@@ -182,9 +182,10 @@ Caveats of ``scrudful_viewset``:
   ``item_schema_url`` does above.
 * An explicit ``@scrudful`` on ``update`` applies to PATCH when
   ``partial_update`` is DRF's stock one (decorate a subclass of a decorated
-  viewset with ``scrudful_viewset`` too, or it inherits the parent's wrapper). With a user-defined ``partial_update``
-  that calls ``update``, the ``Meta``-configured wrapper of ``partial_update``
-  wins: decorate ``partial_update`` explicitly to override it.
+  viewset with ``scrudful_viewset`` too, or it inherits the parent's wrapper).
+  With a user-defined ``partial_update`` that calls ``update``, the
+  ``Meta``-configured wrapper of ``partial_update`` wins: decorate
+  ``partial_update`` explicitly to override it.
 * OPTIONS uses ``ScrudfulMetadata`` only when the viewset's ``metadata_class``
   is DRF's default ``SimpleMetadata``. A custom ``metadata_class`` (or ``None``,
   or a project-wide ``DEFAULT_METADATA_CLASS``) is kept; subclass

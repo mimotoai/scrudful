@@ -45,7 +45,12 @@ WRITE_DESCRIPTIONS = {
 
 
 class Headers(Protocol):
-    """Case-insensitive response headers (Starlette's, or a Django response)."""
+    """Case-insensitive response headers (Starlette's, or a Django response).
+
+    ``get`` returns a single value and ``[]=`` replaces every existing line of
+    that name, so a field repeated on several lines must be joined by the
+    caller first.
+    """
 
     def __contains__(self, name: str, /) -> bool: ...
     def __setitem__(self, name: str, value: str, /) -> None: ...
@@ -63,10 +68,14 @@ def check_validators(etag_func: Any, last_modified_func: Any) -> None:
 
 
 def precondition_headers(getlist: Callable[[str], Sequence[str]]) -> dict[str, str]:
-    """Collect the precondition fields, joining repeated lines (RFC 9110 §5.3)."""
+    """Collect the precondition fields, joining repeated lines (RFC 9110 §5.3).
+
+    Empty (or blank) lines are dropped: an empty field is the same as an absent
+    one, as in :func:`scrudful.conditional.evaluate_preconditions`.
+    """
     headers = {}
     for name in PRECONDITION_FIELDS:
-        values = getlist(name)
+        values = [value for value in getlist(name) if value.strip(" \t")]
         if values:
             headers[name] = ", ".join(values)
     return headers
