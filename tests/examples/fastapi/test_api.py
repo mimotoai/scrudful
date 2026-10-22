@@ -298,6 +298,14 @@ def test_patch_updates_only_the_given_fields(client):
     )
 
 
+@pytest.mark.parametrize("body", [{"name": None}, {"age": None}, {"name": ""}])
+def test_patch_rejects_invalid_values(client, body):
+    response = client.patch("/users/2", json=body, headers={"If-Match": '"user-2-v1"'})
+    assert response.status_code == 422
+    assert_unchanged(client)
+    assert client.get("/users/2").json()["name"] == "Alice"
+
+
 def test_put_under_a_non_utc_local_timezone(client):
     """Last-Modified is real UTC whatever the server's local timezone."""
     if not hasattr(time, "tzset"):
@@ -369,10 +377,16 @@ def test_delete_missing_user_with_precondition(client):
 
 def test_openapi_documents_conditional_responses(client):
     paths = client.get("/openapi.json").json()["paths"]
-    for method in ("get", "put", "patch", "delete"):
+    get = paths["/users/{user_id}"]["get"]
+    assert set(get["responses"]) == {"200", "304", "400", "404", "412", "422"}
+    assert [p["name"] for p in get["parameters"]] == ["user_id"]
+    for method, success in [("put", "200"), ("patch", "200"), ("delete", "204")]:
         operation = paths["/users/{user_id}"][method]
-        assert {"304", "400", "404", "412", "428"} <= set(operation["responses"])
+        expected = {success, "400", "404", "412", "422", "428"}
+        assert set(operation["responses"]) == expected
         assert [p["name"] for p in operation["parameters"]] == ["user_id"]
+    patch = client.get("/openapi.json").json()["components"]["schemas"]["UserPatch"]
+    assert patch["properties"]["name"]["type"] == "string"  # not nullable
     post = paths["/users"]["post"]
     assert "parameters" not in post
     assert set(post["responses"]) == {"201", "422"}

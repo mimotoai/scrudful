@@ -10,7 +10,7 @@ import functools
 import inspect
 import sys
 from collections.abc import Callable, Mapping
-from typing import Any, TypeVar
+from typing import Annotated, Any, TypeVar, get_args, get_origin
 
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
@@ -32,19 +32,34 @@ from scrudful.utils import (
     merge_expose_headers,
 )
 
-__all__ = ["CONDITIONAL_RESPONSES", "scrudful"]
+__all__ = [
+    "CONDITIONAL_READ_RESPONSES",
+    "CONDITIONAL_WRITE_RESPONSES",
+    "scrudful",
+]
 
-#: OpenAPI descriptions of the responses ``@scrudful`` can produce without
-#: calling the endpoint. Pass it to the route decorator, e.g.
-#: ``@app.put("/items/{item_id}", responses=CONDITIONAL_RESPONSES)``, or merge
-#: it with your own: ``responses={**CONDITIONAL_RESPONSES, 404: {...}}``.
-CONDITIONAL_RESPONSES: dict[int | str, dict[str, Any]] = {
+_MALFORMED = {"description": "Malformed If-Match or If-None-Match header."}
+_PRECONDITION_FAILED = {"description": "Precondition Failed."}
+
+#: OpenAPI descriptions of the responses ``@scrudful`` can produce for GET/HEAD
+#: without calling the endpoint. Pass it to the route decorator, e.g.
+#: ``@app.get("/items/{item_id}", responses=CONDITIONAL_READ_RESPONSES)``, or
+#: merge it with your own: ``responses={**CONDITIONAL_READ_RESPONSES, 404: ...}``.
+CONDITIONAL_READ_RESPONSES: dict[int | str, dict[str, Any]] = {
     304: {
         "description": "Not Modified: the representation matches the request's "
         "If-None-Match or If-Modified-Since validators.",
     },
-    400: {"description": "Malformed If-Match or If-None-Match header."},
-    412: {"description": "Precondition Failed."},
+    400: dict(_MALFORMED),
+    412: dict(_PRECONDITION_FAILED),
+}
+
+#: OpenAPI descriptions of the responses ``@scrudful`` can produce for
+#: PUT/PATCH/DELETE without calling the endpoint, e.g.
+#: ``@app.put("/items/{item_id}", responses=CONDITIONAL_WRITE_RESPONSES)``.
+CONDITIONAL_WRITE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    400: dict(_MALFORMED),
+    412: dict(_PRECONDITION_FAILED),
     428: {
         "description": "Precondition Required: this request must be conditional "
         "(send If-Match or If-Unmodified-Since).",
@@ -88,7 +103,7 @@ def scrudful(
 
     ``@scrudful(...)`` must sit *below* the route decorator::
 
-        @app.get("/items/{item_id}", responses=CONDITIONAL_RESPONSES)
+        @app.get("/items/{item_id}", responses=CONDITIONAL_READ_RESPONSES)
         @scrudful(etag_func=item_etag, last_modified_func=item_modified)
         async def get_item(item_id: int): ...
 
@@ -105,7 +120,9 @@ def scrudful(
         an awaitable result is awaited.
 
     Validators
-        Without validator callbacks no preconditions are evaluated. A
+        Without validator callbacks no preconditions are evaluated: the If-*
+        headers are ignored and the route behaves like an undecorated one
+        (apart from the Link and expose headers). A
         validator callback returning ``None`` means the target resource has
         no current representation. When both validators are ``None`` the
         preconditions are skipped (except for PUT) and the endpoint decides,
@@ -119,7 +136,14 @@ def scrudful(
         a matching GET/HEAD with 304 carrying the validators. These responses
         are JSON responses (304 without a body) returned without calling the
         endpoint, so ``response_model`` does not apply to them; document them
-        with :data:`CONDITIONAL_RESPONSES`.
+        with :data:`CONDITIONAL_READ_RESPONSES` and
+        :data:`CONDITIONAL_WRITE_RESPONSES`.
+
+        The preconditions are evaluated before the endpoint runs, so two
+        concurrent requests carrying the same If-Match can both pass. Strict
+        lost-update protection needs an atomic re-check in the endpoint's
+        storage layer (e.g. ``UPDATE ... WHERE version = :expected`` or
+        ``SELECT ... FOR UPDATE`` inside a transaction).
 
         After the endpoint runs, 2xx responses to GET/HEAD get the validators
         computed for the precondition check, and 2xx responses to PUT/PATCH get
@@ -385,7 +409,11 @@ def _signature(endpoint: Callable[..., Any]) -> inspect.Signature:
 
 
 def _annotation_is(annotation: Any, cls: type, globalns: dict[str, Any]) -> bool:
-    """Whether ``annotation`` (possibly a string) is ``cls`` or a subclass."""
+    """Whether ``annotation`` is ``cls`` or a subclass.
+
+    String / forward-reference annotations are evaluated in the endpoint's
+    globals and ``Annotated[cls, ...]`` is unwrapped, as FastAPI does.
+    """
     if not isinstance(annotation, (str, type)):
         annotation = getattr(annotation, "__forward_arg__", annotation)
     if isinstance(annotation, str):
@@ -393,4 +421,6 @@ def _annotation_is(annotation: Any, cls: type, globalns: dict[str, Any]) -> bool
             annotation = eval(annotation, globalns)  # same as typing/inspect
         except Exception:
             return False
+    if get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
     return isinstance(annotation, type) and issubclass(annotation, cls)

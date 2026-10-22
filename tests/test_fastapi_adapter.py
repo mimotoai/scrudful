@@ -4,6 +4,7 @@ import inspect
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Annotated
 
 import pytest
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -12,7 +13,11 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
-from scrudful.fastapi import CONDITIONAL_RESPONSES, scrudful
+from scrudful.fastapi import (
+    CONDITIONAL_READ_RESPONSES,
+    CONDITIONAL_WRITE_RESPONSES,
+    scrudful,
+)
 
 # Non-zero microseconds: the header is floored to whole seconds and conditional
 # requests echoing it must still match.
@@ -80,7 +85,7 @@ def client(store, make_client) -> TestClient:
     def missing() -> HTTPException:
         return HTTPException(status_code=404, detail="Not found")
 
-    @app.get("/item", responses=CONDITIONAL_RESPONSES)
+    @app.get("/item", responses=CONDITIONAL_READ_RESPONSES)
     @scrudful(
         **validators,
         schema_link_or_func=SCHEMA,
@@ -148,6 +153,47 @@ def test_endpoint_with_differently_named_request_and_response(make_client, store
 
     response = make_client(app).get("/items/3")
     assert response.status_code == 200
+    assert response.headers["x-path"] == "/items/3"
+    assert response.headers["etag"] == '"v1"'
+
+
+def _annotated_endpoint(received):
+    async def endpoint(
+        item_id: int, req: Annotated[Request, "doc"], resp: Annotated[Response, "doc"]
+    ):
+        received.update(req=req, resp=resp)
+        resp.headers["X-Path"] = req.url.path
+        return {"id": item_id}
+
+    return endpoint
+
+
+def _stringified_annotated_endpoint(received):
+    async def endpoint(
+        item_id: int, req: 'Annotated[Request, "doc"]', resp: "Annotated[Response, 1]"
+    ):
+        received.update(req=req, resp=resp)
+        resp.headers["X-Path"] = req.url.path
+        return {"id": item_id}
+
+    return endpoint
+
+
+@pytest.mark.parametrize(
+    "factory", [_annotated_endpoint, _stringified_annotated_endpoint]
+)
+def test_annotated_request_and_response_are_detected(make_client, store, factory):
+    app = FastAPI()
+    received = {}
+    wrapped = scrudful(etag_func=store.etag)(factory(received))
+    app.get("/items/{item_id}")(wrapped)
+
+    assert list(inspect.signature(wrapped).parameters) == ["item_id", "req", "resp"]
+    response = make_client(app).get("/items/3")
+    assert response.status_code == 200
+    assert response.json() == {"id": 3}
+    assert isinstance(received["req"], Request)
+    assert isinstance(received["resp"], Response)
     assert response.headers["x-path"] == "/items/3"
     assert response.headers["etag"] == '"v1"'
 
@@ -545,24 +591,28 @@ def test_response_model_does_not_turn_precondition_errors_into_500(make_client, 
 
 def test_conditional_responses_document_the_status_codes(make_client):
     app = FastAPI()
-    before = {key: dict(value) for key, value in CONDITIONAL_RESPONSES.items()}
+    originals = [CONDITIONAL_READ_RESPONSES, CONDITIONAL_WRITE_RESPONSES]
+    before = [{k: dict(v) for k, v in d.items()} for d in originals]
 
-    @app.put("/items", responses=CONDITIONAL_RESPONSES)
+    @app.get("/items", responses=CONDITIONAL_READ_RESPONSES)
+    @app.put("/items", responses=CONDITIONAL_WRITE_RESPONSES)
     @scrudful(etag_func=lambda **kwargs: "a")
-    async def put_items():
+    async def items():
         return {}
 
-    responses = (
-        make_client(app)
-        .get("/openapi.json")
-        .json()["paths"]["/items"]["put"]["responses"]
-    )
-    for status in ("304", "400", "412", "428"):
-        expected = CONDITIONAL_RESPONSES[int(status)]["description"]
-        assert responses[status]["description"] == expected
-    assert set(responses) == {"200", "304", "400", "412", "428"}
-    assert "content" not in responses["304"]
-    assert CONDITIONAL_RESPONSES == before
+    paths = make_client(app).get("/openapi.json").json()["paths"]
+    read = paths["/items"]["get"]["responses"]
+    write = paths["/items"]["put"]["responses"]
+    assert set(read) == {"200", "304", "400", "412"}
+    assert set(write) == {"200", "400", "412", "428"}
+    for responses, documented in [
+        (read, CONDITIONAL_READ_RESPONSES),
+        (write, CONDITIONAL_WRITE_RESPONSES),
+    ]:
+        for status, response in documented.items():
+            assert responses[str(status)]["description"] == response["description"]
+    assert "content" not in read["304"]
+    assert [CONDITIONAL_READ_RESPONSES, CONDITIONAL_WRITE_RESPONSES] == before
 
 
 # --- links -----------------------------------------------------------------------

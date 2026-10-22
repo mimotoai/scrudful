@@ -17,7 +17,11 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
-from scrudful.fastapi import CONDITIONAL_RESPONSES, scrudful
+from scrudful.fastapi import (
+    CONDITIONAL_READ_RESPONSES,
+    CONDITIONAL_WRITE_RESPONSES,
+    scrudful,
+)
 
 
 class UserIn(BaseModel):
@@ -30,8 +34,10 @@ class UserIn(BaseModel):
 class UserPatch(BaseModel):
     """A partial update of a user."""
 
-    name: str | None = Field(default=None, min_length=1)
-    age: int | None = Field(default=None, ge=0)
+    # Omitted fields are left unchanged; an explicit null is rejected (422),
+    # because defaults are not validated but supplied values are.
+    name: str = Field(default=None, min_length=1)
+    age: int = Field(default=None, ge=0)
 
 
 class User(UserIn):
@@ -104,10 +110,9 @@ def user_context_link(request: Request, **kwargs: Any) -> Any:
     return request.url_for("user_context")
 
 
-USER_RESPONSES: dict[int | str, dict[str, Any]] = {
-    **CONDITIONAL_RESPONSES,
-    404: {"description": "User not found"},
-}
+NOT_FOUND: dict[int | str, dict[str, Any]] = {404: {"description": "User not found"}}
+READ_RESPONSES = {**CONDITIONAL_READ_RESPONSES, **NOT_FOUND}
+WRITE_RESPONSES = {**CONDITIONAL_WRITE_RESPONSES, **NOT_FOUND}
 
 app = FastAPI(title="SCRUDful users")
 
@@ -148,7 +153,7 @@ async def create_user(request: Request, response: Response, user: UserIn) -> Use
 
 # ``@scrudful`` goes below the route decorator. The endpoints declare ``request``
 # only so that the link callbacks receive it.
-@app.get("/users/{user_id}", response_model=User, responses=USER_RESPONSES)
+@app.get("/users/{user_id}", response_model=User, responses=READ_RESPONSES)
 @scrudful(
     etag_func=user_etag,
     last_modified_func=user_last_modified,
@@ -160,7 +165,7 @@ async def get_user(request: Request, user_id: int) -> User:
     return _get_record(user_id).user
 
 
-@app.put("/users/{user_id}", response_model=User, responses=USER_RESPONSES)
+@app.put("/users/{user_id}", response_model=User, responses=WRITE_RESPONSES)
 @scrudful(
     etag_func=user_etag,
     last_modified_func=user_last_modified,
@@ -177,7 +182,7 @@ async def replace_user(request: Request, user_id: int, user: UserIn) -> User:
     return record.user
 
 
-@app.patch("/users/{user_id}", response_model=User, responses=USER_RESPONSES)
+@app.patch("/users/{user_id}", response_model=User, responses=WRITE_RESPONSES)
 @scrudful(
     etag_func=user_etag,
     last_modified_func=user_last_modified,
@@ -196,7 +201,7 @@ async def update_user(request: Request, user_id: int, patch: UserPatch) -> User:
 @app.delete(
     "/users/{user_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    responses=USER_RESPONSES,
+    responses=WRITE_RESPONSES,
 )
 @scrudful(
     etag_func=user_etag,
