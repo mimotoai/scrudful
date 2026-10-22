@@ -2,8 +2,8 @@
 Changelog
 =========
 
-Unreleased (0.3.0, since 0.2.0)
-===============================
+0.3.0 (since 0.2.0)
+===================
 
 Packaging and tooling
 ---------------------
@@ -24,9 +24,11 @@ Packaging and tooling
   publishes only after the tests pass.
 * The CI pipeline runs for merge requests and the default branch; the docs
   (``pages``) and the release (``publish``) run only on the default branch, and
-  the docs build treats warnings as errors. ``publish`` releases the version in
-  ``pyproject.toml`` and then bumps the patch version on the default branch, so
-  the branch always holds the next unreleased version.
+  the docs build treats warnings as errors. A merge request that changes the
+  package sets the version to release (``uv version --bump minor``); the
+  ``version-check`` job requires it to be higher than the target branch's and
+  PyPI's. Merging publishes that version to PyPI and creates the ``vX.Y.Z`` tag
+  and GitLab release; merges that don't change the version publish nothing.
 * The package ships a ``py.typed`` marker and declares ``Source`` and
   ``Changelog`` project URLs; the sdist also contains the tests, the example
   projects and this changelog.

@@ -1,6 +1,11 @@
 # Pipelines run for merge requests and for the default branch only (no
-# duplicate branch + MR pipelines). `test` runs in both; `pages` and `publish`
-# deploy, so they run only on the default branch.
+# duplicate branch + MR pipelines). `test` runs in both and `version-check` in
+# merge requests; `pages` and `publish` deploy, so they run only on the default
+# branch.
+#
+# Releasing: a merge request that changes the package sets the version to
+# release (`uv version --bump minor`, `uv version 1.0.0`); merging it publishes
+# that version. See scripts/release.py.
 #
 # Stage ordering (rather than `needs:`) makes the deploy jobs wait for the
 # whole test matrix: with stages, a deploy job starts only after every job of
@@ -23,6 +28,20 @@ test:
   script:
     - uv run --locked -p "$PYTHON" pytest -q
 
+# A merge request that changes the package (scrudful/, or the published parts
+# of pyproject.toml) must raise the version above the target branch's and every
+# release on PyPI.
+version-check:
+  stage: test
+  image: ghcr.io/astral-sh/uv:0.9.0-python3.12-bookworm
+  variables:
+    TARGET: origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+  script:
+    - git fetch -q origin "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "+refs/heads/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}:refs/remotes/${TARGET}"
+    - uv run --no-project --with packaging python scripts/release.py check-bump "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$TARGET"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
 pages:
   stage: deploy
   image: ghcr.io/astral-sh/uv:0.9.0-python3.12-bookworm
@@ -43,53 +62,40 @@ pages:
         - README.rst
         - CHANGELOG.rst
 
-# Publishes the version in pyproject.toml, then bumps the patch version and
-# pushes it, so the default branch always holds the next unreleased version.
+# Publishes the version in pyproject.toml if it isn't on PyPI yet; merges that
+# don't change the version publish nothing.
 #
 # Only the tip of the default branch publishes: a job for a superseded commit
 # (a late or retried pipeline) exits without publishing, so older code is never
-# released under a newer version. If a previous run published but failed to push
-# its bump, the version is already on PyPI; it is bumped until it is free, so
-# this run publishes the next one instead of failing on the upload. If the push
-# failed because the branch moved, the next pipeline (or a retry while this
-# commit is still the tip) recovers. A partial upload (e.g. only the sdist)
-# leaves that version incomplete: the next run skips it.
+# released under a newer version. The tag and GitLab release (vX.Y.Z) are
+# created before the upload, so a failed upload can simply be retried. A partial
+# upload (e.g. only the sdist) needs a new version.
 publish:
   stage: deploy
   image: ghcr.io/astral-sh/uv:0.9.0-python3.12-bookworm
-  # Serialises publish jobs: concurrent pipelines would race on the upload and
-  # on the bump.
+  # Serialises publish jobs: concurrent pipelines would race on the upload.
   resource_group: publish
   variables:
     UV_PUBLISH_TOKEN: $UV_PYPI_ACCESS_TOKEN
-  before_script:
-    - git config --global user.name "Gitlab CI/CD"
-    - git config --global user.email "CICD@gitlab.com"
   script:
-    # Fail before building if either token is missing.
-    - ': "${PROJECT_ACCESS_TOKEN:?}" "${UV_PYPI_ACCESS_TOKEN:?}"'
-    - git fetch -q "https://oauth2:${PROJECT_ACCESS_TOKEN}@${CI_SERVER_FQDN}/${CI_PROJECT_PATH}.git" "${CI_DEFAULT_BRANCH}"
+    - git fetch -q origin "$CI_DEFAULT_BRANCH"
     - |
       if [ "$(git rev-parse FETCH_HEAD)" != "$CI_COMMIT_SHA" ]; then
         echo "$CI_COMMIT_SHA is no longer the tip of ${CI_DEFAULT_BRANCH}; skipping"
         exit 0
       fi
+    # Exit status 10: this version is already on PyPI.
     - |
-      while curl -sfo /dev/null "https://pypi.org/pypi/scrudful/$(uv version --short)/json"; do
-        echo "scrudful $(uv version --short) is already on PyPI; bumping first"
-        uv version --bump patch --no-sync
-      done
+      status=0
+      uv run --no-project --with packaging python scripts/release.py needs-release || status=$?
+      if [ "$status" -eq 10 ]; then exit 0; fi
+      if [ "$status" -ne 0 ]; then exit "$status"; fi
+    - ': "${UV_PYPI_ACCESS_TOKEN:?}"'
+    - uv run --no-project --with packaging python scripts/release.py create-release
     - uv build
     - uv publish
-    - uv version --bump patch --no-sync
-    - git add pyproject.toml uv.lock
-    - git commit -m "[ci skip] bump to $(uv version --short)"
-    - git push -o ci-skip "https://oauth2:${PROJECT_ACCESS_TOKEN}@${CI_SERVER_FQDN}/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
   artifacts:
     paths:
       - dist
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      changes:
-        - scrudful/**/*
-        - pyproject.toml

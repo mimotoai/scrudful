@@ -54,10 +54,10 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-root = ""
-# The sdist also carries the changelog and the tests, with the example apps
-# they exercise (pyproject.toml, README, licenses and the package are always
-# included).
-source-include = ["CHANGELOG.rst", "tests/**", "examples/**"]
+# The sdist also carries the changelog and the tests, with the example apps and
+# the release script they exercise (pyproject.toml, README, licenses and the
+# package are always included).
+source-include = ["CHANGELOG.rst", "tests/**", "examples/**", "scripts/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
