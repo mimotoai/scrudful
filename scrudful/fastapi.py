@@ -17,22 +17,28 @@ from fastapi import Request, Response
 from fastapi.datastructures import DefaultPlaceholder
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
-from starlette.datastructures import Headers, MutableHeaders
+from starlette.datastructures import Headers
 
+from scrudful._adapter import (
+    DEFAULT_CONTEXT_REL,
+    DEFAULT_CONTEXT_TYPE,
+    DEFAULT_SCHEMA_REL,
+    DEFAULT_SCHEMA_TYPE,
+    READ_DESCRIPTIONS,
+    WRITE_DESCRIPTIONS,
+    check_validators,
+    expose_headers,
+    precondition_headers,
+    set_validator_headers,
+    validator_policy,
+)
 from scrudful.conditional import (
-    SAFE_METHODS,
     ConditionalResult,
     evaluate_preconditions,
     http_timestamp,
     quote_etag,
-    validator_headers,
 )
-from scrudful.utils import (
-    EXPOSABLE_HEADERS,
-    join_links,
-    link_content,
-    merge_expose_headers,
-)
+from scrudful.utils import join_links, link_content, merge_expose_headers
 
 __all__ = [
     "CONDITIONAL_READ_RESPONSES",
@@ -40,46 +46,21 @@ __all__ = [
     "scrudful",
 ]
 
-_MALFORMED = {"description": "Malformed If-Match or If-None-Match header."}
-_PRECONDITION_FAILED = {"description": "Precondition Failed."}
-
 #: OpenAPI descriptions of the responses ``@scrudful`` can produce for GET/HEAD
 #: without calling the endpoint. Pass it to the route decorator, e.g.
 #: ``@app.get("/items/{item_id}", responses=CONDITIONAL_READ_RESPONSES)``, or
 #: merge it with your own: ``responses={**CONDITIONAL_READ_RESPONSES, 404: ...}``.
 CONDITIONAL_READ_RESPONSES: dict[int | str, dict[str, Any]] = {
-    304: {
-        "description": "Not Modified: the representation matches the request's "
-        "If-None-Match or If-Modified-Since validators.",
-    },
-    400: dict(_MALFORMED),
-    412: dict(_PRECONDITION_FAILED),
+    status: {"description": text} for status, text in READ_DESCRIPTIONS.items()
 }
 
 #: OpenAPI descriptions of the responses ``@scrudful`` can produce for
 #: PUT/PATCH/DELETE without calling the endpoint, e.g.
 #: ``@app.put("/items/{item_id}", responses=CONDITIONAL_WRITE_RESPONSES)``.
 CONDITIONAL_WRITE_RESPONSES: dict[int | str, dict[str, Any]] = {
-    400: dict(_MALFORMED),
-    412: dict(_PRECONDITION_FAILED),
-    428: {
-        "description": "Precondition Required: this request must be conditional "
-        "(send If-Match or If-Unmodified-Since).",
-    },
+    status: {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
 }
 
-DEFAULT_SCHEMA_REL = "describedBy"
-DEFAULT_SCHEMA_TYPE = "application/json"
-DEFAULT_CONTEXT_REL = "http://www.w3.org/ns/json-ld#context"
-DEFAULT_CONTEXT_TYPE = "application/ld+json"
-
-_PRECONDITION_FIELDS = (
-    "if-match",
-    "if-none-match",
-    "if-modified-since",
-    "if-unmodified-since",
-)
-_FRESH_VALIDATOR_METHODS = frozenset({"PUT", "PATCH"})
 # Representation metadata: not for the body-less (or differently typed) early
 # response (RFC 9110 §15.4.5).
 _BODY_HEADERS = frozenset(
@@ -149,11 +130,11 @@ def scrudful(
         answered with 400, a failed precondition with 412 and a matching
         GET/HEAD with 304 carrying the validators. These responses are JSON
         responses (304 without a body) returned without calling the endpoint,
-        so ``response_model`` does not apply to them. Headers dependencies set
-        on the injected ``Response`` are kept: all of them on a 304 (except
-        ``Content-*`` metadata), only ``Set-Cookie`` on the others; document them with
-        :data:`CONDITIONAL_READ_RESPONSES` and
-        :data:`CONDITIONAL_WRITE_RESPONSES`.
+        so ``response_model`` does not apply to them; describe them in the
+        route's OpenAPI ``responses=`` with :data:`CONDITIONAL_READ_RESPONSES`
+        and :data:`CONDITIONAL_WRITE_RESPONSES`. Headers dependencies set on
+        the injected ``Response`` are kept: all of them on a 304 (except
+        ``Content-*`` metadata), only ``Set-Cookie`` on the others.
 
         The preconditions are evaluated before the endpoint runs, so two
         concurrent requests carrying the same If-Match can both pass. Strict
@@ -212,12 +193,7 @@ def scrudful(
     context_type_or_func : str or callable, optional
         ``type`` of the context link. Defaults to ``"application/ld+json"``.
     """
-    for name, func in (
-        ("etag_func", etag_func),
-        ("last_modified_func", last_modified_func),
-    ):
-        if func is not None and not callable(func):
-            raise TypeError(f"{name} must be callable, not {type(func).__name__}")
+    check_validators(etag_func, last_modified_func)
     has_validators = etag_func is not None or last_modified_func is not None
 
     async def validators(kwargs: Mapping[str, Any]) -> tuple[str | None, int | None]:
@@ -267,7 +243,7 @@ def scrudful(
                 etag, last_modified = await validators(kwargs)
                 result = evaluate_preconditions(
                     method,
-                    _precondition_headers(request),
+                    precondition_headers(request.headers.getlist),
                     etag=etag,
                     last_modified=last_modified,
                     require_precondition=True,
@@ -281,17 +257,16 @@ def scrudful(
                 headers, status = content.headers, content.status_code
             else:
                 headers, status = response.headers, _status_code(request, response)
-            if 200 <= status < 300 and has_validators:
-                if method in _FRESH_VALIDATOR_METHODS:
+            if has_validators:
+                refresh, send = validator_policy(method, status)
+                if refresh:
                     etag, last_modified = await validators(kwargs)
-                if method in SAFE_METHODS or method in _FRESH_VALIDATOR_METHODS:
-                    for name, value in validator_headers(etag, last_modified).items():
-                        if name not in headers:
-                            headers[name] = value
+                if send:
+                    set_validator_headers(headers, etag, last_modified)
             link = join_links(", ".join(headers.getlist("link")), await links(kwargs))
             if link is not None:
                 headers["Link"] = link
-            _expose_headers(headers)
+            expose_headers(headers)
             return content
 
         wrapper.__signature__ = signature  # type: ignore[attr-defined]
@@ -362,17 +337,6 @@ async def _link(
     return link_content(url, rel, content_type)
 
 
-def _precondition_headers(request: Request) -> dict[str, str]:
-    # Repeated field lines are combined as one comma-separated list (RFC 9110
-    # §5.3).
-    headers = {}
-    for name in _PRECONDITION_FIELDS:
-        values = request.headers.getlist(name)
-        if values:
-            headers[name] = ", ".join(values)
-    return headers
-
-
 def _conditional_response(result: ConditionalResult, injected: Headers) -> Response:
     """Build the early response, keeping headers set on the injected Response.
 
@@ -404,16 +368,8 @@ def _conditional_response(result: ConditionalResult, injected: Headers) -> Respo
             and name.encode("latin-1") not in own
         ):
             headers.append(name, value)
-    _expose_headers(headers)
+    expose_headers(headers)
     return response
-
-
-def _expose_headers(headers: MutableHeaders) -> None:
-    names = [name for name in EXPOSABLE_HEADERS if name in headers]
-    if names:
-        headers["Access-Control-Expose-Headers"] = merge_expose_headers(
-            headers.get("access-control-expose-headers"), names
-        )
 
 
 def _status_code(request: Request, response: Response) -> int:
@@ -441,14 +397,24 @@ def _response_class(request: Request) -> Any:
     return response_class
 
 
-@functools.lru_cache(maxsize=None)
 def _default_status(response_class: Any) -> int:
     """Default ``status_code`` of ``response_class``, or 200 if unknown."""
+    try:
+        hash(response_class)
+    except TypeError:  # e.g. a callable instance defining __eq__ but no __hash__
+        return _lookup_default_status(response_class)
+    return _cached_default_status(response_class)
+
+
+def _lookup_default_status(response_class: Any) -> int:
     try:
         default = inspect.signature(response_class).parameters["status_code"].default
     except (KeyError, TypeError, ValueError):
         return 200
     return default if isinstance(default, int) else 200
+
+
+_cached_default_status = functools.lru_cache(maxsize=128)(_lookup_default_status)
 
 
 def _wrapper_signature(

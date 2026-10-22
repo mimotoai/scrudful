@@ -114,13 +114,13 @@ Both adapters
   ``metadata_class = ScrudfulMetadata`` unless the class's ``metadata_class`` is
   something other than DRF's default ``SimpleMetadata`` (a custom class, ``None``
   or a project-wide ``DEFAULT_METADATA_CLASS`` is kept; subclass or mix in
-  ``ScrudfulMetadata`` to combine it with your own). It no
-  longer adds methods the class lacks (read-only viewsets answer 405 instead of
-  500), wraps ``partial_update`` (unless it is DRF's stock one and ``update`` is
-  decorated explicitly), leaves explicit ``@scrudful`` methods alone and
-  gives ``create`` the link configuration only; an explicit ``@scrudful`` on
-  ``update`` also applies to PATCH when ``partial_update`` is DRF's stock one. Re-decorating a subclass
-  replaces inherited wrappers.
+  ``ScrudfulMetadata`` to combine it with your own). It no longer adds methods
+  the class lacks (read-only viewsets answer 405 instead of 500), wraps
+  ``partial_update``, leaves explicit ``@scrudful`` methods alone and gives
+  ``create`` the link configuration only. An explicit ``@scrudful`` on
+  ``update`` also applies to PATCH when ``partial_update`` is DRF's stock one,
+  which is then not wrapped. Re-decorating a subclass replaces inherited
+  wrappers.
 * ``ScrudfulMetadata``: ``determine_metadata_for_detail`` and
   ``determine_metadata_for_list`` are removed;
   ``determine_metadata_for_get/post/put/delete`` take ``(handler, args, kwargs)``

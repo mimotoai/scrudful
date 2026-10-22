@@ -88,20 +88,26 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from scrudful._adapter import (
+    DEFAULT_CONTEXT_REL,
+    DEFAULT_CONTEXT_TYPE,
+    DEFAULT_SCHEMA_REL,
+    DEFAULT_SCHEMA_TYPE,
+    READ_DESCRIPTIONS,
+    WRITE_DESCRIPTIONS,
+    check_validators,
+    expose_headers,
+    precondition_headers,
+    set_validator_headers,
+    validator_policy,
+)
 from scrudful.conditional import (
-    SAFE_METHODS,
     ConditionalResult,
     evaluate_preconditions,
     http_timestamp,
     quote_etag,
-    validator_headers,
 )
-from scrudful.utils import (
-    EXPOSABLE_HEADERS,
-    join_links,
-    link_content,
-    merge_expose_headers,
-)
+from scrudful.utils import join_links, link_content
 
 __all__ = [
     "ScrudfulAPIViewMetadata",
@@ -112,18 +118,6 @@ __all__ = [
     "scrudful_viewset",
 ]
 
-DEFAULT_SCHEMA_REL = "describedBy"
-DEFAULT_SCHEMA_TYPE = "application/json"
-DEFAULT_CONTEXT_REL = "http://www.w3.org/ns/json-ld#context"
-DEFAULT_CONTEXT_TYPE = "application/ld+json"
-
-_PRECONDITION_FIELDS = (
-    "if-match",
-    "if-none-match",
-    "if-modified-since",
-    "if-unmodified-since",
-)
-_FRESH_VALIDATOR_METHODS = frozenset({"PUT", "PATCH"})
 # Set on the request while a ScrudfulViewFunc handles it, so that a wrapped
 # method calling another one (partial_update -> update) is handled once.
 _ACTIVE_ATTR = "_scrudful_active"
@@ -198,7 +192,7 @@ class ScrudfulViewFunc:
         context_rel_or_func: Any = None,
         context_type_or_func: Any = None,
     ) -> None:
-        _check_validators(etag_func, last_modified_func)
+        check_validators(etag_func, last_modified_func)
         _check_sync(view_method)
         # Copies __name__, __doc__, __wrapped__ and the wrapped view's
         # attributes (e.g. @action's mapping); our own attributes come after.
@@ -259,13 +253,12 @@ class ScrudfulViewFunc:
 
         response = self.view_method(*args, **kwargs)
 
-        if self.has_validators and 200 <= response.status_code < 300:
-            if method in _FRESH_VALIDATOR_METHODS:
+        if self.has_validators:
+            refresh, send = validator_policy(method, response.status_code)
+            if refresh:
                 etag, last_modified = self._validators(cb_args, cb_kwargs)
-            if method in SAFE_METHODS or method in _FRESH_VALIDATOR_METHODS:
-                for name, value in validator_headers(etag, last_modified).items():
-                    if name not in response:
-                        response[name] = value
+            if send:
+                set_validator_headers(response, etag, last_modified)
         link = join_links(response.get("Link"), self.link_header(*cb_args, **cb_kwargs))
         if link is not None:
             response["Link"] = link
@@ -289,7 +282,7 @@ class ScrudfulViewFunc:
 
     def add_expose_headers(self, response: HttpResponseBase) -> None:
         """Add the ETag/Link/Location headers present to the expose header."""
-        _expose_headers(response)
+        expose_headers(response)
 
     def schema_link(self, *args: Any, **kwargs: Any) -> Any:
         """Return the schema URL, or ``None``."""
@@ -381,7 +374,7 @@ def scrudful(
         "context_rel_or_func": context_rel_or_func,
         "context_type_or_func": context_type_or_func,
     }
-    _check_validators(etag_func, last_modified_func)
+    check_validators(etag_func, last_modified_func)
 
     def decorator(view_method: Callable[..., Any]) -> ScrudfulViewFunc:
         return ScrudfulViewFunc(view_method, **options)
@@ -574,20 +567,10 @@ def _install_metadata(cls: type) -> None:
 
 
 _READ_RESPONSES = {
-    "304": {
-        "description": "Not Modified: the representation matches the request's "
-        "If-None-Match or If-Modified-Since validators."
-    },
-    "400": {"description": "Malformed If-Match or If-None-Match header."},
-    "412": {"description": "Precondition Failed."},
+    str(status): {"description": text} for status, text in READ_DESCRIPTIONS.items()
 }
 _WRITE_RESPONSES = {
-    "400": {"description": "Malformed If-Match or If-None-Match header."},
-    "412": {"description": "Precondition Failed."},
-    "428": {
-        "description": "Precondition Required: this request must be conditional "
-        "(send If-Match or If-Unmodified-Since)."
-    },
+    str(status): {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
 }
 
 
@@ -746,15 +729,6 @@ ScrudfulAPIViewMetadata = ScrudfulMetadata
 _STATUS_TEXT = {"200": "OK", "201": "Created", "204": "No Content"}
 
 
-def _check_validators(etag_func: Any, last_modified_func: Any) -> None:
-    for name, func in (
-        ("etag_func", etag_func),
-        ("last_modified_func", last_modified_func),
-    ):
-        if func is not None and not callable(func):
-            raise TypeError(f"{name} must be callable, not {type(func).__name__}")
-
-
 def _check_sync(view: Callable[..., Any]) -> None:
     if inspect.iscoroutinefunction(view):
         name = getattr(view, "__qualname__", repr(view))
@@ -794,13 +768,13 @@ def _callback_arguments(
 
 
 def _precondition_headers(request: HttpRequest | Request) -> dict[str, str]:
-    # WSGI/ASGI servers combine repeated field lines with "," (RFC 9110 §5.3).
-    headers = {}
-    for name in _PRECONDITION_FIELDS:
+    # WSGI/ASGI servers already combine repeated field lines with ",", so each
+    # field has at most one (non-empty) value.
+    def getlist(name: str) -> list[str]:
         value = request.headers.get(name)
-        if value:
-            headers[name] = value
-    return headers
+        return [value] if value else []
+
+    return precondition_headers(getlist)
 
 
 def _conditional_response(result: ConditionalResult, drf: bool) -> HttpResponseBase:
@@ -815,16 +789,8 @@ def _conditional_response(result: ConditionalResult, drf: bool) -> HttpResponseB
         response = JsonResponse(result.body, status=result.status)
         for name, value in result.headers.items():
             response[name] = value
-    _expose_headers(response)
+    expose_headers(response)
     return response
-
-
-def _expose_headers(response: HttpResponseBase) -> None:
-    names = [name for name in EXPOSABLE_HEADERS if name in response]
-    if names:
-        response["Access-Control-Expose-Headers"] = merge_expose_headers(
-            response.get("Access-Control-Expose-Headers"), names
-        )
 
 
 def _has_validators(handler: Any) -> bool:

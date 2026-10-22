@@ -1198,6 +1198,67 @@ def test_response_class_default_status_decides_validators(make_client, store):
     assert response.headers["etag"] == '"v1"'
 
 
+class UnhashableResponseClass:
+    """A callable response class instance defining ``__eq__`` but no hash."""
+
+    def __init__(self, default_status: int) -> None:
+        self.default_status = default_status
+        self.media_type = "application/json"
+        # A default that depends on the instance: the signature reports it.
+        self.__signature__ = inspect.Signature(
+            [
+                inspect.Parameter(
+                    "content", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None
+                ),
+                inspect.Parameter(
+                    "status_code",
+                    inspect.Parameter.KEYWORD_ONLY,
+                    default=default_status,
+                ),
+                inspect.Parameter("kwargs", inspect.Parameter.VAR_KEYWORD),
+            ]
+        )
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, UnhashableResponseClass)
+
+    def __call__(self, content=None, status_code=None, **kwargs):
+        if status_code is None:
+            status_code = self.default_status
+        return JSONResponse(content, status_code=status_code, **kwargs)
+
+
+def test_unhashable_response_class(make_client, store):
+    app = FastAPI()
+    ok, not_found = UnhashableResponseClass(200), UnhashableResponseClass(404)
+
+    @app.get("/ok", response_class=ok)
+    @scrudful(etag_func=store.etag)
+    def get_ok():
+        return {}
+
+    @app.get("/missing", response_class=not_found)
+    @scrudful(etag_func=store.etag)
+    def get_missing():
+        return {}
+
+    client = make_client(app)
+    for _ in range(2):
+        response = client.get("/ok")
+        assert response.status_code == 200
+        assert response.headers["etag"] == '"v1"'
+        response = client.get("/missing")
+        assert response.status_code == 404
+        assert "etag" not in response.headers
+
+
+def test_default_status_cache_is_bounded():
+    assert fastapi_module._default_status(RedirectResponse) == 307
+    assert fastapi_module._default_status(UnhashableResponseClass(202)) == 202
+    assert fastapi_module._default_status(object()) == 200
+    assert fastapi_module._cached_default_status.cache_info().maxsize == 128
+
+
 def test_included_router_default_response_class(make_client, store):
     router = APIRouter()
 
