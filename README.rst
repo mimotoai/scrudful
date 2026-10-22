@@ -51,10 +51,11 @@ Status  When
 412     ``If-Match`` does not match (strong comparison), or, with no
         ``If-Match``, the resource is newer than ``If-Unmodified-Since``; or
         ``If-None-Match`` matches on a method other than GET/HEAD (for example
-        ``If-None-Match: *`` on a PUT to an existing resource).
-428     PUT, PATCH or DELETE on an existing resource without ``If-Match`` and
-        without a valid ``If-Unmodified-Since``. Either header is enough. The
-        body lists the accepted headers.
+        ``If-None-Match: *``, "create only", on a PUT to an existing resource).
+428     PUT, PATCH or DELETE on an existing resource without ``If-Match``,
+        without ``If-None-Match: *`` and without a valid
+        ``If-Unmodified-Since``. ``If-Match`` or ``If-Unmodified-Since`` is
+        enough to update; the body lists them.
 ======  ==========================================================================
 
 The error responses are JSON (``{"detail": ...}``), and none of them calls your
@@ -72,7 +73,14 @@ Rules worth knowing:
 * **Callbacks returning ``None``** mean "no current representation": the
   preconditions are skipped and your view produces its own 404. The exception
   is PUT, which may create the resource: ``If-None-Match: *`` passes and
-  ``If-Match`` gives 412.
+  ``If-Match`` gives 412. POST is not an exception: when both callbacks
+  return ``None`` its preconditions are skipped too, so even a failing
+  ``If-Match`` reaches your view.
+* **Callbacks run first**, before your view's own lookup and permission
+  checks, so they must apply the same scoping (for example
+  ``view.get_queryset()`` with DRF, or the current user from a dependency with
+  FastAPI). Otherwise a resource the view would hide reveals its validators
+  (304) and its existence (412 or 428 instead of 404).
 * **Validators on responses.** 2xx responses to GET/HEAD get ``ETag`` and
   ``Last-Modified``; 2xx responses to PUT/PATCH get freshly recomputed ones
   (the callbacks run again, so they describe the new representation); POST,
@@ -81,8 +89,11 @@ Rules worth knowing:
 * **ETags.** ``str()`` of the callback's result is used. A valid entity-tag
   (``'"abc"'``, ``'W/"abc"'``) is sent as is, anything else is wrapped in double
   quotes. A value that cannot be an entity-tag (it contains a double quote, a
-  space or a control character) raises ``ValueError``. No library version is
-  appended.
+  space, a control character or a character above U+00FF) raises
+  ``ValueError``. No library version is appended. Weak tags are allowed, but
+  ``If-Match`` uses the strong comparison, which a weak tag never passes: with
+  a weak ``etag_func`` only ``If-Unmodified-Since`` (or ``If-Match: *``) can
+  make a write succeed.
 * **Datetimes.** ``last_modified_func`` returns a ``datetime`` or an epoch
   timestamp. Aware datetimes are converted to UTC and sub-second precision is
   discarded. A *naive* datetime is taken to be UTC by the FastAPI adapter and
@@ -130,13 +141,16 @@ configure the list response):
     from items.serializers import ItemSerializer
 
 
+    # The callbacks run before the view's lookup: use its queryset.
     def item_etag(view, request, pk):
-        version = Item.objects.filter(pk=pk).values_list("version", flat=True).first()
+        items = view.get_queryset().filter(pk=pk)
+        version = items.values_list("version", flat=True).first()
         return None if version is None else f"v{version}"
 
 
     def item_last_modified(view, request, pk):
-        return Item.objects.filter(pk=pk).values_list("updated_at", flat=True).first()
+        items = view.get_queryset().filter(pk=pk)
+        return items.values_list("updated_at", flat=True).first()
 
 
     def item_schema_url(view, request, **kwargs):
@@ -183,7 +197,7 @@ don't need. Callbacks and endpoints may be ``def`` (run in the threadpool) or
 
 .. code-block:: python
 
-    from datetime import datetime
+    from datetime import datetime, timezone
     from typing import Any
 
     from fastapi import FastAPI, HTTPException, Request
@@ -195,7 +209,13 @@ don't need. Callbacks and endpoints may be ``def`` (run in the threadpool) or
     )
 
     app = FastAPI()
-    users = {1: {"name": "John", "version": 1, "updated_at": datetime(2021, 5, 25)}}
+    users = {
+        1: {
+            "name": "John",
+            "version": 1,
+            "updated_at": datetime(2021, 5, 25, tzinfo=timezone.utc),
+        }
+    }
 
 
     def user_etag(user_id: int, **kwargs: Any) -> str | None:
@@ -222,7 +242,9 @@ don't need. Callbacks and endpoints may be ``def`` (run in the threadpool) or
         if user_id not in users:
             raise HTTPException(404, "User not found")
         record = users[user_id]
-        record.update(user, version=record["version"] + 1, updated_at=datetime.now())
+        record.update(
+            user, version=record["version"] + 1, updated_at=datetime.now(timezone.utc)
+        )
         return record
 
 Notes:

@@ -2,8 +2,8 @@
 Changelog
 =========
 
-Unreleased
-==========
+Unreleased (0.3.0, since 0.2.0)
+===============================
 
 Packaging and tooling
 ---------------------
@@ -21,6 +21,14 @@ Packaging and tooling
 * ``scrudful.__version__`` is read from the installed package metadata.
 * The README is now the package's long description; the CI pipeline uses uv and
   publishes only after the tests pass.
+* The CI pipeline runs for merge requests and the default branch; the docs
+  (``pages``) and the release (``publish``) run only on the default branch, and
+  the docs build treats warnings as errors. ``publish`` releases the version in
+  ``pyproject.toml`` and then bumps the patch version on the default branch, so
+  the branch always holds the next unreleased version.
+* The package ships a ``py.typed`` marker and declares ``Source`` and
+  ``Changelog`` project URLs; the sdist also contains the tests, the example
+  projects and this changelog.
 
 Breaking changes
 ----------------
@@ -33,7 +41,9 @@ Both adapters
   ``{"detail": "This request must be conditional.", "accepted-precondition-headers": [...]}``
   (before: 400 ``{"missing-required-headers": [...]}``, PUT and DELETE only).
   Either ``If-Match`` or a valid ``If-Unmodified-Since`` is enough (before:
-  both were required).
+  both were required). ``If-None-Match: *`` ("create only", RFC 9110
+  §13.1.2) also makes the request conditional; on an existing resource it is
+  answered with 412.
 * A malformed ``If-Match`` or ``If-None-Match`` is answered with 400 (before: it
   was ignored). Invalid ``If-Modified-Since`` / ``If-Unmodified-Since`` dates are
   ignored. 412 responses have a JSON body, ``{"detail": "Precondition failed."}``.
@@ -63,6 +73,7 @@ Both adapters
 * ``scrudful.handlers`` (the vendored Django helpers, including
   ``scrudful.handlers.fastapi.get_conditional_response``) is removed; use
   ``scrudful.conditional``.
+* The empty ``scrudful.flask`` module is removed.
 
 ``scrudful.utils``
 ~~~~~~~~~~~~~~~~~~
@@ -71,6 +82,7 @@ Both adapters
   emits ``rel`` / ``type`` as escaped quoted-strings; control characters (and
   characters above U+00FF) in ``rel`` / ``type`` raise ``ValueError``.
   ``content_type`` is optional: when empty the ``type`` parameter is omitted.
+* ``get_string_or_evaluate`` is removed (the adapters no longer use it).
 
 ``scrudful.fastapi``
 ~~~~~~~~~~~~~~~~~~~~
@@ -106,10 +118,17 @@ Both adapters
 * ``ScrudfulMetadata``: ``determine_metadata_for_detail`` and
   ``determine_metadata_for_list`` are removed;
   ``determine_metadata_for_get/post/put/delete`` take ``(handler, args, kwargs)``
-  and ``determine_metadata_for_patch`` is new. The OPTIONS body now lists only
-  routed methods, uses "Created" / 204 "No Content", and documents
-  304/400/412/428 and the precondition headers (``required`` only when a single
-  validator is configured). ``ScrudfulAPIViewMetadata`` is an alias.
+  and ``determine_metadata_for_patch`` is new. ``determine_metadata(request,
+  view)`` describes the methods routed to the view (viewset action map or
+  allowed methods) instead of guessing "detail" from URL arguments.
+  ``get_method(view, name)`` returns the ``ScrudfulViewFunc`` or ``None`` (it
+  used to assume a ``functools.partial``). ``required_conditional_headers``
+  marks a header ``required`` only when it is the only one accepted and adds a
+  description. The OPTIONS body now lists only routed methods, uses "Created" /
+  204 "No Content", and documents 304/400/412/428 and the precondition headers.
+  ``ScrudfulAPIViewMetadata`` is an alias.
+* Decorating an ``async def`` view raises ``TypeError`` (DRF views are
+  synchronous; before, the request failed).
 * Callbacks receive ``(view, request, **url_kwargs)``; extra keyword arguments
   such as ``partial=True`` are no longer passed. ``*_or_func`` values are called
   when callable and used as they are otherwise (lazy strings and ``reverse``
@@ -133,7 +152,15 @@ Fixes
   callbacks, handles ``@action`` methods and function views, and keeps
   ``partial_update`` / ``update`` from being evaluated twice.
 * The OPTIONS description is correct for list, detail, nested and ``@action``
-  routes.
+  routes, and mutating it no longer changes later responses (the response
+  descriptions were shared module-level dictionaries).
+* ``scrudful.fastapi`` evaluates string annotations (``from __future__ import
+  annotations``) in the endpoint's module: FastAPI before 0.124 evaluated them
+  in the wrapper's module, so body models became required query parameters
+  (422).
+* The example projects: the DRF validator callbacks look items up in
+  ``view.get_queryset()``, so items the view hides are a 404 whatever the
+  preconditions; the FastAPI README example uses timezone-aware datetimes.
 * Documentation: the README, usage and changelog pages were added, the API
   documentation covers all modules, and the Sphinx build is warning-free.
 

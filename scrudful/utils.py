@@ -60,11 +60,3 @@ def merge_expose_headers(existing: str | None, names: Iterable[str]) -> str | No
             seen.add(name.lower())
             merged.append(name)
     return ", ".join(merged) or None
-
-
-def get_string_or_evaluate(string_or_func, *args, **kwargs):
-    if not string_or_func:
-        return None
-    if isinstance(string_or_func, str):
-        return string_or_func
-    return string_or_func(*args, **kwargs)

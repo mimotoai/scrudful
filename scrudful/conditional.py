@@ -243,7 +243,15 @@ def evaluate_preconditions(
     is an already-quoted entity-tag and ``last_modified`` an epoch timestamp;
     both ``None`` means the target resource has no current representation.
     When ``require_precondition`` is true, unconditional PUT/PATCH/DELETE
-    requests on an existing resource are rejected with 428 (RFC 6585 §3).
+    requests on an existing resource are rejected with 428 (RFC 6585 §3); a
+    request is conditional if it has an If-Match, an ``If-None-Match: *``
+    (which then fails with 412, RFC 9110 §13.1.2) or a valid
+    If-Unmodified-Since while ``last_modified`` is known.
+
+    Preconditions are evaluated only for an existing resource and for PUT,
+    which may create one. In particular a POST to a target whose validators
+    are both ``None`` proceeds whatever its If-Match says (the handler answers,
+    e.g. 201 or 404).
 
     Return ``None`` if the request should proceed to the handler, otherwise
     the ``ConditionalResult`` to respond with.
@@ -272,8 +280,12 @@ def evaluate_preconditions(
         return None
 
     if require_precondition and exists and method in PRECONDITION_REQUIRED_METHODS:
-        conditional = bool(if_match) or (
-            if_unmodified_since is not None and last_modified is not None
+        # ``If-None-Match: *`` (create only if absent, RFC 9110 §13.1.2) is
+        # conditional too; on an existing resource it fails below with 412.
+        conditional = (
+            bool(if_match)
+            or if_none_match == ["*"]
+            or (if_unmodified_since is not None and last_modified is not None)
         )
         if not conditional:
             accepted = []

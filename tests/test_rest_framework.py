@@ -505,6 +505,15 @@ def test_unconditional_write_gives_428(client, method):
     assert store.version == 1
 
 
+@pytest.mark.parametrize("method", ["put", "patch", "delete"])
+def test_if_none_match_star_on_an_existing_resource_gives_412(client, method):
+    """Create-only (RFC 9110 §13.1.2): conditional, so 412 rather than 428."""
+    response = getattr(client, method)("/things/1/", headers={"If-None-Match": "*"})
+    assert response.status_code == 412
+    assert response.json() == {"detail": "Precondition failed."}
+    assert store.version == 1
+
+
 @pytest.mark.parametrize(
     "prefix, accepted",
     [("etag-only", ["If-Match"]), ("lm-only", ["If-Unmodified-Since"])],
@@ -997,3 +1006,39 @@ def test_metadata_can_be_called_directly():
     request = APIRequestFactory().options("/things/3/")
     response = view(request, pk="3")
     assert set(response.data) == {"get", "put"}
+
+
+def test_metadata_output_does_not_share_the_module_dictionaries():
+    def describe():
+        view = ThingViewSet.as_view({"get": "retrieve", "put": "update"})
+        return view(APIRequestFactory().options("/things/3/"), pk="3").data
+
+    first = describe()
+    for operation in first.values():
+        for response in operation["responses"].values():
+            response["description"] = "mutated"
+    second = describe()
+    assert second["get"]["responses"]["304"]["description"].startswith("Not Modified")
+    assert second["put"]["responses"]["412"]["description"] == "Precondition Failed."
+    assert second["put"]["responses"]["428"]["description"].startswith(
+        "Precondition Required"
+    )
+
+
+def test_async_views_are_rejected_at_decoration_time():
+    async def view(request):
+        pass
+
+    with pytest.raises(TypeError, match="async views"):
+        scrudful()(view)
+    with pytest.raises(TypeError, match="async views"):
+        ScrudfulViewFunc(view)
+    with pytest.raises(TypeError, match="async views"):
+        scrudful_api_view(["GET"])(view)
+
+    with pytest.raises(TypeError, match="async views"):
+
+        @scrudful_viewset
+        class AsyncViewSet(viewsets.ViewSet):
+            async def retrieve(self, request, pk):
+                pass

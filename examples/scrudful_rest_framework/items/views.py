@@ -2,7 +2,11 @@
 
 Validator callbacks are called as ``func(view, request, **url_kwargs)`` and
 return ``None`` when the item does not exist, so that the view itself answers
-404. Settings enable ``ATOMIC_REQUESTS``: the callbacks and the write run in one
+404. They run before the view's own lookup and permission checks, so they look
+the item up in ``view.get_queryset()``: an item the view would not show must
+not reveal its validators (304) or its existence (412/428 instead of 404).
+
+Settings enable ``ATOMIC_REQUESTS``: the callbacks and the write run in one
 transaction, and on PUT/PATCH/DELETE the callbacks lock the row with
 ``select_for_update()`` so a concurrent write cannot slip in between the
 precondition check and the save (SQLite ignores the lock; use a database that
@@ -46,25 +50,28 @@ ITEM_CONTEXT = {
 }
 
 
-def _item_value(request, pk, field):
-    items = Item.objects.filter(pk=pk)
+def _item_value(view, request, pk, field):
+    # The view's queryset, not Item.objects: apply the view's own scoping.
+    items = view.get_queryset().filter(pk=pk)
     if request.method not in ("GET", "HEAD"):
         items = items.select_for_update()
     return items.values_list(field, flat=True).first()
 
 
 def item_etag(view, request, pk):
-    version = _item_value(request, pk, "version")
+    version = _item_value(view, request, pk, "version")
     return None if version is None else f"v{version}"
 
 
 def item_last_modified(view, request, pk):
-    return _item_value(request, pk, "updated_at")
+    return _item_value(view, request, pk, "updated_at")
 
 
 def collection_etag(view, request):
     """An ETag that changes whenever an item is created, changed or deleted."""
-    rows = list(Item.objects.order_by("pk").values_list("pk", "version"))
+    # Viewsets list their own queryset; the stats function view covers all items.
+    items = view.get_queryset() if hasattr(view, "get_queryset") else Item.objects
+    rows = list(items.order_by("pk").values_list("pk", "version"))
     return hashlib.sha256(repr(rows).encode()).hexdigest()[:32]
 
 

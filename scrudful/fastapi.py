@@ -119,6 +119,12 @@ def scrudful(
         need. Callbacks may be ``def`` (run in the threadpool) or ``async def``;
         an awaitable result is awaited.
 
+        The validator callbacks run before the endpoint, so before any lookup
+        or authorization check its body makes: they must apply the same
+        scoping (e.g. the current user from a dependency). Otherwise a
+        resource the endpoint would hide reveals its validators (304) and its
+        existence (412/428 instead of 404).
+
     Validators
         Without validator callbacks no preconditions are evaluated: the If-*
         headers are ignored and the route behaves like an undecorated one
@@ -130,13 +136,14 @@ def scrudful(
 
         When either validator callback is configured, PUT, PATCH and DELETE on
         an existing resource must be conditional: a request without If-Match
-        (or a valid If-Unmodified-Since, when ``last_modified_func`` is set) is
-        answered with 428 Precondition Required. A malformed If-Match or
-        If-None-Match is answered with 400, a failed precondition with 412 and
-        a matching GET/HEAD with 304 carrying the validators. These responses
-        are JSON responses (304 without a body) returned without calling the
-        endpoint, so ``response_model`` does not apply to them; document them
-        with :data:`CONDITIONAL_READ_RESPONSES` and
+        (or a valid If-Unmodified-Since, when ``last_modified_func`` is set, or
+        ``If-None-Match: *``, which then fails with 412) is answered with 428
+        Precondition Required. A malformed If-Match or If-None-Match is
+        answered with 400, a failed precondition with 412 and a matching
+        GET/HEAD with 304 carrying the validators. These responses are JSON
+        responses (304 without a body) returned without calling the endpoint,
+        so ``response_model`` does not apply to them; document them with
+        :data:`CONDITIONAL_READ_RESPONSES` and
         :data:`CONDITIONAL_WRITE_RESPONSES`.
 
         The preconditions are evaluated before the endpoint runs, so two
@@ -171,8 +178,11 @@ def scrudful(
         there is none. ``str()`` of the result is used: a valid entity-tag
         (``'"abc"'`` or ``'W/"abc"'``) is sent unchanged, anything else is
         wrapped in double quotes (a strong entity-tag). Values that cannot be an
-        entity-tag (containing a double quote, space or control character)
-        raise ``ValueError``. No library version is appended.
+        entity-tag (containing a double quote, space, control character or a
+        character above U+00FF) raise ``ValueError``. No library version is
+        appended. Weak entity-tags are allowed, but If-Match uses the strong
+        comparison, which they never pass: only If-Unmodified-Since (or
+        ``If-Match: *``) can then make a write succeed.
     last_modified_func : callable, optional
         Returns the modification time of the current representation as a
         ``datetime`` (naive values are taken to be UTC) or an epoch timestamp,
@@ -396,6 +406,14 @@ def _wrapper_signature(
 
 
 def _signature(endpoint: Callable[..., Any]) -> inspect.Signature:
+    # Evaluate string annotations (``from __future__ import annotations``) in
+    # the endpoint's own module: FastAPI < 0.124 evaluates the strings it finds
+    # on the wrapper in the wrapper's globals (this module's), where the
+    # endpoint's names are undefined.
+    try:
+        return inspect.signature(endpoint, eval_str=True)
+    except NameError:
+        pass
     try:
         return inspect.signature(endpoint)
     except NameError:

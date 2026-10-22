@@ -480,6 +480,25 @@ def test_either_validator_satisfies_requirement(method, headers):
 
 
 @pytest.mark.parametrize("method", sorted(PRECONDITION_REQUIRED_METHODS))
+@pytest.mark.parametrize("etag, last_modified", [(ETAG, TS), (ETAG, None), (None, TS)])
+def test_if_none_match_star_satisfies_requirement_and_fails(
+    method, etag, last_modified
+):
+    """``If-None-Match: *`` is the create-only precondition (RFC 9110
+    §13.1.2): on an existing resource it is 412, not 428."""
+    assert (
+        evaluate(
+            method,
+            {"if-none-match": "*"},
+            etag=etag,
+            last_modified=last_modified,
+            require_precondition=True,
+        )
+        == precondition_failed()
+    )
+
+
+@pytest.mark.parametrize("method", sorted(PRECONDITION_REQUIRED_METHODS))
 def test_satisfied_requirement_still_evaluated(method):
     assert (
         evaluate(method, {"if-match": OTHER}, require_precondition=True)

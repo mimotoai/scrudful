@@ -13,6 +13,12 @@ Callbacks
     view methods pass to each other (such as DRF's ``partial=True``) are never
     passed on.
 
+    The validator callbacks run before the view, so before its own lookup
+    (``get_object()``) and object permission checks: they must apply the same
+    scoping, e.g. ``view.get_queryset().filter(pk=pk)`` rather than
+    ``Model.objects.filter(pk=pk)``. Otherwise an object the view would hide
+    reveals its validators (304) and its existence (412/428 instead of 404).
+
 Validators
     Without validator callbacks no preconditions are evaluated: the If-*
     headers are ignored and the view behaves like an undecorated one (apart
@@ -24,8 +30,9 @@ Validators
 
     When either validator callback is configured, PUT, PATCH and DELETE on an
     existing resource must be conditional: a request without If-Match (or a
-    valid If-Unmodified-Since, when ``last_modified_func`` is set) is answered
-    with 428 Precondition Required. A malformed If-Match or If-None-Match is
+    valid If-Unmodified-Since, when ``last_modified_func`` is set, or
+    ``If-None-Match: *``, which then fails with 412) is answered with 428
+    Precondition Required. A malformed If-Match or If-None-Match is
     answered with 400, a failed precondition with 412 and a matching GET/HEAD
     with 304 carrying the validators. These responses are returned without
     calling the view: 400/412/428 as a DRF ``Response`` (a ``JsonResponse`` for
@@ -59,7 +66,9 @@ Headers
 
 from __future__ import annotations
 
+import copy
 import functools
+import inspect
 import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime
@@ -146,8 +155,11 @@ class ScrudfulViewFunc:
         there is none. ``str()`` of the result is used: a valid entity-tag
         (``'"abc"'`` or ``'W/"abc"'``) is sent unchanged, anything else is
         wrapped in double quotes (a strong entity-tag). Values that cannot be
-        an entity-tag (containing a double quote, space or control character)
-        raise ``ValueError``. No library version is appended.
+        an entity-tag (containing a double quote, space, control character or
+        a character above U+00FF) raise ``ValueError``. No library version is
+        appended. Weak entity-tags are allowed, but If-Match uses the strong
+        comparison, which they never pass: only If-Unmodified-Since (or
+        ``If-Match: *``) can then make a write succeed.
     last_modified_func : callable, optional
         Returns the modification time of the current representation as a
         ``datetime`` or an epoch timestamp, or ``None`` if there is none. Naive
@@ -185,6 +197,7 @@ class ScrudfulViewFunc:
         context_type_or_func: Any = None,
     ) -> None:
         _check_validators(etag_func, last_modified_func)
+        _check_sync(view_method)
         # Copies __name__, __doc__, __wrapped__ and the wrapped view's
         # attributes (e.g. @action's mapping); our own attributes come after.
         functools.update_wrapper(self, view_method)
@@ -353,6 +366,8 @@ def scrudful(
 
     All arguments are keyword-only; they are described in
     :class:`ScrudfulViewFunc`, and the behaviour in the module docstring.
+    Decorating an ``async def`` view raises ``TypeError``: DRF views are
+    synchronous.
     """
     options = {
         "etag_func": etag_func,
@@ -425,6 +440,7 @@ def scrudful_api_view(
     )
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        _check_sync(func)
         view = api_view(list(http_method_names))(func)
 
         def handler(self: APIView, *args: Any, **kwargs: Any) -> Any:
@@ -598,7 +614,7 @@ class ScrudfulMetadata(BaseMetadata):
             ok["content"] = content
         responses = {"200": ok}
         if _has_validators(handler):
-            responses.update(_READ_RESPONSES)
+            responses.update(copy.deepcopy(_READ_RESPONSES))
         return {"responses": responses}
 
     def determine_metadata_for_post(
@@ -650,10 +666,13 @@ class ScrudfulMetadata(BaseMetadata):
             if status == "201":
                 # POST is evaluated but never required to be conditional.
                 metadata["responses"].update(
-                    {code: _WRITE_RESPONSES[code] for code in ("400", "412")}
+                    {
+                        code: copy.deepcopy(_WRITE_RESPONSES[code])
+                        for code in ("400", "412")
+                    }
                 )
             else:
-                metadata["responses"].update(_WRITE_RESPONSES)
+                metadata["responses"].update(copy.deepcopy(_WRITE_RESPONSES))
                 metadata["parameters"] = self.required_conditional_headers(handler)
         return metadata
 
@@ -708,6 +727,12 @@ def _check_validators(etag_func: Any, last_modified_func: Any) -> None:
     ):
         if func is not None and not callable(func):
             raise TypeError(f"{name} must be callable, not {type(func).__name__}")
+
+
+def _check_sync(view: Callable[..., Any]) -> None:
+    if inspect.iscoroutinefunction(view):
+        name = getattr(view, "__qualname__", repr(view))
+        raise TypeError(f"@scrudful does not support async views ({name})")
 
 
 def _evaluate(

@@ -4,7 +4,6 @@ from starlette.datastructures import URL
 
 from scrudful.utils import (
     EXPOSABLE_HEADERS,
-    get_string_or_evaluate,
     join_links,
     link_content,
     merge_expose_headers,
@@ -201,13 +200,3 @@ def test_exposable_headers():
 )
 def test_merge_expose_headers(existing, names, expected):
     assert merge_expose_headers(existing, names) == expected
-
-
-# --- get_string_or_evaluate -------------------------------------------------
-
-
-def test_get_string_or_evaluate():
-    assert get_string_or_evaluate(None) is None
-    assert get_string_or_evaluate("") is None
-    assert get_string_or_evaluate("x") == "x"
-    assert get_string_or_evaluate(lambda *a, **k: (a, k), 1, b=2) == ((1,), {"b": 2})

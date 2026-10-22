@@ -9,8 +9,10 @@ from datetime import datetime, timezone
 
 import pytest
 from django.db import connection
+from django.urls import include, path
 from items import views
 from items.models import Item
+from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient
 
 pytestmark = pytest.mark.django_db
@@ -263,9 +265,9 @@ def test_write_validators_run_in_the_request_transaction(client, item, monkeypat
     seen = []
     item_value = views._item_value
 
-    def spy(request, pk, field):
+    def spy(view, request, pk, field):
         seen.append((field, connection.in_atomic_block))
-        return item_value(request, pk, field)
+        return item_value(view, request, pk, field)
 
     monkeypatch.setattr(views, "_item_value", spy)
     response = client.put(
@@ -311,6 +313,60 @@ def test_put_with_if_match_on_a_missing_item_gives_412(client):
         detail(999), {"name": "x"}, format="json", headers={"If-Match": '"v1"'}
     )
     assert response.status_code == 412
+
+
+# --- Queryset scoping ---------------------------------------------------------
+
+
+class ScopedItemViewSet(views.ItemViewSet):
+    """Only shows items named "public" (e.g. per-tenant scoping)."""
+
+    def get_queryset(self):
+        return super().get_queryset().filter(name="public")
+
+
+scoped_router = SimpleRouter()
+scoped_router.register("scoped-items", ScopedItemViewSet, basename="scoped-item")
+urlpatterns = [path("", include("items.urls")), path("", include(scoped_router.urls))]
+
+
+@pytest.mark.urls(__name__)
+@pytest.mark.parametrize(
+    "method, headers",
+    [
+        ("get", {}),
+        ("get", {"If-None-Match": "*"}),
+        ("get", {"If-Modified-Since": MODIFIED_HTTP}),
+        ("put", {}),
+        ("put", {"If-None-Match": "*"}),
+        ("patch", {}),
+        ("delete", {}),
+        ("delete", {"If-Unmodified-Since": MODIFIED_HTTP}),
+    ],
+)
+def test_callbacks_apply_the_view_queryset(client, item, method, headers):
+    """An item hidden by get_queryset() is a 404 whatever the preconditions:
+    the callbacks must not reveal its validators (304) or its existence
+    (412/428)."""
+    path_ = f"/scoped-items/{item.pk}/"
+    response = getattr(client, method)(
+        path_, {"name": "x"}, format="json", headers=headers
+    )
+    assert response.status_code == 404
+    assert "ETag" not in response
+    assert "Last-Modified" not in response
+    assert Item.objects.get(pk=item.pk).name == "One"
+
+
+@pytest.mark.urls(__name__)
+def test_scoped_viewset_serves_visible_items(client):
+    public = Item.objects.create(name="public")
+    path_ = f"/scoped-items/{public.pk}/"
+    response = client.get(path_)
+    assert response.status_code == 200
+    assert response["ETag"] == '"v1"'
+    assert client.get(path_, headers={"If-None-Match": '"v1"'}).status_code == 304
+    assert client.put(path_, {"name": "public"}, format="json").status_code == 428
 
 
 # --- Collection and create ----------------------------------------------------

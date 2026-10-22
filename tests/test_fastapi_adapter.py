@@ -18,6 +18,7 @@ from scrudful.fastapi import (
     CONDITIONAL_WRITE_RESPONSES,
     scrudful,
 )
+from tests import fastapi_future_annotations as future_endpoints
 
 # Non-zero microseconds: the header is floored to whole seconds and conditional
 # requests echoing it must still match.
@@ -212,6 +213,34 @@ def test_string_annotations_are_resolved(make_client, store):
     assert response.status_code == 200
     assert response.headers["x-method"] == "GET"
     assert response.headers["etag"] == '"v1"'
+
+
+def test_future_annotations_are_evaluated_in_the_endpoint_module(make_client):
+    # FastAPI < 0.124 evaluates string annotations in the wrapper's globals, so
+    # the wrapper's signature must carry the classes themselves; otherwise the
+    # body model becomes a required query parameter (422).
+    params = inspect.signature(future_endpoints.replace_item).parameters
+    assert params["request"].annotation is Request
+    assert params["item_id"].annotation is int
+    assert params["body"].annotation is future_endpoints.Body
+    assert params["_scrudful_response"].annotation is Response
+
+    response = make_client(future_endpoints.make_app()).put(
+        "/items/3", json={"name": "a"}, headers={"If-Match": '"v3"'}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"name": "a", "method": "PUT"}
+    assert response.headers["etag"] == '"v3"'
+
+
+def test_unresolvable_annotations_fall_back_to_the_unevaluated_signature():
+    @scrudful()
+    async def endpoint(item_id: "int", thing: "Undefined" = None):  # noqa: F821
+        pass
+
+    params = inspect.signature(endpoint).parameters
+    assert params["item_id"].annotation == "int"
+    assert params["thing"].annotation == "Undefined"
 
 
 def test_wrapper_signature_adds_private_keyword_only_parameters():
@@ -833,7 +862,7 @@ def test_malformed_if_match_gives_400(client, store, method, if_match):
 @pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
 @pytest.mark.parametrize(
     "headers",
-    [{}, {"If-Unmodified-Since": "yesterday"}, {"If-None-Match": "*"}],
+    [{}, {"If-Unmodified-Since": "yesterday"}, {"If-None-Match": '"v1"'}],
 )
 def test_unconditional_writes_give_428(client, store, method, headers):
     response = client.request(method, "/item", headers=headers)
@@ -842,6 +871,16 @@ def test_unconditional_writes_give_428(client, store, method, headers):
         "detail": "This request must be conditional.",
         "accepted-precondition-headers": ["If-Match", "If-Unmodified-Since"],
     }
+    assert "endpoint" not in store.calls
+    assert (store.exists, store.version) == (True, 1)
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+def test_if_none_match_star_on_an_existing_resource_gives_412(client, store, method):
+    """Create-only (RFC 9110 §13.1.2): conditional, so 412 rather than 428."""
+    response = client.request(method, "/item", headers={"If-None-Match": "*"})
+    assert response.status_code == 412
+    assert response.json() == {"detail": "Precondition failed."}
     assert "endpoint" not in store.calls
     assert (store.exists, store.version) == (True, 1)
 
