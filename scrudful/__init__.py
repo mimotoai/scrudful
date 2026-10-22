@@ -1,3 +1,6 @@
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
-__version__ = version("scrudful")
+try:
+    __version__ = version("scrudful")
+except PackageNotFoundError:  # a source tree that isn't installed
+    __version__ = "0+unknown"

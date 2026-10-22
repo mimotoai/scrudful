@@ -180,9 +180,14 @@ Caveats of ``scrudful_viewset``:
 * The item link callbacks also run for ``create`` and for OPTIONS and POST on the
   list route, where there is no ``pk``. Accept ``**kwargs``, as
   ``item_schema_url`` does above.
-* When a class is decorated with ``scrudful_viewset``, an explicit ``@scrudful``
-  on ``update`` does not apply to PATCH: the ``Meta``-configured wrapper of
-  ``partial_update`` wins. Decorate ``partial_update`` explicitly to override it.
+* An explicit ``@scrudful`` on ``update`` applies to PATCH when
+  ``partial_update`` is DRF's stock one. With a user-defined ``partial_update``
+  that calls ``update``, the ``Meta``-configured wrapper of ``partial_update``
+  wins: decorate ``partial_update`` explicitly to override it.
+* OPTIONS uses ``ScrudfulMetadata`` only when the viewset's ``metadata_class``
+  is DRF's default ``SimpleMetadata``. A custom ``metadata_class`` (or ``None``,
+  or a project-wide ``DEFAULT_METADATA_CLASS``) is kept; subclass
+  ``ScrudfulMetadata`` to get its output with your own additions.
 * Methods the class does not have are not added (a read-only viewset answers
   405 to writes).
 

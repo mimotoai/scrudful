@@ -82,7 +82,8 @@ from django.http import (
 )
 from django.utils import timezone
 from rest_framework.decorators import api_view
-from rest_framework.metadata import BaseMetadata
+from rest_framework.metadata import BaseMetadata, SimpleMetadata
+from rest_framework.mixins import UpdateModelMixin
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -126,6 +127,7 @@ _FRESH_VALIDATOR_METHODS = frozenset({"PUT", "PATCH"})
 # Set on the request while a ScrudfulViewFunc handles it, so that a wrapped
 # method calling another one (partial_update -> update) is handled once.
 _ACTIVE_ATTR = "_scrudful_active"
+_STOCK_PARTIAL_UPDATE = UpdateModelMixin.partial_update
 _LINK_OPTIONS = (
     "schema_link_or_func",
     "schema_rel_or_func",
@@ -408,9 +410,11 @@ def scrudful_api_view(
     ``@parser_classes``, ``@authentication_classes``, ``@throttle_classes``,
     ``@permission_classes``, ``@schema`` ...) work as usual, and every method
     handler is wrapped in a :class:`ScrudfulViewFunc`. The callbacks are
-    called as ``func(view, request, **url_kwargs)``. Unless the function has a
-    ``metadata_class`` attribute, OPTIONS is answered by
-    :class:`ScrudfulMetadata`.
+    called as ``func(view, request, **url_kwargs)``. OPTIONS is answered by
+    :class:`ScrudfulMetadata` unless the view's ``metadata_class`` (a
+    ``metadata_class`` attribute of the function, or ``DEFAULT_METADATA_CLASS``)
+    is something other than DRF's default ``SimpleMetadata``; a custom class
+    (or ``None``) is kept, so subclass :class:`ScrudfulMetadata` to combine them.
     ::
 
         @scrudful_api_view(["GET", "PUT"], etag_func=settings_etag)
@@ -450,8 +454,9 @@ def scrudful_api_view(
         scrudful_handler = decorate(handler)
         for method in http_method_names:
             setattr(view.cls, method.lower(), scrudful_handler)
-        if not hasattr(func, "metadata_class"):
-            view.cls.metadata_class = ScrudfulMetadata
+        if hasattr(func, "metadata_class"):
+            view.cls.metadata_class = func.metadata_class
+        _install_metadata(view.cls)
         return view
 
     return decorator
@@ -466,9 +471,13 @@ def scrudful_viewset(cls: type) -> type:
     ``list_*`` configuration, and ``create`` with the item *link*
     configuration only: its target is the collection, so the item validators
     do not apply to it. Methods the class doesn't have are not added, and
-    methods decorated with :func:`scrudful` explicitly are left alone. Unless
-    the class defines its own ``metadata_class``, OPTIONS is answered by
-    :class:`ScrudfulMetadata`; a user-defined ``options`` is kept.
+    methods decorated with :func:`scrudful` explicitly are left alone. OPTIONS
+    is answered by :class:`ScrudfulMetadata` only when the class's
+    ``metadata_class`` is DRF's default ``SimpleMetadata``; any other value
+    (``None``, or a class set on the viewset, a base class or
+    ``DEFAULT_METADATA_CLASS``) is kept, so subclass or mix in
+    :class:`ScrudfulMetadata` to combine it with a custom metadata class. A
+    user-defined ``options`` is kept.
 
     Decorating a subclass of a decorated viewset again re-wraps the original
     methods with the subclass's configuration.
@@ -485,10 +494,12 @@ def scrudful_viewset(cls: type) -> type:
 
     .. warning::
 
-       When a class is decorated with :func:`scrudful_viewset`, an explicit
-       ``@scrudful`` on ``update`` does not apply to PATCH: DRF's
-       ``partial_update`` calls ``update``, and the wrapper that ``Meta``
-       configures for ``partial_update`` handles the request first. Decorate
+       An explicit ``@scrudful`` on ``update`` applies to PATCH when
+       ``partial_update`` is DRF's stock ``UpdateModelMixin.partial_update``
+       (it is then not wrapped). With a user-defined ``partial_update`` that
+       calls ``update``, the wrapper that ``Meta`` configures for
+       ``partial_update`` handles the request first and the explicit
+       ``update`` decorator is a pass-through for PATCH. Decorate
        ``partial_update`` explicitly as well to override it.
 
     ::
@@ -537,14 +548,28 @@ def scrudful_viewset(cls: type) -> type:
             if not method._from_viewset:
                 continue
             method = method.view_method
+        if name == "partial_update" and method is _STOCK_PARTIAL_UPDATE:
+            update = getattr(cls, "update", None)
+            if isinstance(update, ScrudfulViewFunc) and not update._from_viewset:
+                # PATCH goes straight to the explicitly decorated update.
+                setattr(cls, name, method)
+                continue
         wrapper = ScrudfulViewFunc(method, **config)
         wrapper._from_viewset = True
         setattr(cls, name, wrapper)
-    if not any(
-        "metadata_class" in vars(klass) for klass in cls.__mro__ if klass is not APIView
-    ):
-        cls.metadata_class = ScrudfulMetadata
+    _install_metadata(cls)
     return cls
+
+
+def _install_metadata(cls: type) -> None:
+    """Make OPTIONS use :class:`ScrudfulMetadata` unless the class chose another.
+
+    Only DRF's stock default, ``SimpleMetadata``, is replaced: ``None`` and any
+    other class (set on the class, a base class or ``DEFAULT_METADATA_CLASS``)
+    are the project's choice and are kept.
+    """
+    if getattr(cls, "metadata_class", None) is SimpleMetadata:
+        cls.metadata_class = ScrudfulMetadata  # type: ignore[attr-defined]
 
 
 _READ_RESPONSES = {

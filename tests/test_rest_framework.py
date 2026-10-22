@@ -22,7 +22,9 @@ from rest_framework.decorators import (
     renderer_classes,
     throttle_classes,
 )
+from rest_framework import views as drf_views
 from rest_framework.metadata import SimpleMetadata
+from rest_framework.mixins import UpdateModelMixin
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
@@ -201,6 +203,53 @@ class ExplicitViewSet(ThingViewSetBase):
         return Response({"id": pk})
 
 
+def other_etag(view, request, pk):
+    return f"other{store.version}"
+
+
+class StockPartialUpdate(ThingViewSetBase):
+    """PATCH is DRF's stock partial_update, which delegates to update."""
+
+    partial_update = UpdateModelMixin.partial_update
+
+
+@scrudful_viewset
+class StockPatchViewSet(StockPartialUpdate):
+    class Meta:
+        etag_func = etag_func
+
+
+@scrudful_viewset
+class StockExplicitUpdateViewSet(StockPartialUpdate):
+    class Meta:
+        etag_func = etag_func
+
+    @scrudful(etag_func=other_etag)
+    def update(self, request, pk, partial=False):
+        return super().update(request, pk, partial=partial)
+
+
+@scrudful_viewset
+class SubclassedStockViewSet(StockPatchViewSet):
+    """Decorates a decorated viewset again, now with an explicit update."""
+
+    @scrudful(etag_func=other_etag)
+    def update(self, request, pk, partial=False):
+        return super(StockPatchViewSet, self).update(request, pk, partial=partial)
+
+
+@scrudful_viewset
+class UserPartialUpdateViewSet(ThingViewSetBase):
+    """A user-defined partial_update keeps the Meta configuration."""
+
+    class Meta:
+        etag_func = etag_func
+
+    @scrudful(etag_func=other_etag)
+    def update(self, request, pk, partial=False):
+        return super().update(request, pk, partial=partial)
+
+
 @scrudful_viewset
 class ActionViewSet(ThingViewSetBase):
     class Meta:
@@ -253,9 +302,13 @@ class OwnOptionsViewSet(ThingViewSetBase):
         return Response({"own": True})
 
 
+class CustomMetadata(SimpleMetadata):
+    """A project's own metadata class."""
+
+
 @scrudful_viewset
 class OwnMetadataViewSet(ThingViewSetBase):
-    metadata_class = SimpleMetadata
+    metadata_class = CustomMetadata
 
     class Meta:
         etag_func = etag_func
@@ -383,7 +436,7 @@ def own_metadata(request):
     return Response({})
 
 
-own_metadata.metadata_class = SimpleMetadata
+own_metadata.metadata_class = CustomMetadata
 api_own_metadata = scrudful_api_view(["GET"], etag_func=lambda view, request: "x")(
     own_metadata
 )
@@ -411,6 +464,10 @@ for prefix, viewset in [
     ("child", ChildViewSet),
     ("inheriting-child", InheritingChildViewSet),
     ("explicit", ExplicitViewSet),
+    ("stock-patch", StockPatchViewSet),
+    ("stock-explicit", StockExplicitUpdateViewSet),
+    ("stock-subclass", SubclassedStockViewSet),
+    ("user-partial", UserPartialUpdateViewSet),
     ("actions", ActionViewSet),
     ("headers", HeaderViewSet),
     ("own-options", OwnOptionsViewSet),
@@ -900,7 +957,7 @@ def test_api_view_options_metadata(client):
 
 
 def test_api_view_metadata_class_can_be_overridden(client):
-    assert api_own_metadata.cls.metadata_class is SimpleMetadata
+    assert api_own_metadata.cls.metadata_class is CustomMetadata
     assert client.options("/api-own-metadata/").json()["name"] == "Own Metadata"
 
 
@@ -976,7 +1033,7 @@ def test_user_defined_options_is_kept(client):
 
 
 def test_user_defined_metadata_class_is_kept(client):
-    assert OwnMetadataViewSet.metadata_class is SimpleMetadata
+    assert OwnMetadataViewSet.metadata_class is CustomMetadata
     assert ThingViewSet.metadata_class is ScrudfulMetadata
     assert client.options("/own-metadata/1/").json()["name"] == "Own Metadata Instance"
 
@@ -1042,3 +1099,139 @@ def test_async_views_are_rejected_at_decoration_time():
         class AsyncViewSet(viewsets.ViewSet):
             async def retrieve(self, request, pk):
                 pass
+
+
+# --- PATCH with an explicit update --------------------------------------------
+
+
+def test_stock_partial_update_reaches_an_explicit_update(client):
+    """An explicit @scrudful on update applies to PATCH (stock partial_update)."""
+    stock = UpdateModelMixin.partial_update
+    assert StockExplicitUpdateViewSet.partial_update is stock
+    # Meta's validator would accept "v1"; the explicit one is "other1".
+    assert (
+        client.patch("/stock-explicit/1/", headers={"If-Match": '"v1"'}).status_code
+        == 412
+    )
+    response = client.patch("/stock-explicit/1/", headers={"If-Match": '"other1"'})
+    assert response.status_code == 200
+    assert response.json()["partial"] is True
+    assert response["ETag"] == '"other2"'
+
+
+def test_patch_without_an_explicit_update_uses_meta(client):
+    assert isinstance(StockPatchViewSet.__dict__["partial_update"], ScrudfulViewFunc)
+    assert (
+        client.patch("/stock-patch/1/", headers={"If-Match": '"other1"'}).status_code
+        == 412
+    )
+    response = client.patch("/stock-patch/1/", headers={"If-Match": '"v1"'})
+    assert response.status_code == 200
+    assert response["ETag"] == '"v2"'
+
+
+def test_redecorated_subclass_with_an_explicit_update(client):
+    """The inherited partial_update wrapper is dropped for the stock method."""
+    assert SubclassedStockViewSet.partial_update is UpdateModelMixin.partial_update
+    assert (
+        client.patch("/stock-subclass/1/", headers={"If-Match": '"v1"'}).status_code
+        == 412
+    )
+    response = client.patch("/stock-subclass/1/", headers={"If-Match": '"other1"'})
+    assert response.status_code == 200
+    assert response["ETag"] == '"other2"'
+    # The parent is unchanged.
+    assert (
+        client.patch("/stock-patch/1/", headers={"If-Match": '"v2"'}).status_code == 200
+    )
+
+
+def test_user_defined_partial_update_keeps_the_meta_configuration(client):
+    assert (
+        client.patch("/user-partial/1/", headers={"If-Match": '"other1"'}).status_code
+        == 412
+    )
+    response = client.patch("/user-partial/1/", headers={"If-Match": '"v1"'})
+    assert response.status_code == 200
+    assert response["ETag"] == '"v2"'
+
+
+# --- metadata_class -----------------------------------------------------------
+
+
+def _options(view_or_cls, path_prefix="/"):
+    factory = APIRequestFactory()
+    return view_or_cls.as_view({"get": "retrieve"})(
+        factory.options(path_prefix), pk="1"
+    )
+
+
+class DefaultMetadataViewSet(ThingViewSetBase):
+    class Meta:
+        etag_func = etag_func
+
+
+def test_default_metadata_class_is_replaced():
+    assert drf_views.APIView.metadata_class is SimpleMetadata
+
+    @scrudful_viewset
+    class Default(DefaultMetadataViewSet):
+        pass
+
+    assert Default.metadata_class is ScrudfulMetadata
+    assert _options(Default).status_code == 200
+
+
+def test_metadata_class_none_is_kept():
+    @scrudful_viewset
+    class NoMetadata(DefaultMetadataViewSet):
+        metadata_class = None
+
+    assert NoMetadata.metadata_class is None
+    # DRF answers OPTIONS with 405 when metadata is disabled.
+    assert _options(NoMetadata).status_code == 405
+
+
+def test_project_wide_metadata_class_is_kept(monkeypatch):
+    monkeypatch.setattr(drf_views.APIView, "metadata_class", CustomMetadata)
+
+    @scrudful_viewset
+    class Project(DefaultMetadataViewSet):
+        pass
+
+    assert Project.metadata_class is CustomMetadata
+
+
+def test_project_wide_none_is_kept(monkeypatch):
+    monkeypatch.setattr(drf_views.APIView, "metadata_class", None)
+
+    @scrudful_viewset
+    class Project(DefaultMetadataViewSet):
+        pass
+
+    assert Project.metadata_class is None
+
+
+def test_api_view_default_metadata_class_is_replaced():
+    assert api_default.cls.metadata_class is ScrudfulMetadata
+
+
+def test_api_view_metadata_class_none_is_kept():
+    def view(request):
+        return Response({})
+
+    view.metadata_class = None
+    built = scrudful_api_view(["GET"], etag_func=lambda view, request: "x")(view)
+    assert built.cls.metadata_class is None
+    assert built(APIRequestFactory().options("/")).status_code == 405
+
+
+@pytest.mark.parametrize("project_wide", [CustomMetadata, None])
+def test_api_view_project_wide_metadata_class_is_kept(monkeypatch, project_wide):
+    monkeypatch.setattr(drf_views.APIView, "metadata_class", project_wide)
+
+    def view(request):
+        return Response({})
+
+    built = scrudful_api_view(["GET"], etag_func=lambda view, request: "x")(view)
+    assert built.cls.metadata_class is project_wide

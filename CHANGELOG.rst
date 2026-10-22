@@ -110,7 +110,10 @@ Both adapters
   (throttling, authentication, renderers, parsers, ...) are now honoured.
 * ``scrudful_viewset`` no longer assigns ``cls.options`` (the module-level
   ``options()`` function is removed): OPTIONS is answered through
-  ``metadata_class = ScrudfulMetadata`` unless the class sets its own. It no
+  ``metadata_class = ScrudfulMetadata`` unless the class's ``metadata_class`` is
+  something other than DRF's default ``SimpleMetadata`` (a custom class, ``None``
+  or a project-wide ``DEFAULT_METADATA_CLASS`` is kept; subclass or mix in
+  ``ScrudfulMetadata`` to combine it with your own). It no
   longer adds methods the class lacks (read-only viewsets answer 405 instead of
   500), wraps ``partial_update``, leaves explicit ``@scrudful`` methods alone and
   gives ``create`` the link configuration only. Re-decorating a subclass replaces
@@ -151,6 +154,13 @@ Fixes
 * The DRF adapter no longer fails on PATCH, no longer passes ``partial`` to
   callbacks, handles ``@action`` methods and function views, and keeps
   ``partial_update`` / ``update`` from being evaluated twice.
+* ``scrudful_viewset`` / ``scrudful_api_view`` no longer override a project's
+  ``DEFAULT_METADATA_CLASS`` (including ``None``, which disables OPTIONS
+  metadata); only DRF's default ``SimpleMetadata`` is replaced.
+* An explicit ``@scrudful`` on ``update`` in a ``scrudful_viewset`` now applies to
+  PATCH when ``partial_update`` is DRF's stock one (before it was ignored).
+* ``import scrudful`` works from an uninstalled source tree
+  (``__version__`` is ``"0+unknown"`` there).
 * The OPTIONS description is correct for list, detail, nested and ``@action``
   routes, and mutating it no longer changes later responses (the response
   descriptions were shared module-level dictionaries).
