@@ -123,6 +123,57 @@ Create
     ``ScrudfulResponse.created``, or ``None`` if unset. The values set on
     ``ScrudfulResponse`` and headers the handler set win, as below.
 
+Collections
+    :func:`scrudful_list` decorates a GET on a collection. It works like
+    ninja's ``@paginate`` and is the flow above with a preset: there is no
+    ``load``, and the handler returns the authorized queryset (or a sequence,
+    possibly in a ``ninja.Status``). The operation must declare a collection
+    response, e.g. ``response=List[ItemOut]`` (``ninja.errors.ConfigError``
+    otherwise, when the operation is built). It is replaced by a generated
+    schema, ``Scrudful<Item>Page``, so ninja's validation and OpenAPI describe
+    the envelope (:mod:`scrudful.collection` builds its JSON Schema and
+    JSON-LD context)::
+
+        {"count": 240, "page_count": 3,
+         "first": ".../items?page=1", "previous": ".../items?page=1",
+         "next": ".../items?page=3", "last": ".../items?page=3",
+         "content": [{"href": ..., "etag": ..., "last_modified": ...,
+                      "link": ..., "content": <the item, as ItemOut>}]}
+
+    - The query parameters ``page`` (from 1) and ``page_size`` (``page_size``
+      by default, at most ``max_page_size``) are added to the operation and
+      not passed to the handler. Invalid values are answered with 422 by
+      ninja, a page past the last one with 404 (page 1 always exists).
+    - ``count`` is ``queryset.count()`` for a ``QuerySet``, else ``len()``;
+      ``page_count`` is ``ceil(count / page_size)``. An unordered
+      ``QuerySet`` (no ``order_by()`` and no ``Meta.ordering``) gets Django's
+      ``UnorderedObjectListWarning``, as with Django's and DRF's paginators:
+      its pages are not stable. Order it.
+    - ``first``, ``previous``, ``next`` and ``last`` are the request's
+      absolute URI with ``page`` replaced and the other query parameters kept
+      (sorted by name, as DRF does). ``previous`` and ``next`` are ``null``
+      at the ends; ``first`` and ``last`` are page 1 for an empty collection.
+    - Each entry's ``href`` is ``href_func(request, item)``; its ``etag``,
+      ``last_modified`` (an HTTP-date) and ``link`` come from the item
+      callbacks and links, so they equal the ``ETag``, ``Last-Modified`` and
+      ``Link`` of a detail GET given the same arguments. Each is ``null``
+      without its callbacks.
+    - The response's Links are the collection entity's (the ``list_*`` link
+      arguments; their callables get the queryset). With ``list_etag_func``
+      or ``list_last_modified_func``, which are called with the queryset, the
+      preconditions are evaluated after the handler returns it, since it is
+      the authorized object: a matching GET is answered with 304, a failed
+      If-Match with 412, a malformed one with 400 (with ``error``'s Links),
+      and 2xx responses carry the collection's validators. These responses
+      keep the headers and cookies the handler set (not its Content-Type).
+      Without them, the If-* headers are ignored.
+
+    Only a response ninja validates as the collection response is
+    paginated: a ``Status`` with another code (e.g. ``Status(403, ...)``) or
+    an ``HttpResponse`` is sent as the handler returned it. In an async
+    operation the queryset is counted and sliced through ``sync_to_async``,
+    never on the event loop, so the handler may return it unevaluated.
+
 The runtime response
     A handler parameter annotated :class:`ScrudfulResponse` receives a fresh
     instance on every request; like the ``load_as`` parameter, it is hidden
@@ -175,15 +226,25 @@ from __future__ import annotations
 
 import functools
 import inspect
+import math
+import re
+import warnings
 from collections.abc import Callable, Generator, Iterator, Mapping
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
-from typing import Any, NamedTuple, TypeVar
+from typing import Any, NamedTuple, TypeVar, get_args
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from asgiref.sync import sync_to_async
+from django.core.paginator import UnorderedObjectListWarning
+from django.db.models import QuerySet
 from django.http import HttpRequest, HttpResponse, HttpResponseBase
 from django.utils.encoding import iri_to_uri
-from ninja import Status
+from ninja import Query, Schema, Status
+from ninja.constants import NOT_SET
+from ninja.errors import ConfigError, HttpError
+from ninja.signature.details import is_collection_type
+from pydantic import Field, create_model
 
 from scrudful._adapter import (
     DEFAULT_CONTEXT_REL,
@@ -200,7 +261,14 @@ from scrudful._adapter import (
     validator_policy,
 )
 from scrudful._django import aware, conditional_response, precondition_headers
-from scrudful.conditional import evaluate_preconditions, http_timestamp, quote_etag
+from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS
+from scrudful.conditional import (
+    ConditionalResult,
+    evaluate_preconditions,
+    format_http_date,
+    http_timestamp,
+    quote_etag,
+)
 from scrudful.utils import join_links, link_content
 
 __all__ = [
@@ -210,6 +278,7 @@ __all__ = [
     "ScrudfulResponse",
     "scrudful",
     "scrudful_create",
+    "scrudful_list",
 ]
 
 #: OpenAPI descriptions of the responses ``@scrudful`` can produce for GET/HEAD
@@ -236,6 +305,10 @@ T = TypeVar("T")
 #: that yields each call of a user callable, as ``(func, args, kwargs)``, and
 #: is sent its result. :func:`_run_sync` and :func:`_run_async` make the calls.
 _Flow = Generator[tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any]], Any, T]
+
+#: The argument a list operation's query parameters ``page`` and ``page_size``
+#: are passed in (pydantic rejects names with a leading underscore).
+_PAGINATION = "scrudful_pagination"
 
 
 @dataclass(frozen=True)
@@ -321,16 +394,21 @@ class ScrudfulResponse:
 class _Config:
     """What a scrudful decorator declared, set as ``view_func._scrudful``.
 
-    The six ``schema_*`` / ``context_*`` fields are the default response
-    entity, also available as :attr:`entity`: of 2xx responses for an item
-    operation, of 201 responses (the created item) for a create operation.
+    The six ``schema_*`` / ``context_*`` fields are the item entity, also
+    available as :attr:`entity`: the default entity of 2xx responses for an
+    item operation, of 201 responses (the created item) for a create
+    operation, and the ``link`` of each entry of a list operation's envelope,
+    whose responses get :attr:`collection`.
     """
 
-    #: ``"item"`` (:func:`scrudful`) or ``"create"`` (:func:`scrudful_create`).
+    #: ``"item"`` (:func:`scrudful`), ``"create"`` (:func:`scrudful_create`)
+    #: or ``"list"`` (:func:`scrudful_list`).
     kind: str
     load: Callable[..., Any] | None = None
     #: ``location_func(request, obj)`` of a create operation.
     location_func: Callable[[Any, Any], Any] | None = None
+    #: ``href_func(request, item)`` of a list operation.
+    href_func: Callable[[Any, Any], Any] | None = None
     load_as: str = "obj"
     etag_func: Callable[[Any], Any] | None = None
     last_modified_func: Callable[[Any], Any] | None = None
@@ -348,10 +426,19 @@ class _Config:
     )
     #: The entity of scrudful's own 400, 412 and 428 bodies.
     error: Entity | None = None
+    #: The validators of a list operation's collection (called with the
+    #: queryset the handler returned).
+    list_etag_func: Callable[[Any], Any] | None = None
+    list_last_modified_func: Callable[[Any], Any] | None = None
+    #: The collection entity of a list operation: its 2xx responses' Links.
+    collection: Entity | None = None
+    #: A list operation's default and maximum ``page_size``.
+    page_size: int | None = None
+    max_page_size: int | None = None
 
     @property
     def entity(self) -> Entity:
-        """The default response entity, for 2xx responses."""
+        """The item entity (see the class docstring)."""
         return Entity(
             **{
                 entity_field.name: getattr(self, entity_field.name)
@@ -375,11 +462,16 @@ class _Config:
             return status == 201
         return 200 <= status < 300
 
+    @property
+    def default_entity(self) -> Entity | None:
+        """The entity of the responses :meth:`has_default_entity` selects."""
+        return self.collection if self.kind == "list" else self.entity
+
     def response_entity(self, status: int) -> Entity | None:
         """The declared entity of a response with ``status``."""
         if status in self.responses:
             return self.responses[status]
-        return self.entity if self.has_default_entity(status) else None
+        return self.default_entity if self.has_default_entity(status) else None
 
     @property
     def has_etag(self) -> bool:
@@ -392,6 +484,18 @@ class _Config:
     @property
     def has_validators(self) -> bool:
         return self.has_etag or self.has_last_modified
+
+    @property
+    def has_list_etag(self) -> bool:
+        return self.list_etag_func is not None
+
+    @property
+    def has_list_last_modified(self) -> bool:
+        return self.list_last_modified_func is not None
+
+    @property
+    def has_list_validators(self) -> bool:
+        return self.has_list_etag or self.has_list_last_modified
 
 
 def scrudful(
@@ -652,6 +756,184 @@ def scrudful_create(
     return _decorator(config, "@scrudful_create")
 
 
+def scrudful_list(
+    *,
+    href_func: Callable[[Any, Any], Any],
+    etag_func: Callable[[Any], Any] | None = None,
+    last_modified_func: Callable[[Any], Any] | None = None,
+    schema_link_or_func: Any = None,
+    schema_rel_or_func: Any = None,
+    schema_type_or_func: Any = None,
+    context_link_or_func: Any = None,
+    context_rel_or_func: Any = None,
+    context_type_or_func: Any = None,
+    list_etag_func: Callable[[Any], Any] | None = None,
+    list_last_modified_func: Callable[[Any], Any] | None = None,
+    list_schema_link_or_func: Any = None,
+    list_schema_rel_or_func: Any = None,
+    list_schema_type_or_func: Any = None,
+    list_context_link_or_func: Any = None,
+    list_context_rel_or_func: Any = None,
+    list_context_type_or_func: Any = None,
+    page_size: int = 100,
+    max_page_size: int = 1000,
+    error: Entity | None = None,
+) -> Callable[[Handler], Handler]:
+    """Decorate a django-ninja operation listing a collection (GET on a list).
+
+    ``@scrudful_list(...)`` must sit *below* the operation decorator, which
+    must declare a collection response (as for ninja's ``@paginate``)::
+
+        @router.get("/items", response=List[ItemOut])
+        @scrudful_list(
+            href_func=lambda request, item: request.build_absolute_uri(
+                f"/items/{item.pk}"
+            ),
+            etag_func=lambda item: item.version,
+            last_modified_func=lambda item: item.modified_at,
+            schema_link_or_func="/schemas/item",
+            context_link_or_func="/contexts/item",
+            list_schema_link_or_func="/schemas/items",
+            list_context_link_or_func="/contexts/items",
+        )
+        def list_items(request):
+            return Item.objects.filter(owner=request.auth)
+
+    The handler returns the authorized queryset (or a sequence); the wrapper
+    paginates it and returns the scrud envelope, whose response schema
+    replaces ``List[ItemOut]`` (see "Collections" in the module docstring).
+    Pass the validator callbacks and link arguments of the item operations,
+    so each entry carries the validators and Link a detail GET sends. The
+    handler may be ``async def``, and then the callables may be too.
+
+    Parameters
+    ----------
+    href_func : callable
+        ``href_func(request, item)`` returns the URL of ``item``, an entry's
+        ``href``, as an IRI (encoded as a URI). An absolute URL is
+        recommended (the collection schema says ``"format": "uri"``).
+    etag_func : callable, optional
+        ``etag_func(item)``: the entity-tag of an item, as for
+        :func:`scrudful`: an entry's ``etag``, else ``null``.
+    last_modified_func : callable, optional
+        ``last_modified_func(item)``: the modification time of an item, as for
+        :func:`scrudful`: an entry's ``last_modified`` (an HTTP-date), else
+        ``null``.
+    schema_link_or_func : str or callable, optional
+        URL of the item's schema: this argument and the five after it are the
+        item entity, with the meaning they have for :func:`scrudful`. Their
+        Link value is an entry's ``link`` (``null`` without links); link
+        callables get the item.
+    schema_rel_or_func : str or callable, optional
+        ``rel`` of the item schema link. Defaults to ``"describedBy"``.
+    schema_type_or_func : str or callable, optional
+        ``type`` of the item schema link. Defaults to ``"application/json"``.
+    context_link_or_func : str or callable, optional
+        URL of the item's JSON-LD context.
+    context_rel_or_func : str or callable, optional
+        ``rel`` of the item context link. Defaults to
+        ``"http://www.w3.org/ns/json-ld#context"``.
+    context_type_or_func : str or callable, optional
+        ``type`` of the item context link. Defaults to
+        ``"application/ld+json"``.
+    list_etag_func : callable, optional
+        ``list_etag_func(queryset)``: the entity-tag of the collection, called
+        with what the handler returned (the whole queryset, not the page). With
+        either list validator, the preconditions are evaluated after the
+        handler returns (304, 400, 412) and 2xx responses carry the
+        validators.
+    list_last_modified_func : callable, optional
+        ``list_last_modified_func(queryset)``: the modification time of the
+        collection.
+    list_schema_link_or_func : str or callable, optional
+        URL of the collection's schema (e.g. one built with
+        :func:`scrudful.collection.collection_schema`): this argument and the
+        five after it are the collection entity, whose Links 2xx responses
+        get. Link callables get the queryset.
+    list_schema_rel_or_func : str or callable, optional
+        ``rel`` of the collection schema link.
+    list_schema_type_or_func : str or callable, optional
+        ``type`` of the collection schema link.
+    list_context_link_or_func : str or callable, optional
+        URL of the collection's JSON-LD context (e.g. one built with
+        :func:`scrudful.collection.collection_context`).
+    list_context_rel_or_func : str or callable, optional
+        ``rel`` of the collection context link.
+    list_context_type_or_func : str or callable, optional
+        ``type`` of the collection context link.
+    page_size : int, optional
+        The default of the ``page_size`` query parameter (100).
+    max_page_size : int, optional
+        The largest ``page_size`` a client may ask for (1000); a larger one
+        is answered with 422.
+    error : Entity, optional
+        The schema and context of scrudful's own 400 and 412 bodies (with a
+        list validator set), sent as Links on them; link callables get the
+        queryset.
+
+    Raises
+    ------
+    TypeError
+        If ``href_func`` or a validator callback isn't callable, if
+        ``page_size`` or ``max_page_size`` isn't an ``int``, if ``error``
+        isn't an :class:`Entity`, if the handler is a generator, or if the
+        handler is sync and ``href_func``, a validator callback or a link
+        callable (also inside ``error``) is ``async def``.
+    ValueError
+        If ``page_size`` is less than 1 or ``max_page_size`` less than
+        ``page_size``.
+    ninja.errors.ConfigError
+        When the operation is built, if it declares no collection response
+        (e.g. ``response=List[ItemOut]``).
+    """
+    if not callable(href_func):
+        raise TypeError(f"href_func must be callable, not {type(href_func).__name__}")
+    check_validators(etag_func, last_modified_func)
+    for name, func in (
+        ("list_etag_func", list_etag_func),
+        ("list_last_modified_func", list_last_modified_func),
+    ):
+        if func is not None and not callable(func):
+            raise TypeError(f"{name} must be callable, not {type(func).__name__}")
+    for name, value in (("page_size", page_size), ("max_page_size", max_page_size)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an int, not {type(value).__name__}")
+    if page_size < 1:
+        raise ValueError(f"page_size must be at least 1, not {page_size}")
+    if max_page_size < page_size:
+        raise ValueError(
+            f"max_page_size ({max_page_size}) must be at least page_size "
+            f"({page_size})"
+        )
+    _check_entity("error", error)
+    config = _Config(
+        kind="list",
+        href_func=href_func,
+        etag_func=etag_func,
+        last_modified_func=last_modified_func,
+        schema_link_or_func=schema_link_or_func,
+        schema_rel_or_func=schema_rel_or_func,
+        schema_type_or_func=schema_type_or_func,
+        context_link_or_func=context_link_or_func,
+        context_rel_or_func=context_rel_or_func,
+        context_type_or_func=context_type_or_func,
+        error=error,
+        list_etag_func=list_etag_func,
+        list_last_modified_func=list_last_modified_func,
+        collection=Entity(
+            schema_link_or_func=list_schema_link_or_func,
+            schema_rel_or_func=list_schema_rel_or_func,
+            schema_type_or_func=list_schema_type_or_func,
+            context_link_or_func=list_context_link_or_func,
+            context_rel_or_func=list_context_rel_or_func,
+            context_type_or_func=list_context_type_or_func,
+        ),
+        page_size=page_size,
+        max_page_size=max_page_size,
+    )
+    return _decorator(config, "@scrudful_list")
+
+
 def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
     """The decorator of ``config``: one request flow for every kind.
 
@@ -668,6 +950,8 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
         response_name = hidden.response_name
         # The single response code each method's operation declares, if any.
         declared: dict[str, int | None] = {}
+        # A list operation's collection response, per method.
+        collections: dict[str, _CollectionResponse] = {}
 
         def flow(request: HttpRequest, values: dict[str, Any]) -> _Flow[Any]:
             """The request flow; each call of a user callable is a ``yield``."""
@@ -675,6 +959,9 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 values[response_name]
                 if hidden.pass_response
                 else values.pop(response_name)
+            )
+            pagination = (
+                values.pop(_PAGINATION, None) if config.kind == "list" else None
             )
             params = {
                 name: value for name, value in values.items() if name != response_name
@@ -689,7 +976,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 values[load_as] = obj
 
             if config.evaluates_preconditions:
-                etag, last_modified = yield from _validators(config, obj)
+                etag, last_modified = yield from _item_validators(config, obj)
                 result = evaluate_preconditions(
                     method,
                     precondition_headers(request),
@@ -698,11 +985,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                     require_precondition=True,
                 )
                 if result is not None:
-                    early = conditional_response(result)
-                    if result.body is not None and config.error is not None:
-                        yield from _add_links(early, config.error, request, obj)
-                        expose_headers(early)
-                    return early
+                    return (yield from _early_response(config, result, request, obj))
 
             content = yield handler, (request,), values
 
@@ -712,6 +995,33 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             headers, status = _response_and_status(
                 content, response, declared.get(method)
             )
+            list_etag = list_last_modified = None
+            if (
+                config.kind == "list"
+                and not isinstance(content, HttpResponseBase)
+                and method in collections
+                and collections[method].includes(status)
+            ):
+                # The queryset is the authorized object: the collection's
+                # preconditions are evaluated now, then the page is built.
+                obj = _body(content)
+                if config.has_list_validators:
+                    list_etag, list_last_modified = yield from _validators(
+                        config.list_etag_func, config.list_last_modified_func, obj
+                    )
+                    result = evaluate_preconditions(
+                        method,
+                        precondition_headers(request),
+                        etag=list_etag,
+                        last_modified=list_last_modified,
+                        require_precondition=False,
+                    )
+                    if result is not None:
+                        early = yield from _early_response(config, result, request, obj)
+                        _keep_handler_headers(early, response)
+                        return early
+                page = yield from _page(config, request, obj, pagination)
+                content = _with_body(content, page)
             # Explicit values first: the computed ones never overwrite a header.
             set_validator_headers(
                 headers,
@@ -728,11 +1038,15 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                     obj = created
                     if status == 201:
                         yield from _created_headers(config, headers, request, obj)
+            elif config.kind == "list":
+                # None unless the collection's validators were computed.
+                if validator_policy(method, status)[1]:
+                    set_validator_headers(headers, list_etag, list_last_modified)
             elif config.has_validators:
                 refresh, send = validator_policy(method, status)
                 if refresh:
                     obj = yield load, (request,), params
-                    etag, last_modified = yield from _validators(config, obj)
+                    etag, last_modified = yield from _item_validators(config, obj)
                 if send:
                     set_validator_headers(headers, etag, last_modified)
             if meta.entity is None:
@@ -772,9 +1086,218 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             *getattr(handler, "_ninja_contribute_to_operation", []),
             functools.partial(_capture_declared_status, declared),
         ]
+        if config.kind == "list":
+            wrapper._ninja_contribute_to_operation.append(
+                functools.partial(_envelope_response, collections)
+            )
+            # The query parameters, passed to the wrapper as ``_PAGINATION``
+            # (as ninja's ``contribute_operation_args`` does, on a fresh list).
+            wrapper._ninja_contribute_args = [  # type: ignore[attr-defined]
+                *getattr(handler, "_ninja_contribute_args", []),
+                (_PAGINATION, _pagination_model(config), Query(...)),
+            ]
         return wrapper  # type: ignore[return-value]
 
     return decorator
+
+
+def _early_response(
+    config: _Config, result: ConditionalResult, request: HttpRequest, obj: Any
+) -> _Flow[HttpResponseBase]:
+    """scrudful's own response to a failed or short-circuited precondition.
+
+    The 400, 412 and 428 bodies get the Links of ``config.error``, whose link
+    callables get ``obj``.
+    """
+    early = conditional_response(result)
+    if result.body is not None and config.error is not None:
+        yield from _add_links(early, config.error, request, obj)
+        expose_headers(early)
+    return early
+
+
+def _keep_handler_headers(early: HttpResponseBase, temporal: HttpResponse) -> None:
+    """Copy onto ``early`` the headers and cookies the handler set on ninja's
+    temporal response (but not its Content-Type), without overwriting any."""
+    for name, value in temporal.items():
+        if name.lower() != "content-type" and name not in early:
+            early[name] = value
+    early.cookies.update(temporal.cookies)
+    expose_headers(early)
+
+
+class _CollectionResponse(NamedTuple):
+    """The response of a list operation that ninja validates as the envelope."""
+
+    #: The code whose response model is the envelope (or ``...``).
+    code: Any
+    #: Every code the operation declares.
+    codes: frozenset[Any]
+
+    def includes(self, status: int) -> bool:
+        """Whether ninja validates a response with ``status`` as the envelope."""
+        return status == self.code if status in self.codes else self.code is ...
+
+
+def _envelope_response(
+    collections: dict[str, _CollectionResponse], operation: Any
+) -> None:
+    """Replace the operation's collection response by the envelope.
+
+    The first response declared as a collection, e.g. ``List[ItemOut]``,
+    becomes ``Scrudful<Item>Page``, as ninja's ``@paginate`` does. Called by
+    ninja at the end of ``Operation.__init__``.
+
+    Raises
+    ------
+    ninja.errors.ConfigError
+        If the operation declares no collection response.
+    """
+    for code, model in operation.response_models.items():
+        if model is None or model is NOT_SET:
+            continue
+        annotation = model.model_fields["response"].annotation
+        if is_collection_type(annotation):
+            page = _page_model(get_args(annotation)[0])
+            operation.response_models[code] = operation._create_response_model(page)
+            for method in operation.methods:
+                collections[method.upper()] = _CollectionResponse(
+                    code, frozenset(operation.response_models)
+                )
+            return
+    raise ConfigError(
+        f"{operation.view_func.__qualname__}() has no collection response "
+        "(e.g. response=List[ItemOut]), which @scrudful_list requires"
+    )
+
+
+@functools.cache
+def _page_model(item: Any) -> type[Schema]:
+    """The schema of a page of ``item`` (cached, so one per item schema).
+
+    Named ``Scrudful<Item>Page``, with entries ``Scrudful<Item>Envelope``.
+    Every field is required, as in :func:`scrudful.collection.collection_schema`.
+    """
+    name = getattr(item, "__name__", None) or re.sub(r"\W+", "_", str(item))
+    envelope = create_model(  # type: ignore[call-overload]
+        f"Scrudful{name}Envelope",
+        __base__=Schema,
+        **dict(
+            zip(
+                ENVELOPE_FIELDS,
+                [(str, ...), (str | None, ...), (str | None, ...)]
+                + [(str | None, ...), (item, ...)],
+            )
+        ),
+    )
+    return create_model(  # type: ignore[call-overload,no-any-return]
+        f"Scrudful{name}Page",
+        __base__=Schema,
+        **dict(
+            zip(
+                PAGE_FIELDS,
+                [(int, ...), (int, ...), (str, ...), (str | None, ...)]
+                + [(str | None, ...), (str, ...), (list[envelope], ...)],
+            )
+        ),
+    )
+
+
+def _pagination_model(config: _Config) -> type[Schema]:
+    """The schema of a list operation's query parameters."""
+    return create_model(  # type: ignore[call-overload,no-any-return]
+        "ScrudfulPagination",
+        __base__=Schema,
+        page=(int, Field(1, ge=1)),
+        page_size=(int, Field(config.page_size, ge=1, le=config.max_page_size)),
+    )
+
+
+def _page(
+    config: _Config, request: HttpRequest, queryset: Any, pagination: Any
+) -> _Flow[dict[str, Any]]:
+    """The envelope of the requested page of ``queryset``.
+
+    Raises
+    ------
+    ninja.errors.HttpError
+        404 for a page past the last one (page 1 always exists).
+    """
+    number = 1 if pagination is None else pagination.page
+    size = config.page_size if pagination is None else pagination.page_size
+    # Counted and sliced in one call: in an async operation, in a thread.
+    count, items = yield _slice, (queryset, number, size), {}
+    page_count = math.ceil(count / size)
+    entries = []
+    for item in items:
+        href = yield config.href_func, (request, item), {}
+        etag, last_modified = yield from _item_validators(config, item)
+        link = yield from _links(config.entity, request, item)
+        values = (
+            iri_to_uri(str(href)),
+            etag,
+            None if last_modified is None else format_http_date(last_modified),
+            link,
+            item,
+        )
+        entries.append(dict(zip(ENVELOPE_FIELDS, values)))
+    url = functools.partial(_page_url, request.build_absolute_uri(), request.GET)
+    values = (
+        count,
+        page_count,
+        url(1),
+        url(number - 1) if number > 1 else None,
+        url(number + 1) if number < page_count else None,
+        url(max(page_count, 1)),
+        entries,
+    )
+    return dict(zip(PAGE_FIELDS, values))
+
+
+def _slice(queryset: Any, number: int, size: int) -> tuple[int, list[Any]]:
+    """The item count of ``queryset`` and the items of page ``number``.
+
+    ``count()`` for a ``QuerySet``, else ``len()``. An unordered ``QuerySet``
+    gets Django's ``UnorderedObjectListWarning``, as with its ``Paginator``.
+    """
+    if isinstance(queryset, QuerySet):
+        if not queryset.ordered:
+            warnings.warn(
+                "Pagination may yield inconsistent results with an unordered "
+                f"object_list: {queryset.model} {queryset.__class__.__name__}.",
+                UnorderedObjectListWarning,
+                stacklevel=2,
+            )
+        count = queryset.count()
+    else:
+        count = len(queryset)
+    if number > max(math.ceil(count / size), 1):
+        raise HttpError(404, "Invalid page.")
+    start = (number - 1) * size
+    return count, list(queryset[start : start + size])
+
+
+def _page_url(url: str, query: Any, number: int) -> str:
+    """``url`` with the query ``query`` (a ``QueryDict``) and ``page=number``.
+
+    The parameters are sorted by name, as DRF's ``replace_query_param`` does.
+    The query comes from ``request.GET``, not from ``url``: they are the same
+    in Django, but ninja's ``TestClient`` builds URLs without a query.
+    """
+    query = query.copy()
+    query.setlist("page", [str(number)])
+    scheme, netloc, path, _, _ = urlsplit(url)
+    encoded = urlencode(sorted(query.lists()), doseq=True)
+    return urlunsplit((scheme, netloc, path, encoded, ""))
+
+
+def _with_body(content: Any, body: Any) -> Any:
+    """The handler's return value ``content`` with ``body`` in place of its own."""
+    if isinstance(content, Status):
+        return Status(content.status_code, body)
+    if isinstance(content, tuple):
+        return content[0], body
+    return body
 
 
 def _body(content: Any) -> Any:
@@ -796,7 +1319,7 @@ def _created_headers(
         location = yield config.location_func, (request, obj), {}
         if location is not None:
             headers["Location"] = iri_to_uri(str(location))
-    etag, last_modified = yield from _validators(config, obj)
+    etag, last_modified = yield from _item_validators(config, obj)
     set_validator_headers(headers, etag, last_modified)
 
 
@@ -871,10 +1394,14 @@ def _declared_callables(config: _Config) -> Iterator[tuple[str, Any]]:
     """``(name, value)`` of every argument that may be a callable."""
     yield "load", config.load
     yield "location_func", config.location_func
+    yield "href_func", config.href_func
     yield "etag_func", config.etag_func
     yield "last_modified_func", config.last_modified_func
+    yield "list_etag_func", config.list_etag_func
+    yield "list_last_modified_func", config.list_last_modified_func
     entities: list[tuple[str, Entity | None]] = [
         ("", config.entity),
+        ("list_", config.collection),
         ("request.", config.request),
         ("error.", config.error),
     ]
@@ -912,16 +1439,25 @@ def _entities_by_status(
     return MappingProxyType(dict(responses))
 
 
-def _validators(config: _Config, obj: Any) -> _Flow[tuple[str | None, int | None]]:
+def _item_validators(config: _Config, obj: Any) -> _Flow[tuple[str | None, int | None]]:
+    """The validators of the item ``obj``, see :func:`_validators`."""
+    return (yield from _validators(config.etag_func, config.last_modified_func, obj))
+
+
+def _validators(
+    etag_func: Callable[[Any], Any] | None,
+    last_modified_func: Callable[[Any], Any] | None,
+    obj: Any,
+) -> _Flow[tuple[str | None, int | None]]:
     """The validators of ``obj``; none when there is no representation."""
     etag = last_modified = None
     if obj is None:
         return etag, last_modified
-    if config.etag_func is not None:
-        value = yield config.etag_func, (obj,), {}
+    if etag_func is not None:
+        value = yield etag_func, (obj,), {}
         etag = None if value is None else quote_etag(value)
-    if config.last_modified_func is not None:
-        value = yield config.last_modified_func, (obj,), {}
+    if last_modified_func is not None:
+        value = yield last_modified_func, (obj,), {}
         last_modified = http_timestamp(aware(value))
     return etag, last_modified
 
