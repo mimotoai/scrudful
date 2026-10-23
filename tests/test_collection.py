@@ -1,5 +1,4 @@
 import ast
-import copy
 import sys
 from pathlib import Path
 
@@ -126,30 +125,72 @@ def test_schema_item_etag_last_modified_link_nullable():
 def test_schema_counts_non_negative_integers():
     validator = _validator()
     for key in ("count", "page_count"):
-        page = copy.deepcopy(_envelope())
+        page = _envelope()
         page[key] = -1
         assert not validator.is_valid(page)
         page[key] = 1.5
         assert not validator.is_valid(page)
 
 
+V = "https://v/#"
+
+
 def test_context_maps_fields():
-    context = collection_context("https://x/Role", vocabulary="https://v/#")["@context"]
-    for name in set(collection.PAGE_FIELDS) | set(collection.ENVELOPE_FIELDS):
-        if name != "content":
-            assert context[name] == "https://v/#" + name
-    assert context["content"]["@id"] == "https://v/#content"
-    assert context["content"]["@container"] == "@list"
-    assert context["item_type"] == "https://x/Role"
+    body = collection_context("https://i/ctx", vocabulary=V)["@context"]
+    assert body["@version"] == 1.1
+    assert body["count"] == V + "count"
+    assert body["etag"] == V + "etag"
+    assert body["content"]["@id"] == V + "content"
+    assert body["content"]["@container"] == "@list"
+    assert body["content"]["@context"]["content"]["@context"] == "https://i/ctx"
+    for name in ("href", "first", "previous", "next", "last"):
+        assert body[name] == {"@id": V + name, "@type": "@id"}
 
 
-def test_context_collection_iri():
-    plain = collection_context("https://x/Role", vocabulary="https://v/#")
-    assert "@type" not in plain["@context"]
-    with_iri = collection_context(
-        "https://x/Role", vocabulary="https://v/#", collection_iri="https://x/Roles"
+def test_context_has_no_keyword_strings():
+    body = collection_context("https://i/ctx", vocabulary=V)["@context"]
+    assert [k for k in body if k.startswith("@") and k != "@version"] == []
+
+
+def test_context_expands_item_content():
+    jsonld = pytest.importorskip("pyld.jsonld")
+    item_ctx = "https://i/ctx"
+
+    def loader(url, options=None):
+        assert url == item_ctx
+        return {
+            "contentType": "application/ld+json",
+            "contextUrl": None,
+            "documentUrl": url,
+            "document": {"@context": {"name": "https://i/#name"}},
+        }
+
+    doc = {
+        **collection_context(item_ctx, vocabulary=V),
+        "count": 1,
+        "content": [{"href": "https://x/1", "content": {"name": "n"}}],
+    }
+    out = jsonld.expand(
+        doc, {"documentLoader": loader, "processingMode": "json-ld-1.1"}
     )
-    assert with_iri["@context"]["@type"] == "https://x/Roles"
+    entry = out[0][V + "content"][0]["@list"][0]
+    assert entry[V + "content"][0]["https://i/#name"] == [{"@value": "n"}]
+
+
+def test_schema_calls_are_independent():
+    schema = collection_schema(ITEM_URI)
+    props = schema["properties"]
+    assert props["first"] is not props["last"]
+    assert (
+        props["first"]
+        is not schema["properties"]["content"]["items"]["properties"]["href"]
+    )
+    props["first"]["format"] = "mutated"
+    props["content"]["items"]["properties"]["href"]["format"] = "mutated"
+    fresh = collection_schema(ITEM_URI)["properties"]
+    assert fresh["first"]["format"] == "uri"
+    assert fresh["last"]["format"] == "uri"
+    assert fresh["content"]["items"]["properties"]["href"]["format"] == "uri"
 
 
 def test_context_requires_vocabulary():

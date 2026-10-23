@@ -33,6 +33,7 @@ ninja = ["django>=4.2", "django-ninja>=1.6"]
 dev = [
     "scrudful[drf,fastapi,ninja]",
     "jsonschema>=4.23",
+    "pyld>=2.0",
     "pytest>=8",
     "pytest-cov>=5",
     "pytest-django>=4.8",

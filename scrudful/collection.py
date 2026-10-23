@@ -26,9 +26,7 @@ PAGE_FIELDS = (
 )
 
 _DRAFT = "https://json-schema.org/draft/2020-12/schema"
-_URI = {"type": "string", "format": "uri"}
-_NULLABLE_URI = {"type": ["string", "null"], "format": "uri"}
-_COUNT = {"type": "integer", "minimum": 0}
+_URL_TERMS = ("href", "first", "previous", "next", "last")
 
 
 def collection_schema(
@@ -55,10 +53,17 @@ def collection_schema(
     an entry's ``etag``, ``last_modified`` and ``link``, which are optional in
     the adapter.
     """
+
+    def uri(nullable: bool = False) -> dict[str, Any]:
+        return {"type": ["string", "null"] if nullable else "string", "format": "uri"}
+
+    def count() -> dict[str, Any]:
+        return {"type": "integer", "minimum": 0}
+
     entry = {
         "type": "object",
         "properties": {
-            "href": _URI,
+            "href": uri(),
             "etag": {"type": ["string", "null"]},
             "last_modified": {"type": ["string", "null"]},
             "link": {"type": ["string", "null"]},
@@ -75,12 +80,12 @@ def collection_schema(
         {
             "type": "object",
             "properties": {
-                "count": _COUNT,
-                "page_count": _COUNT,
-                "first": _URI,
-                "previous": _NULLABLE_URI,
-                "next": _NULLABLE_URI,
-                "last": _URI,
+                "count": count(),
+                "page_count": count(),
+                "first": uri(),
+                "previous": uri(True),
+                "next": uri(True),
+                "last": uri(),
                 "content": {"type": "array", "items": entry},
             },
             "required": list(PAGE_FIELDS),
@@ -89,33 +94,38 @@ def collection_schema(
     return schema
 
 
-def collection_context(
-    item_type_iri: str,
-    *,
-    vocabulary: str,
-    collection_iri: str | None = None,
-) -> dict[str, Any]:
+def collection_context(item_context_uri: str, *, vocabulary: str) -> dict[str, Any]:
     """Return the JSON-LD context of a list envelope.
 
     Parameters
     ----------
-    item_type_iri
-        IRI of the type of the items; exposed as the ``item_type`` term.
+    item_context_uri
+        URI of the JSON-LD context of one item. Each entry's ``content`` is
+        expanded with it, so the item's fields survive expansion.
     vocabulary
         Prefix prepended to each field name to form its IRI (for example
         ``"https://example.com/vocab#"``). Required: no default is assumed.
-    collection_iri
-        Optional IRI used as the ``@type`` of the collection.
 
     Notes
     -----
-    ``content`` is mapped as an ``@list`` container, preserving item order.
+    The page's ``content`` is an ``@list`` of entries, preserving order. The
+    URL-valued terms (``href``, ``first``, ``previous``, ``next``, ``last``)
+    are typed ``@id``. The type of the collection and of its items belongs in
+    the response body or the item context; a JSON-LD context cannot assert it.
     """
-    context: dict[str, Any] = {}
-    if collection_iri is not None:
-        context["@type"] = collection_iri
-    context["item_type"] = item_type_iri
+    context: dict[str, Any] = {"@version": 1.1}
     for name in dict.fromkeys(PAGE_FIELDS + ENVELOPE_FIELDS):
-        context[name] = vocabulary + name
-    context["content"] = {"@id": vocabulary + "content", "@container": "@list"}
+        if name == "content":
+            continue
+        if name in _URL_TERMS:
+            context[name] = {"@id": vocabulary + name, "@type": "@id"}
+        else:
+            context[name] = vocabulary + name
+    context["content"] = {
+        "@id": vocabulary + "content",
+        "@container": "@list",
+        "@context": {
+            "content": {"@id": vocabulary + "content", "@context": item_context_uri}
+        },
+    }
     return {"@context": context}
