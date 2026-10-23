@@ -608,9 +608,10 @@ def scrudful(
         )
         def update_item(request, pk: int, payload: ItemIn, obj: Item): ...
 
-    Placed above it, ninja registers the undecorated function and the
-    decorator has no effect. The handler may be ``async def``, and then the
-    callables may be too (see "Async operations" in the module docstring).
+    Placed above it, ninja would have registered the undecorated function,
+    so the decorator raises ``TypeError``. The handler may be ``async def``,
+    and then the callables may be too (see "Async operations" in the module
+    docstring).
     All arguments are keyword-only; the behaviour is described in the module
     docstring.
 
@@ -684,9 +685,10 @@ def scrudful(
         validator callback isn't callable, if ``request``, ``error`` or a value
         of ``responses`` isn't an :class:`Entity` or a key of ``responses``
         isn't an HTTP status code, if ``load`` is set and the handler has no
-        ``load_as`` parameter, if the handler is a generator, or if the
-        handler is sync and ``load``, a validator callback or a link callable
-        (also inside an entity) is ``async def``.
+        ``load_as`` parameter, if the handler is a generator or already a
+        ninja operation (the decorator sits above the operation decorator),
+        or if the handler is sync and ``load``, a validator callback or a
+        link callable (also inside an entity) is ``async def``.
     """
     check_validators(etag_func, last_modified_func)
     if load is not None and not callable(load):
@@ -796,9 +798,10 @@ def scrudful_create(
     ------
     TypeError
         If ``location_func`` or a validator callback isn't callable, if
-        ``request`` or a value of ``responses`` isn't an
-        :class:`Entity` or a key of ``responses`` isn't an HTTP status code,
-        if the handler is a generator, or if the handler is sync and
+        ``request`` or a value of ``responses`` isn't an :class:`Entity` or a
+        key of ``responses`` isn't an HTTP status code, if the handler is a
+        generator or already a ninja operation (the decorator sits above the
+        operation decorator), or if the handler is sync and
         ``location_func``, a validator callback or a link callable (also
         inside an entity) is ``async def``.
     """
@@ -956,9 +959,10 @@ def scrudful_list(
     TypeError
         If ``href_func`` or a validator callback isn't callable, if
         ``page_size`` or ``max_page_size`` isn't an ``int``, if ``error``
-        isn't an :class:`Entity`, if the handler is a generator, or if the
-        handler is sync and ``href_func``, a validator callback or a link
-        callable (also inside ``error``) is ``async def``.
+        isn't an :class:`Entity`, if the handler is a generator or already a
+        ninja operation (the decorator sits above the operation decorator),
+        or if the handler is sync and ``href_func``, a validator callback or
+        a link callable (also inside ``error``) is ``async def``.
     ValueError
         If ``page_size`` is less than 1 or ``max_page_size`` less than
         ``page_size``.
@@ -1123,6 +1127,13 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
     load, load_as = config.load, config.load_as
 
     def decorator(handler: Handler) -> Handler:
+        if hasattr(handler, "_ninja_operation"):
+            # ninja already registered the undecorated function: wrapping it
+            # now would silently change nothing.
+            raise TypeError(
+                f"{name} must sit below the operation decorator: "
+                f"{handler.__qualname__}() is already a ninja operation"
+            )
         if inspect.isgeneratorfunction(handler) or inspect.isasyncgenfunction(handler):
             raise TypeError(f"{name} does not support generator handlers")
         if not inspect.iscoroutinefunction(handler):

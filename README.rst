@@ -348,7 +348,8 @@ and so does the handler. It does not need Django REST Framework.
 Notes:
 
 * ``@scrudful(...)``, ``@scrudful_create(...)`` and ``@scrudful_list(...)``
-  must sit **below** the operation decorator.
+  must sit **below** the operation decorator (above it, they raise
+  ``TypeError``).
 * ``load`` returns the object, ``None`` ("no current representation", RFC
   9110 semantics, e.g. for a PUT that may create) or raises, through ninja's
   exception handlers; an object it returns exists even if its validators are

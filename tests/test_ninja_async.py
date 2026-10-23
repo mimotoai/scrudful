@@ -27,6 +27,7 @@ from scrudful.ninja import (
 from tests.test_ninja_adapter import (
     ALICE,
     CONTEXT_LINK,
+    Deny,
     HIDDEN,
     IF_HEADERS,
     LINKS,
@@ -520,3 +521,18 @@ def test_async_handler_accepts_async_callables(store, name):
     async def handler(request, pk: int, obj): ...
 
     assert inspect.iscoroutinefunction(handler)
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_async_throttle_429_before_load(store, method):
+    client = TestAsyncClient(
+        make_api(
+            async_item_router(store, async_load(store)), store, throttle=Deny(store)
+        )
+    )
+    response = send(client, method, "/items/1", {"If-None-Match": '"v1"', **ALICE})
+    assert response.status_code == 429
+    assert "ETag" not in response.headers
+    assert "Last-Modified" not in response.headers
+    assert store.calls["throttle"] == 1
+    assert store.calls["load"] == 0

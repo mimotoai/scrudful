@@ -54,10 +54,11 @@ your application serves. Alignment with the spec's 0.1 revision is planned.
 Single resources
 ----------------
 
-``@scrudful(...)`` sits **below** the operation decorator. ``load`` is the
-fetch-if-allowed callable; the validator callbacks are called with what it
-returns, and the handler receives it in the ``load_as`` parameter (``obj`` by
-default), hidden from ninja's signature and OpenAPI:
+``@scrudful(...)`` sits **below** the operation decorator (above it, ninja
+would register the undecorated function, so it raises ``TypeError``). ``load``
+is the fetch-if-allowed callable; the validator callbacks are called with what
+it returns, and the handler receives it in the ``load_as`` parameter (``obj``
+by default), hidden from ninja's signature and OpenAPI:
 
 .. code-block:: python
 

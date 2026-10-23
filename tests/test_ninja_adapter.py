@@ -13,6 +13,7 @@ from django.http import Http404, HttpResponse, JsonResponse
 from ninja import NinjaAPI, Router, Schema, Status
 from ninja.errors import HttpError
 from ninja.security import APIKeyHeader
+from ninja.throttling import BaseThrottle
 from ninja.testing import TestClient
 
 from scrudful._adapter import READ_DESCRIPTIONS, WRITE_DESCRIPTIONS
@@ -20,6 +21,8 @@ from scrudful.ninja import (
     CONDITIONAL_READ_RESPONSES,
     CONDITIONAL_WRITE_RESPONSES,
     scrudful,
+    scrudful_create,
+    scrudful_list,
 )
 from tests import ninja_future_annotations as future_endpoints
 
@@ -192,8 +195,24 @@ class KeyAuth(APIKeyHeader):
         return key if key == "alice" else None
 
 
-def make_api(router: Router, store: Store) -> NinjaAPI:
-    api = NinjaAPI(auth=KeyAuth(store), urls_namespace=f"api-{uuid.uuid4().hex}")
+class Deny(BaseThrottle):
+    """A throttle refusing every request (ninja answers 429)."""
+
+    def __init__(self, store: Store) -> None:
+        self.store = store
+
+    def allow_request(self, request):
+        self.store.calls["throttle"] += 1
+        return False
+
+    def wait(self):
+        return 30
+
+
+def make_api(router: Router, store: Store, **options: Any) -> NinjaAPI:
+    api = NinjaAPI(
+        auth=KeyAuth(store), urls_namespace=f"api-{uuid.uuid4().hex}", **options
+    )
     api.add_router("", router)
     return api
 
@@ -297,6 +316,25 @@ def test_unauthenticated_get_401_before_load(store):
 
     response = client.get("/items/1", headers={"If-None-Match": '"v1"', **ALICE})
     assert response.status_code == 304
+
+
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize(
+    "headers",
+    [{"If-None-Match": '"v1"'}, {"If-Match": '"stale"'}, {}],
+    ids=["match-not-304", "stale-not-412", "none-not-428"],
+)
+def test_throttle_429_before_load(store, method, headers):
+    client = TestClient(make_api(item_router(store), store, throttle=Deny(store)))
+    response = call(client, method, "/items/1", {**headers, **ALICE})
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "30"
+    assert "ETag" not in response.headers
+    assert "Last-Modified" not in response.headers
+    assert "Link" not in response.headers
+    assert store.calls["throttle"] == 1
+    assert store.calls["load"] == 0
+    assert store.calls[method.lower()] == 0
 
 
 @pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
@@ -888,3 +926,26 @@ def test_loaded_object_without_validators_get(store):
     assert "ETag" not in response.headers
     assert client.get("/items/1", headers={"If-None-Match": '"v1"'}).status_code == 200
     assert store.calls["get"] == 1
+
+
+@pytest.mark.parametrize(
+    "decorator, name",
+    [
+        (lambda store: scrudful(load=store.load), "@scrudful"),
+        (
+            lambda store: scrudful_create(location_func=lambda r, o: "/x"),
+            "@scrudful_create",
+        ),
+        (lambda store: scrudful_list(href_func=lambda r, o: "/x"), "@scrudful_list"),
+    ],
+)
+def test_decorator_above_the_operation_decorator_raises(store, decorator, name):
+    """Above the router decorator, ninja has already registered the
+    undecorated function: the scrudful decorator would silently do nothing."""
+    router = Router()
+    with pytest.raises(TypeError, match=f"{name}.*below"):
+
+        @decorator(store)
+        @router.get("/items/{pk}")
+        def get_item(request, pk: int, obj=None):
+            return {}
