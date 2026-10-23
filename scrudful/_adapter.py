@@ -46,6 +46,29 @@ WRITE_DESCRIPTIONS = {
     "(send If-Match or If-Unmodified-Since).",
 }
 
+#: :data:`READ_DESCRIPTIONS` as OpenAPI responses (int status keys), published
+#: by the FastAPI and django-ninja adapters as ``CONDITIONAL_READ_RESPONSES``.
+CONDITIONAL_READ_RESPONSES: dict[int, dict[str, str]] = {
+    status: {"description": text} for status, text in READ_DESCRIPTIONS.items()
+}
+#: :data:`WRITE_DESCRIPTIONS` as OpenAPI responses (int status keys), published
+#: as ``CONDITIONAL_WRITE_RESPONSES``.
+CONDITIONAL_WRITE_RESPONSES: dict[int, dict[str, str]] = {
+    status: {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
+}
+
+#: Representation metadata of the response an early one replaces: not copied
+#: onto the body-less (or differently typed) early response (RFC 9110 §15.4.5).
+BODY_HEADERS = frozenset(
+    {
+        "content-length",
+        "content-type",
+        "content-encoding",
+        "content-range",
+        "content-language",
+    }
+)
+
 #: :data:`READ_DESCRIPTIONS` as OPTIONS responses (string status keys).
 READ_RESPONSES = {
     str(status): {"description": text} for status, text in READ_DESCRIPTIONS.items()

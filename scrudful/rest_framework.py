@@ -85,8 +85,6 @@ from scrudful._adapter import (
     DEFAULT_CONTEXT_TYPE,
     DEFAULT_SCHEMA_REL,
     DEFAULT_SCHEMA_TYPE,
-    READ_RESPONSES,
-    WRITE_RESPONSES,
     check_validators,
     conditional_header_parameters,
     describe_read,
@@ -559,11 +557,6 @@ def _install_metadata(cls: type) -> None:
     """
     if getattr(cls, "metadata_class", None) is SimpleMetadata:
         cls.metadata_class = ScrudfulMetadata  # type: ignore[attr-defined]
-
-
-# The early responses of the OPTIONS descriptions, under their former names.
-_READ_RESPONSES = READ_RESPONSES
-_WRITE_RESPONSES = WRITE_RESPONSES
 
 
 class ScrudfulMetadata(BaseMetadata):

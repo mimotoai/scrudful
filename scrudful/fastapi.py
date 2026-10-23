@@ -18,13 +18,13 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers, MutableHeaders
 
+from scrudful import _adapter
 from scrudful._adapter import (
+    BODY_HEADERS,
     DEFAULT_CONTEXT_REL,
     DEFAULT_CONTEXT_TYPE,
     DEFAULT_SCHEMA_REL,
     DEFAULT_SCHEMA_TYPE,
-    READ_DESCRIPTIONS,
-    WRITE_DESCRIPTIONS,
     check_validators,
     evaluated_signature,
     expose_headers,
@@ -51,27 +51,15 @@ __all__ = [
 #: without calling the endpoint. Pass it to the route decorator, e.g.
 #: ``@app.get("/items/{item_id}", responses=CONDITIONAL_READ_RESPONSES)``, or
 #: merge it with your own: ``responses={**CONDITIONAL_READ_RESPONSES, 404: ...}``.
-CONDITIONAL_READ_RESPONSES: dict[int | str, dict[str, Any]] = {
-    status: {"description": text} for status, text in READ_DESCRIPTIONS.items()
-}
+CONDITIONAL_READ_RESPONSES: dict[int | str, dict[str, Any]] = (
+    _adapter.CONDITIONAL_READ_RESPONSES  # type: ignore[assignment]
+)
 
 #: OpenAPI descriptions of the responses ``@scrudful`` can produce for
 #: PUT/PATCH/DELETE without calling the endpoint, e.g.
 #: ``@app.put("/items/{item_id}", responses=CONDITIONAL_WRITE_RESPONSES)``.
-CONDITIONAL_WRITE_RESPONSES: dict[int | str, dict[str, Any]] = {
-    status: {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
-}
-
-# Representation metadata: not for the body-less (or differently typed) early
-# response (RFC 9110 §15.4.5).
-_BODY_HEADERS = frozenset(
-    {
-        "content-length",
-        "content-type",
-        "content-encoding",
-        "content-range",
-        "content-language",
-    }
+CONDITIONAL_WRITE_RESPONSES: dict[int | str, dict[str, Any]] = (
+    _adapter.CONDITIONAL_WRITE_RESPONSES  # type: ignore[assignment]
 )
 
 Endpoint = TypeVar("Endpoint", bound=Callable[..., Any])
@@ -377,7 +365,7 @@ def _conditional_response(result: ConditionalResult, injected: Headers) -> Respo
                 headers[name] = merged
         elif (
             result.status == 304
-            and name not in _BODY_HEADERS
+            and name not in BODY_HEADERS
             and name.encode("latin-1") not in own
         ):
             headers.append(name, value)

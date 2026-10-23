@@ -652,6 +652,18 @@ def test_future_annotations_module():
     assert response.status_code == 422
 
 
+def test_conditional_responses_defined_once():
+    from scrudful import _adapter, fastapi, ninja
+
+    assert ninja.CONDITIONAL_READ_RESPONSES is _adapter.CONDITIONAL_READ_RESPONSES
+    assert fastapi.CONDITIONAL_READ_RESPONSES is _adapter.CONDITIONAL_READ_RESPONSES
+    assert ninja.CONDITIONAL_WRITE_RESPONSES is _adapter.CONDITIONAL_WRITE_RESPONSES
+    assert fastapi.CONDITIONAL_WRITE_RESPONSES is _adapter.CONDITIONAL_WRITE_RESPONSES
+    assert CONDITIONAL_READ_RESPONSES == {
+        status: {"description": text} for status, text in READ_DESCRIPTIONS.items()
+    }
+
+
 def test_config_attribute(store):
     @scrudful(load=store.load, load_as="item", etag_func=etag, **LINKS)
     def get_item(request, pk: int, item):

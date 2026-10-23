@@ -311,13 +311,13 @@ from ninja.signature.details import is_collection_type
 from ninja.signature.utils import get_path_param_names
 from pydantic import Field, create_model
 
+from scrudful import _adapter
 from scrudful._adapter import (
+    BODY_HEADERS,
     DEFAULT_CONTEXT_REL,
     DEFAULT_CONTEXT_TYPE,
     DEFAULT_SCHEMA_REL,
     DEFAULT_SCHEMA_TYPE,
-    READ_DESCRIPTIONS,
-    WRITE_DESCRIPTIONS,
     check_validators,
     describe_read,
     describe_write,
@@ -355,16 +355,16 @@ __all__ = [
 #: your own. The keys are ints, as ninja keys an operation's responses, so a
 #: status the operation also declares in ``response=`` (e.g. a 412 schema) is
 #: merged into one entry; the JSON schema output has string keys.
-CONDITIONAL_READ_RESPONSES: dict[int, dict[str, str]] = {
-    status: {"description": text} for status, text in READ_DESCRIPTIONS.items()
-}
+CONDITIONAL_READ_RESPONSES: dict[int, dict[str, str]] = (
+    _adapter.CONDITIONAL_READ_RESPONSES
+)
 
 #: OpenAPI descriptions of the responses ``@scrudful`` can produce for
 #: PUT/PATCH/DELETE without calling the handler, e.g.
 #: ``openapi_extra={"responses": CONDITIONAL_WRITE_RESPONSES}``.
-CONDITIONAL_WRITE_RESPONSES: dict[int, dict[str, str]] = {
-    status: {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
-}
+CONDITIONAL_WRITE_RESPONSES: dict[int, dict[str, str]] = (
+    _adapter.CONDITIONAL_WRITE_RESPONSES
+)
 
 Handler = TypeVar("Handler", bound=Callable[..., Any])
 T = TypeVar("T")
@@ -1312,18 +1312,6 @@ def _early_response(
     return early
 
 
-#: Representation metadata of the 200 a 304 replaces: not sent on the 304.
-_BODY_HEADERS = frozenset(
-    {
-        "content-length",
-        "content-type",
-        "content-encoding",
-        "content-range",
-        "content-language",
-    }
-)
-
-
 def _keep_handler_headers(early: HttpResponseBase, temporal: HttpResponse) -> None:
     """Copy onto ``early`` what the handler set on ninja's temporal response.
 
@@ -1340,7 +1328,7 @@ def _keep_handler_headers(early: HttpResponseBase, temporal: HttpResponse) -> No
                 merged = merge_expose_headers(early.get(name), value.split(","))
                 if merged:
                     early[name] = merged
-            elif lower not in _BODY_HEADERS and name not in early:
+            elif lower not in BODY_HEADERS and name not in early:
                 early[name] = value
     early.cookies.update(temporal.cookies)
     expose_headers(early)

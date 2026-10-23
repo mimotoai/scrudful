@@ -185,18 +185,18 @@ def test_response_descriptions():
 
 
 def test_adapters_render_shared_descriptions():
-    from scrudful import fastapi, rest_framework
+    from scrudful import fastapi
 
     for shared, fastapi_responses, drf_responses in (
         (
             _adapter.READ_DESCRIPTIONS,
             fastapi.CONDITIONAL_READ_RESPONSES,
-            rest_framework._READ_RESPONSES,
+            _adapter.READ_RESPONSES,
         ),
         (
             _adapter.WRITE_DESCRIPTIONS,
             fastapi.CONDITIONAL_WRITE_RESPONSES,
-            rest_framework._WRITE_RESPONSES,
+            _adapter.WRITE_RESPONSES,
         ),
     ):
         expected = {status: {"description": text} for status, text in shared.items()}
