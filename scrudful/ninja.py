@@ -31,7 +31,11 @@ Choosing what ``load`` returns
     ``If-None-Match: *`` reaches the handler (which may create the resource), a
     PUT with If-Match is answered with 412, and other methods reach the handler
     (which answers, e.g. 404). Whether PUT may create, and how hidden rows are
-    reported, is the application's choice.
+    reported, is the application's choice. When it returns an object, the
+    resource exists, even if the validator callbacks return ``None`` for it
+    (RFC 9110 §13.1.1-2): a write then needs ``If-Match: *`` (428 without
+    it), an If-Match listing entity-tags fails with 412, and
+    ``If-None-Match: *`` fails with 412 (304 for GET/HEAD).
 
 Validators
     Without validator callbacks no preconditions are evaluated: the If-*
@@ -164,7 +168,9 @@ Collections
       preconditions are evaluated after the handler returns it, since it is
       the authorized object: a matching GET is answered with 304, a failed
       If-Match with 412, a malformed one with 400 (with ``error``'s Links),
-      and 2xx responses carry the collection's validators. These early
+      and 2xx responses carry the collection's validators. The collection
+      exists even if they return ``None`` (``If-None-Match: *`` gives 304,
+      ``If-Match: *`` passes). These early
       responses keep the cookies the handler set; the 304 also keeps its
       other headers (e.g. Cache-Control, Vary), except Content-Type,
       Content-Length, Content-Encoding, Content-Range and Content-Language
@@ -614,19 +620,22 @@ def scrudful(
         OpenAPI; the handler must declare it when ``load`` is set.
     etag_func : callable, optional
         ``etag_func(obj)`` returns the entity-tag of the loaded object, or
-        ``None`` if there is none. ``str()`` of the result is used: a valid
-        entity-tag (``'"abc"'`` or ``'W/"abc"'``) is sent unchanged, anything
-        else is wrapped in double quotes (a strong entity-tag). Values that
-        cannot be an entity-tag (containing a double quote, space, control
-        character or a character above U+00FF) raise ``ValueError``. Weak
-        entity-tags are allowed, but If-Match uses the strong comparison, which
-        they never pass: only If-Unmodified-Since (or ``If-Match: *``) can then
-        make a write succeed.
+        ``None`` if there is none: the object ``load`` returned still exists
+        (see "Choosing what ``load`` returns" in the module docstring).
+        ``str()`` of the result is used: a valid entity-tag (``'"abc"'`` or
+        ``'W/"abc"'``) is sent unchanged, anything else is wrapped in double
+        quotes (a strong entity-tag). Values that cannot be an entity-tag
+        (containing a double quote, space, control character or a character
+        above U+00FF) raise ``ValueError``. Weak entity-tags are allowed, but
+        If-Match uses the strong comparison, which they never pass: only
+        If-Unmodified-Since (or ``If-Match: *``) can then make a write
+        succeed.
     last_modified_func : callable, optional
         ``last_modified_func(obj)`` returns the modification time of the
         loaded object as a ``datetime`` or an epoch timestamp, or ``None`` if
-        there is none. Naive datetimes are taken to be in the default time
-        zone (``settings.TIME_ZONE``), as Django does. Sub-second precision is
+        there is none: the object still exists, as for ``etag_func``. Naive
+        datetimes are taken to be in the default time zone
+        (``settings.TIME_ZONE``), as Django does. Sub-second precision is
         discarded.
     schema_link_or_func : str or callable, optional
         URL of the schema of the 2xx response body: this argument and the
@@ -1144,6 +1153,8 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                     etag=etag,
                     last_modified=last_modified,
                     require_precondition=True,
+                    # load decides existence, not the validators (spec §1).
+                    exists=obj is not None,
                 )
                 if result is not None:
                     return (yield from _early_response(config, result, request, obj))
@@ -1176,6 +1187,8 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                         etag=list_etag,
                         last_modified=list_last_modified,
                         require_precondition=False,
+                        # The collection exists, even without validators.
+                        exists=True,
                     )
                     if result is not None:
                         early = yield from _early_response(config, result, request, obj)

@@ -728,3 +728,147 @@ def test_result_is_frozen():
     result = evaluate("PUT", {"if-match": OTHER})
     with pytest.raises(AttributeError):
         result.status = 200
+
+
+# --- explicit existence (``exists=``) ----------------------------------------
+#
+# An adapter that knows whether the target exists (e.g. it loaded the object)
+# passes ``exists``: an existing resource without validators is still an
+# existing resource (RFC 9110 §13.1.1, §13.1.2).
+
+
+def evaluate_exists(method, headers=None, *, exists, etag=None, last_modified=None):
+    return evaluate_preconditions(
+        method,
+        headers or {},
+        etag=etag,
+        last_modified=last_modified,
+        require_precondition=True,
+        exists=exists,
+    )
+
+
+@pytest.mark.parametrize("method", ALL_METHODS)
+def test_exists_without_validators_if_none_match_star(method):
+    result = evaluate_exists(method, {"if-none-match": "*"}, exists=True)
+    if method in SAFE_METHODS:
+        assert result == not_modified(None, None)
+    else:
+        assert result == precondition_failed()
+
+
+@pytest.mark.parametrize("method", ALL_METHODS)
+def test_exists_without_validators_if_match_star_passes(method):
+    assert evaluate_exists(method, {"if-match": "*"}, exists=True) is None
+
+
+@pytest.mark.parametrize("method", ALL_METHODS)
+@pytest.mark.parametrize("value", [ETAG, f"{OTHER}, {ETAG}"])
+def test_exists_without_validators_if_match_list_fails(method, value):
+    """No current entity-tag matches no listed one (RFC 9110 §13.1.1)."""
+    assert (
+        evaluate_exists(method, {"if-match": value}, exists=True)
+        == precondition_failed()
+    )
+
+
+@pytest.mark.parametrize("method", sorted(PRECONDITION_REQUIRED_METHODS))
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"if-none-match": OTHER},
+        {"if-unmodified-since": IMF},  # no modification date: ignored
+        {"if-modified-since": IMF},
+    ],
+)
+def test_exists_without_validators_requires_precondition(method, headers):
+    # Only If-Match (``*``) can pass without validators.
+    assert evaluate_exists(method, headers, exists=True) == precondition_required(
+        "If-Match"
+    )
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD", "POST", "OPTIONS"])
+def test_exists_without_validators_other_methods_proceed(method):
+    assert evaluate_exists(method, exists=True) is None
+
+
+def test_exists_without_validators_if_none_match_tag_proceeds():
+    assert (
+        evaluate_exists("PUT", {"if-none-match": ETAG, "if-match": "*"}, exists=True)
+        is None
+    )
+
+
+def test_exists_true_with_validators_is_unchanged():
+    for headers in (
+        {},
+        {"if-match": ETAG},
+        {"if-match": OTHER},
+        {"if-none-match": ETAG},
+    ):
+        for method in ALL_METHODS:
+            assert evaluate_preconditions(
+                method,
+                headers,
+                etag=ETAG,
+                last_modified=TS,
+                require_precondition=True,
+                exists=True,
+            ) == evaluate(method, headers, require_precondition=True)
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD", "POST", "PATCH", "DELETE"])
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"if-match": "*"},
+        {"if-match": ETAG},
+        {"if-none-match": "*"},
+        {"if-none-match": ETAG},
+        {"if-unmodified-since": IMF},
+        {"if-modified-since": IMF},
+    ],
+)
+def test_exists_false_with_validators_proceeds_except_put(method, headers):
+    assert (
+        evaluate_exists(method, headers, exists=False, etag=ETAG, last_modified=TS)
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "headers, expected",
+    [
+        ({}, None),  # no 428 for a create
+        ({"if-none-match": "*"}, None),  # create-only: proceeds
+        ({"if-none-match": ETAG}, None),
+        ({"if-match": "*"}, precondition_failed()),
+        ({"if-match": ETAG}, precondition_failed()),  # the validator is ignored
+        ({"if-unmodified-since": format_http_date(TS - 1)}, None),  # ignored
+    ],
+)
+def test_exists_false_with_validators_put_is_a_create(headers, expected):
+    assert (
+        evaluate_exists("PUT", headers, exists=False, etag=ETAG, last_modified=TS)
+        == expected
+    )
+
+
+def test_exists_none_infers_from_validators():
+    assert (
+        evaluate_preconditions(
+            "PUT",
+            {},
+            etag=None,
+            last_modified=None,
+            require_precondition=True,
+            exists=None,
+        )
+        is None
+    )
+    assert evaluate_preconditions(
+        "PUT", {}, etag=ETAG, last_modified=None, require_precondition=True, exists=None
+    ) == precondition_required("If-Match")

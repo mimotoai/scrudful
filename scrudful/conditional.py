@@ -236,13 +236,10 @@ def evaluate_preconditions(
     etag: str | None,
     last_modified: int | None,
     require_precondition: bool,
+    exists: bool | None = None,
 ) -> ConditionalResult | None:
     """Evaluate the request preconditions of RFC 9110 §13.2.2.
 
-    ``headers`` maps lower-case field names to field values (repeated field
-    lines joined with ``", "``); empty values are treated as absent. ``etag``
-    is an already-quoted entity-tag and ``last_modified`` an epoch timestamp;
-    both ``None`` means the target resource has no current representation.
     When ``require_precondition`` is true, unconditional PUT/PATCH/DELETE
     requests on an existing resource are rejected with 428 (RFC 6585 §3); a
     request is conditional if it has an If-Match, an ``If-None-Match: *``
@@ -250,12 +247,41 @@ def evaluate_preconditions(
     If-Unmodified-Since while ``last_modified`` is known.
 
     Preconditions are evaluated only for an existing resource and for PUT,
-    which may create one. In particular a POST to a target whose validators
-    are both ``None`` proceeds whatever its If-Match says (the handler answers,
-    e.g. 201 or 404).
+    which may create one. In particular a POST to a target that does not
+    exist proceeds whatever its If-Match says (the handler answers, e.g. 201
+    or 404).
 
-    Return ``None`` if the request should proceed to the handler, otherwise
-    the ``ConditionalResult`` to respond with.
+    Parameters
+    ----------
+    method : str
+        The request method, upper-case.
+    headers : mapping of str to str
+        Lower-case field names to field values (repeated field lines joined
+        with ``", "``); empty values are treated as absent.
+    etag : str or None
+        The current entity-tag, already quoted, or ``None`` if there is none.
+    last_modified : int or None
+        The current modification time as an epoch timestamp, or ``None`` if
+        there is none.
+    require_precondition : bool
+        Whether unconditional PUT/PATCH/DELETE requests on an existing
+        resource are answered with 428.
+    exists : bool or None, optional
+        Whether the target resource has a current representation. ``None``
+        (the default) infers it from the validators: it exists if ``etag`` or
+        ``last_modified`` is not ``None``. ``True`` says it exists even if
+        both validators are ``None``: then ``If-Match: *`` passes, an
+        If-Match listing entity-tags fails (412), ``If-None-Match: *`` fails
+        (412, or 304 for GET/HEAD) and an unconditional PUT/PATCH/DELETE
+        needs If-Match (428, when ``require_precondition`` is true).
+        ``False`` says it does not exist, whatever the validators: they are
+        ignored.
+
+    Returns
+    -------
+    ConditionalResult or None
+        ``None`` if the request should proceed to the handler, otherwise the
+        result to respond with.
     """
 
     def header(name: str) -> str | None:
@@ -275,7 +301,11 @@ def evaluate_preconditions(
     if_unmodified_since = parse_http_date(header("if-unmodified-since"))
     if_modified_since = parse_http_date(header("if-modified-since"))
 
-    exists = etag is not None or last_modified is not None
+    if exists is None:
+        exists = etag is not None or last_modified is not None
+    elif not exists:
+        # No current representation: there is nothing to validate against.
+        etag = last_modified = None
     if not exists and method != "PUT":
         # Let the handler respond (e.g. 404); RFC 9110 §13.2.1.
         return None
@@ -294,6 +324,10 @@ def evaluate_preconditions(
                 accepted.append("If-Match")
             if last_modified is not None:
                 accepted.append("If-Unmodified-Since")
+            if not accepted:
+                # An existing resource without validators: only
+                # ``If-Match: *`` can pass.
+                accepted.append("If-Match")
             return ConditionalResult(
                 status=428,
                 headers={},

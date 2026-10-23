@@ -821,3 +821,70 @@ def test_handler_contribute_list_not_shared(store):
     assert handler._ninja_contribute_to_operation == [callback]
     assert wrapper._ninja_contribute_to_operation[0] is callback
     assert len(wrapper._ninja_contribute_to_operation) == 2
+
+
+def none_etag_router(store: Store) -> Router:
+    """``/items/{pk}`` whose ``etag_func`` returns None (no last_modified_func)."""
+    router = Router()
+    options = dict(load=store.load, etag_func=lambda item: None)
+
+    @router.get("/items/{pk}", response=ItemOut)
+    @scrudful(**options)
+    def get_item(request, pk: int, obj):
+        store.calls["get"] += 1
+        return obj
+
+    @router.put("/items/{pk}", response=ItemOut)
+    @scrudful(**options)
+    def put_item(request, pk: int, payload: ItemIn, obj):
+        store.calls["put"] += 1
+        update(obj, payload.name)
+        return obj
+
+    @router.patch("/items/{pk}", response=ItemOut)
+    @scrudful(**options)
+    def patch_item(request, pk: int, payload: ItemIn, obj):
+        store.calls["patch"] += 1
+        update(obj, payload.name)
+        return obj
+
+    @router.delete("/items/{pk}", response={204: None})
+    @scrudful(**options)
+    def delete_item(request, pk: int, obj):
+        store.calls["delete"] += 1
+        del store.items[pk]
+        return Status(204, None)
+
+    return router
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+def test_loaded_object_without_validators_exists(store, method):
+    """``load`` returned an object: it exists although its validators are
+    None (RFC 9110 §13.1.1-2), so writes must be conditional, ``If-None-Match:
+    *`` fails and ``If-Match: *`` passes."""
+    client = TestClient(none_etag_router(store))
+
+    response = call(client, method, "/items/1", {})
+    assert response.status_code == 428
+    assert response.json()["accepted-precondition-headers"] == ["If-Match"]
+
+    for headers in ({"If-None-Match": "*"}, {"If-Match": '"v1"'}):
+        response = call(client, method, "/items/1", headers)
+        assert response.status_code == 412
+    assert store.calls[method.lower()] == 0
+    assert store.items[1]["version"] == 1
+
+    response = call(client, method, "/items/1", {"If-Match": "*"})
+    assert response.status_code == (204 if method == "DELETE" else 200)
+    assert "ETag" not in response.headers
+    assert store.calls[method.lower()] == 1
+
+
+def test_loaded_object_without_validators_get(store):
+    client = TestClient(none_etag_router(store))
+    response = client.get("/items/1", headers={"If-None-Match": "*"})
+    assert response.status_code == 304
+    assert "ETag" not in response.headers
+    assert client.get("/items/1", headers={"If-None-Match": '"v1"'}).status_code == 200
+    assert store.calls["get"] == 1

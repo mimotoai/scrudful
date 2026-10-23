@@ -710,3 +710,23 @@ def test_list_handler_errors_use_ninja_handlers(items):
     response = TestClient(router).get("/items")
     assert response.status_code == 403
     assert response.json() == {"detail": "Forbidden"}
+
+
+def test_list_without_validator_values_exists(db):
+    """The queryset the handler returned is the collection: it exists even
+    when the list validators return None (e.g. the latest modification of an
+    empty collection)."""
+    router = Router()
+
+    @router.get("/items", response=list[ItemOut])
+    @scrudful_list(href_func=href, list_last_modified_func=lambda qs: None)
+    def list_items(request):
+        return Item.objects.order_by("pk")
+
+    client = TestClient(router)
+    response = client.get("/items", headers={"If-None-Match": "*"})
+    assert response.status_code == 304
+    assert "Last-Modified" not in response.headers
+    assert client.get("/items", headers={"If-Match": "*"}).status_code == 200
+    assert client.get("/items", headers={"If-Match": '"n1"'}).status_code == 412
+    assert client.get("/items").status_code == 200

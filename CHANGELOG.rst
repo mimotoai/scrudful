@@ -17,9 +17,13 @@ django-ninja adapter
     DELETE and POST actions): ``load(request, **params)`` is the
     fetch-if-allowed callable; the validator callbacks and the handler get the
     object it returns. It returns ``None`` for "no current representation"
-    (RFC 9110 semantics) or raises, through ninja's exception handlers. 304,
-    400, 412 and 428 as in the other adapters; fresh validators after a
-    PUT/PATCH (``load`` is called again).
+    (RFC 9110 semantics) or raises, through ninja's exception handlers.
+    ``load`` alone decides whether the resource exists: an object it returns
+    exists even when ``etag_func`` / ``last_modified_func`` return ``None``
+    for it, so an unconditional write gets 428, ``If-None-Match: *`` gets 412
+    and ``If-Match: *`` passes (RFC 9110 §13.1.1-2). 304, 400, 412 and 428 as
+    in the other adapters; fresh validators after a PUT/PATCH (``load`` is
+    called again).
   * ``@scrudful_create(...)``: 201 with ``Location``, the item's Links and the
     created item's ``ETag`` and ``Last-Modified``.
   * ``@scrudful_list(...)``: the handler returns the authorized queryset; the
@@ -40,6 +44,11 @@ django-ninja adapter
 
   201 validators, entity declarations, error Links and load-based validators
   are not in the DRF and FastAPI adapters yet.
+* ``scrudful.conditional.evaluate_preconditions`` takes a keyword-only
+  ``exists``: ``True`` or ``False`` says whether the target resource exists,
+  in place of inferring it from the validators (the default, ``None``, which
+  the DRF and FastAPI adapters keep using). With ``exists=True`` and no
+  validators, a 428 lists ``If-Match`` as the accepted precondition header.
 * Added ``scrudful.collection``: ``collection_schema()`` and
   ``collection_context()`` build the JSON Schema (draft 2020-12) and the
   JSON-LD context of the scrud list envelope. It is framework-neutral.

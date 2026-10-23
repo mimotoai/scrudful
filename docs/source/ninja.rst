@@ -153,6 +153,14 @@ When ``load`` returns ``None``, RFC 9110 applies: a PUT with
 ``If-None-Match: *`` reaches the handler, a PUT with ``If-Match`` is answered
 with 412, and the other methods reach the handler, which answers (e.g. 404).
 
+``load`` alone decides whether the resource exists. When it returns an object,
+the resource exists even if ``etag_func`` / ``last_modified_func`` return
+``None`` for it (RFC 9110 §13.1.1-2): PUT, PATCH and DELETE then need
+``If-Match: *`` (428 without a precondition), an ``If-Match`` listing
+entity-tags fails with 412 (there is no current entity-tag to match), and
+``If-None-Match: *`` fails with 412 (304 for GET and HEAD), so it never
+overwrites an existing row.
+
 **No PUT-create** (the example project's choice):
 
 .. code-block:: python
