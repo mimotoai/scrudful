@@ -121,6 +121,10 @@ still put Links on a 204 if you want them.
 
 ninja routes HEAD only to operations that list it, as above.
 
+Handlers in modules with ``from __future__ import annotations`` work, including
+when the hidden parameter's annotation is imported only under
+``TYPE_CHECKING``: each annotation is evaluated on its own.
+
 Choosing what ``load`` returns
 ------------------------------
 
@@ -234,10 +238,14 @@ and without a 500:
         meta.status = 201
         return role
 
-After a successful PUT or PATCH, ``load`` is called again to compute the
-validators of the representation just written. If it raises then (e.g. the
-write moved the object out of the caller's scope), the client gets that error
-although the write was committed.
+After a successful (2xx) PUT or PATCH, ``load`` is called again, so that the
+validators and the Links describe the representation just written: the
+validators are computed from what it returns, and link callables get it. The
+second call happens when ``etag_func`` or ``last_modified_func`` is set or a
+value of the response's entity is callable, and not otherwise (static Links
+need no object). If it raises then (e.g. the write moved the object out of the
+caller's scope), the client gets that error although the write was committed:
+make ``load`` find what the handler just wrote.
 
 The preconditions are evaluated before the handler runs, so two concurrent
 requests with the same ``If-Match`` can both pass them. For strict lost-update
@@ -266,6 +274,21 @@ item operations' callbacks:
 
 The operation must declare ``response={201: ...}`` (or ``...``): with
 ``response=RoleOut`` (a 200) ninja raises ``ConfigError``.
+
+The created object is the handler's return value, or what it sets as
+``ScrudfulResponse.created``. A handler that returns ``None`` (e.g. with
+``response={201: None}``) or an ``HttpResponse`` has created no object as far
+as scrudful knows: its 201 gets no ``Location``, validators or item Links, and
+``location_func``, the validator callbacks and the item's link callables are
+not called. Set ``meta.created`` to get them all, or ``meta.location`` for the
+``Location`` alone:
+
+.. code-block:: python
+
+    @roles.post("", response={201: None})
+    @scrudful_create(location_func=role_url, **ROLE)
+    def create_role(request, payload: RoleIn, meta: ScrudfulResponse):
+        meta.created = Role.objects.create(**payload.dict())
 
 General POST
 ------------
@@ -326,6 +349,12 @@ callbacks as the detail GET. ``page`` and ``page_size`` (default 100, at most
 1000) are query parameters. The optional list validators are called with the
 queryset, and then a list can answer 304.
 
+The collection response is a list, set or tuple of the item schema
+(``List[RoleOut]``, ``list[RoleOut]``). ``Optional[List[RoleOut]]`` or another
+union raises ``ConfigError`` when the operation is built, since the envelope is
+always sent, and so does a bare ``list``, which names no item schema for the
+entries.
+
 * Order the queryset: an unordered one raises Django's
   ``UnorderedObjectListWarning``, as with Django's paginator, because its pages
   are not stable.
@@ -335,6 +364,10 @@ queryset, and then a list can answer 304.
   but ninja serializes the items on the event loop, so the item schema must
   not touch lazy relations: use ``select_related`` / ``prefetch_related`` in
   the handler. ninja's ``@paginate`` has the same limit.
+* In an async list operation whose ``href_func``, item validator callbacks and
+  item link callables are all sync, the count, the slice and every entry's
+  values are computed in one ``sync_to_async`` call per page. An ``async def``
+  one among them is awaited, and the others then take a thread hop per call.
 
 The collection documents
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -351,8 +384,12 @@ OPTIONS
 The automatic OPTIONS operation answers, for each method the path serves, an
 OpenAPI-like description in the shape DRF's ``ScrudfulMetadata`` produces: the
 request and response ``content`` (``{"schema": <url>, "context": <url>}``),
-the statuses (scrudful's early responses and those the operation declares) and
-the precondition headers of conditional writes. It is the same for everyone:
+the statuses and the precondition headers of conditional writes. The statuses
+are those the operation answers: the ones it declares in ``response=`` (200
+without one), plus 201 for a ``@scrudful_create`` operation, and scrudful's
+early responses (304, 400, 412, 428) when it evaluates preconditions. So
+``POST /roles/search`` lists 200, where DRF's ``ScrudfulMetadata`` lists 201 for
+every POST. It is the same for everyone:
 
 * it runs no ``load``, handler or validator callback, ignores the API's and
   the router's ``auth``, and scrudful runs no permission check for it, so it

@@ -75,7 +75,10 @@ Validators
     computed for the precondition check, and 2xx responses to PUT/PATCH get
     fresh ones: ``load`` is called again and the validators are computed from
     what it returns, so they describe the representation just written (RFC
-    9110 §9.3.4). Other methods (e.g. a general POST such as
+    9110 §9.3.4). That second call happens after the handler's write: if it
+    raises (e.g. the write moved the object out of the caller's scope), the
+    client gets that error although the write is committed. Other methods
+    (e.g. a general POST such as
     ``POST /items/search``, or a POST action on an item) and non-2xx responses
     get none, unless the handler sets them on its ``ScrudfulResponse``. The
     status is the one of a returned ``HttpResponse``, else of a returned
@@ -93,9 +96,12 @@ Entities and Links
     a response the handler produces are those of, in this order: the
     ``ScrudfulResponse.entity`` the handler set; ``responses[status]``; the
     default entity, for 2xx responses other than 204 (which has no body);
-    else none. Link callables are
-    called with the request and the loaded object (after a PUT/PATCH, the one
-    loaded again), or ``None`` without ``load``.
+    else none. Link callables are called with the request and the loaded
+    object, or ``None`` without ``load``. After a 2xx PUT/PATCH they get the
+    object loaded again: ``load`` is called a second time (as for the
+    validators, with the same consequence if it raises) when a validator
+    callback is set or a value of the response's entity is callable, and not
+    otherwise.
 
 Create
     :func:`scrudful_create` decorates a POST on a collection that creates an
@@ -111,8 +117,11 @@ Create
 
     The created object is ``ScrudfulResponse.created`` if the handler set it,
     else the body the handler returned (the value of a returned ``Status``).
-    A returned ``HttpResponse`` is not an object: set ``created`` to get the
-    Location and validators. A 201 response with a created object gets:
+    A returned ``HttpResponse`` is not an object, and neither is ``None``
+    (e.g. with ``response={201: None}``): such a handler sets
+    ``ScrudfulResponse.created`` to get the Location, validators and item
+    Links, or ``ScrudfulResponse.location`` for the Location alone. A 201
+    response with a created object gets:
 
     - ``Location``: ``location_func(request, obj)``, not called when the
       response already has one (from the handler or ``ScrudfulResponse``);
@@ -123,8 +132,10 @@ Create
     - the item entity's Links (``responses[201]``, if declared, replaces it);
       link callables get the created object.
 
-    Any other status (e.g. a ``Status(400, ...)``) gets none of these, only
-    the Links of ``responses[status]``; their link callables get
+    Any other status (e.g. a ``Status(400, ...)``), and a 201 without a
+    created object, gets none of these (``location_func``, the validator
+    callbacks and the item entity's callables are not called), only the
+    Links of ``responses[status]``; their link callables get
     ``ScrudfulResponse.created``, or ``None`` if unset. The values set on
     ``ScrudfulResponse`` and headers the handler set win, as below.
 
@@ -133,8 +144,11 @@ Collections
     ninja's ``@paginate`` and is the flow above with a preset: there is no
     ``load``, and the handler returns the authorized queryset (or a sequence,
     possibly in a ``ninja.Status``). The operation must declare a collection
-    response, e.g. ``response=List[ItemOut]`` (``ninja.errors.ConfigError``
-    otherwise, when the operation is built). It is replaced by a generated
+    response, a list, set or tuple of the item schema, e.g.
+    ``response=List[ItemOut]``; without one, and for one that is
+    ``Optional`` or another union (the envelope is always sent) or names no
+    item type (a bare ``list``), ninja raises ``ninja.errors.ConfigError``
+    when the operation is built. It is replaced by a generated
     schema, ``Scrudful<Item>Page``, so ninja's validation and OpenAPI describe
     the envelope (:mod:`scrudful.collection` builds its JSON Schema and
     JSON-LD context)::
@@ -181,9 +195,14 @@ Collections
 
     Only a response ninja validates as the collection response is
     paginated: a ``Status`` with another code (e.g. ``Status(403, ...)``) or
-    an ``HttpResponse`` is sent as the handler returned it. In an async
-    operation the queryset is counted and sliced through ``sync_to_async``,
-    never on the event loop, so the handler may return it unevaluated.
+    an ``HttpResponse`` is sent as the handler returned it. Each operation
+    keeps its own: a function registered on several paths with different
+    ``response=`` is paginated as each declares. In an async operation the
+    queryset is counted and sliced through ``sync_to_async``, never on the
+    event loop, so the handler may return it unevaluated; when ``href_func``,
+    the item validator callbacks and the item entity's callables are all
+    sync, the count, the slice and every entry's values take a single
+    ``sync_to_async`` call per page.
 
 OPTIONS
     A :class:`ScrudfulRouter` adds an OPTIONS operation to every path that has
@@ -206,14 +225,18 @@ OPTIONS
 
     - ``requestBody`` (POST, PUT, PATCH) with the ``content`` of the
       ``request`` entity, else of the item entity, as in DRF;
-    - ``responses``: DRF's success status (200, 201 for POST, 204 for
-      DELETE) and, when the operation evaluates the If-* headers, the early
-      responses (304, 400 and 412 for GET/HEAD; 400, 412 and 428 for writes,
-      only 400 and 412 for POST), plus every status the operation declares
-      in ``response=``, with its reason phrase. Each status with a body gets
-      the ``content`` of its entity: scrudful's own 400, 412 and 428 get
-      ``error``'s, if declared, the others ``responses[status]``, else the
-      default entity (2xx, 201 for a create, the collection for a list);
+    - ``responses``: the statuses the operation answers, with their reason
+      phrase: those it declares in ``response=`` (ninja's default, 200,
+      without one), and 201 for a :func:`scrudful_create` operation, whose
+      plain return value is a 201. So a search POST declaring
+      ``response=List[...]`` lists 200 (DRF lists 201 for every POST), and
+      a DELETE lists 204 only if it declares it. When the operation
+      evaluates the If-* headers, the early responses are added: 304, 400
+      and 412 for GET/HEAD; 400, 412 and 428 for writes, only 400 and 412
+      for POST. Each status with a body gets the ``content`` of its entity:
+      scrudful's own 400, 412 and 428 get ``error``'s, if declared, the
+      others ``responses[status]``, else the default entity (2xx, 201 for a
+      create, the collection for a list);
     - ``parameters``: the precondition headers of a conditional write.
 
     A ``content`` is ``{"application/json": {"schema": <url>, "context":
@@ -278,7 +301,9 @@ Async operations
     ``def`` or ``async def``: ``async def`` ones are awaited, sync ones run
     through ``asgiref.sync.sync_to_async(func, thread_sensitive=True)``, so
     they may use the Django ORM, and an awaitable a sync callable returns is
-    awaited. They are called one after the other, never concurrently. With a
+    awaited. They are called one after the other, never concurrently (a list
+    page's sync per-item callables run together in one ``sync_to_async``
+    call, see "Collections"). With a
     sync handler, the operation is sync and every callable is called directly,
     so they must all be sync: an ``async def`` one raises ``TypeError`` at
     decoration time (also inside the declared entities), or at request time
@@ -449,9 +474,10 @@ class ScrudfulResponse:
         one.
     created : object
         The object a :func:`scrudful_create` operation created, whose
-        Location and validators a 201 gets. Unset by default: the handler's
-        return value is used (the value of a returned ``Status``). Ignored by
-        :func:`scrudful`.
+        Location, validators and item Links a 201 gets. Unset by default: the
+        handler's return value is used (the value of a returned ``Status``).
+        ``None`` (also a ``None`` return value) is no created object: the 201
+        gets none of them. Ignored by :func:`scrudful`.
     """
 
     status: int | None = None
@@ -623,7 +649,11 @@ def scrudful(
         raises (e.g. ``HttpError(404)``). ``params`` are the parameters ninja
         validated for the operation (path, query, body ...), without the
         hidden ones; accept ``**kwargs`` to ignore those you don't need.
-        Required when a validator callback is set.
+        Required when a validator callback is set. After a 2xx PUT/PATCH it
+        is called again, for the validators and Links of what was just
+        written, when a validator callback is set or a value of the
+        response's entity is callable: if it raises then, the client gets
+        that error although the handler's write is committed.
     load_as : str, optional
         Name of the handler parameter receiving the loaded object (default
         ``"obj"``). The parameter is hidden from ninja's signature and
@@ -653,8 +683,10 @@ def scrudful(
         not sent on a 204, which has no body.
         If no value is given, no schema link is sent. Each ``*_or_func``
         argument is a value or a callable ``func(request, obj)``, where
-        ``obj`` is the loaded object (after a PUT/PATCH, the one loaded
-        again), or ``None`` without ``load``.
+        ``obj`` is the loaded object, or ``None`` without ``load``. After a
+        2xx PUT/PATCH, ``obj`` is the object ``load`` returns when called
+        again, which it is when a validator callback is set or a value of the
+        response's entity is callable.
     schema_rel_or_func : str or callable, optional
         ``rel`` of the schema link. Defaults to ``"describedBy"``.
     schema_type_or_func : str or callable, optional
@@ -762,6 +794,9 @@ def scrudful_create(
     location_func : callable
         ``location_func(request, obj)`` returns the URL of the created object
         ``obj``, as an IRI (encoded as a URI), or ``None`` for no Location.
+        Not called without a created object (a handler returning ``None`` or
+        an ``HttpResponse`` sets ``ScrudfulResponse.created`` or
+        ``ScrudfulResponse.location``).
     etag_func : callable, optional
         ``etag_func(obj)``: the entity-tag of the created object, as for
         :func:`scrudful` (no ``load`` is needed: the validators are computed
@@ -968,7 +1003,9 @@ def scrudful_list(
         ``page_size``.
     ninja.errors.ConfigError
         When the operation is built, if it declares no collection response
-        (e.g. ``response=List[ItemOut]``).
+        (e.g. ``response=List[ItemOut]``), or one that is a union (e.g.
+        ``Optional[List[ItemOut]]``: the envelope is never ``None``) or names
+        no item type (a bare ``list``).
     """
     if not callable(href_func):
         raise TypeError(f"href_func must be callable, not {type(href_func).__name__}")
