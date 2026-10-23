@@ -6,7 +6,8 @@ django-ninja
 context ``Link`` headers of the semantic-http spec, collections in the scrud
 list envelope, and an automatic OPTIONS answer (the spec's "HTTP Schema
 Resource"). Install it with ``pip install "scrudful[ninja]"`` (django-ninja
-1.7 or newer). It does not need Django REST Framework.
+1.7 or newer, below 2: the adapter relies on django-ninja internals). It does
+not need Django REST Framework.
 
 The example project in ``examples/ninja`` uses the three decorators, entities,
 error Links and OPTIONS on a ``Role`` resource scoped by an ``rbac_context``;

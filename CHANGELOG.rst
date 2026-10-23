@@ -71,14 +71,16 @@ Internal
 Packaging
 ---------
 
-* New extra ``scrudful[ninja]``: ``django>=4.2`` and ``django-ninja>=1.7``.
+* New extra ``scrudful[ninja]``: ``django>=4.2`` and
+  ``django-ninja>=1.7,<2``. The upper bound is there because the adapter
+  relies on private django-ninja internals (how operations are built and
+  their response models), which a major release may change.
   The adapter's code also works with django-ninja 1.6, but the test suite
   verifies 1.7.0 and newer only: 1.6's ``TestAsyncClient`` methods are not
   ``async def``, so driving them with ``asgiref``'s ``async_to_sync`` warns,
   which the tests treat as an error.
-* The package description names django-ninja; added the
-  ``Framework :: Django :: 5.2`` classifier (there is no django-ninja
-  classifier).
+* The package description names django-ninja (there is no django-ninja
+  classifier; ``Framework :: Django`` covers it).
 
 0.3.0 (since 0.2.0)
 ===================
