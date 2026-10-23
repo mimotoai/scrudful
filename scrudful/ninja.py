@@ -164,9 +164,13 @@ Collections
       preconditions are evaluated after the handler returns it, since it is
       the authorized object: a matching GET is answered with 304, a failed
       If-Match with 412, a malformed one with 400 (with ``error``'s Links),
-      and 2xx responses carry the collection's validators. These responses
-      keep the headers and cookies the handler set (not its Content-Type).
-      Without them, the If-* headers are ignored.
+      and 2xx responses carry the collection's validators. These early
+      responses keep the cookies the handler set; the 304 also keeps its
+      other headers (e.g. Cache-Control, Vary), except Content-Type,
+      Content-Length, Content-Encoding, Content-Range and Content-Language
+      (RFC 9110 §15.4.5), and the 400 and 412 keep no other header (so a
+      ``public`` Cache-Control does not make them cacheable). Without the
+      list validators, the If-* headers are ignored.
 
     Only a response ninja validates as the collection response is
     paginated: a ``Status`` with another code (e.g. ``Status(403, ...)``) or
@@ -269,7 +273,7 @@ from scrudful.conditional import (
     http_timestamp,
     quote_etag,
 )
-from scrudful.utils import join_links, link_content
+from scrudful.utils import join_links, link_content, merge_expose_headers
 
 __all__ = [
     "CONDITIONAL_READ_RESPONSES",
@@ -806,12 +810,17 @@ def scrudful_list(
     so each entry carries the validators and Link a detail GET sends. The
     handler may be ``async def``, and then the callables may be too.
 
+    A 2-tuple the handler returns is ninja's deprecated ``(status, body)``,
+    not a sequence of two items: return a list (or wrap it in ``Status``).
+    Tuples of any other length are sequences.
+
     Parameters
     ----------
     href_func : callable
         ``href_func(request, item)`` returns the URL of ``item``, an entry's
         ``href``, as an IRI (encoded as a URI). An absolute URL is
         recommended (the collection schema says ``"format": "uri"``).
+        Returning ``None`` raises ``TypeError``.
     etag_func : callable, optional
         ``etag_func(item)``: the entity-tag of an item, as for
         :func:`scrudful`: an entry's ``etag``, else ``null``.
@@ -1116,12 +1125,36 @@ def _early_response(
     return early
 
 
+#: Representation metadata of the 200 a 304 replaces: not sent on the 304.
+_BODY_HEADERS = frozenset(
+    {
+        "content-length",
+        "content-type",
+        "content-encoding",
+        "content-range",
+        "content-language",
+    }
+)
+
+
 def _keep_handler_headers(early: HttpResponseBase, temporal: HttpResponse) -> None:
-    """Copy onto ``early`` the headers and cookies the handler set on ninja's
-    temporal response (but not its Content-Type), without overwriting any."""
-    for name, value in temporal.items():
-        if name.lower() != "content-type" and name not in early:
-            early[name] = value
+    """Copy onto ``early`` what the handler set on ninja's temporal response.
+
+    As ``scrudful.fastapi`` does: a 304 gets the headers a 200 would carry
+    (``Cache-Control``, ``Vary``, ..., RFC 9110 §15.4.5), except
+    representation metadata and those it already has; every early response
+    gets the cookies. A 400 or 412 gets no other header (e.g. a ``public``
+    Cache-Control must not let a shared cache store it).
+    """
+    if early.status_code == 304:
+        for name, value in temporal.items():
+            lower = name.lower()
+            if lower == "access-control-expose-headers":
+                merged = merge_expose_headers(early.get(name), value.split(","))
+                if merged:
+                    early[name] = merged
+            elif lower not in _BODY_HEADERS and name not in early:
+                early[name] = value
     early.cookies.update(temporal.cookies)
     expose_headers(early)
 
@@ -1231,6 +1264,11 @@ def _page(
     entries = []
     for item in items:
         href = yield config.href_func, (request, item), {}
+        if href is None:
+            raise TypeError(
+                f"href_func returned None for {item!r}: it must return the "
+                "item's URL"
+            )
         etag, last_modified = yield from _item_validators(config, item)
         link = yield from _links(config.entity, request, item)
         values = (
@@ -1295,7 +1333,7 @@ def _with_body(content: Any, body: Any) -> Any:
     """The handler's return value ``content`` with ``body`` in place of its own."""
     if isinstance(content, Status):
         return Status(content.status_code, body)
-    if isinstance(content, tuple):
+    if isinstance(content, tuple) and len(content) == 2:
         return content[0], body
     return body
 

@@ -286,13 +286,6 @@ def test_list_validators_304(items):
 
     router = list_router(href_func=item_href, list_etag_func=list_etag)
 
-    @router.get("/cookie", response=list[ItemOut])
-    @scrudful_list(href_func=href, list_etag_func=list_etag, error=ERROR)
-    def with_cookie(request, response: HttpResponse):
-        response.set_cookie("seen", "1")
-        response["Cache-Control"] = "max-age=60"
-        return Item.objects.all()
-
     client = TestClient(router)
     response = client.get("/items", headers={"If-None-Match": '"n3"'})
     assert response.status_code == 304
@@ -310,18 +303,69 @@ def test_list_validators_304(items):
     assert response.status_code == 412
     assert "Link" not in response.headers
 
-    # The headers and cookies the handler set are kept; the error entity's
-    # Links go on scrudful's own error bodies.
-    response = client.get("/cookie", headers={"If-None-Match": '"n3"'})
+
+def test_list_early_responses_keep_handler_headers(items):
+    """R12: the 304 keeps the handler's headers but Content-*; the 400 and 412
+    keep only its cookies. The error entity's Links go on the error bodies."""
+    router = Router()
+
+    @router.get("/items", response=list[ItemOut])
+    @scrudful_list(href_func=href, list_etag_func=lambda qs: "n3", error=ERROR)
+    def list_items(request, response: HttpResponse):
+        response.set_cookie("seen", "1")
+        response["Cache-Control"] = "public, max-age=60"
+        response["Vary"] = "X-API-Key"
+        response["Content-Language"] = "en"
+        return Item.objects.all()
+
+    client = TestClient(router)
+    response = client.get("/items", headers={"If-None-Match": '"n3"'})
     assert response.status_code == 304
-    assert response.headers["Cache-Control"] == "max-age=60"
+    assert response.headers["Cache-Control"] == "public, max-age=60"
+    assert response.headers["Vary"] == "X-API-Key"
     assert response.cookies["seen"].value == "1"
+    assert response.headers["ETag"] == '"n3"'
     assert "Content-Type" not in response.headers
-    response = client.get("/cookie", headers={"If-Match": "bad"})
-    assert response.status_code == 400
-    assert response.headers["Link"] == ERROR_LINK
-    assert response.headers["Content-Type"] == "application/json"
-    assert response.cookies["seen"].value == "1"
+    assert "Content-Language" not in response.headers
+    assert expose(response) == {"ETag"}
+
+    for headers, status in (({"If-Match": '"n2"'}, 412), ({"If-Match": "bad"}, 400)):
+        response = client.get("/items", headers=headers)
+        assert response.status_code == status
+        assert response.cookies["seen"].value == "1"
+        assert "Cache-Control" not in response.headers
+        assert "Vary" not in response.headers
+        assert "Content-Language" not in response.headers
+        assert response.headers["Content-Type"] == "application/json"
+        assert response.headers["Link"] == ERROR_LINK
+
+
+def test_list_tuple_of_rows():
+    rows = tuple({"id": n, "name": f"n{n}", "version": n} for n in range(1, 4))
+    router = Router()
+
+    @router.get("/rows", response=list[ItemOut])
+    @scrudful_list(href_func=lambda request, row: f"/rows/{row['id']}")
+    def list_rows(request):
+        return rows
+
+    response = TestClient(router).get("/rows?page_size=2")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 3
+    assert [entry["content"] for entry in body["content"]] == list(rows[:2])
+
+
+def test_list_href_func_none_raises(items):
+    router = Router()
+
+    @router.get("/items", response=list[ItemOut])
+    @scrudful_list(href_func=lambda request, item: None)
+    def list_items(request):
+        return Item.objects.all()
+
+    with pytest.raises(TypeError, match="href_func returned None"):
+        TestClient(router).get("/items")
 
 
 def test_list_without_list_validators_ignores_if_headers(items):
