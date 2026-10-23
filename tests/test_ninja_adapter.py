@@ -1,0 +1,773 @@
+"""Single-resource operations of ``scrudful.ninja``, tested with small routers."""
+
+import inspect
+import itertools
+import uuid
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import pytest
+from django.http import Http404, HttpResponse, JsonResponse
+from ninja import NinjaAPI, Router, Schema, Status
+from ninja.errors import HttpError
+from ninja.security import APIKeyHeader
+from ninja.testing import TestClient
+
+from scrudful._adapter import READ_DESCRIPTIONS, WRITE_DESCRIPTIONS
+from scrudful.ninja import (
+    CONDITIONAL_READ_RESPONSES,
+    CONDITIONAL_WRITE_RESPONSES,
+    scrudful,
+)
+from tests import ninja_future_annotations as future_endpoints
+
+# Non-zero microseconds: the header is floored to whole seconds.
+MODIFIED = datetime(2024, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)
+MODIFIED_HTTP = "Tue, 02 Jan 2024 03:04:05 GMT"
+SCHEMA_LINK = '</schemas/item>; rel="describedBy"; type="application/json"'
+CONTEXT_LINK = (
+    '</contexts/item>; rel="http://www.w3.org/ns/json-ld#context"; '
+    'type="application/ld+json"'
+)
+LINKS = dict(schema_link_or_func="/schemas/item", context_link_or_func="/contexts/item")
+METHODS = ["GET", "PUT", "PATCH", "DELETE"]
+IF_HEADERS = [{}, {"If-Match": "*"}, {"If-None-Match": "*"}, {"If-Match": '"stale"'}]
+
+ALICE = {"X-API-Key": "alice"}
+MISSING = 3  # no such row
+HIDDEN = 2  # a row alice may not see
+
+
+class ItemIn(Schema):
+    name: str
+
+
+class ItemOut(Schema):
+    id: int
+    name: str
+    version: int
+
+
+class Message(Schema):
+    detail: str
+
+
+class Store:
+    """In-memory rows; ``calls`` counts load and handler calls."""
+
+    def __init__(self) -> None:
+        self.items: dict[int, dict[str, Any]] = {
+            1: {
+                "id": 1,
+                "name": "a",
+                "version": 1,
+                "modified": MODIFIED,
+                "owner": "alice",
+            },
+            HIDDEN: {
+                "id": HIDDEN,
+                "name": "b",
+                "version": 7,
+                "modified": MODIFIED,
+                "owner": "bob",
+            },
+        }
+        self.calls: Counter[str] = Counter()
+        self.load_params: list[dict[str, Any]] = []
+
+    def _row(self, pk: int, params: dict[str, Any]) -> dict[str, Any] | None:
+        self.calls["load"] += 1
+        self.load_params.append({"pk": pk, **params})
+        return self.items.get(pk)
+
+    # "No PUT-create": missing and hidden both raise 404.
+    def load(self, request: Any, pk: int, **params: Any) -> dict[str, Any]:
+        item = self._row(pk, params)
+        if item is None or item["owner"] != "alice":
+            raise HttpError(404, "Not Found")
+        return item
+
+    # "PUT-create with hidden rows" (and "nothing hidden" when no row is hidden).
+    def load_or_none(self, request: Any, pk: int, **params: Any) -> Any:
+        item = self._row(pk, params)
+        if item is not None and item["owner"] != "alice":
+            raise HttpError(404, "Not Found")
+        return item
+
+    # "PUT-create, hidden treated as missing".
+    def load_hidden_as_none(self, request: Any, pk: int, **params: Any) -> Any:
+        item = self._row(pk, params)
+        return item if item is not None and item["owner"] == "alice" else None
+
+
+def etag(item: dict[str, Any]) -> str:
+    return f"v{item['version']}"
+
+
+def modified(item: dict[str, Any]) -> datetime:
+    return item["modified"]
+
+
+def item_router(store: Store, load: Any = None) -> Router:
+    """GET/PUT/PATCH/DELETE on ``/items/{pk}`` with both validators."""
+    options = dict(
+        load=load or store.load,
+        etag_func=etag,
+        last_modified_func=modified,
+        **LINKS,
+    )
+    router = Router()
+
+    @router.get(
+        "/items/{pk}",
+        response=ItemOut,
+        openapi_extra={"responses": CONDITIONAL_READ_RESPONSES},
+    )
+    @scrudful(**options)
+    def get_item(request, pk: int, obj):
+        store.calls["get"] += 1
+        if obj is None:
+            raise HttpError(404, "Not Found")
+        return obj
+
+    @router.put(
+        "/items/{pk}",
+        response={200: ItemOut, 201: ItemOut, 409: Message},
+        openapi_extra={"responses": CONDITIONAL_WRITE_RESPONSES},
+    )
+    @scrudful(**options)
+    def put_item(request, pk: int, payload: ItemIn, obj):
+        store.calls["put"] += 1
+        if obj is None:
+            if pk in store.items:  # a create colliding with a hidden row
+                return Status(409, {"detail": "Conflict"})
+            store.items[pk] = obj = {"id": pk, "version": 0, "owner": "alice"}
+            update(obj, payload.name)
+            return Status(201, obj)
+        update(obj, payload.name)
+        return obj
+
+    @router.patch("/items/{pk}", response=ItemOut)
+    @scrudful(**options)
+    def patch_item(request, pk: int, payload: ItemIn, obj):
+        store.calls["patch"] += 1
+        if obj is None:
+            raise HttpError(404, "Not Found")
+        update(obj, payload.name)
+        return obj
+
+    @router.delete("/items/{pk}", response={204: None})
+    @scrudful(**options)
+    def delete_item(request, pk: int, obj):
+        store.calls["delete"] += 1
+        if obj is None:
+            raise HttpError(404, "Not Found")
+        del store.items[pk]
+
+    return router
+
+
+def update(item: dict[str, Any], name: str) -> None:
+    item["name"] = name
+    item["version"] += 1
+    item["modified"] = MODIFIED + timedelta(hours=item["version"])
+
+
+def call(client: TestClient, method: str, path: str, headers: dict[str, str]) -> Any:
+    body = {"name": "new"} if method in ("PUT", "PATCH") else None
+    return client.request(method, path, json=body, headers=headers)
+
+
+class KeyAuth(APIKeyHeader):
+    param_name = "X-API-Key"
+
+    def __init__(self, store: Store) -> None:
+        super().__init__()
+        self.store = store
+
+    def authenticate(self, request, key):
+        self.store.calls["auth"] += 1
+        return key if key == "alice" else None
+
+
+def make_api(router: Router, store: Store) -> NinjaAPI:
+    api = NinjaAPI(auth=KeyAuth(store), urls_namespace=f"api-{uuid.uuid4().hex}")
+    api.add_router("", router)
+    return api
+
+
+@pytest.fixture
+def store() -> Store:
+    return Store()
+
+
+@pytest.fixture
+def client(store) -> TestClient:
+    return TestClient(item_router(store))
+
+
+def expose(response: Any) -> set[str]:
+    value = response.headers.get("Access-Control-Expose-Headers", "")
+    return {name.strip() for name in value.split(",") if name.strip()}
+
+
+def test_get_sets_validators_and_links(client):
+    response = client.get("/items/1")
+    assert response.status_code == 200
+    assert response.json() == {"id": 1, "name": "a", "version": 1}
+    assert response.headers["ETag"] == '"v1"'
+    assert response.headers["Last-Modified"] == MODIFIED_HTTP
+    assert response.headers["Link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+    assert {"ETag", "Link"} <= expose(response)
+
+
+def test_get_if_none_match_304(client, store):
+    response = client.get("/items/1", headers={"If-None-Match": '"v1"'})
+    assert response.status_code == 304
+    assert response.headers["ETag"] == '"v1"'
+    assert response.content == b""
+    assert store.calls["get"] == 0
+
+
+def test_get_if_modified_since_304(client, store):
+    response = client.get("/items/1", headers={"If-Modified-Since": MODIFIED_HTTP})
+    assert response.status_code == 304
+    assert response.headers["Last-Modified"] == MODIFIED_HTTP
+    assert store.calls["get"] == 0
+
+
+def test_put_without_precondition_428(client, store):
+    response = client.put("/items/1", json={"name": "new"})
+    assert response.status_code == 428
+    assert response.json()["accepted-precondition-headers"] == [
+        "If-Match",
+        "If-Unmodified-Since",
+    ]
+    assert store.calls["put"] == 0
+    assert store.items[1]["version"] == 1
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+def test_put_stale_if_match_412(client, store, method):
+    response = call(client, method, "/items/1", {"If-Match": '"v0"'})
+    assert response.status_code == 412
+    assert response.json() == {"detail": "Precondition failed."}
+    assert "ETag" not in response.headers
+    assert store.calls[method.lower()] == 0
+
+
+@pytest.mark.parametrize(
+    "headers", [{"If-Match": "v1"}, {"If-None-Match": '"v1'}], ids=["im", "inm"]
+)
+def test_malformed_if_match_400(client, store, headers):
+    response = client.put("/items/1", json={"name": "new"}, headers=headers)
+    assert response.status_code == 400
+    assert response.json()["detail"].startswith("Malformed")
+    assert store.calls["put"] == 0
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH"])
+def test_put_success_fresh_validators(client, store, method):
+    response = call(client, method, "/items/1", {"If-Match": '"v1"'})
+    assert response.status_code == 200
+    assert response.json()["version"] == 2
+    assert response.headers["ETag"] == '"v2"'
+    assert response.headers["Last-Modified"] == "Tue, 02 Jan 2024 05:04:05 GMT"
+    # Once for the preconditions, once more for the fresh validators.
+    assert store.calls["load"] == 2
+
+
+def test_delete_success_no_validators(client, store):
+    response = client.delete("/items/1", headers={"If-Match": '"v1"'})
+    assert response.status_code == 204
+    assert "ETag" not in response.headers
+    assert "Last-Modified" not in response.headers
+    assert 1 not in store.items
+
+
+def test_unauthenticated_get_401_before_load(store):
+    client = TestClient(make_api(item_router(store), store))
+    response = client.get("/items/1", headers={"If-None-Match": '"v1"'})
+    assert response.status_code == 401
+    assert "ETag" not in response.headers
+    assert store.calls["auth"] == 1
+    assert store.calls["load"] == 0
+
+    response = client.get("/items/1", headers={"If-None-Match": '"v1"', **ALICE})
+    assert response.status_code == 304
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+@pytest.mark.parametrize(
+    "headers", [{"If-Match": '"stale"'}, {}], ids=["stale-not-412", "none-not-428"]
+)
+def test_unauthenticated_put_401(store, method, headers):
+    client = TestClient(make_api(item_router(store), store))
+    response = call(client, method, "/items/1", headers)
+    assert response.status_code == 401
+    assert "ETag" not in response.headers
+    assert store.calls["load"] == 0
+
+    authorized = call(client, method, "/items/1", {**headers, **ALICE})
+    assert authorized.status_code == (412 if headers else 428)
+
+
+def test_load_http404_uses_ninja_handler(store):
+    def load(request, pk: int):
+        raise Http404("no such item")
+
+    router = Router()
+
+    @router.get("/items/{pk}")
+    @scrudful(load=load, etag_func=etag)
+    def get_item(request, pk: int, obj):
+        raise AssertionError("not reached")
+
+    response = TestClient(router).get("/items/1")
+    assert response.status_code == 404
+    assert response.headers["Content-Type"].startswith("application/json")
+    assert response.json() == {"detail": "Not Found"}
+
+
+@pytest.mark.parametrize(
+    "method, headers",
+    list(itertools.product(METHODS, IF_HEADERS)),
+    ids=[f"{m}-{h}" for m, h in itertools.product(METHODS, IF_HEADERS)],
+)
+def test_hidden_resource_same_for_all_if_headers(client, store, method, headers):
+    hidden = call(client, method, f"/items/{HIDDEN}", headers)
+    missing = call(client, method, f"/items/{MISSING}", headers)
+    for response in (hidden, missing):
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Not Found"}
+        assert "ETag" not in response.headers
+        assert "Last-Modified" not in response.headers
+    assert dict(hidden.headers) == dict(missing.headers)
+    assert store.items[HIDDEN]["version"] == 7
+
+
+def test_load_none_follows_rfc(store):
+    client = TestClient(item_router(store, load=store.load_hidden_as_none))
+
+    response = client.put(
+        f"/items/{MISSING}", json={"name": "new"}, headers={"If-None-Match": "*"}
+    )
+    assert response.status_code == 201
+    assert store.calls["put"] == 1
+
+    response = client.put("/items/4", json={"name": "new"}, headers={"If-Match": '"x"'})
+    assert response.status_code == 412
+    assert store.calls["put"] == 1
+
+    response = client.get("/items/4")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}
+    assert store.calls["get"] == 1
+    assert "ETag" not in response.headers
+
+
+def test_handler_error_has_no_validators(store):
+    router = Router()
+
+    @router.put("/items/{pk}")
+    @scrudful(load=store.load, etag_func=etag, last_modified_func=modified, **LINKS)
+    def put_item(request, pk: int, obj, response: HttpResponse):
+        response["ETag"] = '"handler"'
+        raise HttpError(403, "Forbidden")
+
+    client = TestClient(router)
+    for method_headers in ({"If-Match": '"v1"'}, {"If-Match": "*"}):
+        response = client.put("/items/1", headers=method_headers)
+        assert response.status_code == 403
+        assert response.json() == {"detail": "Forbidden"}
+        assert "ETag" not in response.headers
+        assert "Last-Modified" not in response.headers
+
+
+def no_put_create(store: Store) -> None:
+    client = TestClient(item_router(store))
+    for method, headers in itertools.product(METHODS, IF_HEADERS):
+        hidden = call(client, method, f"/items/{HIDDEN}", headers)
+        missing = call(client, method, f"/items/{MISSING}", headers)
+        assert hidden.status_code == missing.status_code == 404
+        assert hidden.content == missing.content
+        assert dict(hidden.headers) == dict(missing.headers)
+
+
+def put_create_nothing_hidden(store: Store) -> None:
+    del store.items[HIDDEN]
+    client = TestClient(item_router(store, load=store.load_or_none))
+    response = client.put(
+        f"/items/{MISSING}", json={"name": "new"}, headers={"If-Match": '"v1"'}
+    )
+    assert response.status_code == 412
+    response = client.put(
+        f"/items/{MISSING}", json={"name": "new"}, headers={"If-None-Match": "*"}
+    )
+    assert response.status_code == 201
+    # The fresh validators describe the representation just created.
+    assert response.headers["ETag"] == '"v1"'
+    # Now it exists: a second create-only PUT fails.
+    response = client.put(
+        f"/items/{MISSING}", json={"name": "new"}, headers={"If-None-Match": "*"}
+    )
+    assert response.status_code == 412
+
+
+def put_create_with_hidden(store: Store) -> None:
+    client = TestClient(item_router(store, load=store.load_or_none))
+    headers = {"If-Match": '"v1"'}
+    # The documented trade-off: If-Match tells missing (412) from hidden (404).
+    missing = client.put(f"/items/{MISSING}", json={"name": "new"}, headers=headers)
+    hidden = client.put(f"/items/{HIDDEN}", json={"name": "new"}, headers=headers)
+    assert missing.status_code == 412
+    assert hidden.status_code == 404
+
+
+def hidden_as_missing(store: Store) -> None:
+    client = TestClient(item_router(store, load=store.load_hidden_as_none))
+    response = client.put(
+        f"/items/{HIDDEN}", json={"name": "new"}, headers={"If-None-Match": "*"}
+    )
+    assert response.status_code == 409
+    assert "ETag" not in response.headers
+    assert store.items[HIDDEN] == {
+        "id": HIDDEN,
+        "name": "b",
+        "version": 7,
+        "modified": MODIFIED,
+        "owner": "bob",
+    }
+    # Missing and hidden look the same to If-Match.
+    for pk in (HIDDEN, MISSING):
+        response = client.put(
+            f"/items/{pk}", json={"name": "new"}, headers={"If-Match": '"v7"'}
+        )
+        assert response.status_code == 412
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        no_put_create,
+        put_create_nothing_hidden,
+        put_create_with_hidden,
+        hidden_as_missing,
+    ],
+    ids=lambda pattern: pattern.__name__,
+)
+def test_load_patterns(store, pattern):
+    pattern(store)
+
+
+def test_head_routed_with_get(store):
+    router = Router()
+
+    @router.api_operation(["GET", "HEAD"], "/items/{pk}", response=ItemOut)
+    @scrudful(load=store.load, etag_func=etag, **LINKS)
+    def get_item(request, pk: int, obj):
+        store.calls["get"] += 1
+        return obj
+
+    client = TestClient(router)
+    response = client.request("HEAD", "/items/1")
+    assert response.status_code == 200
+    assert response.headers["ETag"] == '"v1"'
+    response = client.request("HEAD", "/items/1", headers={"If-None-Match": '"v1"'})
+    assert response.status_code == 304
+    assert response.headers["ETag"] == '"v1"'
+    assert store.calls["get"] == 1
+
+
+def test_params_are_validated_types(store):
+    router = Router()
+
+    @router.get("/items/{pk}")
+    @scrudful(load=store.load, etag_func=etag)
+    def get_item(request, pk: int, obj, q: int = 0):
+        return {"q": q}
+
+    response = TestClient(router).get("/items/1?q=5")
+    assert response.status_code == 200
+    assert store.load_params == [{"pk": 1, "q": 5}]
+    assert type(store.load_params[0]["pk"]) is int
+
+
+def test_hidden_params_not_in_openapi(store):
+    router = Router()
+
+    @router.get("/items/{pk}")
+    @scrudful(load=store.load, etag_func=etag)
+    def get_item(request, pk: int, obj: dict):
+        return obj
+
+    @router.get("/other/{pk}")
+    @scrudful(load=store.load, load_as="item", etag_func=etag)
+    def get_other(request, pk: int, response: HttpResponse, item: dict, **kwargs):
+        return item
+
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    api.add_router("", router)
+    paths = api.get_openapi_schema(path_prefix="")["paths"]
+    for path in ("/items/{pk}", "/other/{pk}"):
+        parameters = paths[path]["get"]["parameters"]
+        assert [parameter["name"] for parameter in parameters] == ["pk"]
+
+    params = inspect.signature(get_item).parameters
+    assert list(params) == ["request", "pk", "_scrudful_response"]
+    assert params["_scrudful_response"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["_scrudful_response"].annotation is HttpResponse
+    assert list(inspect.signature(get_other).parameters) == [
+        "request",
+        "pk",
+        "response",
+        "kwargs",
+    ]
+
+
+def test_openapi_constants(store):
+    assert CONDITIONAL_READ_RESPONSES == {
+        str(status): {"description": text} for status, text in READ_DESCRIPTIONS.items()
+    }
+    assert CONDITIONAL_WRITE_RESPONSES == {
+        str(status): {"description": text}
+        for status, text in WRITE_DESCRIPTIONS.items()
+    }
+    assert list(CONDITIONAL_READ_RESPONSES) == ["304", "400", "412"]
+    assert list(CONDITIONAL_WRITE_RESPONSES) == ["400", "412", "428"]
+
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    api.add_router("", item_router(store))
+    operations = api.get_openapi_schema(path_prefix="")["paths"]["/items/{pk}"]
+    assert operations["put"]["responses"]["428"] == CONDITIONAL_WRITE_RESPONSES["428"]
+    assert 200 in operations["put"]["responses"]  # ninja's own, as int
+    assert operations["get"]["responses"]["304"] == CONDITIONAL_READ_RESPONSES["304"]
+
+
+def test_decoration_errors(store):
+    def handler(request, pk: int, obj):
+        pass
+
+    with pytest.raises(TypeError, match="load"):
+        scrudful(etag_func=etag)
+    with pytest.raises(TypeError, match="load"):
+        scrudful(last_modified_func=modified)
+    with pytest.raises(TypeError, match="etag_func"):
+        scrudful(load=store.load, etag_func="v1")
+    with pytest.raises(TypeError, match="load"):
+        scrudful(load="items")
+    with pytest.raises(TypeError, match="'item'"):
+        scrudful(load=store.load, load_as="item")(handler)
+
+    def generator(request, pk: int, obj):
+        yield obj
+
+    async def async_generator(request, pk: int, obj):
+        yield obj
+
+    for func in (generator, async_generator):
+        with pytest.raises(TypeError, match="generator"):
+            scrudful(load=store.load)(func)
+
+
+def test_future_annotations_module():
+    client = TestClient(future_endpoints.make_router())
+    response = client.get("/items/1")
+    assert response.status_code == 200
+    assert response.json() == {"pk": 1, "name": "a"}
+    assert response.headers["ETag"] == '"v1"'
+    assert response.headers["X-Handler"] == "yes"
+
+    response = client.put("/items/1", json={"name": "b"}, headers={"If-Match": '"v1"'})
+    assert response.status_code == 200
+    assert response.json() == {"pk": 1, "name": "b"}
+    assert response.headers["ETag"] == '"v2"'
+    response = client.put("/items/1", json={"name": 1}, headers={"If-Match": '"v2"'})
+    assert response.status_code == 422
+
+
+def test_config_attribute(store):
+    @scrudful(load=store.load, load_as="item", etag_func=etag, **LINKS)
+    def get_item(request, pk: int, item):
+        pass
+
+    config = get_item._scrudful
+    assert config.kind == "item"
+    assert config.load == store.load
+    assert config.load_as == "item"
+    assert config.has_etag and not config.has_last_modified
+    assert config.schema_link_or_func == "/schemas/item"
+    assert config.context_link_or_func == "/contexts/item"
+    assert config.schema_rel_or_func is None
+    with pytest.raises(AttributeError):
+        config.kind = "list"
+
+
+def test_handler_headers_kept_and_link_joined(store):
+    router = Router()
+
+    @router.get("/items/{pk}")
+    @scrudful(load=store.load, etag_func=etag, last_modified_func=modified, **LINKS)
+    def get_item(request, pk: int, obj, response: HttpResponse):
+        response["ETag"] = '"own"'
+        response["Link"] = '</items/2>; rel="next"'
+        response["Access-Control-Expose-Headers"] = "X-Total"
+        response.set_cookie("seen", "1")
+        return {"id": obj["id"]}
+
+    response = TestClient(router).get("/items/1")
+    assert response.status_code == 200
+    assert response.headers["ETag"] == '"own"'
+    assert response.headers["Last-Modified"] == MODIFIED_HTTP
+    assert response.headers["Link"] == (
+        f'</items/2>; rel="next", {SCHEMA_LINK}, {CONTEXT_LINK}'
+    )
+    assert response.headers["Access-Control-Expose-Headers"] == "X-Total, ETag, Link"
+    assert response.cookies["seen"].value == "1"
+
+
+def test_returned_http_response_gets_the_headers(store):
+    router = Router()
+
+    @router.get("/items/{pk}")
+    @scrudful(load=store.load, etag_func=etag, **LINKS)
+    def get_item(request, pk: int, obj):
+        return JsonResponse({"id": obj["id"]}, status=203)
+
+    response = TestClient(router).get("/items/1")
+    assert response.status_code == 203
+    assert response.json() == {"id": 1}
+    assert response.headers["ETag"] == '"v1"'
+    assert response.headers["Link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+    assert {"ETag", "Link"} <= expose(response)
+
+
+def test_status_decides_the_validators(store):
+    router = Router()
+
+    @router.get("/status/{pk}", response={200: ItemOut, 404: Message})
+    @scrudful(load=store.load, etag_func=etag)
+    def returned_status(request, pk: int, obj):
+        return Status(404, {"detail": "gone"})
+
+    @router.get("/declared/{pk}", response={410: Message})
+    @scrudful(load=store.load, etag_func=etag)
+    def declared_code(request, pk: int, obj):
+        return {"detail": "gone"}
+
+    @router.get("/default/{pk}", response={200: ItemOut, 404: Message})
+    @scrudful(load=store.load, etag_func=etag)
+    def default_code(request, pk: int, obj):
+        return obj
+
+    @router.get("/tuple/{pk}", response={200: ItemOut, 404: Message})
+    @scrudful(load=store.load, etag_func=etag)
+    def returned_tuple(request, pk: int, obj):
+        return 404, {"detail": "gone"}
+
+    client = TestClient(router)
+    assert client.get("/status/1").status_code == 404
+    assert "ETag" not in client.get("/status/1").headers
+    assert client.get("/declared/1").status_code == 410
+    assert "ETag" not in client.get("/declared/1").headers
+    assert client.get("/default/1").headers["ETag"] == '"v1"'
+    with pytest.warns(DeprecationWarning):
+        response = client.get("/tuple/1")
+    assert response.status_code == 404
+    assert "ETag" not in response.headers
+
+
+def test_link_callables_get_request_and_object(store):
+    seen = []
+
+    def schema(request, obj):
+        seen.append((request.method, obj and obj["version"]))
+        return f"/schemas/item/{obj['version']}" if obj else "/schemas/new"
+
+    router = Router()
+
+    @router.api_operation(["GET", "PUT"], "/items/{pk}", response={200: ItemOut})
+    @scrudful(
+        load=store.load_or_none,
+        etag_func=etag,
+        schema_link_or_func=schema,
+        schema_rel_or_func=lambda request, obj: "profile",
+        context_link_or_func="/contexts/item",
+        context_type_or_func=lambda request, obj: "application/json",
+    )
+    def item(request, pk: int, obj):
+        if request.method == "PUT":
+            update(obj, "new")
+        return obj
+
+    client = TestClient(router)
+    response = client.get("/items/1")
+    assert response.headers["Link"] == (
+        '</schemas/item/1>; rel="profile"; type="application/json", '
+        '</contexts/item>; rel="http://www.w3.org/ns/json-ld#context"; '
+        'type="application/json"'
+    )
+    response = client.put("/items/1", headers={"If-Match": '"v1"'})
+    # After a PUT the links describe the object loaded again.
+    assert response.headers["Link"].startswith("</schemas/item/2>")
+    assert seen == [("GET", 1), ("PUT", 2)]
+
+
+def test_links_without_load(store):
+    router = Router()
+
+    @router.get("/items/{pk}")
+    @scrudful(
+        schema_link_or_func=lambda request, obj: f"/schemas/{obj}",
+        context_link_or_func="/contexts/item",
+    )
+    def get_item(request, pk: int, obj: str = "q"):
+        return {"obj": obj}
+
+    response = TestClient(router).get("/items/1?obj=x", headers={"If-Match": '"x"'})
+    assert response.status_code == 200
+    assert response.json() == {"obj": "x"}
+    assert "ETag" not in response.headers
+    assert response.headers["Link"].startswith("</schemas/None>")
+
+
+def test_load_without_validators_ignores_preconditions(store):
+    router = Router()
+
+    @router.put("/items/{pk}")
+    @scrudful(load=store.load, **LINKS)
+    def put_item(request, pk: int, obj):
+        return {"id": obj["id"]}
+
+    response = TestClient(router).put("/items/1", headers={"If-Match": '"stale"'})
+    assert response.status_code == 200
+    assert "ETag" not in response.headers
+    assert response.headers["Link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+    assert store.calls["load"] == 1
+
+
+@pytest.mark.parametrize("failing", ["etag_func", "schema_link_or_func"])
+def test_callback_errors_use_ninja_handlers(store, failing):
+    def fail(*args):
+        raise HttpError(403, "Forbidden")
+
+    options = {"etag_func": etag, "schema_link_or_func": "/schemas/item", failing: fail}
+    router = Router()
+
+    @router.get("/items/{pk}")
+    @scrudful(load=store.load, **options)
+    def get_item(request, pk: int, obj):
+        return {"id": obj["id"]}
+
+    response = TestClient(router).get("/items/1")
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Forbidden"}
+    assert "ETag" not in response.headers
+
+
+def test_naive_last_modified_uses_time_zone(store, settings):
+    settings.TIME_ZONE = "Europe/Paris"
+    store.items[1]["modified"] = datetime(2024, 1, 2, 4, 4, 5)
+    client = TestClient(item_router(store))
+    assert client.get("/items/1").headers["Last-Modified"] == MODIFIED_HTTP
