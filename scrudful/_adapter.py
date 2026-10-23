@@ -6,6 +6,7 @@ everything that touches their framework's request and response objects.
 
 from __future__ import annotations
 
+import copy
 import inspect
 import sys
 from collections.abc import Callable, Sequence
@@ -44,6 +45,23 @@ WRITE_DESCRIPTIONS = {
     428: "Precondition Required: this request must be conditional "
     "(send If-Match or If-Unmodified-Since).",
 }
+
+#: :data:`READ_DESCRIPTIONS` as OPTIONS responses (string status keys).
+READ_RESPONSES = {
+    str(status): {"description": text} for status, text in READ_DESCRIPTIONS.items()
+}
+#: :data:`WRITE_DESCRIPTIONS` as OPTIONS responses (string status keys).
+WRITE_RESPONSES = {
+    str(status): {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
+}
+#: The request body description and success status of each write method.
+_WRITES = {
+    "post": ("The content for the resource to be created.", "201"),
+    "put": ("The new content of the resource.", "200"),
+    "patch": ("The changes to apply to the resource.", "200"),
+    "delete": (None, "204"),
+}
+_STATUS_TEXT = {"200": "OK", "201": "Created", "204": "No Content"}
 
 
 class Headers(Protocol):
@@ -147,3 +165,100 @@ def resolve_annotation(annotation: Any, globalns: dict[str, Any]) -> Any:
         except Exception:
             return None
     return annotation
+
+
+# --- OPTIONS descriptions ----------------------------------------------------
+#
+# The operations of an OPTIONS body (an OpenAPI-like Path Item), shared by the
+# DRF and django-ninja adapters. ``content`` is a Media Type map such as
+# ``{"application/json": {"schema": <url>, "context": <url>}}``; falsy means
+# none. ``conditional``: whether the method's preconditions are evaluated.
+
+
+def describe_read(content: dict[str, Any] | None, conditional: bool) -> dict[str, Any]:
+    """Describe a GET: its 200 and, when conditional, the 304, 400 and 412."""
+    ok: dict[str, Any] = {"description": "OK"}
+    if content:
+        ok["content"] = content
+    responses = {"200": ok}
+    if conditional:
+        responses.update(copy.deepcopy(READ_RESPONSES))
+    return {"responses": responses}
+
+
+def describe_write(
+    method: str,
+    content: dict[str, Any] | None,
+    conditional: bool,
+    has_etag: bool,
+    has_last_modified: bool,
+) -> dict[str, Any]:
+    """Describe a ``post``, ``put``, ``patch`` or ``delete``.
+
+    ``content`` describes the request body (DELETE has none). A conditional
+    POST gets the 400 and 412, since it is evaluated but never required to be
+    conditional; the other methods also get the 428 and the precondition
+    header ``parameters`` (see :func:`conditional_header_parameters`).
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is not one of the four.
+    """
+    if method not in _WRITES:
+        raise ValueError(f"not a write method: {method!r}")
+    body_description, status = _WRITES[method]
+    metadata: dict[str, Any] = {}
+    if body_description is not None:
+        request_body: dict[str, Any] = {
+            "description": body_description,
+            "required": True,
+        }
+        if content:
+            request_body["content"] = content
+        metadata["requestBody"] = request_body
+    metadata["responses"] = {status: {"description": _STATUS_TEXT[status]}}
+    if conditional:
+        if method == "post":
+            metadata["responses"].update(
+                {code: copy.deepcopy(WRITE_RESPONSES[code]) for code in ("400", "412")}
+            )
+        else:
+            metadata["responses"].update(copy.deepcopy(WRITE_RESPONSES))
+            metadata["parameters"] = conditional_header_parameters(
+                has_etag, has_last_modified
+            )
+    return metadata
+
+
+def conditional_header_parameters(
+    has_etag: bool, has_last_modified: bool
+) -> list[dict[str, Any]] | None:
+    """Describe the precondition headers a conditional write accepts.
+
+    One of them is required; a header is marked ``required`` when it is the
+    only one accepted. ``None`` without validators.
+    """
+    headers = []
+    if has_etag:
+        headers.append(("If-Match", "The entity-tag of the current representation."))
+    if has_last_modified:
+        headers.append(
+            (
+                "If-Unmodified-Since",
+                "The Last-Modified date of the current representation.",
+            )
+        )
+    if not headers:
+        return None
+    either = " Either If-Match or If-Unmodified-Since is required."
+    return [
+        {
+            "in": "header",
+            "name": name,
+            "schema": {"type": "string"},
+            "required": len(headers) == 1,
+            "description": description if len(headers) == 1 else description + either,
+        }
+        for name, description in headers
+    ]
