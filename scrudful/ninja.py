@@ -3,7 +3,8 @@
 The HTTP logic lives in :mod:`scrudful.conditional` and :mod:`scrudful.utils`;
 this module only adapts it to django-ninja's operations. Validators and
 precondition results are computed only from the object the operation's
-``load`` callable returns, i.e. from what authorization already approved.
+``load`` callable returns, i.e. from what authorization already approved (for
+a create, from the object the handler created).
 
 Order of execution
     ``@scrudful`` wraps the operation's function, so everything it does runs
@@ -91,6 +92,37 @@ Entities and Links
     called with the request and the loaded object (after a PUT/PATCH, the one
     loaded again), or ``None`` without ``load``.
 
+Create
+    :func:`scrudful_create` decorates a POST on a collection that creates an
+    item. It is the flow above with a preset, not a separate one: there is no
+    ``load`` and no precondition evaluation (the If-* headers are ignored and
+    a create is never answered with 428), so authorization is the handler's,
+    decided from the parsed body. A plain return value gets status 201: the
+    wrapper returns ``ninja.Status(201, result)``, so the operation must
+    declare 201 (e.g. ``response={201: ItemOut}``) or ``...`` in
+    ``response=``; with ``response=ItemOut`` (a 200) or no ``response=``,
+    ninja raises ``ConfigError``. ``ScrudfulResponse.status`` and a returned
+    ``Status`` or ``HttpResponse`` set another status.
+
+    The created object is ``ScrudfulResponse.created`` if the handler set it,
+    else the body the handler returned (the value of a returned ``Status``).
+    A returned ``HttpResponse`` is not an object: set ``created`` to get the
+    Location and validators. A 201 response with a created object gets:
+
+    - ``Location``: ``location_func(request, obj)``, not called when the
+      response already has one (from the handler or ``ScrudfulResponse``);
+    - ``ETag`` and ``Last-Modified``: from ``etag_func`` and
+      ``last_modified_func`` applied to the created object. Pass the
+      callbacks of the item operations, so the 201 carries the validators a
+      GET of the new item sends and a client can edit it without a GET;
+    - the item entity's Links (``responses[201]``, if declared, replaces it);
+      link callables get the created object.
+
+    Any other status (e.g. a ``Status(400, ...)``) gets none of these, only
+    the Links of ``responses[status]``; their link callables get
+    ``ScrudfulResponse.created``, or ``None`` if unset. The values set on
+    ``ScrudfulResponse`` and headers the handler set win, as below.
+
 The runtime response
     A handler parameter annotated :class:`ScrudfulResponse` receives a fresh
     instance on every request; like the ``load_as`` parameter, it is hidden
@@ -177,6 +209,7 @@ __all__ = [
     "Entity",
     "ScrudfulResponse",
     "scrudful",
+    "scrudful_create",
 ]
 
 #: OpenAPI descriptions of the responses ``@scrudful`` can produce for GET/HEAD
@@ -270,7 +303,10 @@ class ScrudfulResponse:
         The entity whose Links this response gets, in place of the declared
         one.
     created : object
-        The object an operation created, unset by default.
+        The object a :func:`scrudful_create` operation created, whose
+        Location and validators a 201 gets. Unset by default: the handler's
+        return value is used (the value of a returned ``Status``). Ignored by
+        :func:`scrudful`.
     """
 
     status: int | None = None
@@ -285,12 +321,16 @@ class ScrudfulResponse:
 class _Config:
     """What a scrudful decorator declared, set as ``view_func._scrudful``.
 
-    The six ``schema_*`` / ``context_*`` fields are the default (2xx) response
-    entity, also available as :attr:`entity`.
+    The six ``schema_*`` / ``context_*`` fields are the default response
+    entity, also available as :attr:`entity`: of 2xx responses for an item
+    operation, of 201 responses (the created item) for a create operation.
     """
 
+    #: ``"item"`` (:func:`scrudful`) or ``"create"`` (:func:`scrudful_create`).
     kind: str
     load: Callable[..., Any] | None = None
+    #: ``location_func(request, obj)`` of a create operation.
+    location_func: Callable[[Any, Any], Any] | None = None
     load_as: str = "obj"
     etag_func: Callable[[Any], Any] | None = None
     last_modified_func: Callable[[Any], Any] | None = None
@@ -319,11 +359,27 @@ class _Config:
             }
         )
 
+    @property
+    def default_status(self) -> int | None:
+        """The status of a plain return value, unless the handler sets one."""
+        return 201 if self.kind == "create" else None
+
+    @property
+    def evaluates_preconditions(self) -> bool:
+        """Whether the If-* headers are evaluated before the handler runs."""
+        return self.kind == "item" and self.has_validators
+
+    def has_default_entity(self, status: int) -> bool:
+        """Whether a response with ``status`` gets the default entity."""
+        if self.kind == "create":
+            return status == 201
+        return 200 <= status < 300
+
     def response_entity(self, status: int) -> Entity | None:
         """The declared entity of a response with ``status``."""
         if status in self.responses:
             return self.responses[status]
-        return self.entity if 200 <= status < 300 else None
+        return self.entity if self.has_default_entity(status) else None
 
     @property
     def has_etag(self) -> bool:
@@ -475,9 +531,137 @@ def scrudful(
             "computed from the object load returns"
         )
 
+    return _decorator(config, "@scrudful")
+
+
+def scrudful_create(
+    *,
+    location_func: Callable[[Any, Any], Any],
+    etag_func: Callable[[Any], Any] | None = None,
+    last_modified_func: Callable[[Any], Any] | None = None,
+    schema_link_or_func: Any = None,
+    schema_rel_or_func: Any = None,
+    schema_type_or_func: Any = None,
+    context_link_or_func: Any = None,
+    context_rel_or_func: Any = None,
+    context_type_or_func: Any = None,
+    request: Entity | None = None,
+    responses: Mapping[int, Entity] | None = None,
+    error: Entity | None = None,
+) -> Callable[[Handler], Handler]:
+    """Decorate a django-ninja operation creating an item (POST on a collection).
+
+    ``@scrudful_create(...)`` must sit *below* the operation decorator, which
+    must declare a 201 response::
+
+        @router.post("/items", response={201: ItemOut})
+        @scrudful_create(
+            location_func=lambda request, item: f"/items/{item.pk}",
+            etag_func=lambda item: item.version,
+            last_modified_func=lambda item: item.modified_at,
+            schema_link_or_func="/schemas/item",
+            context_link_or_func="/contexts/item",
+        )
+        def create_item(request, payload: ItemIn):
+            return Item.objects.create(**payload.dict())
+
+    It is :func:`scrudful` with a preset: no ``load`` and no precondition
+    evaluation, a default status of 201, and on a 201 the ``Location``, the
+    Links and the validators of the created item (see "Create" in the module
+    docstring). Pass the same validator callbacks and link arguments as the
+    item operations, so the 201 carries the validators a detail GET sends.
+    The handler may be ``async def``, and then the callables may be too.
+
+    Parameters
+    ----------
+    location_func : callable
+        ``location_func(request, obj)`` returns the URL of the created object
+        ``obj``, as an IRI (encoded as a URI), or ``None`` for no Location.
+    etag_func : callable, optional
+        ``etag_func(obj)``: the entity-tag of the created object, as for
+        :func:`scrudful` (no ``load`` is needed: the validators are computed
+        from the created object).
+    last_modified_func : callable, optional
+        ``last_modified_func(obj)``: the modification time of the created
+        object, as for :func:`scrudful`.
+    schema_link_or_func : str or callable, optional
+        URL of the item's schema, sent on 201 responses: this argument and the
+        five after it are the item entity, with the meaning they have for
+        :func:`scrudful`. Link callables get the created object.
+    schema_rel_or_func : str or callable, optional
+        ``rel`` of the schema link. Defaults to ``"describedBy"``.
+    schema_type_or_func : str or callable, optional
+        ``type`` of the schema link. Defaults to ``"application/json"``.
+    context_link_or_func : str or callable, optional
+        URL of the item's JSON-LD context, sent on 201 responses.
+    context_rel_or_func : str or callable, optional
+        ``rel`` of the context link. Defaults to
+        ``"http://www.w3.org/ns/json-ld#context"``.
+    context_type_or_func : str or callable, optional
+        ``type`` of the context link. Defaults to ``"application/ld+json"``.
+    request : Entity, optional
+        The schema and context of the request body, described by OPTIONS.
+        Defaults to the item entity (the body is an item, as for DRF's
+        create).
+    responses : mapping of int to Entity, optional
+        The response entity of each status, e.g. ``{400: Entity(...)}`` for a
+        ``Status(400, ...)`` the handler returns. ``responses[201]`` replaces
+        the item entity's Links on 201 responses.
+    error : Entity, optional
+        The entity of scrudful's own 400, 412 and 428 bodies. A create
+        operation produces none; it is kept for OPTIONS.
+
+    Raises
+    ------
+    TypeError
+        If ``location_func`` or a validator callback isn't callable, if
+        ``request``, ``error`` or a value of ``responses`` isn't an
+        :class:`Entity` or a key of ``responses`` isn't an HTTP status code,
+        if the handler is a generator, or if the handler is sync and
+        ``location_func``, a validator callback or a link callable (also
+        inside an entity) is ``async def``.
+    """
+    if not callable(location_func):
+        raise TypeError(
+            f"location_func must be callable, not {type(location_func).__name__}"
+        )
+    check_validators(etag_func, last_modified_func)
+    _check_entity("request", request)
+    _check_entity("error", error)
+    item = Entity(
+        schema_link_or_func=schema_link_or_func,
+        schema_rel_or_func=schema_rel_or_func,
+        schema_type_or_func=schema_type_or_func,
+        context_link_or_func=context_link_or_func,
+        context_rel_or_func=context_rel_or_func,
+        context_type_or_func=context_type_or_func,
+    )
+    config = _Config(
+        kind="create",
+        location_func=location_func,
+        etag_func=etag_func,
+        last_modified_func=last_modified_func,
+        **{
+            entity_field.name: getattr(item, entity_field.name)
+            for entity_field in fields(Entity)
+        },
+        request=item if request is None else request,
+        responses=_entities_by_status(responses),
+        error=error,
+    )
+    return _decorator(config, "@scrudful_create")
+
+
+def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
+    """The decorator of ``config``: one request flow for every kind.
+
+    ``name`` is the public decorator's, for error messages.
+    """
+    load, load_as = config.load, config.load_as
+
     def decorator(handler: Handler) -> Handler:
         if inspect.isgeneratorfunction(handler) or inspect.isasyncgenfunction(handler):
-            raise TypeError("@scrudful does not support generator handlers")
+            raise TypeError(f"{name} does not support generator handlers")
         if not inspect.iscoroutinefunction(handler):
             _check_sync_callables(config, handler)
         hidden = _wrapper_signature(handler, load_as if load is not None else None)
@@ -504,7 +688,7 @@ def scrudful(
                 obj = yield load, (request,), params
                 values[load_as] = obj
 
-            if config.has_validators:
+            if config.evaluates_preconditions:
                 etag, last_modified = yield from _validators(config, obj)
                 result = evaluate_preconditions(
                     method,
@@ -522,8 +706,9 @@ def scrudful(
 
             content = yield handler, (request,), values
 
-            if meta.status is not None and not _has_status(content):
-                content = Status(meta.status, content)
+            default = config.default_status if meta.status is None else meta.status
+            if default is not None and not _has_status(content):
+                content = Status(default, content)
             headers, status = _response_and_status(
                 content, response, declared.get(method)
             )
@@ -535,7 +720,15 @@ def scrudful(
             )
             if meta.location is not None and "Location" not in headers:
                 headers["Location"] = iri_to_uri(str(meta.location))
-            if config.has_validators:
+            if config.kind == "create":
+                created = meta.created
+                if created is _UNSET and status == 201:
+                    created = _body(content)
+                if created is not _UNSET:
+                    obj = created
+                    if status == 201:
+                        yield from _created_headers(config, headers, request, obj)
+            elif config.has_validators:
                 refresh, send = validator_policy(method, status)
                 if refresh:
                     obj = yield load, (request,), params
@@ -582,6 +775,29 @@ def scrudful(
         return wrapper  # type: ignore[return-value]
 
     return decorator
+
+
+def _body(content: Any) -> Any:
+    """The body the handler returned, or ``_UNSET`` for an ``HttpResponse``."""
+    if isinstance(content, HttpResponseBase):
+        return _UNSET
+    if isinstance(content, Status):
+        return content.value
+    if isinstance(content, tuple) and len(content) == 2:
+        return content[1]
+    return content
+
+
+def _created_headers(
+    config: _Config, headers: HttpResponseBase, request: HttpRequest, obj: Any
+) -> _Flow[None]:
+    """Set the Location and validators of the created object ``obj``."""
+    if "Location" not in headers:
+        location = yield config.location_func, (request, obj), {}
+        if location is not None:
+            headers["Location"] = iri_to_uri(str(location))
+    etag, last_modified = yield from _validators(config, obj)
+    set_validator_headers(headers, etag, last_modified)
 
 
 def _run_sync(flow: _Flow[T]) -> T:
@@ -654,6 +870,7 @@ def _check_sync_callables(config: _Config, handler: Callable[..., Any]) -> None:
 def _declared_callables(config: _Config) -> Iterator[tuple[str, Any]]:
     """``(name, value)`` of every argument that may be a callable."""
     yield "load", config.load
+    yield "location_func", config.location_func
     yield "etag_func", config.etag_func
     yield "last_modified_func", config.last_modified_func
     entities: list[tuple[str, Entity | None]] = [
