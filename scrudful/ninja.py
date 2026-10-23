@@ -49,9 +49,13 @@ Validators
     handler, as a ``JsonResponse`` (304 without a body), so the operation's
     ``response`` schema does not apply to them; describe them in OpenAPI with
     ``openapi_extra={"responses": CONDITIONAL_READ_RESPONSES}`` (or
-    :data:`CONDITIONAL_WRITE_RESPONSES`). They are built fresh: nothing can
-    have written to ninja's temporal response yet, because ninja creates it
-    after authentication and only hands it to the operation's function.
+    :data:`CONDITIONAL_WRITE_RESPONSES`). They are built fresh, without the
+    headers and cookies of ninja's temporal response: with ninja's stock
+    ``NinjaAPI.create_temporal_response`` that response is still empty at this
+    point, because ninja creates it after authentication and only hands it to
+    the operation's function. An API overriding ``create_temporal_response``
+    to preset headers or cookies does not get them on these 304, 400, 412 and
+    428 responses.
 
     The preconditions are evaluated before the handler runs, so two concurrent
     requests carrying the same If-Match can both pass. Strict lost-update
@@ -93,7 +97,6 @@ from typing import Any, TypeVar
 
 from django.http import HttpRequest, HttpResponse, HttpResponseBase
 from ninja import Status
-from ninja.utils import contribute_operation_callback
 
 from scrudful._adapter import (
     DEFAULT_CONTEXT_REL,
@@ -122,16 +125,18 @@ __all__ = [
 #: OpenAPI descriptions of the responses ``@scrudful`` can produce for GET/HEAD
 #: without calling the handler. Pass it to the operation decorator, e.g.
 #: ``openapi_extra={"responses": CONDITIONAL_READ_RESPONSES}``, or merge it with
-#: your own. The keys are strings, as OpenAPI requires.
-CONDITIONAL_READ_RESPONSES: dict[str, dict[str, str]] = {
-    str(status): {"description": text} for status, text in READ_DESCRIPTIONS.items()
+#: your own. The keys are ints, as ninja keys an operation's responses, so a
+#: status the operation also declares in ``response=`` (e.g. a 412 schema) is
+#: merged into one entry; the JSON schema output has string keys.
+CONDITIONAL_READ_RESPONSES: dict[int, dict[str, str]] = {
+    status: {"description": text} for status, text in READ_DESCRIPTIONS.items()
 }
 
 #: OpenAPI descriptions of the responses ``@scrudful`` can produce for
 #: PUT/PATCH/DELETE without calling the handler, e.g.
 #: ``openapi_extra={"responses": CONDITIONAL_WRITE_RESPONSES}``.
-CONDITIONAL_WRITE_RESPONSES: dict[str, dict[str, str]] = {
-    str(status): {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
+CONDITIONAL_WRITE_RESPONSES: dict[int, dict[str, str]] = {
+    status: {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
 }
 
 Handler = TypeVar("Handler", bound=Callable[..., Any])
@@ -333,9 +338,13 @@ def scrudful(
 
         wrapper.__signature__ = signature  # type: ignore[attr-defined]
         wrapper._scrudful = config  # type: ignore[attr-defined]
-        contribute_operation_callback(
-            wrapper, functools.partial(_capture_declared_status, declared)
-        )
+        # ninja calls these at the end of ``Operation.__init__``. A fresh list:
+        # ``functools.wraps`` copied the handler's (e.g. from ``@paginate``) by
+        # reference, and appending to it would change the handler.
+        wrapper._ninja_contribute_to_operation = [  # type: ignore[attr-defined]
+            *getattr(handler, "_ninja_contribute_to_operation", []),
+            functools.partial(_capture_declared_status, declared),
+        ]
         return wrapper  # type: ignore[return-value]
 
     return decorator

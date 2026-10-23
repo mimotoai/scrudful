@@ -2,6 +2,7 @@
 
 import inspect
 import itertools
+import json
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -527,22 +528,48 @@ def test_hidden_params_not_in_openapi(store):
 
 
 def test_openapi_constants(store):
+    # Int keys, like ninja's own, so that they merge with declared codes.
     assert CONDITIONAL_READ_RESPONSES == {
-        str(status): {"description": text} for status, text in READ_DESCRIPTIONS.items()
+        status: {"description": text} for status, text in READ_DESCRIPTIONS.items()
     }
     assert CONDITIONAL_WRITE_RESPONSES == {
-        str(status): {"description": text}
-        for status, text in WRITE_DESCRIPTIONS.items()
+        status: {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
     }
-    assert list(CONDITIONAL_READ_RESPONSES) == ["304", "400", "412"]
-    assert list(CONDITIONAL_WRITE_RESPONSES) == ["400", "412", "428"]
+    assert list(CONDITIONAL_READ_RESPONSES) == [304, 400, 412]
+    assert list(CONDITIONAL_WRITE_RESPONSES) == [400, 412, 428]
 
     api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
     api.add_router("", item_router(store))
-    operations = api.get_openapi_schema(path_prefix="")["paths"]["/items/{pk}"]
-    assert operations["put"]["responses"]["428"] == CONDITIONAL_WRITE_RESPONSES["428"]
-    assert 200 in operations["put"]["responses"]  # ninja's own, as int
-    assert operations["get"]["responses"]["304"] == CONDITIONAL_READ_RESPONSES["304"]
+    schema = api.get_openapi_schema(path_prefix="")
+    operations = schema["paths"]["/items/{pk}"]
+    assert operations["put"]["responses"][428] == CONDITIONAL_WRITE_RESPONSES[428]
+    assert operations["get"]["responses"][304] == CONDITIONAL_READ_RESPONSES[304]
+    assert '"428": {"description": ' in json.dumps(schema, sort_keys=True)
+
+
+def test_openapi_constants_merge_with_declared_codes(store):
+    router = Router()
+
+    @router.put(
+        "/items/{pk}",
+        response={200: ItemOut, 412: Message},
+        openapi_extra={"responses": CONDITIONAL_WRITE_RESPONSES},
+    )
+    @scrudful(load=store.load, etag_func=etag)
+    def put_item(request, pk: int, obj):
+        return obj
+
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    api.add_router("", router)
+    schema = api.get_openapi_schema(path_prefix="")
+    responses = schema["paths"]["/items/{pk}"]["put"]["responses"]
+    assert sorted(responses, key=str) == [200, 400, 412, 428]
+    assert responses[412]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/Message"
+    }
+    assert responses[412]["description"] == "Precondition Failed."
+    encoded = json.dumps(schema, sort_keys=True)
+    assert encoded.count('"412":') == 1
 
 
 def test_decoration_errors(store):
@@ -771,3 +798,26 @@ def test_naive_last_modified_uses_time_zone(store, settings):
     store.items[1]["modified"] = datetime(2024, 1, 2, 4, 4, 5)
     client = TestClient(item_router(store))
     assert client.get("/items/1").headers["Last-Modified"] == MODIFIED_HTTP
+
+
+def test_load_not_called_when_validation_fails(store):
+    client = TestClient(item_router(store))
+    response = client.put("/items/1", json={"name": 1}, headers={"If-Match": '"v1"'})
+    assert response.status_code == 422
+    response = client.get("/items/one", headers={"If-None-Match": '"v1"'})
+    assert response.status_code == 422
+    assert store.calls["load"] == 0
+
+
+def test_handler_contribute_list_not_shared(store):
+    def callback(operation):
+        pass
+
+    def handler(request, pk: int, obj):
+        pass
+
+    handler._ninja_contribute_to_operation = [callback]
+    wrapper = scrudful(load=store.load)(handler)
+    assert handler._ninja_contribute_to_operation == [callback]
+    assert wrapper._ninja_contribute_to_operation[0] is callback
+    assert len(wrapper._ninja_contribute_to_operation) == 2
