@@ -8,9 +8,9 @@ list envelope, and an automatic OPTIONS answer (the spec's "HTTP Schema
 Resource"). Install it with ``pip install "scrudful[ninja]"`` (django-ninja
 1.7 or newer). It does not need Django REST Framework.
 
-The example project in ``examples/ninja`` uses every feature on a ``Role``
-resource scoped by an ``rbac_context``; its tests (``examples/ninja/tests``)
-show the HTTP exchanges.
+The example project in ``examples/ninja`` uses the three decorators, entities,
+error Links and OPTIONS on a ``Role`` resource scoped by an ``rbac_context``;
+its tests (``examples/ninja/tests``) show the HTTP exchanges.
 
 The rule everything follows: **no precondition result and no validator is
 computed from anything but the object (or queryset) authorization already
@@ -111,6 +111,11 @@ precondition, 412 when it is stale, 400 for a malformed ``If-Match`` /
 ``If-None-Match``, and fresh validators on 2xx. With ``error=Entity(...)``
 scrudful's own 400, 412 and 428 bodies carry that entity's Links. ``load`` is
 required when ``etag_func`` or ``last_modified_func`` is set.
+
+The ``schema_*`` / ``context_*`` arguments are the default entity: its Links go
+on 2xx responses, except a 204, which has no body (so a DELETE answering 204
+gets none). ``responses={204: Entity(...)}`` or ``ScrudfulResponse.entity``
+still put Links on a 204 if you want them.
 
 ninja routes HEAD only to operations that list it, as above.
 

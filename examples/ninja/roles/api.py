@@ -31,7 +31,6 @@ from scrudful.ninja import (
     CONDITIONAL_READ_RESPONSES,
     CONDITIONAL_WRITE_RESPONSES,
     Entity,
-    ScrudfulResponse,
     ScrudfulRouter,
     scrudful,
     scrudful_create,
@@ -286,10 +285,7 @@ def update_role(request: HttpRequest, pk: int, payload: RolePatch, role: Role) -
     openapi_extra={"responses": CONDITIONAL_WRITE_RESPONSES},
 )
 @scrudful(**ITEM, load_as="role")
-def delete_role(
-    request: HttpRequest, pk: int, role: Role, meta: ScrudfulResponse
-) -> None:
+def delete_role(request: HttpRequest, pk: int, role: Role) -> None:
+    # The 204 has no body, so it gets none of the role entity's Links.
     if not Role.objects.filter(pk=role.pk, etag=role.etag).delete()[0]:
         raise HttpError(412, "Precondition failed.")
-    # No body: no Links (the default entity would describe a role).
-    meta.entity = Entity()

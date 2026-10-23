@@ -92,7 +92,8 @@ Entities and Links
     body: OPTIONS uses it, and it puts no header on the response. The Links of
     a response the handler produces are those of, in this order: the
     ``ScrudfulResponse.entity`` the handler set; ``responses[status]``; the
-    default entity, for 2xx responses only; else none. Link callables are
+    default entity, for 2xx responses other than 204 (which has no body);
+    else none. Link callables are
     called with the request and the loaded object (after a PUT/PATCH, the one
     loaded again), or ``None`` without ``load``.
 
@@ -466,8 +467,8 @@ class _Config:
     """What a scrudful decorator declared, set as ``view_func._scrudful``.
 
     The six ``schema_*`` / ``context_*`` fields are the item entity, also
-    available as :attr:`entity`: the default entity of 2xx responses for an
-    item operation, of 201 responses (the created item) for a create
+    available as :attr:`entity`: the default entity of 2xx responses but 204
+    for an item operation, of 201 responses (the created item) for a create
     operation, and the ``link`` of each entry of a list operation's envelope,
     whose responses get :attr:`collection`.
     """
@@ -501,7 +502,8 @@ class _Config:
     #: queryset the handler returned).
     list_etag_func: Callable[[Any], Any] | None = None
     list_last_modified_func: Callable[[Any], Any] | None = None
-    #: The collection entity of a list operation: its 2xx responses' Links.
+    #: The collection entity of a list operation: its 2xx responses' Links
+    #: (but a 204's).
     collection: Entity | None = None
     #: A list operation's default and maximum ``page_size``.
     page_size: int | None = None
@@ -528,10 +530,13 @@ class _Config:
         return self.kind == "item" and self.has_validators
 
     def has_default_entity(self, status: int) -> bool:
-        """Whether a response with ``status`` gets the default entity."""
+        """Whether a response with ``status`` gets the default entity.
+
+        Not a 204: it has no body for the entity to describe.
+        """
         if self.kind == "create":
             return status == 201
-        return 200 <= status < 300
+        return 200 <= status < 300 and status != 204
 
     @property
     def default_entity(self) -> Entity | None:
@@ -643,7 +648,8 @@ def scrudful(
         discarded.
     schema_link_or_func : str or callable, optional
         URL of the schema of the 2xx response body: this argument and the
-        five after it are the default response entity (see ``responses``).
+        five after it are the default response entity (see ``responses``),
+        not sent on a 204, which has no body.
         If no value is given, no schema link is sent. Each ``*_or_func``
         argument is a value or a callable ``func(request, obj)``, where
         ``obj`` is the loaded object (after a PUT/PATCH, the one loaded
@@ -923,7 +929,7 @@ def scrudful_list(
         URL of the collection's schema (e.g. one built with
         :func:`scrudful.collection.collection_schema`): this argument and the
         five after it are the collection entity, whose Links 2xx responses
-        get. Link callables get the queryset.
+        (but 204) get. Link callables get the queryset.
     list_schema_rel_or_func : str or callable, optional
         ``rel`` of the collection schema link.
     list_schema_type_or_func : str or callable, optional

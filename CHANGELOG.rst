@@ -23,7 +23,9 @@ django-ninja adapter
     for it, so an unconditional write gets 428, ``If-None-Match: *`` gets 412
     and ``If-Match: *`` passes (RFC 9110 §13.1.1-2). 304, 400, 412 and 428 as
     in the other adapters; fresh validators after a PUT/PATCH (``load`` is
-    called again).
+    called again). The default entity's Links go on 2xx responses except a
+    204, which has no body; an explicit ``responses[204]`` or
+    ``ScrudfulResponse.entity`` still applies.
   * ``@scrudful_create(...)``: 201 with ``Location``, the item's Links and the
     created item's ``ETag`` and ``Last-Modified``.
   * ``@scrudful_list(...)``: the handler returns the authorized queryset; the
@@ -54,8 +56,8 @@ django-ninja adapter
 * Added ``scrudful.collection``: ``collection_schema()`` and
   ``collection_context()`` build the JSON Schema (draft 2020-12) and the
   JSON-LD context of the scrud list envelope. It is framework-neutral.
-* Added the example project ``examples/ninja``, a ``Role`` resource using every
-  feature of the adapter.
+* Added the example project ``examples/ninja``, a ``Role`` resource using the
+  three decorators, entities, error Links and OPTIONS.
 
 Internal
 --------

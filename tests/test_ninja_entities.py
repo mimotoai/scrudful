@@ -616,3 +616,45 @@ def test_async_operation_error_links(store):
     assert response.headers["Link"] == (
         '</schemas/problem>; rel="describedBy"; type="application/json"'
     )
+
+
+def test_no_default_entity_links_on_204(store):
+    """A 204 has no body, so it gets none of the default (2xx) entity's
+    Links; an explicit ``responses[204]`` or ``ScrudfulResponse.entity``
+    still applies."""
+    router = Router()
+    options = dict(load=store.load, etag_func=etag, **LINKS)
+
+    @router.delete("/items/{pk}", response={204: None})
+    @scrudful(**options)
+    def delete_item(request, pk: int, obj):
+        return Status(204, None)
+
+    @router.delete("/declared/{pk}", response={204: None})
+    @scrudful(**options, responses={204: ERROR})
+    def delete_declared(request, pk: int, obj):
+        return Status(204, None)
+
+    @router.delete("/runtime/{pk}", response={204: None})
+    @scrudful(**options)
+    def delete_runtime(request, pk: int, obj, meta: ScrudfulResponse):
+        meta.entity = ERROR
+        return Status(204, None)
+
+    @router.post("/items/{pk}/touch", response={204: None})
+    @scrudful(**LINKS)
+    def touch(request, pk: int):
+        return Status(204, None)
+
+    client = TestClient(router)
+    for path in ("/items/1", "/declared/1", "/runtime/1"):
+        response = client.delete(path, headers={"If-Match": '"v1"'})
+        assert response.status_code == 204
+        if path == "/items/1":
+            assert "Link" not in response.headers
+            assert "Link" not in expose(response)
+        else:
+            assert response.headers["Link"] == ERROR_LINK
+    response = client.post("/items/1/touch")
+    assert response.status_code == 204
+    assert "Link" not in response.headers
