@@ -4,16 +4,23 @@ All annotations here are strings naming this module's globals. ninja evaluates
 the strings it finds on a view function in that function's ``__globals__``,
 which for the wrapper are scrudful.ninja's. The hidden parameters (the loaded
 object and the handler's own ``HttpResponse``) must still be recognised.
-Used by ``test_ninja_adapter.py``.
+``put_unchecked_item`` annotates its hidden parameter with a name imported only
+under ``TYPE_CHECKING``, which can't be evaluated: the other annotations must
+still be. Used by ``test_ninja_adapter.py``.
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 from django.http import HttpRequest, HttpResponse
 from ninja import Router, Schema
 from ninja.errors import HttpError
 
 from scrudful.ninja import scrudful
+
+if TYPE_CHECKING:
+    from collections import OrderedDict as TypeCheckingOnly
 
 
 class Body(Schema):
@@ -58,10 +65,28 @@ def put_item(
     return {"pk": item.pk, "name": item.name}
 
 
+@scrudful(load=load, load_as="item", etag_func=etag)
+def put_unchecked_item(
+    request: HttpRequest, pk: int, body: Body, item: TypeCheckingOnly
+) -> dict[str, object]:
+    item.name = body.name
+    item.version += 1
+    return {"pk": item.pk, "name": item.name}
+
+
 def make_router() -> Router:
     ITEMS.clear()
     ITEMS[1] = Item(1, "a")
     router = Router()
     router.get("/items/{pk}")(get_item)
     router.put("/items/{pk}")(put_item)
+    return router
+
+
+def make_type_checking_router() -> Router:
+    """``PUT /items/{pk}`` with ``put_unchecked_item``."""
+    ITEMS.clear()
+    ITEMS[1] = Item(1, "a")
+    router = Router()
+    router.put("/items/{pk}")(put_unchecked_item)
     return router

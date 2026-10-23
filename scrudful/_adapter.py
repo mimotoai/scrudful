@@ -175,6 +175,42 @@ def evaluated_signature(func: Callable[..., Any]) -> inspect.Signature:
         return inspect.signature(func, annotation_format=Format.FORWARDREF)
 
 
+def resolved_signature(func: Callable[..., Any]) -> inspect.Signature:
+    """``func``'s signature with each string annotation evaluated in its module.
+
+    For endpoints written with ``from __future__ import annotations``, as
+    :func:`evaluated_signature`, but each annotation is evaluated on its own:
+    one that can't be (e.g. a name imported only under ``TYPE_CHECKING``) is
+    left as it is, and the others are still evaluated.
+    """
+    try:
+        signature = inspect.signature(func)
+    except NameError:
+        # Python 3.14+, see evaluated_signature.
+        if sys.version_info < (3, 14):
+            raise
+        from annotationlib import Format
+
+        signature = inspect.signature(func, annotation_format=Format.FORWARDREF)
+    globalns = getattr(inspect.unwrap(func), "__globals__", {})
+
+    def resolve(annotation: Any) -> Any:
+        if isinstance(annotation, str):
+            try:
+                return eval(annotation, globalns)  # same as typing/inspect
+            except Exception:
+                pass
+        return annotation
+
+    return signature.replace(
+        parameters=[
+            param.replace(annotation=resolve(param.annotation))
+            for param in signature.parameters.values()
+        ],
+        return_annotation=resolve(signature.return_annotation),
+    )
+
+
 def resolve_annotation(annotation: Any, globalns: dict[str, Any]) -> Any:
     """Evaluate a string or forward-reference annotation in ``globalns``.
 

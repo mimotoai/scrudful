@@ -9,14 +9,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
-from django.http import Http404, HttpResponse, JsonResponse
+from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from ninja import NinjaAPI, Router, Schema, Status
 from ninja.errors import HttpError
 from ninja.security import APIKeyHeader
 from ninja.throttling import BaseThrottle
 from ninja.testing import TestClient
 
-from scrudful._adapter import READ_DESCRIPTIONS, WRITE_DESCRIPTIONS
+from scrudful._adapter import READ_DESCRIPTIONS, WRITE_DESCRIPTIONS, resolved_signature
 from scrudful.ninja import (
     CONDITIONAL_READ_RESPONSES,
     CONDITIONAL_WRITE_RESPONSES,
@@ -650,6 +650,37 @@ def test_future_annotations_module():
     assert response.headers["ETag"] == '"v2"'
     response = client.put("/items/1", json={"name": 1}, headers={"If-Match": '"v2"'})
     assert response.status_code == 422
+
+
+def test_future_annotations_with_an_unresolvable_hidden_annotation():
+    """The hidden parameter's annotation is imported only under TYPE_CHECKING.
+
+    Each annotation is evaluated on its own, so the visible ones (``Body``)
+    still reach ninja as classes.
+    """
+    client = TestClient(future_endpoints.make_type_checking_router())
+    response = client.put("/items/1", json={"name": "b"}, headers={"If-Match": '"v1"'})
+    assert response.status_code == 200
+    assert response.json() == {"pk": 1, "name": "b"}
+    assert response.headers["ETag"] == '"v2"'
+    response = client.put("/items/1", json={"name": 1}, headers={"If-Match": '"v2"'})
+    assert response.status_code == 422
+    response = client.put("/items/1", json={"name": "c"})
+    assert response.status_code == 428
+
+
+def test_resolved_signature_evaluates_each_annotation():
+    signature = resolved_signature(future_endpoints.put_unchecked_item.__wrapped__)
+    annotations = {
+        name: param.annotation for name, param in signature.parameters.items()
+    }
+    assert annotations == {
+        "request": HttpRequest,
+        "pk": int,
+        "body": future_endpoints.Body,
+        "item": "TypeCheckingOnly",
+    }
+    assert signature.return_annotation == dict[str, object]
 
 
 def test_conditional_responses_defined_once():

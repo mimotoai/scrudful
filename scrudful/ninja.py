@@ -321,9 +321,9 @@ from scrudful._adapter import (
     check_validators,
     describe_read,
     describe_write,
-    evaluated_signature,
     expose_headers,
     resolve_annotation,
+    resolved_signature,
     set_validator_headers,
     validator_policy,
 )
@@ -1789,7 +1789,10 @@ def _wrapper_signature(
     (by identity); one is appended (keyword-only, with a private name) unless
     the handler declares it.
     """
-    signature = evaluated_signature(handler)
+    # Each annotation evaluated on its own: one that can't be (e.g. the
+    # hidden parameter's, imported only under TYPE_CHECKING) stays a string
+    # and the others reach ninja evaluated.
+    signature = resolved_signature(handler)
     if load_as is not None and load_as not in signature.parameters:
         raise TypeError(
             f"{handler.__qualname__}() has no parameter {load_as!r} to receive "
