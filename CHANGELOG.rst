@@ -32,7 +32,9 @@ django-ninja adapter
     envelope schema in OpenAPI, and optional collection validators.
   * ``Entity`` declares request and per-status response entities (schema and
     JSON-LD context Links) and the ``error`` entity carried as Links by
-    scrudful's own 400, 412 and 428 bodies; ``ScrudfulResponse`` is the
+    scrudful's own 400, 412 and 428 bodies (an argument of ``@scrudful`` and
+    ``@scrudful_list``; ``@scrudful_create`` has none, since a create
+    produces none of these responses); ``ScrudfulResponse`` is the
     handler's place to set the status, ``Location``, validators, Links or
     created object of one response.
   * ``ScrudfulRouter`` answers OPTIONS on every path with a scrudful

@@ -417,7 +417,6 @@ async def async_value(*args: Any) -> str:
         ({"schema_link_or_func": async_value}, "schema_link_or_func"),
         ({"request": Entity(async_value)}, "request.schema_link_or_func"),
         ({"responses": {400: Entity(async_value)}}, r"responses\[400\]"),
-        ({"error": Entity(async_value)}, "error.schema_link_or_func"),
     ],
 )
 def test_create_sync_handler_rejects_async_callables(options, name):
@@ -438,7 +437,6 @@ def test_create_config():
         location_func=lambda request, item: "/x",
         etag_func=etag,
         responses={400: ERROR},
-        error=ERROR,
         **LINKS,
     )
     def handler(request): ...
@@ -452,7 +450,9 @@ def test_create_config():
     # The request body is an item, as for DRF's create.
     assert config.request == config.entity
     assert dict(config.responses) == {400: ERROR}
-    assert config.error == ERROR
+    # A create produces no 400, 412 or 428 of its own: no error entity.
+    assert config.error is None
+    assert "error" not in inspect.signature(scrudful_create).parameters
     assert config.has_etag
     assert not config.has_last_modified
 
@@ -470,7 +470,6 @@ def test_create_config():
         ({"location_func": None}, "location_func"),
         ({"location_func": lambda r, o: "/x", "etag_func": "v1"}, "etag_func"),
         ({"location_func": lambda r, o: "/x", "request": "/s"}, "request"),
-        ({"location_func": lambda r, o: "/x", "error": "/s"}, "error"),
         ({"location_func": lambda r, o: "/x", "responses": {"201": ERROR}}, "resp"),
     ],
 )

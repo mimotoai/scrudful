@@ -725,7 +725,6 @@ def scrudful_create(
     context_type_or_func: Any = None,
     request: Entity | None = None,
     responses: Mapping[int, Entity] | None = None,
-    error: Entity | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation creating an item (POST on a collection).
 
@@ -784,17 +783,14 @@ def scrudful_create(
     responses : mapping of int to Entity, optional
         The response entity of each status, e.g. ``{400: Entity(...)}`` for a
         ``Status(400, ...)`` the handler returns. ``responses[201]`` replaces
-        the item entity's Links on 201 responses.
-    error : Entity, optional
-        The entity of scrudful's own 400, 412 and 428 bodies. A create
-        operation produces none (and OPTIONS lists none for it), so it is
-        unused.
+        the item entity's Links on 201 responses. There is no ``error``
+        argument: a create produces no 400, 412 or 428 of its own.
 
     Raises
     ------
     TypeError
         If ``location_func`` or a validator callback isn't callable, if
-        ``request``, ``error`` or a value of ``responses`` isn't an
+        ``request`` or a value of ``responses`` isn't an
         :class:`Entity` or a key of ``responses`` isn't an HTTP status code,
         if the handler is a generator, or if the handler is sync and
         ``location_func``, a validator callback or a link callable (also
@@ -806,7 +802,6 @@ def scrudful_create(
         )
     check_validators(etag_func, last_modified_func)
     _check_entity("request", request)
-    _check_entity("error", error)
     item = Entity(
         schema_link_or_func=schema_link_or_func,
         schema_rel_or_func=schema_rel_or_func,
@@ -826,7 +821,6 @@ def scrudful_create(
         },
         request=item if request is None else request,
         responses=_entities_by_status(responses),
-        error=error,
     )
     return _decorator(config, "@scrudful_create")
 

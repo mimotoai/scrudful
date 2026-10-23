@@ -439,8 +439,6 @@ def test_options_entities():
         **LINKS,
         request=Entity(),  # no request entity
         responses={409: Entity(schema_link_or_func="/schemas/conflict")},
-        # A create produces no 400/412/428 itself: not described.
-        error=error,
     )
     def create_job(request, payload: ItemIn):
         return {"id": 1}

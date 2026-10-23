@@ -351,8 +351,9 @@ Notes:
   must sit **below** the operation decorator.
 * ``load`` returns the object, ``None`` ("no current representation", RFC
   9110 semantics, e.g. for a PUT that may create) or raises, through ninja's
-  exception handlers. Whether PUT may create and how hidden rows are reported
-  is yours to choose; the docs show the four patterns.
+  exception handlers; an object it returns exists even if its validators are
+  ``None``. Whether PUT may create and how hidden rows are reported is yours
+  to choose; the docs show the four patterns.
 * Use ``ScrudfulRouter`` (and ``NinjaAPI(default_router=ScrudfulRouter(...))``
   for operations on the API itself): it answers OPTIONS with the
   semantic-http "HTTP Schema Resource", the same for every client, without
