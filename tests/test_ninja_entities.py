@@ -658,3 +658,71 @@ def test_no_default_entity_links_on_204(store):
     response = client.post("/items/1/touch")
     assert response.status_code == 204
     assert "Link" not in response.headers
+
+
+def test_link_callables_get_the_reloaded_object_without_validators(store):
+    """After a 2xx PUT/PATCH, link callables get what ``load`` returns again.
+
+    No validators are configured: the reload is for the Link callables. The
+    handler replaces the row, so the first loaded object is stale.
+    """
+    seen = []
+
+    def schema(request, obj):
+        seen.append(obj["version"])
+        return f"/schemas/item/v{obj['version']}"
+
+    router = Router()
+
+    @router.api_operation(["PUT", "PATCH"], "/items/{pk}", response=ItemOut)
+    @scrudful(load=store.load, schema_link_or_func=schema)
+    def put_item(request, pk: int, obj):
+        store.items[pk] = {**obj, "version": obj["version"] + 1}
+        return store.items[pk]
+
+    client = TestClient(router)
+    for method, version in (("PUT", 2), ("PATCH", 3)):
+        response = client.request(method, "/items/1")
+        assert response.status_code == 200
+        assert response.headers["Link"] == (
+            f'</schemas/item/v{version}>; rel="describedBy"; type="application/json"'
+        )
+    assert seen == [2, 3]
+    assert store.calls["load"] == 4
+
+
+def test_no_reload_without_validators_or_link_callables(store):
+    router = Router()
+
+    @router.put("/items/{pk}", response=ItemOut)
+    @scrudful(load=store.load, **LINKS)
+    def put_item(request, pk: int, obj):
+        return obj
+
+    response = TestClient(router).put("/items/1")
+    assert response.status_code == 200
+    assert response.headers["Link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+    assert store.calls["load"] == 1
+
+
+def test_operation_registered_on_several_paths(store):
+    """Each registration keeps its own declared status (and so its entity)."""
+
+    @scrudful(load=store.load, responses={202: RESULTS}, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    for order in (("x", "y"), ("y", "x")):
+        router = Router()
+        for name in order:
+            if name == "x":
+                router.get("/x/{pk}", response=ItemOut)(get_item)
+            else:
+                router.get("/y/{pk}", response={202: ItemOut})(get_item)
+        client = TestClient(router)
+        response = client.get("/x/1")
+        assert response.status_code == 200
+        assert response.headers["Link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}", order
+        response = client.get("/y/1")
+        assert response.status_code == 202
+        assert response.headers["Link"] == RESULTS_LINK, order

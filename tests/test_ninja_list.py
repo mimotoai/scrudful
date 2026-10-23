@@ -2,7 +2,7 @@
 
 import inspect
 import uuid
-from typing import Any
+from typing import Any, List, Optional, Union
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -457,6 +457,63 @@ def test_list_requires_collection_response(response):
 
 
 @pytest.mark.parametrize(
+    "response, match",
+    [
+        # Python 3.14 writes Optional[X] as X | None.
+        (
+            Optional[List[ItemOut]],
+            r"(Optional\[List\[ItemOut\]\]|List\[ItemOut\] \| None) must be a list",
+        ),
+        (list[ItemOut] | None, r"list\[ItemOut\] \| None must be a list"),
+        ({200: Union[list[ItemOut], Message]}, r"\[ItemOut\], Message\]|\| Message"),
+        (list, "response list names no item type"),
+        (List, "response List names no item type"),
+        ({200: tuple}, "response tuple names no item type"),
+    ],
+    ids=["Optional", "or-None", "Union", "list", "List", "tuple"],
+)
+def test_list_collection_response_must_name_one_item_type(response, match):
+    """The envelope is always sent, and its entries need an item schema."""
+    router = Router()
+    decorator = router.get("/items", response=response)
+    wrapped = scrudful_list(href_func=href)(lambda request: [])
+    with pytest.raises(ConfigError, match=match):
+        decorator(wrapped)
+
+
+def test_list_registered_on_several_paths(items):
+    """Each registration keeps its own declared statuses and envelope code."""
+
+    @scrudful_list(href_func=href, list_etag_func=lambda qs: "n", **LIST_LINKS)
+    def list_items(request):
+        if request.path.endswith("/b"):
+            return Status(206, Item.objects.all())
+        return Item.objects.all()
+
+    for order in (("a", "b"), ("b", "a")):
+        router = Router()
+        for name in order:
+            if name == "a":
+                router.get("/a", response=list[ItemOut])(list_items)
+            else:
+                router.get("/b", response={200: Message, 206: list[ItemOut]})(
+                    list_items
+                )
+        api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+        # Mounted twice: ninja clones the operations.
+        api.add_router("/one", router, url_name_prefix="one")
+        api.add_router("/two", router, url_name_prefix="two")
+        client = TestClient(api)
+        for prefix in ("/one", "/two"):
+            for name, status in (("a", 200), ("b", 206)):
+                response = client.get(f"{prefix}/{name}")
+                assert response.status_code == status, (order, prefix, name)
+                assert response.json()["count"] == 3
+                assert response.headers["ETag"] == '"n"'
+                assert response.headers["Link"] == LIST_LINK
+
+
+@pytest.mark.parametrize(
     "query, status",
     [
         ("page=0", 422),
@@ -544,6 +601,92 @@ def test_list_async_handler(items):
     assert response.status_code == 304
     response = async_to_sync(client.get)("/items?page=3")
     assert response.status_code == 404
+
+
+@pytest.fixture
+def hops(monkeypatch) -> list[Any]:
+    """The functions ``scrudful.ninja`` runs through ``sync_to_async``."""
+    import scrudful.ninja
+
+    calls: list[Any] = []
+    original = scrudful.ninja.sync_to_async
+
+    def counting(func, *args, **kwargs):
+        calls.append(func)
+        return original(func, *args, **kwargs)
+
+    monkeypatch.setattr(scrudful.ninja, "sync_to_async", counting)
+    return calls
+
+
+def async_list_router(**options: Any) -> Router:
+    router = Router()
+
+    @router.get("/items", response=list[ItemOut])
+    @scrudful_list(**{"href_func": href, **options})
+    async def list_items(request):
+        return Item.objects.all()
+
+    return router
+
+
+def item_link(request, item):
+    return f"/schemas/item/{item.pk}"
+
+
+@pytest.mark.parametrize("size", [1, 2, 3])
+def test_async_list_page_in_one_thread_hop(db, hops, size):
+    """With sync per-item callables, the whole page takes one thread hop."""
+    for name in "abcdef":
+        Item.objects.create(name=name)
+    client = TestAsyncClient(
+        async_list_router(**ITEM_OPTIONS, context_rel_or_func=lambda r, i: "context")
+    )
+    response = async_to_sync(client.get)(f"/items?page_size={size}")
+    assert response.status_code == 200
+    assert len(response.json()["content"]) == size
+    assert len(hops) == 1
+
+
+def test_async_list_async_per_item_callable(db, hops):
+    """An async per-item callable is awaited: the others take a hop each."""
+    items = [Item.objects.create(name=name) for name in "abc"]
+
+    async def async_etag(item):
+        return f"a{item.version}"
+
+    client = TestAsyncClient(
+        async_list_router(etag_func=async_etag, schema_link_or_func=item_link)
+    )
+    response = async_to_sync(client.get)("/items")
+    assert response.status_code == 200
+    assert [entry["etag"] for entry in response.json()["content"]] == ['"a1"'] * 3
+    assert [entry["link"] for entry in response.json()["content"]] == [
+        f'</schemas/item/{item.pk}>; rel="describedBy"; type="application/json"'
+        for item in items
+    ]
+    # The slice, then href_func and the link callable of each item.
+    assert len(hops) == 1 + 2 * 3
+
+
+def test_async_list_sync_callable_returning_an_awaitable(db, hops):
+    """In the page's thread hop too, an awaitable a sync callable returns is
+    awaited."""
+    items = [Item.objects.create(name=name) for name in "ab"]
+
+    def awaitable_href(request, item):
+        async def value():
+            return href(request, item)
+
+        return value()
+
+    client = TestAsyncClient(async_list_router(href_func=awaitable_href))
+    response = async_to_sync(client.get)("/items")
+    assert response.status_code == 200
+    assert [entry["href"] for entry in response.json()["content"]] == [
+        f"http://testlocation/items/{item.pk}" for item in items
+    ]
+    assert len(hops) == 1
 
 
 def test_list_unauthenticated_401(items):

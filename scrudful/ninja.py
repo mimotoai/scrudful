@@ -291,11 +291,12 @@ import functools
 import inspect
 import math
 import re
+import types
 import warnings
 from collections.abc import Callable, Generator, Iterator, Mapping
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
-from typing import Any, NamedTuple, TypeVar, get_args
+from typing import Any, NamedTuple, TypeVar, Union, get_args, get_origin
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from asgiref.sync import async_to_sync, sync_to_async
@@ -1139,13 +1140,18 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             _check_sync_callables(config, handler)
         hidden = _wrapper_signature(handler, load_as if load is not None else None)
         response_name = hidden.response_name
-        # The single response code each method's operation declares, if any.
-        declared: dict[str, int | None] = {}
-        # A list operation's collection response, per method.
-        collections: dict[str, _CollectionResponse] = {}
+        asynchronous = inspect.iscoroutinefunction(handler)
+        # In an async operation with sync per-item callables, a page is built
+        # in one call (one thread hop), not one call per callable.
+        page_in_one_call = asynchronous and not _has_async_item_callables(config)
 
-        def flow(request: HttpRequest, values: dict[str, Any]) -> _Flow[Any]:
-            """The request flow; each call of a user callable is a ``yield``."""
+        def flow(
+            request: HttpRequest, values: dict[str, Any], answers: _Answers
+        ) -> _Flow[Any]:
+            """The request flow; each call of a user callable is a ``yield``.
+
+            ``answers`` is what the running operation declares.
+            """
             response: HttpResponse = (
                 values[response_name]
                 if hidden.pass_response
@@ -1185,15 +1191,13 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             default = config.default_status if meta.status is None else meta.status
             if default is not None and not _has_status(content):
                 content = Status(default, content)
-            headers, status = _response_and_status(
-                content, response, declared.get(method)
-            )
+            headers, status = _response_and_status(content, response, answers.declared)
             list_etag = list_last_modified = None
             if (
                 config.kind == "list"
                 and not isinstance(content, HttpResponseBase)
-                and method in collections
-                and collections[method].includes(status)
+                and answers.collection is not None
+                and answers.collection.includes(status)
             ):
                 # The queryset is the authorized object: the collection's
                 # preconditions are evaluated now, then the page is built.
@@ -1215,7 +1219,12 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                         early = yield from _early_response(config, result, request, obj)
                         _keep_handler_headers(early, response)
                         return early
-                page = yield from _page(config, request, obj, pagination)
+                page = _page(config, request, obj, pagination)
+                if page_in_one_call:
+                    # The count, the slice and every entry's values.
+                    page = yield _run_in_thread, (page,), {}
+                else:
+                    page = yield from page
                 content = _with_body(content, page)
             # Explicit values first: the computed ones never overwrite a header.
             set_validator_headers(
@@ -1229,62 +1238,88 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 created = meta.created
                 if created is _UNSET and status == 201:
                     created = _body(content)
-                if created is not _UNSET:
-                    obj = created
-                    if status == 201:
-                        yield from _created_headers(config, headers, request, obj)
-            elif config.kind == "list":
+                # None and _UNSET: no created object, nothing to describe.
+                obj = None if created is _UNSET else created
+                if status == 201 and obj is not None:
+                    yield from _created_headers(config, headers, request, obj)
+            if meta.entity is not None:
+                if not isinstance(meta.entity, Entity):
+                    raise TypeError(
+                        "ScrudfulResponse.entity must be an Entity, not "
+                        f"{type(meta.entity).__name__}"
+                    )
+                entity = meta.entity
+            elif config.kind == "create" and obj is None:
+                # The item entity describes the created object: without one,
+                # only an explicit ``responses[status]``.
+                entity = config.responses.get(status)
+            else:
+                entity = config.response_entity(status)
+            if config.kind == "list":
                 # None unless the collection's validators were computed.
                 if validator_policy(method, status)[1]:
                     set_validator_headers(headers, list_etag, list_last_modified)
-            elif config.has_validators:
+            elif config.kind == "item" and load is not None:
                 refresh, send = validator_policy(method, status)
-                if refresh:
+                if refresh and (config.has_validators or _has_callables(entity)):
+                    # What was just written: for the validators and the Links.
                     obj = yield load, (request,), params
-                    etag, last_modified = yield from _item_validators(config, obj)
-                if send:
+                    if config.has_validators:
+                        etag, last_modified = yield from _item_validators(config, obj)
+                if send and config.has_validators:
                     set_validator_headers(headers, etag, last_modified)
-            if meta.entity is None:
-                entity = config.response_entity(status)
-            elif isinstance(meta.entity, Entity):
-                entity = meta.entity
-            else:
-                raise TypeError(
-                    "ScrudfulResponse.entity must be an Entity, not "
-                    f"{type(meta.entity).__name__}"
-                )
             if entity is not None:
                 yield from _add_links(headers, entity, request, obj)
             expose_headers(headers)
             return content
 
-        # ninja builds an AsyncOperation for a coroutine function: the wrapper
-        # is one exactly when the handler is.
-        if inspect.iscoroutinefunction(handler):
+        def bind(answers: _Answers) -> Callable[..., Any]:
+            """The wrapper running :func:`flow` with ``answers``."""
+            # ninja builds an AsyncOperation for a coroutine function: the
+            # wrapper is one exactly when the handler is.
+            if asynchronous:
 
-            @functools.wraps(handler)
-            async def wrapper(request: HttpRequest, **values: Any) -> Any:
-                return await _run_async(flow(request, values))
+                @functools.wraps(handler)
+                async def wrapper(request: HttpRequest, **values: Any) -> Any:
+                    return await _run_async(flow(request, values, answers))
 
-        else:
+            else:
 
-            @functools.wraps(handler)
-            def wrapper(request: HttpRequest, **values: Any) -> Any:
-                return _run_sync(flow(request, values))
+                @functools.wraps(handler)
+                def wrapper(request: HttpRequest, **values: Any) -> Any:
+                    return _run_sync(flow(request, values, answers))
 
-        wrapper.__signature__ = hidden.signature  # type: ignore[attr-defined]
-        wrapper._scrudful = config  # type: ignore[attr-defined]
+            wrapper.__signature__ = hidden.signature  # type: ignore[attr-defined]
+            wrapper._scrudful = config  # type: ignore[attr-defined]
+            return wrapper
+
+        def bind_operation(operation: Any) -> None:
+            """Give ``operation`` a wrapper bound to its own declarations.
+
+            Called by ninja at the end of ``Operation.__init__``. The function
+            may be registered on several paths, with different ``response=``:
+            each operation runs its own wrapper, which ninja's clones of it
+            (one per mount of the router) share, with its response models.
+            """
+            collection = (
+                _envelope_response(operation) if config.kind == "list" else None
+            )
+            operation.view_func = bind(
+                _Answers(_declared_status(operation), collection)
+            )
+
+        # Registered with ninja, which replaces it in each operation by the
+        # wrapper :func:`bind_operation` binds (called directly, it declares
+        # nothing: a plain return value is a 200).
+        wrapper = bind(_Answers())
         # ninja calls these at the end of ``Operation.__init__``. A fresh list:
         # ``functools.wraps`` copied the handler's (e.g. from ``@paginate``) by
         # reference, and appending to it would change the handler.
         wrapper._ninja_contribute_to_operation = [  # type: ignore[attr-defined]
             *getattr(handler, "_ninja_contribute_to_operation", []),
-            functools.partial(_capture_declared_status, declared),
+            bind_operation,
         ]
         if config.kind == "list":
-            wrapper._ninja_contribute_to_operation.append(
-                functools.partial(_envelope_response, collections)
-            )
             # The query parameters, passed to the wrapper as ``_PAGINATION``
             # (as ninja's ``contribute_operation_args`` does, on a fresh list).
             wrapper._ninja_contribute_args = [  # type: ignore[attr-defined]
@@ -1346,36 +1381,66 @@ class _CollectionResponse(NamedTuple):
         return status == self.code if status in self.codes else self.code is ...
 
 
-def _envelope_response(
-    collections: dict[str, _CollectionResponse], operation: Any
-) -> None:
+def _envelope_response(operation: Any) -> _CollectionResponse:
     """Replace the operation's collection response by the envelope.
 
     The first response declared as a collection, e.g. ``List[ItemOut]``,
-    becomes ``Scrudful<Item>Page``, as ninja's ``@paginate`` does. Called by
-    ninja at the end of ``Operation.__init__``.
+    becomes ``Scrudful<Item>Page``, as ninja's ``@paginate`` does. Called when
+    ninja builds the operation.
 
     Raises
     ------
     ninja.errors.ConfigError
-        If the operation declares no collection response.
+        If the operation declares no collection response, or one that is not
+        a list, set or tuple of one item type (e.g. ``Optional[List[ItemOut]]``
+        or a bare ``list``).
     """
     for code, model in operation.response_models.items():
         if model is None or model is NOT_SET:
             continue
         annotation = model.model_fields["response"].annotation
         if is_collection_type(annotation):
-            page = _page_model(get_args(annotation)[0])
+            page = _page_model(_collection_item(annotation, operation))
             operation.response_models[code] = operation._create_response_model(page)
-            for method in operation.methods:
-                collections[method.upper()] = _CollectionResponse(
-                    code, frozenset(operation.response_models)
-                )
-            return
+            return _CollectionResponse(code, frozenset(operation.response_models))
     raise ConfigError(
         f"{operation.view_func.__qualname__}() has no collection response "
         "(e.g. response=List[ItemOut]), which @scrudful_list requires"
     )
+
+
+def _collection_item(annotation: Any, operation: Any) -> Any:
+    """The item type of the collection response ``annotation``.
+
+    Raises
+    ------
+    ninja.errors.ConfigError
+        If ``annotation`` is a union (the envelope is always sent, so it is
+        never ``None``) or names no item type.
+    """
+    name = operation.view_func.__qualname__
+    if get_origin(annotation) in (Union, types.UnionType):
+        raise ConfigError(
+            f"{name}(): the collection response {_type_name(annotation)} must "
+            "be a list, set or tuple of the item schema, e.g. "
+            "response=List[ItemOut]: @scrudful_list always sends the envelope, "
+            "never None or another type"
+        )
+    args = get_args(annotation)
+    if not args or args[0] is Ellipsis:
+        raise ConfigError(
+            f"{name}(): the collection response {_type_name(annotation)} names "
+            "no item type, which @scrudful_list needs for the envelope's "
+            "entries: declare e.g. response=List[ItemOut]"
+        )
+    return args[0]
+
+
+def _type_name(annotation: Any) -> str:
+    """``annotation`` as written, without module prefixes."""
+    if isinstance(annotation, type) and not get_args(annotation):
+        return annotation.__name__
+    return re.sub(r"\b(?:[A-Za-z_]\w*\.)+(?=[A-Za-z_])", "", repr(annotation))
 
 
 @functools.cache
@@ -1466,6 +1531,15 @@ def _page(
     return dict(zip(PAGE_FIELDS, values))
 
 
+def _has_async_item_callables(config: _Config) -> bool:
+    """Whether a callable :func:`_page` calls for each item is async."""
+    item_callables = [config.href_func, config.etag_func, config.last_modified_func]
+    item_callables += [
+        getattr(config.entity, entity_field.name) for entity_field in fields(Entity)
+    ]
+    return any(_is_async_callable(func) for func in item_callables)
+
+
 def _slice(queryset: Any, number: int, size: int) -> tuple[int, list[Any]]:
     """The item count of ``queryset`` and the items of page ``number``.
 
@@ -1535,11 +1609,12 @@ def _created_headers(
     set_validator_headers(headers, etag, last_modified)
 
 
-def _run_sync(flow: _Flow[T]) -> T:
+def _run_sync(flow: _Flow[T], *, in_thread: bool = False) -> T:
     """Run ``flow``, calling the callables it yields directly.
 
     The decorator already rejected the declared ``async def`` callables; this
     catches those set at request time (``ScrudfulResponse.entity``).
+    ``in_thread``: see :func:`_run_in_thread`.
     """
     result = None
     while True:
@@ -1553,6 +1628,22 @@ def _run_sync(flow: _Flow[T]) -> T:
                 "need an async def handler"
             )
         result = func(*args, **kwargs)
+        if in_thread and inspect.isawaitable(result):
+            result = async_to_sync(_await)(result)
+
+
+def _run_in_thread(flow: _Flow[T]) -> T:
+    """Run ``flow``, of sync callables only, in one call of an async operation.
+
+    :func:`_run_async` runs this call in one ``sync_to_async`` thread, instead
+    of one thread per callable. As in :func:`_call_async`, an awaitable a sync
+    callable returns is awaited, on the event loop (``async_to_sync``).
+    """
+    return _run_sync(flow, in_thread=True)
+
+
+async def _await(awaitable: Any) -> Any:
+    return await awaitable
 
 
 async def _run_async(flow: _Flow[T]) -> T:
@@ -1674,6 +1765,13 @@ def _validators(
     return etag, last_modified
 
 
+def _has_callables(entity: Entity | None) -> bool:
+    """Whether a value of ``entity`` is a callable (called with the object)."""
+    return entity is not None and any(
+        callable(getattr(entity, entity_field.name)) for entity_field in fields(Entity)
+    )
+
+
 def _add_links(
     headers: HttpResponseBase, entity: Entity, request: HttpRequest, obj: Any
 ) -> _Flow[None]:
@@ -1752,16 +1850,22 @@ def _response_and_status(
     return temporal, 200 if declared is None else declared
 
 
-def _capture_declared_status(declared: dict[str, int | None], operation: Any) -> None:
-    """Record the operation's single declared response code, per method.
+def _declared_status(operation: Any) -> int | None:
+    """The operation's single declared response code, if it has one.
 
-    ninja uses it as the status of a plain return value. Called by ninja at the
-    end of ``Operation.__init__``.
+    ninja uses it as the status of a plain return value (200 otherwise).
     """
     codes = list(operation.response_models)
-    code = codes[0] if len(codes) == 1 and isinstance(codes[0], int) else None
-    for method in operation.methods:
-        declared[method.upper()] = code
+    return codes[0] if len(codes) == 1 and isinstance(codes[0], int) else None
+
+
+class _Answers(NamedTuple):
+    """What an operation declares in ``response=``, for its request flow."""
+
+    #: The status of a plain return value, see :func:`_declared_status`.
+    declared: int | None = None
+    #: A list operation's collection response.
+    collection: _CollectionResponse | None = None
 
 
 class _HiddenParameters(NamedTuple):

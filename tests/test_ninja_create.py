@@ -296,17 +296,108 @@ def test_create_http_response_needs_meta_created(store, counted):
         return JsonResponse({"id": item["id"]}, status=201)
 
     client = TestClient(router)
-    # A returned HttpResponse is not the created object.
+    # A returned HttpResponse is not the created object: without one, the
+    # 201 gets no Location, validators or item Links.
     response = client.post("/items", json={"name": "c"})
     assert response.status_code == 201
     assert "Location" not in response.headers
     assert "ETag" not in response.headers
-    assert response.headers["Link"] == ITEM_LINK
+    assert "Link" not in response.headers
     assert counted.calls == {}
 
     response = client.post("/items?meta=1", json={"name": "c"})
     assert response.headers["Location"] == "/items/3"
     assert response.headers["ETag"] == '"v1"'
+    assert response.headers["Link"] == ITEM_LINK
+
+
+def test_create_without_a_created_object(store):
+    """A 201 whose body is None: no Location, validators or item Links.
+
+    The callables would get ``None`` for the item: they aren't called. The
+    handler names the created object with ``meta.created`` (or sets
+    ``meta.location``).
+    """
+    calls = []
+
+    def location(request, item):
+        calls.append("location")
+        return f"/items/{item['id']}"
+
+    def schema(request, item):
+        calls.append("schema")
+        return f"/schemas/item/{item['id']}"
+
+    def counted_etag(item):
+        calls.append("etag")
+        return etag(item)
+
+    router = Router()
+
+    @router.post("/items", response={201: None})
+    @scrudful_create(
+        location_func=location,
+        etag_func=counted_etag,
+        schema_link_or_func=schema,
+        context_link_or_func="/contexts/item",
+    )
+    def create_item(request, payload: ItemIn, meta: ScrudfulResponse):
+        item = new_item(store, payload.name)
+        if request.GET.get("meta") == "created":
+            meta.created = item
+        elif request.GET.get("meta") == "location":
+            meta.location = f"/items/{item['id']}"
+
+    client = TestClient(router)
+    response = client.post("/items", json={"name": "c"})
+    assert response.status_code == 201
+    assert store.items[MISSING]["name"] == "c"
+    for name in ("Location", "ETag", "Last-Modified", "Link"):
+        assert name not in response.headers
+    assert calls == []
+
+    response = client.post("/items?meta=location", json={"name": "c"})
+    assert response.status_code == 201
+    assert response.headers["Location"] == "/items/3"
+    assert "Link" not in response.headers
+    assert calls == []
+
+    response = client.post("/items?meta=created", json={"name": "c"})
+    assert response.status_code == 201
+    assert response.headers["Location"] == "/items/3"
+    assert response.headers["ETag"] == '"v1"'
+    assert response.headers["Link"] == (
+        '</schemas/item/3>; rel="describedBy"; type="application/json", ' + CONTEXT_LINK
+    )
+    assert calls == ["location", "etag", "schema"]
+
+
+def test_create_without_a_created_object_gets_responses_201(store):
+    """An explicit ``responses[201]`` still applies; its callables get None."""
+    seen = []
+
+    def schema(request, obj):
+        seen.append(obj)
+        return "/schemas/accepted"
+
+    router = Router()
+
+    @router.post("/items", response={201: None})
+    @scrudful_create(
+        location_func=lambda request, item: f"/items/{item['id']}",
+        responses={201: Entity(schema_link_or_func=schema)},
+        **LINKS,
+    )
+    def create_item(request, payload: ItemIn):
+        new_item(store, payload.name)
+
+    response = TestClient(router).post("/items", json={"name": "c"})
+    assert response.status_code == 201
+    assert "Location" not in response.headers
+    assert response.headers["Link"] == (
+        '</schemas/accepted>; rel="describedBy"; type="application/json"'
+    )
+    assert seen == [None]
 
 
 def test_create_needs_declared_201(store, counted):
