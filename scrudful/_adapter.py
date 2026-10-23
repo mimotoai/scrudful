@@ -1,4 +1,4 @@
-"""Framework-neutral glue shared by the FastAPI and DRF adapters.
+"""Framework-neutral glue shared by the FastAPI, DRF and django-ninja adapters.
 
 Private, and stdlib-only like :mod:`scrudful.conditional`: the adapters keep
 everything that touches their framework's request and response objects.
@@ -6,6 +6,8 @@ everything that touches their framework's request and response objects.
 
 from __future__ import annotations
 
+import inspect
+import sys
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
@@ -105,3 +107,43 @@ def expose_headers(headers: Headers) -> None:
         headers["Access-Control-Expose-Headers"] = merge_expose_headers(
             headers.get("Access-Control-Expose-Headers"), names
         )
+
+
+def evaluated_signature(func: Callable[..., Any]) -> inspect.Signature:
+    """``func``'s signature with string annotations evaluated in its module.
+
+    For endpoints written with ``from __future__ import annotations``: a
+    framework reading the strings off an adapter's wrapper would evaluate them
+    in the wrapper's globals (the adapter module's), where the endpoint's names
+    are undefined. If an annotation can't be evaluated, the unevaluated
+    signature is returned.
+    """
+    try:
+        return inspect.signature(func, eval_str=True)
+    except NameError:
+        pass
+    try:
+        return inspect.signature(func)
+    except NameError:
+        # Python 3.14+: annotations naming objects imported only under
+        # TYPE_CHECKING can't be evaluated; FastAPI and ninja do the same.
+        if sys.version_info < (3, 14):
+            raise
+        from annotationlib import Format
+
+        return inspect.signature(func, annotation_format=Format.FORWARDREF)
+
+
+def resolve_annotation(annotation: Any, globalns: dict[str, Any]) -> Any:
+    """Evaluate a string or forward-reference annotation in ``globalns``.
+
+    Other annotations are returned unchanged; ``None`` if evaluation fails.
+    """
+    if not isinstance(annotation, (str, type)):
+        annotation = getattr(annotation, "__forward_arg__", annotation)
+    if isinstance(annotation, str):
+        try:
+            return eval(annotation, globalns)  # same as typing/inspect
+        except Exception:
+            return None
+    return annotation

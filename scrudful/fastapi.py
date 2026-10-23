@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-import sys
 import types
 from collections.abc import Callable, Mapping
 from typing import Annotated, Any, TypeVar, get_args, get_origin
@@ -27,8 +26,10 @@ from scrudful._adapter import (
     READ_DESCRIPTIONS,
     WRITE_DESCRIPTIONS,
     check_validators,
+    evaluated_signature,
     expose_headers,
     precondition_headers,
+    resolve_annotation,
     set_validator_headers,
     validator_policy,
 )
@@ -451,7 +452,9 @@ def _wrapper_signature(
     unless the endpoint already declares one; the boolean flags tell whether
     the endpoint itself receives them.
     """
-    signature = _signature(endpoint)
+    # FastAPI < 0.124 evaluates string annotations (``from __future__ import
+    # annotations``) in the wrapper's globals (this module's).
+    signature = evaluated_signature(endpoint)
     params = list(signature.parameters.values())
     globalns = getattr(inspect.unwrap(endpoint), "__globals__", {})
     names = {param.name for param in params}
@@ -486,40 +489,13 @@ def _wrapper_signature(
     )
 
 
-def _signature(endpoint: Callable[..., Any]) -> inspect.Signature:
-    # Evaluate string annotations (``from __future__ import annotations``) in
-    # the endpoint's own module: FastAPI < 0.124 evaluates the strings it finds
-    # on the wrapper in the wrapper's globals (this module's), where the
-    # endpoint's names are undefined.
-    try:
-        return inspect.signature(endpoint, eval_str=True)
-    except NameError:
-        pass
-    try:
-        return inspect.signature(endpoint)
-    except NameError:
-        # Python 3.14+: annotations naming objects imported only under
-        # TYPE_CHECKING can't be evaluated; FastAPI does the same.
-        if sys.version_info < (3, 14):
-            raise
-        from annotationlib import Format
-
-        return inspect.signature(endpoint, annotation_format=Format.FORWARDREF)
-
-
 def _annotation_is(annotation: Any, cls: type, globalns: dict[str, Any]) -> bool:
     """Whether ``annotation`` is ``cls`` or a subclass.
 
     String / forward-reference annotations are evaluated in the endpoint's
     globals and ``Annotated[cls, ...]`` is unwrapped, as FastAPI does.
     """
-    if not isinstance(annotation, (str, type)):
-        annotation = getattr(annotation, "__forward_arg__", annotation)
-    if isinstance(annotation, str):
-        try:
-            annotation = eval(annotation, globalns)  # same as typing/inspect
-        except Exception:
-            return False
+    annotation = resolve_annotation(annotation, globalns)
     if get_origin(annotation) is Annotated:
         annotation = get_args(annotation)[0]
     # ``list[int]`` is a ``type`` instance on Python 3.10 but not a class.
