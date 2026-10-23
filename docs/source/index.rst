@@ -3,8 +3,8 @@ scrudful
 
 scrudful helps you build *SCRUDful* REST APIs (Search, Create, Read, Update,
 Delete) with correct HTTP conditional-request semantics (RFC 9110 section 13,
-RFC 6585 section 3) and ``Link`` headers (RFC 8288), for Django REST Framework
-and FastAPI.
+RFC 6585 section 3) and ``Link`` headers (RFC 8288), for Django REST Framework,
+django-ninja and FastAPI.
 
 Decorate a view or endpoint, give it validator callbacks (``etag_func``,
 ``last_modified_func``) and scrudful answers 304, 400, 412 and 428 for you, sets
@@ -14,6 +14,7 @@ Decorate a view or endpoint, give it validator callbacks (``etag_func``,
 Install the extra for your framework::
 
     pip install "scrudful[drf]"
+    pip install "scrudful[ninja]"
     pip install "scrudful[fastapi]"
 
 .. toctree::
@@ -22,6 +23,7 @@ Install the extra for your framework::
 
    usage
    rest_framework
+   ninja
    fastapi
    conditional
    changelog

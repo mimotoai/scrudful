@@ -3,8 +3,8 @@ scrudful
 ========
 
 Helpers for building *SCRUDful* REST APIs (Search, Create, Read, Update,
-Delete) that get HTTP conditional requests right, for Django REST Framework
-and FastAPI.
+Delete) that get HTTP conditional requests right, for Django REST Framework,
+django-ninja and FastAPI.
 
 A decorated view or endpoint:
 
@@ -18,8 +18,9 @@ A decorated view or endpoint:
   ``Access-Control-Expose-Headers``.
 
 The HTTP logic is framework-agnostic and lives in ``scrudful.conditional`` and
-``scrudful.utils``; ``scrudful.rest_framework`` and ``scrudful.fastapi`` are
-thin adapters. The package has no required dependencies.
+``scrudful.utils``; ``scrudful.rest_framework``, ``scrudful.ninja`` and
+``scrudful.fastapi`` are thin adapters. The package has no required
+dependencies.
 
 Installation
 ============
@@ -27,6 +28,7 @@ Installation
 .. code-block:: console
 
     $ pip install "scrudful[drf]"      # Django >= 4.2, djangorestframework >= 3.15
+    $ pip install "scrudful[ninja]"    # Django >= 4.2, django-ninja >= 1.7
     $ pip install "scrudful[fastapi]"  # fastapi >= 0.100
 
 Python 3.10 or newer is required.
@@ -80,7 +82,9 @@ Rules worth knowing:
   checks, so they must apply the same scoping (for example
   ``view.get_queryset()`` with DRF, or the current user from a dependency with
   FastAPI). Otherwise a resource the view would hide reveals its validators
-  (304) and its existence (412 or 428 instead of 404).
+  (304) and its existence (412 or 428 instead of 404). The django-ninja
+  adapter avoids this by design: its callbacks get the object your ``load``
+  callable authorized.
 * **Validators on responses.** 2xx responses to GET/HEAD get ``ETag`` and
   ``Last-Modified``; 2xx responses to PUT/PATCH get freshly recomputed ones
   (the callbacks run again, so they describe the new representation); POST,
@@ -97,8 +101,8 @@ Rules worth knowing:
 * **Datetimes.** ``last_modified_func`` returns a ``datetime`` or an epoch
   timestamp. Aware datetimes are converted to UTC and sub-second precision is
   discarded. A *naive* datetime is taken to be UTC by the FastAPI adapter and
-  to be in ``settings.TIME_ZONE`` by the DRF adapter (the same thing when
-  ``TIME_ZONE`` is ``"UTC"``). Prefer aware datetimes.
+  to be in ``settings.TIME_ZONE`` by the DRF and django-ninja adapters (the
+  same thing when ``TIME_ZONE`` is ``"UTC"``). Prefer aware datetimes.
 * **Link headers.** The schema and context links are added to every response
   your view returns and are appended to any ``Link`` value it set. Each ``*_or_func``
   argument is a value or a callable.
@@ -271,6 +275,99 @@ Notes:
 
 See ``examples/fastapi/api.py`` for a complete application (run it with
 ``python examples/fastapi/api.py``).
+
+django-ninja
+============
+
+``scrudful.ninja`` follows one rule: validators and precondition results are
+computed only from what authorization already approved. Its decorators run
+inside the operation, after ninja's authentication, throttling and parameter
+validation; an item operation's ``load(request, **params)`` is the
+fetch-if-allowed callable, the validator callbacks get the object it returns,
+and so does the handler. It does not need Django REST Framework.
+
+.. code-block:: python
+
+    from typing import List
+
+    from django.shortcuts import get_object_or_404
+    from ninja import NinjaAPI
+
+    from scrudful.ninja import (
+        CONDITIONAL_READ_RESPONSES,
+        CONDITIONAL_WRITE_RESPONSES,
+        ScrudfulRouter,
+        scrudful,
+        scrudful_create,
+        scrudful_list,
+    )
+
+    api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
+    roles = ScrudfulRouter()  # adds OPTIONS to every path with a scrudful operation
+    api.add_router("/roles", roles)
+
+
+    def authorized_role(request, pk: int, **params):
+        # Missing and hidden are both 404, for every method and If-* header.
+        return get_object_or_404(Role, pk=pk, rbac_context=request.auth)
+
+
+    ROLE = dict(
+        etag_func=lambda role: role.etag,
+        last_modified_func=lambda role: role.modified_at,
+        schema_link_or_func="/schemas/role",
+        context_link_or_func="/contexts/role",
+    )
+
+
+    @roles.get("/{int:pk}", response=RoleOut,
+               openapi_extra={"responses": CONDITIONAL_READ_RESPONSES})
+    @scrudful(load=authorized_role, **ROLE)
+    def get_role(request, pk: int, obj: Role):
+        return obj
+
+
+    @roles.put("/{int:pk}", response=RoleOut,
+               openapi_extra={"responses": CONDITIONAL_WRITE_RESPONSES})
+    @scrudful(load=authorized_role, **ROLE)
+    def replace_role(request, pk: int, payload: RoleIn, obj: Role):
+        ...
+
+
+    @roles.post("", response={201: RoleOut})  # 201, Location, item validators
+    @scrudful_create(location_func=lambda request, role: f"/roles/{role.pk}", **ROLE)
+    def create_role(request, payload: RoleIn):
+        return Role.objects.create(**payload.dict())
+
+
+    @roles.get("", response=List[RoleOut])  # the scrud list envelope, paginated
+    @scrudful_list(href_func=role_url, **ROLE)
+    def list_roles(request):
+        return Role.objects.filter(rbac_context=request.auth).order_by("pk")
+
+Notes:
+
+* ``@scrudful(...)``, ``@scrudful_create(...)`` and ``@scrudful_list(...)``
+  must sit **below** the operation decorator.
+* ``load`` returns the object, ``None`` ("no current representation", RFC
+  9110 semantics, e.g. for a PUT that may create) or raises, through ninja's
+  exception handlers. Whether PUT may create and how hidden rows are reported
+  is yours to choose; the docs show the four patterns.
+* Use ``ScrudfulRouter`` (and ``NinjaAPI(default_router=ScrudfulRouter(...))``
+  for operations on the API itself): it answers OPTIONS with the
+  semantic-http "HTTP Schema Resource", the same for every client, without
+  ``auth``. Scrudful operations on a plain ``Router`` get no OPTIONS.
+* ``Entity(...)`` declares request and per-status response entities and the
+  ``error`` entity whose Links scrudful's 400, 412 and 428 bodies carry; a
+  handler parameter annotated ``ScrudfulResponse`` sets the status,
+  ``Location``, validators or Links of one response.
+* ``async def`` handlers are supported; sync callables then run through
+  ``sync_to_async``.
+* ``scrudful.collection`` builds the JSON Schema and JSON-LD context of the
+  list envelope.
+
+See ``examples/ninja`` for a complete project, and the documentation's
+django-ninja page for the details.
 
 Development
 ===========

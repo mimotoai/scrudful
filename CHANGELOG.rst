@@ -2,6 +2,71 @@
 Changelog
 =========
 
+0.4.0 (since 0.3.0)
+===================
+
+django-ninja adapter
+--------------------
+
+* Added ``scrudful.ninja``, which makes django-ninja operations SCRUDful. Its
+  decorators wrap the operation's function, so everything runs after ninja's
+  authentication, throttling and parameter validation, and every validator
+  and precondition result is computed from what authorization approved:
+
+  * ``@scrudful(load=..., ...)`` for single resources (GET, HEAD, PUT, PATCH,
+    DELETE and POST actions): ``load(request, **params)`` is the
+    fetch-if-allowed callable; the validator callbacks and the handler get the
+    object it returns. It returns ``None`` for "no current representation"
+    (RFC 9110 semantics) or raises, through ninja's exception handlers. 304,
+    400, 412 and 428 as in the other adapters; fresh validators after a
+    PUT/PATCH (``load`` is called again).
+  * ``@scrudful_create(...)``: 201 with ``Location``, the item's Links and the
+    created item's ``ETag`` and ``Last-Modified``.
+  * ``@scrudful_list(...)``: the handler returns the authorized queryset; the
+    response is the paginated scrud list envelope (``page``, ``page_size``),
+    with per-item validators and Links equal to the detail GET's, a typed
+    envelope schema in OpenAPI, and optional collection validators.
+  * ``Entity`` declares request and per-status response entities (schema and
+    JSON-LD context Links) and the ``error`` entity carried as Links by
+    scrudful's own 400, 412 and 428 bodies; ``ScrudfulResponse`` is the
+    handler's place to set the status, ``Location``, validators, Links or
+    created object of one response.
+  * ``ScrudfulRouter`` answers OPTIONS on every path with a scrudful
+    operation, without ``auth``, with the semantic-http "HTTP Schema
+    Resource": a superset of DRF's ``ScrudfulMetadata`` output.
+  * Sync and async operations; ``CONDITIONAL_READ_RESPONSES`` and
+    ``CONDITIONAL_WRITE_RESPONSES`` for OpenAPI.
+  * It imports without Django REST Framework.
+
+  201 validators, entity declarations, error Links and load-based validators
+  are not in the DRF and FastAPI adapters yet.
+* Added ``scrudful.collection``: ``collection_schema()`` and
+  ``collection_context()`` build the JSON Schema (draft 2020-12) and the
+  JSON-LD context of the scrud list envelope. It is framework-neutral.
+* Added the example project ``examples/ninja``, a ``Role`` resource using every
+  feature of the adapter.
+
+Internal
+--------
+
+* The OPTIONS description builder (``describe_read``, ``describe_write``,
+  ``conditional_header_parameters``) and the endpoint-signature helpers moved
+  to ``scrudful._adapter``, and the Django request/response helpers to
+  ``scrudful._django``, to be shared with the new adapter. No change to the
+  DRF or FastAPI adapters' behaviour or output.
+
+Packaging
+---------
+
+* New extra ``scrudful[ninja]``: ``django>=4.2`` and ``django-ninja>=1.7``.
+  The adapter's code also works with django-ninja 1.6, but the test suite
+  verifies 1.7.0 and newer only: 1.6's ``TestAsyncClient`` methods are not
+  ``async def``, so driving them with ``asgiref``'s ``async_to_sync`` warns,
+  which the tests treat as an error.
+* The package description names django-ninja; added the
+  ``Framework :: Django :: 5.2`` classifier (there is no django-ninja
+  classifier).
+
 0.3.0 (since 0.2.0)
 ===================
 

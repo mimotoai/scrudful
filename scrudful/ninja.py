@@ -181,10 +181,15 @@ Collections
 OPTIONS
     A :class:`ScrudfulRouter` adds an OPTIONS operation to every path that has
     a scrudful operation; an OPTIONS operation the implementer declares on the
-    path wins. It runs no ``load``, handler, validator callback or permission
-    check and ignores the API's and the router's ``auth``: it describes the
-    path template, so its answer is the same for every client, and for a
-    missing item as for a hidden one. It is not in the OpenAPI document.
+    path wins. It runs no ``load``, handler or validator callback, scrudful
+    runs no permission check for it, and it ignores the API's and the
+    router's ``auth``: it describes the path template, so its answer is the
+    same for every client, and for a missing item as for a hidden one. It is
+    not in the OpenAPI document. ninja still applies the decorators added with
+    the API's or a router's ``add_decorator`` and the API's and routers'
+    throttles to it, as to any operation: a permission decorator added that
+    way gates OPTIONS too. Every automatic OPTIONS operation has the URL name
+    ``scrudful_options``, so don't ``reverse()`` it.
 
     The body is the semantic-http spec's "HTTP Schema Resource": for each of
     ``get``, ``head`` (when an operation routes it, described like ``get``),
@@ -233,7 +238,10 @@ The runtime response
     - ``location``: the ``Location`` header;
     - ``etag`` and ``last_modified``: sent in place of the computed
       validators, for any method and status (the preconditions were evaluated
-      with the computed ones);
+      with the computed ones). With ``etag_func`` or ``last_modified_func``
+      set, keep them consistent with what those return: the preconditions of
+      the next request use the computed values, so a client echoing a
+      different value gets 412;
     - ``entity``: its Links, in place of the declared entity's.
 
 Headers
@@ -417,10 +425,14 @@ class ScrudfulResponse:
     etag : object
         The entity-tag of this response, in place of the computed one (see
         ``etag_func`` of :func:`scrudful` for the conversion). Sent for any
-        method and status.
+        method and status. When the operation also has ``etag_func``, keep
+        the two consistent: preconditions are always evaluated with the
+        computed value, so a client sending this one back in If-Match would
+        get 412.
     last_modified : datetime or float
         The modification time of this response, in place of the computed one
-        (see ``last_modified_func``). Sent for any method and status.
+        (see ``last_modified_func``). Sent for any method and status; keep it
+        consistent with ``last_modified_func``, as for ``etag``.
     entity : Entity or None
         The entity whose Links this response gets, in place of the declared
         one.
@@ -999,10 +1011,13 @@ class ScrudfulRouter(Router):
     no credentials whatever the API's or router's ``auth`` and is not in the
     OpenAPI document, and it answers with the path's HTTP Schema Resource
     (see "OPTIONS" in the module docstring). An operation the implementer
-    adds later whose methods include ``"OPTIONS"`` replaces it.
+    adds later whose methods include ``"OPTIONS"`` replaces it. The API's
+    and routers' ``add_decorator`` decorators and throttles apply to it as to
+    any operation. Its URL name is ``scrudful_options`` on every path.
 
     Use it for the routers holding scrudful operations, nested or not, and
-    for the API's own operations::
+    for the API's own operations (``default_router``); scrudful operations
+    on a plain ``ninja.Router`` get no OPTIONS (ninja answers 405)::
 
         api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
         items = ScrudfulRouter(
