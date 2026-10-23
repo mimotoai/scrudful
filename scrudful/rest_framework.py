@@ -71,16 +71,9 @@ import functools
 import inspect
 import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from datetime import datetime
 from typing import Any
 
-from django.http import (
-    HttpRequest,
-    HttpResponseBase,
-    HttpResponseNotModified,
-    JsonResponse,
-)
-from django.utils import timezone
+from django.http import HttpRequest, HttpResponseBase
 from rest_framework.decorators import api_view
 from rest_framework.metadata import BaseMetadata, SimpleMetadata
 from rest_framework.mixins import UpdateModelMixin
@@ -97,10 +90,12 @@ from scrudful._adapter import (
     WRITE_DESCRIPTIONS,
     check_validators,
     expose_headers,
-    precondition_headers,
     set_validator_headers,
     validator_policy,
 )
+from scrudful._django import aware
+from scrudful._django import conditional_response as django_conditional_response
+from scrudful._django import precondition_headers as django_precondition_headers
 from scrudful.conditional import (
     ConditionalResult,
     evaluate_preconditions,
@@ -243,7 +238,7 @@ class ScrudfulViewFunc:
             etag, last_modified = self._validators(cb_args, cb_kwargs)
             result = evaluate_preconditions(
                 method,
-                _precondition_headers(request),
+                django_precondition_headers(request),
                 etag=etag,
                 last_modified=last_modified,
                 require_precondition=True,
@@ -275,9 +270,7 @@ class ScrudfulViewFunc:
         last_modified = None
         if self.last_modified_func is not None:
             value = self.last_modified_func(*args, **kwargs)
-            if isinstance(value, datetime) and timezone.is_naive(value):
-                value = timezone.make_aware(value, timezone.get_default_timezone())
-            last_modified = http_timestamp(value)
+            last_modified = http_timestamp(aware(value))
         return etag, last_modified
 
     def add_expose_headers(self, response: HttpResponseBase) -> None:
@@ -767,28 +760,10 @@ def _callback_arguments(
     return args, kwargs
 
 
-def _precondition_headers(request: HttpRequest | Request) -> dict[str, str]:
-    # WSGI/ASGI servers already combine repeated field lines with ",", so each
-    # field has at most one value.
-    def getlist(name: str) -> list[str]:
-        value = request.headers.get(name)
-        return [] if value is None else [value]
-
-    return precondition_headers(getlist)
-
-
 def _conditional_response(result: ConditionalResult, drf: bool) -> HttpResponseBase:
-    response: HttpResponseBase
-    if result.body is None:
-        response = HttpResponseNotModified()
-        for name, value in result.headers.items():
-            response[name] = value
-    elif drf:
-        response = Response(result.body, status=result.status, headers=result.headers)
-    else:
-        response = JsonResponse(result.body, status=result.status)
-        for name, value in result.headers.items():
-            response[name] = value
+    if result.body is None or not drf:
+        return django_conditional_response(result)
+    response = Response(result.body, status=result.status, headers=result.headers)
     expose_headers(response)
     return response
 
