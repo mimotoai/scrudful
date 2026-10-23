@@ -5,6 +5,7 @@ async pytest plugin is needed.
 """
 
 import asyncio
+import functools
 import inspect
 import itertools
 from typing import Any
@@ -468,3 +469,54 @@ def test_sync_load_runs_in_thread(db):
     assert response.json() == {"name": "b"}
     assert response.headers["ETag"] == '"2"'
     assert counts == [1, 1, 1]
+
+
+async def async_value(*args, **kwargs):
+    return "/schemas/item"
+
+
+ASYNC_CALLABLES = {
+    "load": async_value,
+    "etag_func": async_value,
+    "last_modified_func": functools.partial(async_value),
+    "schema_link_or_func": async_value,
+    "context_type_or_func": async_callable_object(lambda *args: "x"),
+}
+
+
+@pytest.mark.parametrize("name", list(ASYNC_CALLABLES))
+def test_sync_handler_rejects_async_callables(store, name):
+    options = {"load": store.load, name: ASYNC_CALLABLES[name]}
+    decorator = scrudful(**options)
+
+    def handler(request, pk: int, obj): ...
+
+    with pytest.raises(
+        TypeError, match="async callables need an async def handler"
+    ) as info:
+        decorator(handler)
+    assert str(info.value).startswith(f"{name} is async")
+
+
+def test_sync_handler_accepts_sync_callables_and_values(store):
+    @scrudful(
+        load=store.load,
+        etag_func=etag,
+        last_modified_func=functools.partial(modified),
+        schema_link_or_func=lambda request, obj: "/schemas/item",
+        schema_rel_or_func=None,
+        context_link_or_func="/contexts/item",
+    )
+    def handler(request, pk: int, obj): ...
+
+    assert not inspect.iscoroutinefunction(handler)
+
+
+@pytest.mark.parametrize("name", list(ASYNC_CALLABLES))
+def test_async_handler_accepts_async_callables(store, name):
+    options = {"load": store.load, name: ASYNC_CALLABLES[name]}
+
+    @scrudful(**options)
+    async def handler(request, pk: int, obj): ...
+
+    assert inspect.iscoroutinefunction(handler)

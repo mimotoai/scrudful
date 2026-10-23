@@ -96,7 +96,8 @@ Async operations
     they may use the Django ORM, and an awaitable a sync callable returns is
     awaited. They are called one after the other, never concurrently. With a
     sync handler, the operation is sync and every callable is called directly,
-    so they must all be sync.
+    so they must all be sync: an ``async def`` one raises ``TypeError`` at
+    decoration time.
 """
 
 from __future__ import annotations
@@ -280,7 +281,9 @@ def scrudful(
     TypeError
         If a validator callback is set without ``load``, if ``load`` or a
         validator callback isn't callable, if ``load`` is set and the handler
-        has no ``load_as`` parameter, or if the handler is a generator.
+        has no ``load_as`` parameter, if the handler is a generator, or if
+        the handler is sync and ``load``, a validator callback or a link
+        callable is ``async def``.
     """
     check_validators(etag_func, last_modified_func)
     if load is not None and not callable(load):
@@ -307,6 +310,8 @@ def scrudful(
     def decorator(handler: Handler) -> Handler:
         if inspect.isgeneratorfunction(handler) or inspect.isasyncgenfunction(handler):
             raise TypeError("@scrudful does not support generator handlers")
+        if not inspect.iscoroutinefunction(handler):
+            _check_sync_callables(config, handler)
         signature, response_name, pass_response = _wrapper_signature(
             handler, load_as if load is not None else None
         )
@@ -417,14 +422,41 @@ async def _call_async(
     ``sync_to_async(thread_sensitive=True)``, off the event loop, as the
     Django ORM requires; an awaitable they return is awaited.
     """
-    if inspect.iscoroutinefunction(func) or inspect.iscoroutinefunction(
-        getattr(func, "__call__", None)
-    ):
+    if _is_async_callable(func):
         return await func(*args, **kwargs)
     result = await sync_to_async(func, thread_sensitive=True)(*args, **kwargs)
     if inspect.isawaitable(result):
         result = await result
     return result
+
+
+def _is_async_callable(func: Any) -> bool:
+    """Whether calling ``func`` returns a coroutine: an ``async def`` function
+    (also behind ``functools.partial``) or an object with an async
+    ``__call__``."""
+    return inspect.iscoroutinefunction(func) or inspect.iscoroutinefunction(
+        getattr(func, "__call__", None)
+    )
+
+
+def _check_sync_callables(config: _Config, handler: Callable[..., Any]) -> None:
+    """Reject ``async def`` callables for a sync handler (a sync operation)."""
+    for name in (
+        "load",
+        "etag_func",
+        "last_modified_func",
+        "schema_link_or_func",
+        "schema_rel_or_func",
+        "schema_type_or_func",
+        "context_link_or_func",
+        "context_rel_or_func",
+        "context_type_or_func",
+    ):
+        if _is_async_callable(getattr(config, name)):
+            raise TypeError(
+                f"{name} is async, but {handler.__qualname__}() is not: async "
+                "callables need an async def handler"
+            )
 
 
 def _validators(config: _Config, obj: Any) -> _Flow[tuple[str | None, int | None]]:
