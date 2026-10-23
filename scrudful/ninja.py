@@ -47,7 +47,10 @@ Validators
     carrying the validators. POST is evaluated but never required to be
     conditional. These early responses are returned without calling the
     handler, as a ``JsonResponse`` (304 without a body), so the operation's
-    ``response`` schema does not apply to them; describe them in OpenAPI with
+    ``response`` schema does not apply to them. With ``error=Entity(...)``
+    the 400, 412 and 428 bodies carry that entity's Links (its link callables
+    get the loaded object); the 304 has no body and gets none, and without
+    ``error`` they carry no Link. Describe them in OpenAPI with
     ``openapi_extra={"responses": CONDITIONAL_READ_RESPONSES}`` (or
     :data:`CONDITIONAL_WRITE_RESPONSES`). They are built fresh, without the
     headers and cookies of ninja's temporal response: with ninja's stock
@@ -67,21 +70,56 @@ Validators
     computed for the precondition check, and 2xx responses to PUT/PATCH get
     fresh ones: ``load`` is called again and the validators are computed from
     what it returns, so they describe the representation just written (RFC
-    9110 §9.3.4). Other methods and non-2xx responses get none. The status is
-    the one of a returned ``HttpResponse``, else of a returned
-    ``ninja.Status``, else the operation's single declared response code, else
-    200.
+    9110 §9.3.4). Other methods (e.g. a general POST such as
+    ``POST /items/search``, or a POST action on an item) and non-2xx responses
+    get none, unless the handler sets them on its ``ScrudfulResponse``. The
+    status is the one of a returned ``HttpResponse``, else of a returned
+    ``ninja.Status`` (or ``(status, body)`` tuple), else
+    ``ScrudfulResponse.status``, else the operation's single declared response
+    code, else 200.
+
+Entities and Links
+    An :class:`Entity` is the schema and JSON-LD context of a body. The six
+    ``schema_*`` / ``context_*`` arguments of :func:`scrudful` are the default
+    response entity, ``responses={status: Entity(...)}`` overrides it per
+    status (also for non-2xx statuses the handler returns, e.g. a
+    ``Status(404, ...)``), and ``request=Entity(...)`` describes the request
+    body: OPTIONS uses it, and it puts no header on the response. The Links of
+    a response the handler produces are those of, in this order: the
+    ``ScrudfulResponse.entity`` the handler set; ``responses[status]``; the
+    default entity, for 2xx responses only; else none. Link callables are
+    called with the request and the loaded object (after a PUT/PATCH, the one
+    loaded again), or ``None`` without ``load``.
+
+The runtime response
+    A handler parameter annotated :class:`ScrudfulResponse` receives a fresh
+    instance on every request; like the ``load_as`` parameter, it is hidden
+    from ninja's signature and OpenAPI. What the handler sets on it applies to
+    this response:
+
+    - ``status``: for a plain return value, the wrapper returns
+      ``ninja.Status(status, result)``. ninja then validates the result
+      against the response schema of that status, so the operation must
+      declare it (or ``...``) in ``response=``; otherwise ninja raises
+      ``ConfigError``. A returned ``Status``, tuple or ``HttpResponse`` keeps
+      its own status;
+    - ``location``: the ``Location`` header;
+    - ``etag`` and ``last_modified``: sent in place of the computed
+      validators, for any method and status (the preconditions were evaluated
+      with the computed ones);
+    - ``entity``: its Links, in place of the declared entity's.
 
 Headers
     The headers go on the ``HttpResponse`` the handler returns, or else on
     ninja's temporal response (passed to a handler parameter annotated
     ``HttpResponse``, which the wrapper adds, hidden, when the handler has
-    none). Headers the handler set itself are never overwritten. The Link
-    header is added to every response the handler produces and is appended to
-    any Link value the handler set. ``Access-Control-Expose-Headers`` is
-    extended with whichever of ``ETag``, ``Link`` and ``Location`` the response
-    carries (django-cors-headers replaces that header when
-    ``CORS_EXPOSE_HEADERS`` is set; list the names there instead).
+    none). Headers the handler set itself are never overwritten, neither by
+    computed values nor by those set on ``ScrudfulResponse``. The Link header
+    is appended to any Link value the handler set.
+    ``Access-Control-Expose-Headers`` is extended with whichever of ``ETag``,
+    ``Link`` and ``Location`` the response carries (django-cors-headers
+    replaces that header when ``CORS_EXPOSE_HEADERS`` is set; list the names
+    there instead).
 
     ninja routes HEAD only to operations that list it, e.g.
     ``@router.api_operation(["GET", "HEAD"], "/items/{pk}")``.
@@ -97,19 +135,22 @@ Async operations
     awaited. They are called one after the other, never concurrently. With a
     sync handler, the operation is sync and every callable is called directly,
     so they must all be sync: an ``async def`` one raises ``TypeError`` at
-    decoration time.
+    decoration time (also inside the declared entities), or at request time
+    for a ``ScrudfulResponse.entity``.
 """
 
 from __future__ import annotations
 
 import functools
 import inspect
-from collections.abc import Callable, Generator
-from dataclasses import dataclass
-from typing import Any, TypeVar
+from collections.abc import Callable, Generator, Iterator, Mapping
+from dataclasses import dataclass, field, fields
+from types import MappingProxyType
+from typing import Any, NamedTuple, TypeVar
 
 from asgiref.sync import sync_to_async
 from django.http import HttpRequest, HttpResponse, HttpResponseBase
+from django.utils.encoding import iri_to_uri
 from ninja import Status
 
 from scrudful._adapter import (
@@ -133,6 +174,8 @@ from scrudful.utils import join_links, link_content
 __all__ = [
     "CONDITIONAL_READ_RESPONSES",
     "CONDITIONAL_WRITE_RESPONSES",
+    "Entity",
+    "ScrudfulResponse",
     "scrudful",
 ]
 
@@ -163,8 +206,88 @@ _Flow = Generator[tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any]], An
 
 
 @dataclass(frozen=True)
+class Entity:
+    """The schema and JSON-LD context of a request or response body.
+
+    Each field is a value or a callable ``func(request, obj)``, with the same
+    meaning as the ``schema_*`` and ``context_*`` arguments of
+    :func:`scrudful`: without a link, no Link is sent; rel and type default to
+    ``"describedBy"`` / ``"application/json"`` for the schema and to
+    ``"http://www.w3.org/ns/json-ld#context"`` / ``"application/ld+json"`` for
+    the context. ``obj`` is the object the operation has at that point (the
+    loaded object, or ``None``).
+    """
+
+    schema_link_or_func: Any = None
+    schema_rel_or_func: Any = None
+    schema_type_or_func: Any = None
+    context_link_or_func: Any = None
+    context_rel_or_func: Any = None
+    context_type_or_func: Any = None
+
+
+class _Unset:
+    """The type of :data:`_UNSET`."""
+
+    def __repr__(self) -> str:
+        return "<unset>"
+
+
+#: ``ScrudfulResponse.created`` when the handler did not set it (``None`` may
+#: be what it created).
+_UNSET: Any = _Unset()
+
+
+@dataclass(eq=False, slots=True)
+class ScrudfulResponse:
+    """What the handler sets, for this response, on top of the declarations.
+
+    A handler parameter annotated ``ScrudfulResponse`` receives a fresh
+    instance on every request; the parameter is hidden from ninja's signature
+    and OpenAPI. Attributes left at their default change nothing. Headers the
+    handler sets directly on the response are never overwritten.
+
+    Attributes
+    ----------
+    status : int or None
+        The status of a plain return value: the wrapper returns
+        ``ninja.Status(status, result)``. ninja then validates the result
+        against the operation's response schema for that status, so the
+        operation must declare it (or ``...``) in ``response=``, otherwise
+        ninja raises ``ConfigError``. A returned ``Status``, ``(status, body)``
+        tuple or ``HttpResponse`` keeps its own status. ``None``: ninja's usual
+        rules.
+    location : str or None
+        The ``Location`` header, as an IRI (encoded as a URI).
+    etag : object
+        The entity-tag of this response, in place of the computed one (see
+        ``etag_func`` of :func:`scrudful` for the conversion). Sent for any
+        method and status.
+    last_modified : datetime or float
+        The modification time of this response, in place of the computed one
+        (see ``last_modified_func``). Sent for any method and status.
+    entity : Entity or None
+        The entity whose Links this response gets, in place of the declared
+        one.
+    created : object
+        The object an operation created, unset by default.
+    """
+
+    status: int | None = None
+    location: str | None = None
+    etag: Any = None
+    last_modified: Any = None
+    entity: Entity | None = None
+    created: Any = _UNSET
+
+
+@dataclass(frozen=True)
 class _Config:
-    """What a scrudful decorator declared, set as ``view_func._scrudful``."""
+    """What a scrudful decorator declared, set as ``view_func._scrudful``.
+
+    The six ``schema_*`` / ``context_*`` fields are the default (2xx) response
+    entity, also available as :attr:`entity`.
+    """
 
     kind: str
     load: Callable[..., Any] | None = None
@@ -177,6 +300,30 @@ class _Config:
     context_link_or_func: Any = None
     context_rel_or_func: Any = None
     context_type_or_func: Any = None
+    #: The request body's entity (described by OPTIONS; no header).
+    request: Entity | None = None
+    #: The response entity of each status, overriding :attr:`entity`.
+    responses: Mapping[int, Entity] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    #: The entity of scrudful's own 400, 412 and 428 bodies.
+    error: Entity | None = None
+
+    @property
+    def entity(self) -> Entity:
+        """The default response entity, for 2xx responses."""
+        return Entity(
+            **{
+                entity_field.name: getattr(self, entity_field.name)
+                for entity_field in fields(Entity)
+            }
+        )
+
+    def response_entity(self, status: int) -> Entity | None:
+        """The declared entity of a response with ``status``."""
+        if status in self.responses:
+            return self.responses[status]
+        return self.entity if 200 <= status < 300 else None
 
     @property
     def has_etag(self) -> bool:
@@ -203,6 +350,9 @@ def scrudful(
     context_link_or_func: Any = None,
     context_rel_or_func: Any = None,
     context_type_or_func: Any = None,
+    request: Entity | None = None,
+    responses: Mapping[int, Entity] | None = None,
+    error: Entity | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation on a single resource to make it SCRUDful.
 
@@ -258,11 +408,12 @@ def scrudful(
         zone (``settings.TIME_ZONE``), as Django does. Sub-second precision is
         discarded.
     schema_link_or_func : str or callable, optional
-        URL of the schema of the response body. If no value is given, no
-        schema link is sent. Each ``*_or_func`` argument is a value or a
-        callable ``func(request, obj)``, where ``obj`` is the loaded object
-        (after a PUT/PATCH, the one loaded again), or ``None`` without
-        ``load``.
+        URL of the schema of the 2xx response body: this argument and the
+        five after it are the default response entity (see ``responses``).
+        If no value is given, no schema link is sent. Each ``*_or_func``
+        argument is a value or a callable ``func(request, obj)``, where
+        ``obj`` is the loaded object (after a PUT/PATCH, the one loaded
+        again), or ``None`` without ``load``.
     schema_rel_or_func : str or callable, optional
         ``rel`` of the schema link. Defaults to ``"describedBy"``.
     schema_type_or_func : str or callable, optional
@@ -275,19 +426,33 @@ def scrudful(
         ``"http://www.w3.org/ns/json-ld#context"``.
     context_type_or_func : str or callable, optional
         ``type`` of the context link. Defaults to ``"application/ld+json"``.
+    request : Entity, optional
+        The schema and context of the request body. Described by OPTIONS; it
+        puts no header on the response.
+    responses : mapping of int to Entity, optional
+        The response entity of each status, in place of the default one (the
+        six arguments above) for that status, e.g. ``{404: Entity(...)}`` for
+        a ``Status(404, ...)`` the handler returns.
+    error : Entity, optional
+        The schema and context of scrudful's own 400, 412 and 428 bodies, sent
+        as Links on them. Without it, they carry no Link.
 
     Raises
     ------
     TypeError
         If a validator callback is set without ``load``, if ``load`` or a
-        validator callback isn't callable, if ``load`` is set and the handler
-        has no ``load_as`` parameter, if the handler is a generator, or if
-        the handler is sync and ``load``, a validator callback or a link
-        callable is ``async def``.
+        validator callback isn't callable, if ``request``, ``error`` or a value
+        of ``responses`` isn't an :class:`Entity` or a key of ``responses``
+        isn't an HTTP status code, if ``load`` is set and the handler has no
+        ``load_as`` parameter, if the handler is a generator, or if the
+        handler is sync and ``load``, a validator callback or a link callable
+        (also inside an entity) is ``async def``.
     """
     check_validators(etag_func, last_modified_func)
     if load is not None and not callable(load):
         raise TypeError(f"load must be callable, not {type(load).__name__}")
+    _check_entity("request", request)
+    _check_entity("error", error)
     config = _Config(
         kind="item",
         load=load,
@@ -300,6 +465,9 @@ def scrudful(
         context_link_or_func=context_link_or_func,
         context_rel_or_func=context_rel_or_func,
         context_type_or_func=context_type_or_func,
+        request=request,
+        responses=_entities_by_status(responses),
+        error=error,
     )
     if config.has_validators and load is None:
         raise TypeError(
@@ -312,20 +480,24 @@ def scrudful(
             raise TypeError("@scrudful does not support generator handlers")
         if not inspect.iscoroutinefunction(handler):
             _check_sync_callables(config, handler)
-        signature, response_name, pass_response = _wrapper_signature(
-            handler, load_as if load is not None else None
-        )
+        hidden = _wrapper_signature(handler, load_as if load is not None else None)
+        response_name = hidden.response_name
         # The single response code each method's operation declares, if any.
         declared: dict[str, int | None] = {}
 
         def flow(request: HttpRequest, values: dict[str, Any]) -> _Flow[Any]:
             """The request flow; each call of a user callable is a ``yield``."""
             response: HttpResponse = (
-                values[response_name] if pass_response else values.pop(response_name)
+                values[response_name]
+                if hidden.pass_response
+                else values.pop(response_name)
             )
             params = {
                 name: value for name, value in values.items() if name != response_name
             }
+            meta = ScrudfulResponse()
+            if hidden.meta_name is not None:
+                values[hidden.meta_name] = meta
             method = request.method.upper()
             obj = None
             if load is not None:
@@ -342,13 +514,27 @@ def scrudful(
                     require_precondition=True,
                 )
                 if result is not None:
-                    return conditional_response(result)
+                    early = conditional_response(result)
+                    if result.body is not None and config.error is not None:
+                        yield from _add_links(early, config.error, request, obj)
+                        expose_headers(early)
+                    return early
 
             content = yield handler, (request,), values
 
+            if meta.status is not None and not _has_status(content):
+                content = Status(meta.status, content)
             headers, status = _response_and_status(
                 content, response, declared.get(method)
             )
+            # Explicit values first: the computed ones never overwrite a header.
+            set_validator_headers(
+                headers,
+                None if meta.etag is None else quote_etag(meta.etag),
+                http_timestamp(aware(meta.last_modified)),
+            )
+            if meta.location is not None and "Location" not in headers:
+                headers["Location"] = iri_to_uri(str(meta.location))
             if config.has_validators:
                 refresh, send = validator_policy(method, status)
                 if refresh:
@@ -356,10 +542,17 @@ def scrudful(
                     etag, last_modified = yield from _validators(config, obj)
                 if send:
                     set_validator_headers(headers, etag, last_modified)
-            links = yield from _links(config, request, obj)
-            link = join_links(headers.get("Link"), links)
-            if link is not None:
-                headers["Link"] = link
+            if meta.entity is None:
+                entity = config.response_entity(status)
+            elif isinstance(meta.entity, Entity):
+                entity = meta.entity
+            else:
+                raise TypeError(
+                    "ScrudfulResponse.entity must be an Entity, not "
+                    f"{type(meta.entity).__name__}"
+                )
+            if entity is not None:
+                yield from _add_links(headers, entity, request, obj)
             expose_headers(headers)
             return content
 
@@ -377,7 +570,7 @@ def scrudful(
             def wrapper(request: HttpRequest, **values: Any) -> Any:
                 return _run_sync(flow(request, values))
 
-        wrapper.__signature__ = signature  # type: ignore[attr-defined]
+        wrapper.__signature__ = hidden.signature  # type: ignore[attr-defined]
         wrapper._scrudful = config  # type: ignore[attr-defined]
         # ninja calls these at the end of ``Operation.__init__``. A fresh list:
         # ``functools.wraps`` copied the handler's (e.g. from ``@paginate``) by
@@ -392,13 +585,22 @@ def scrudful(
 
 
 def _run_sync(flow: _Flow[T]) -> T:
-    """Run ``flow``, calling the callables it yields directly."""
+    """Run ``flow``, calling the callables it yields directly.
+
+    The decorator already rejected the declared ``async def`` callables; this
+    catches those set at request time (``ScrudfulResponse.entity``).
+    """
     result = None
     while True:
         try:
             func, args, kwargs = flow.send(result)
         except StopIteration as stop:
             return stop.value
+        if _is_async_callable(func):
+            raise TypeError(
+                f"{func!r} is async, but the operation is not: async callables "
+                "need an async def handler"
+            )
         result = func(*args, **kwargs)
 
 
@@ -441,22 +643,56 @@ def _is_async_callable(func: Any) -> bool:
 
 def _check_sync_callables(config: _Config, handler: Callable[..., Any]) -> None:
     """Reject ``async def`` callables for a sync handler (a sync operation)."""
-    for name in (
-        "load",
-        "etag_func",
-        "last_modified_func",
-        "schema_link_or_func",
-        "schema_rel_or_func",
-        "schema_type_or_func",
-        "context_link_or_func",
-        "context_rel_or_func",
-        "context_type_or_func",
-    ):
-        if _is_async_callable(getattr(config, name)):
+    for name, func in _declared_callables(config):
+        if _is_async_callable(func):
             raise TypeError(
                 f"{name} is async, but {handler.__qualname__}() is not: async "
                 "callables need an async def handler"
             )
+
+
+def _declared_callables(config: _Config) -> Iterator[tuple[str, Any]]:
+    """``(name, value)`` of every argument that may be a callable."""
+    yield "load", config.load
+    yield "etag_func", config.etag_func
+    yield "last_modified_func", config.last_modified_func
+    entities: list[tuple[str, Entity | None]] = [
+        ("", config.entity),
+        ("request.", config.request),
+        ("error.", config.error),
+    ]
+    entities += [
+        (f"responses[{status}].", entity) for status, entity in config.responses.items()
+    ]
+    for prefix, entity in entities:
+        if entity is not None:
+            for entity_field in fields(Entity):
+                yield prefix + entity_field.name, getattr(entity, entity_field.name)
+
+
+def _check_entity(name: str, entity: Any) -> None:
+    """Raise ``TypeError`` unless ``entity`` is ``None`` or an :class:`Entity`."""
+    if entity is not None and not isinstance(entity, Entity):
+        raise TypeError(f"{name} must be an Entity, not {type(entity).__name__}")
+
+
+def _entities_by_status(
+    responses: Mapping[int, Entity] | None,
+) -> Mapping[int, Entity]:
+    """A read-only copy of the ``responses`` argument, checked."""
+    if responses is None:
+        responses = {}
+    if not isinstance(responses, Mapping):
+        raise TypeError(f"responses must be a mapping, not {type(responses).__name__}")
+    for status, entity in responses.items():
+        if not (
+            isinstance(status, int)
+            and not isinstance(status, bool)
+            and 100 <= status <= 599
+        ):
+            raise TypeError(f"responses keys must be HTTP status codes, not {status!r}")
+        _check_entity(f"responses[{status}]", entity)
+    return MappingProxyType(dict(responses))
 
 
 def _validators(config: _Config, obj: Any) -> _Flow[tuple[str | None, int | None]]:
@@ -473,15 +709,25 @@ def _validators(config: _Config, obj: Any) -> _Flow[tuple[str | None, int | None
     return etag, last_modified
 
 
-def _links(config: _Config, request: HttpRequest, obj: Any) -> _Flow[str | None]:
-    """The Link field value of the schema and context links."""
+def _add_links(
+    headers: HttpResponseBase, entity: Entity, request: HttpRequest, obj: Any
+) -> _Flow[None]:
+    """Append the Links of ``entity`` to the Link header of ``headers``."""
+    links = yield from _links(entity, request, obj)
+    link = join_links(headers.get("Link"), links)
+    if link is not None:
+        headers["Link"] = link
+
+
+def _links(entity: Entity, request: HttpRequest, obj: Any) -> _Flow[str | None]:
+    """The Link field value of the schema and context links of ``entity``."""
     schema = yield from _link(
         request,
         obj,
         (
-            config.schema_link_or_func,
-            config.schema_rel_or_func,
-            config.schema_type_or_func,
+            entity.schema_link_or_func,
+            entity.schema_rel_or_func,
+            entity.schema_type_or_func,
         ),
         (DEFAULT_SCHEMA_REL, DEFAULT_SCHEMA_TYPE),
     )
@@ -489,9 +735,9 @@ def _links(config: _Config, request: HttpRequest, obj: Any) -> _Flow[str | None]
         request,
         obj,
         (
-            config.context_link_or_func,
-            config.context_rel_or_func,
-            config.context_type_or_func,
+            entity.context_link_or_func,
+            entity.context_rel_or_func,
+            entity.context_type_or_func,
         ),
         (DEFAULT_CONTEXT_REL, DEFAULT_CONTEXT_TYPE),
     )
@@ -520,6 +766,13 @@ def _link(
     return link_content(url, rel, content_type)
 
 
+def _has_status(content: Any) -> bool:
+    """Whether the handler's return value carries its own status."""
+    return isinstance(content, (HttpResponseBase, Status)) or (
+        isinstance(content, tuple) and len(content) == 2
+    )
+
+
 def _response_and_status(
     content: Any, temporal: HttpResponse, declared: int | None
 ) -> tuple[HttpResponseBase, int]:
@@ -546,17 +799,29 @@ def _capture_declared_status(declared: dict[str, int | None], operation: Any) ->
         declared[method.upper()] = code
 
 
+class _HiddenParameters(NamedTuple):
+    """The wrapper's signature, and the handler parameters hidden from ninja."""
+
+    signature: inspect.Signature
+    #: The parameter ninja passes its temporal response to.
+    response_name: str
+    #: Whether the handler itself declares ``response_name``.
+    pass_response: bool
+    #: The handler parameter receiving the ``ScrudfulResponse``, if any.
+    meta_name: str | None
+
+
 def _wrapper_signature(
     handler: Callable[..., Any], load_as: str | None
-) -> tuple[inspect.Signature, str, bool]:
-    """Return the wrapper's signature and where ninja's temporal response goes.
+) -> _HiddenParameters:
+    """Return the wrapper's signature and where the hidden parameters go.
 
     The handler's parameters are kept, so ninja's parameter parsing and OpenAPI
-    see the handler unchanged, except for the ``load_as`` parameter, which is
-    removed. ninja passes its temporal response to the parameter annotated
-    ``HttpResponse`` (by identity); one is appended (keyword-only, with a
-    private name) unless the handler declares it. The flag tells whether the
-    handler itself receives it.
+    see the handler unchanged, except for the ``load_as`` parameter and the
+    (first) parameter annotated ``ScrudfulResponse``, which are removed. ninja
+    passes its temporal response to the parameter annotated ``HttpResponse``
+    (by identity); one is appended (keyword-only, with a private name) unless
+    the handler declares it.
     """
     signature = evaluated_signature(handler)
     if load_as is not None and load_as not in signature.parameters:
@@ -566,20 +831,23 @@ def _wrapper_signature(
         )
     globalns = getattr(inspect.unwrap(handler), "__globals__", {})
     params = []
-    response_name = None
+    response_name = meta_name = None
     for param in signature.parameters.values():
         if param.name == load_as:
             continue
-        if (
-            response_name is None
-            and resolve_annotation(param.annotation, globalns) is HttpResponse
-        ):
+        annotation = resolve_annotation(param.annotation, globalns)
+        if meta_name is None and annotation is ScrudfulResponse:
+            meta_name = param.name
+            continue
+        if response_name is None and annotation is HttpResponse:
             response_name = param.name
             # ninja would evaluate a string in this module's globals.
             param = param.replace(annotation=HttpResponse)
         params.append(param)
     if response_name is not None:
-        return signature.replace(parameters=params), response_name, True
+        return _HiddenParameters(
+            signature.replace(parameters=params), response_name, True, meta_name
+        )
 
     # Not a possible ninja parameter name (pydantic rejects leading
     # underscores), so it can't collide with the handler's.
@@ -591,4 +859,6 @@ def _wrapper_signature(
         params.insert(-1, extra)
     else:
         params.append(extra)
-    return signature.replace(parameters=params), response_name, False
+    return _HiddenParameters(
+        signature.replace(parameters=params), response_name, False, meta_name
+    )
