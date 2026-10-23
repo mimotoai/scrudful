@@ -85,16 +85,29 @@ Headers
 
     ninja routes HEAD only to operations that list it, e.g.
     ``@router.api_operation(["GET", "HEAD"], "/items/{pk}")``.
+
+Async operations
+    The handler may be ``async def``: the decorated function is then a
+    coroutine function too, so ninja builds an async operation, and the steps
+    above run in the same order with the same results. In an async operation
+    ``load``, the validator callbacks and the link callables may each be
+    ``def`` or ``async def``: ``async def`` ones are awaited, sync ones run
+    through ``asgiref.sync.sync_to_async(func, thread_sensitive=True)``, so
+    they may use the Django ORM, and an awaitable a sync callable returns is
+    awaited. They are called one after the other, never concurrently. With a
+    sync handler, the operation is sync and every callable is called directly,
+    so they must all be sync.
 """
 
 from __future__ import annotations
 
 import functools
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
+from asgiref.sync import sync_to_async
 from django.http import HttpRequest, HttpResponse, HttpResponseBase
 from ninja import Status
 
@@ -140,6 +153,12 @@ CONDITIONAL_WRITE_RESPONSES: dict[int, dict[str, str]] = {
 }
 
 Handler = TypeVar("Handler", bound=Callable[..., Any])
+T = TypeVar("T")
+
+#: The request flow, written once for sync and async operations: a generator
+#: that yields each call of a user callable, as ``(func, args, kwargs)``, and
+#: is sent its result. :func:`_run_sync` and :func:`_run_async` make the calls.
+_Flow = Generator[tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any]], Any, T]
 
 
 @dataclass(frozen=True)
@@ -203,8 +222,10 @@ def scrudful(
         def update_item(request, pk: int, payload: ItemIn, obj: Item): ...
 
     Placed above it, ninja registers the undecorated function and the
-    decorator has no effect. All arguments are keyword-only; the behaviour is
-    described in the module docstring.
+    decorator has no effect. The handler may be ``async def``, and then the
+    callables may be too (see "Async operations" in the module docstring).
+    All arguments are keyword-only; the behaviour is described in the module
+    docstring.
 
     Parameters
     ----------
@@ -292,8 +313,8 @@ def scrudful(
         # The single response code each method's operation declares, if any.
         declared: dict[str, int | None] = {}
 
-        @functools.wraps(handler)
-        def wrapper(request: HttpRequest, **values: Any) -> Any:
+        def flow(request: HttpRequest, values: dict[str, Any]) -> _Flow[Any]:
+            """The request flow; each call of a user callable is a ``yield``."""
             response: HttpResponse = (
                 values[response_name] if pass_response else values.pop(response_name)
             )
@@ -303,11 +324,11 @@ def scrudful(
             method = request.method.upper()
             obj = None
             if load is not None:
-                obj = load(request, **params)
+                obj = yield load, (request,), params
                 values[load_as] = obj
 
             if config.has_validators:
-                etag, last_modified = _validators(config, obj)
+                etag, last_modified = yield from _validators(config, obj)
                 result = evaluate_preconditions(
                     method,
                     precondition_headers(request),
@@ -318,7 +339,7 @@ def scrudful(
                 if result is not None:
                     return conditional_response(result)
 
-            content = handler(request, **values)
+            content = yield handler, (request,), values
 
             headers, status = _response_and_status(
                 content, response, declared.get(method)
@@ -326,15 +347,30 @@ def scrudful(
             if config.has_validators:
                 refresh, send = validator_policy(method, status)
                 if refresh:
-                    obj = load(request, **params)  # type: ignore[misc]
-                    etag, last_modified = _validators(config, obj)
+                    obj = yield load, (request,), params
+                    etag, last_modified = yield from _validators(config, obj)
                 if send:
                     set_validator_headers(headers, etag, last_modified)
-            link = join_links(headers.get("Link"), _links(config, request, obj))
+            links = yield from _links(config, request, obj)
+            link = join_links(headers.get("Link"), links)
             if link is not None:
                 headers["Link"] = link
             expose_headers(headers)
             return content
+
+        # ninja builds an AsyncOperation for a coroutine function: the wrapper
+        # is one exactly when the handler is.
+        if inspect.iscoroutinefunction(handler):
+
+            @functools.wraps(handler)
+            async def wrapper(request: HttpRequest, **values: Any) -> Any:
+                return await _run_async(flow(request, values))
+
+        else:
+
+            @functools.wraps(handler)
+            def wrapper(request: HttpRequest, **values: Any) -> Any:
+                return _run_sync(flow(request, values))
 
         wrapper.__signature__ = signature  # type: ignore[attr-defined]
         wrapper._scrudful = config  # type: ignore[attr-defined]
@@ -350,22 +386,64 @@ def scrudful(
     return decorator
 
 
-def _validators(config: _Config, obj: Any) -> tuple[str | None, int | None]:
+def _run_sync(flow: _Flow[T]) -> T:
+    """Run ``flow``, calling the callables it yields directly."""
+    result = None
+    while True:
+        try:
+            func, args, kwargs = flow.send(result)
+        except StopIteration as stop:
+            return stop.value
+        result = func(*args, **kwargs)
+
+
+async def _run_async(flow: _Flow[T]) -> T:
+    """Run ``flow`` in an async operation, see :func:`_call_async`."""
+    result = None
+    while True:
+        try:
+            func, args, kwargs = flow.send(result)
+        except StopIteration as stop:
+            return stop.value
+        result = await _call_async(func, args, kwargs)
+
+
+async def _call_async(
+    func: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> Any:
+    """Call ``func`` from an async operation and return its result.
+
+    ``async def`` callables are awaited. Sync ones run through
+    ``sync_to_async(thread_sensitive=True)``, off the event loop, as the
+    Django ORM requires; an awaitable they return is awaited.
+    """
+    if inspect.iscoroutinefunction(func) or inspect.iscoroutinefunction(
+        getattr(func, "__call__", None)
+    ):
+        return await func(*args, **kwargs)
+    result = await sync_to_async(func, thread_sensitive=True)(*args, **kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+def _validators(config: _Config, obj: Any) -> _Flow[tuple[str | None, int | None]]:
     """The validators of ``obj``; none when there is no representation."""
     etag = last_modified = None
     if obj is None:
         return etag, last_modified
     if config.etag_func is not None:
-        value = config.etag_func(obj)
+        value = yield config.etag_func, (obj,), {}
         etag = None if value is None else quote_etag(value)
     if config.last_modified_func is not None:
-        last_modified = http_timestamp(aware(config.last_modified_func(obj)))
+        value = yield config.last_modified_func, (obj,), {}
+        last_modified = http_timestamp(aware(value))
     return etag, last_modified
 
 
-def _links(config: _Config, request: HttpRequest, obj: Any) -> str | None:
+def _links(config: _Config, request: HttpRequest, obj: Any) -> _Flow[str | None]:
     """The Link field value of the schema and context links."""
-    schema = _link(
+    schema = yield from _link(
         request,
         obj,
         (
@@ -375,7 +453,7 @@ def _links(config: _Config, request: HttpRequest, obj: Any) -> str | None:
         ),
         (DEFAULT_SCHEMA_REL, DEFAULT_SCHEMA_TYPE),
     )
-    context = _link(
+    context = yield from _link(
         request,
         obj,
         (
@@ -393,20 +471,20 @@ def _link(
     obj: Any,
     values_or_funcs: tuple[Any, Any, Any],
     defaults: tuple[str, str],
-) -> str | None:
+) -> _Flow[str | None]:
     """Build one link-value from (url, rel, type) values or callables."""
 
-    def value(value_or_func: Any) -> Any:
+    def value(value_or_func: Any) -> _Flow[Any]:
         if callable(value_or_func):
-            return value_or_func(request, obj)
+            return (yield value_or_func, (request, obj), {})
         return value_or_func
 
     url_or_func, rel_or_func, type_or_func = values_or_funcs
-    url = value(url_or_func)
+    url = yield from value(url_or_func)
     if not url:
         return None
-    rel = value(rel_or_func) or defaults[0]
-    content_type = value(type_or_func) or defaults[1]
+    rel = (yield from value(rel_or_func)) or defaults[0]
+    content_type = (yield from value(type_or_func)) or defaults[1]
     return link_content(url, rel, content_type)
 
 
