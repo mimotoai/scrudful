@@ -178,6 +178,46 @@ Collections
     operation the queryset is counted and sliced through ``sync_to_async``,
     never on the event loop, so the handler may return it unevaluated.
 
+OPTIONS
+    A :class:`ScrudfulRouter` adds an OPTIONS operation to every path that has
+    a scrudful operation; an OPTIONS operation the implementer declares on the
+    path wins. It runs no ``load``, handler, validator callback or permission
+    check and ignores the API's and the router's ``auth``: it describes the
+    path template, so its answer is the same for every client, and for a
+    missing item as for a hidden one. It is not in the OpenAPI document.
+
+    The body is the semantic-http spec's "HTTP Schema Resource": for each of
+    ``get``, ``head`` (when an operation routes it, described like ``get``),
+    ``post``, ``put``, ``patch`` and ``delete`` that the path serves, an
+    OpenAPI-like operation, in the shape DRF's ``ScrudfulMetadata`` produces
+    (``scrudful.rest_framework``), which it extends:
+
+    - ``requestBody`` (POST, PUT, PATCH) with the ``content`` of the
+      ``request`` entity, else of the item entity, as in DRF;
+    - ``responses``: DRF's success status (200, 201 for POST, 204 for
+      DELETE) and, when the operation evaluates the If-* headers, the early
+      responses (304, 400 and 412 for GET/HEAD; 400, 412 and 428 for writes,
+      only 400 and 412 for POST), plus every status the operation declares
+      in ``response=``, with its reason phrase. Each status with a body gets
+      the ``content`` of its entity: scrudful's own 400, 412 and 428 get
+      ``error``'s, if declared, the others ``responses[status]``, else the
+      default entity (2xx, 201 for a create, the collection for a list);
+    - ``parameters``: the precondition headers of a conditional write.
+
+    A ``content`` is ``{"application/json": {"schema": <url>, "context":
+    <url>}}``, with the entity's links; an entity without links (such as
+    ``Entity()``) has none. Link callables are called with the request and
+    ``None``; the OPTIONS view is sync, so the callables of an async
+    operation are run with ``asgiref.sync.async_to_sync``, as the operation
+    runs them (ninja runs the view in a thread on a path with async
+    operations). Methods whose operation is not scrudful get no content and
+    no preconditions, as in DRF.
+
+    The response is JSON, with the Links of the ``options_schema_link`` and
+    ``options_context_link`` of :class:`ScrudfulRouter` (the HTTP Schema
+    Resource's own schema and context). Without them it has no Link, which
+    the spec does not allow.
+
 The runtime response
     A handler parameter annotated :class:`ScrudfulResponse` receives a fresh
     instance on every request; like the ``load_as`` parameter, it is hidden
@@ -229,6 +269,7 @@ Async operations
 from __future__ import annotations
 
 import functools
+import http
 import inspect
 import math
 import re
@@ -239,15 +280,16 @@ from types import MappingProxyType
 from typing import Any, NamedTuple, TypeVar, get_args
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
-from asgiref.sync import sync_to_async
+from asgiref.sync import async_to_sync, sync_to_async
 from django.core.paginator import UnorderedObjectListWarning
 from django.db.models import QuerySet
-from django.http import HttpRequest, HttpResponse, HttpResponseBase
+from django.http import HttpRequest, HttpResponse, HttpResponseBase, JsonResponse
 from django.utils.encoding import iri_to_uri
-from ninja import Query, Schema, Status
+from ninja import Query, Router, Schema, Status
 from ninja.constants import NOT_SET
 from ninja.errors import ConfigError, HttpError
 from ninja.signature.details import is_collection_type
+from ninja.signature.utils import get_path_param_names
 from pydantic import Field, create_model
 
 from scrudful._adapter import (
@@ -258,6 +300,8 @@ from scrudful._adapter import (
     READ_DESCRIPTIONS,
     WRITE_DESCRIPTIONS,
     check_validators,
+    describe_read,
+    describe_write,
     evaluated_signature,
     expose_headers,
     resolve_annotation,
@@ -280,6 +324,7 @@ __all__ = [
     "CONDITIONAL_WRITE_RESPONSES",
     "Entity",
     "ScrudfulResponse",
+    "ScrudfulRouter",
     "scrudful",
     "scrudful_create",
     "scrudful_list",
@@ -717,7 +762,8 @@ def scrudful_create(
         the item entity's Links on 201 responses.
     error : Entity, optional
         The entity of scrudful's own 400, 412 and 428 bodies. A create
-        operation produces none; it is kept for OPTIONS.
+        operation produces none (and OPTIONS lists none for it), so it is
+        unused.
 
     Raises
     ------
@@ -941,6 +987,97 @@ def scrudful_list(
         max_page_size=max_page_size,
     )
     return _decorator(config, "@scrudful_list")
+
+
+class ScrudfulRouter(Router):
+    """A ninja ``Router`` answering OPTIONS on every path with a scrudful operation.
+
+    The first scrudful operation added to a path (one decorated with
+    :func:`scrudful`, :func:`scrudful_create` or :func:`scrudful_list`) also
+    adds an OPTIONS operation to it, unless the path already has one. It is
+    registered with ``auth=None`` and ``include_in_schema=False``, so it needs
+    no credentials whatever the API's or router's ``auth`` and is not in the
+    OpenAPI document, and it answers with the path's HTTP Schema Resource
+    (see "OPTIONS" in the module docstring). An operation the implementer
+    adds later whose methods include ``"OPTIONS"`` replaces it.
+
+    Use it for the routers holding scrudful operations, nested or not, and
+    for the API's own operations::
+
+        api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
+        items = ScrudfulRouter(
+            options_schema_link=(
+                "https://w3id.org/semantic-http/0.1/"
+                "http-schema-resource.schema.json"
+            ),
+            options_context_link=(
+                "https://w3id.org/semantic-http/0.1/"
+                "http-schema-resource.context.jsonld"
+            ),
+        )
+        api.add_router("/items", items)
+
+    CORS preflight requests (an OPTIONS with ``Access-Control-Request-Method``)
+    are sent by browsers without credentials and are meant to be answered by
+    the CORS middleware (e.g. django-cors-headers) before the view runs.
+    scrudful's OPTIONS is the other, non-preflight, case: a request that does
+    reach it is answered with the description like any other OPTIONS.
+
+    Parameters
+    ----------
+    options_schema_link : str, optional
+        URL of the JSON Schema of the HTTP Schema Resource, sent as the
+        OPTIONS response's schema Link (``rel="describedBy"``,
+        ``type="application/json"``). Omitted when unset, which the
+        semantic-http spec does not allow.
+    options_context_link : str, optional
+        URL of the JSON-LD context of the HTTP Schema Resource, sent as the
+        OPTIONS response's context Link
+        (``rel="http://www.w3.org/ns/json-ld#context"``,
+        ``type="application/ld+json"``). Omitted when unset.
+
+    The other arguments are ``ninja.Router``'s.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        options_schema_link: str | None = None,
+        options_context_link: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.options_schema_link = options_schema_link
+        self.options_context_link = options_context_link
+
+    def add_api_operation(
+        self,
+        path: str,
+        methods: list[str],
+        view_func: Callable[..., Any],
+        **kwargs: Any,
+    ) -> None:
+        super().add_api_operation(path, methods, view_func, **kwargs)
+        path_view = _path_view(self, view_func)
+        # ninja routes a request to the operations listing its method as is.
+        if "OPTIONS" in methods:
+            # The implementer's OPTIONS replaces the automatic one.
+            path_view.operations = [
+                operation
+                for operation in path_view.operations
+                if not _is_automatic_options(operation)
+            ]
+        elif isinstance(getattr(view_func, "_scrudful", None), _Config) and not any(
+            "OPTIONS" in operation.methods for operation in path_view.operations
+        ):
+            super().add_api_operation(
+                path,
+                ["OPTIONS"],
+                _options_view(self, path, path_view),
+                auth=None,
+                response=NOT_SET,
+                include_in_schema=False,
+            )
 
 
 def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
@@ -1653,3 +1790,204 @@ def _wrapper_signature(
     return _HiddenParameters(
         signature.replace(parameters=params), response_name, False, meta_name
     )
+
+
+# --- OPTIONS -------------------------------------------------------------------
+
+#: The methods an OPTIONS body describes, in this order, when the path serves
+#: them.
+_DESCRIBED_METHODS = ("get", "head", "post", "put", "patch", "delete")
+#: The statuses of scrudful's own responses with a body (``error``'s entity).
+_EARLY_STATUSES = frozenset({400, 412, 428})
+
+
+def _is_automatic_options(operation: Any) -> bool:
+    return getattr(operation.view_func, "_scrudful_options", False)
+
+
+def _path_view(router: Router, view_func: Callable[..., Any]) -> Any:
+    """The ``PathView`` of ``router`` holding the operation just added.
+
+    Found by the operation ninja sets as ``view_func._ninja_operation``, so it
+    does not depend on how ninja normalizes the path key.
+    """
+    operation = getattr(view_func, "_ninja_operation", None)
+    for path_view in router.path_operations.values():
+        if any(candidate is operation for candidate in path_view.operations):
+            return path_view
+    raise LookupError(f"{view_func!r} is not an operation of {router!r}")
+
+
+def _options_view(
+    router: ScrudfulRouter, path: str, path_view: Any
+) -> Callable[..., HttpResponseBase]:
+    """The view of the automatic OPTIONS operation of ``path``.
+
+    It reads ``path_view``, the router's own (template) ``PathView``, when a
+    request comes, so it describes the operations of the path as declared,
+    whichever API, prefix or mount the request came through (ninja serves
+    clones of them). It declares the path parameters, as ``Any`` (a
+    converter such as ``{int:pk}`` passes an ``int``), so that ninja passes
+    them and validates nothing.
+    """
+
+    def scrudful_options(request: HttpRequest, **params: Any) -> HttpResponseBase:
+        body = _describe_path(request, path_view)
+        response = JsonResponse(body)
+        link = join_links(
+            _options_link(
+                router.options_schema_link, DEFAULT_SCHEMA_REL, DEFAULT_SCHEMA_TYPE
+            ),
+            _options_link(
+                router.options_context_link, DEFAULT_CONTEXT_REL, DEFAULT_CONTEXT_TYPE
+            ),
+        )
+        if link is not None:
+            response["Link"] = link
+        expose_headers(response)
+        return response
+
+    parameters = [
+        inspect.Parameter(name, inspect.Parameter.KEYWORD_ONLY, annotation=Any)
+        for name in sorted(get_path_param_names(path))
+    ]
+    scrudful_options.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        [
+            inspect.Parameter("request", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+            *parameters,
+        ]
+    )
+    scrudful_options._scrudful_options = True  # type: ignore[attr-defined]
+    return scrudful_options
+
+
+def _options_link(url: str | None, rel: str, content_type: str) -> str | None:
+    return link_content(url, rel, content_type) if url else None
+
+
+def _describe_path(request: HttpRequest, path_view: Any) -> dict[str, Any]:
+    """The HTTP Schema Resource of the path: each method it serves."""
+    operations = [
+        operation
+        for operation in path_view.operations
+        if not _is_automatic_options(operation)
+    ]
+    body = {}
+    for method in _DESCRIBED_METHODS:
+        # The operation ninja routes the method to: the first that lists it.
+        operation = next(
+            (op for op in operations if method.upper() in op.methods), None
+        )
+        if operation is None:
+            continue
+        flow = _describe_operation(method, operation, request)
+        if getattr(operation, "is_async", False):
+            # Its link callables may be async def; this view is sync, and
+            # ninja runs it in a thread (sync_to_async) on an async path.
+            body[method] = async_to_sync(_run_async)(flow)
+        else:
+            body[method] = _run_sync(flow)
+    return body
+
+
+def _describe_operation(
+    method: str, operation: Any, request: HttpRequest
+) -> _Flow[dict[str, Any]]:
+    """Describe ``operation`` as ``method``; each link callable is a ``yield``.
+
+    The description of :func:`scrudful._adapter.describe_read` /
+    :func:`~scrudful._adapter.describe_write` (DRF's), with the response
+    content of each status's entity and the statuses the operation declares.
+    Link callables are called with ``(request, None)``.
+    """
+    config = getattr(operation.view_func, "_scrudful", None)
+    if not isinstance(config, _Config):
+        config = None
+    read = method in ("get", "head")
+    # Whether the If-* headers are evaluated: a list's (after the handler,
+    # never required) only matter for GET/HEAD; a create never evaluates them.
+    conditional = config is not None and (
+        read and config.has_list_validators
+        if config.kind == "list"
+        else config.evaluates_preconditions
+    )
+    content = None
+    described = set()  # the statuses whose content is known
+    if read:
+        if config is not None:
+            entity = _described_entity(config, 200, conditional)
+            content = yield from _media(entity, request)
+            described.add("200")
+        description = describe_read(content, conditional)
+    else:
+        if config is not None and method != "delete":
+            # As DRF's: the item's unless declared (a create's is the item's).
+            entity = config.entity if config.request is None else config.request
+            content = yield from _media(entity, request)
+        description = describe_write(
+            method,
+            content,
+            conditional,
+            config is not None and config.has_etag,
+            config is not None and config.has_last_modified,
+        )
+
+    responses = description["responses"]
+    for code, model in operation.response_models.items():
+        if (
+            isinstance(code, int)
+            and not isinstance(code, bool)
+            and model is not NOT_SET
+        ):
+            responses.setdefault(str(code), {"description": _phrase(code)})
+    if config is not None:
+        for key, response in responses.items():
+            if key in described or key in ("204", "304"):
+                continue  # no content (204, 304), or already known
+            entity = _described_entity(config, int(key), conditional)
+            content = yield from _media(entity, request)
+            if content:
+                response["content"] = content
+    return description
+
+
+def _described_entity(config: _Config, status: int, conditional: bool) -> Any:
+    """The entity of the responses with ``status``, for OPTIONS.
+
+    scrudful's own early responses (listed when ``conditional``) get the
+    ``error`` entity, if declared; the others the declared entity.
+    """
+    if conditional and status in _EARLY_STATUSES:
+        return (
+            config.error if config.error is not None else config.responses.get(status)
+        )
+    return config.response_entity(status)
+
+
+def _media(entity: Entity | None, request: HttpRequest) -> _Flow[Any]:
+    """The ``content`` of ``entity``: ``{"application/json": {...}}``, or ``None``.
+
+    The values are the schema and context URLs (as DRF's metadata has them);
+    an entity without links (e.g. ``Entity()``) has none.
+    """
+    if entity is None:
+        return None
+    links = {}
+    for key, value_or_func in (
+        ("schema", entity.schema_link_or_func),
+        ("context", entity.context_link_or_func),
+    ):
+        value = value_or_func
+        if callable(value_or_func):
+            value = yield value_or_func, (request, None), {}
+        if value:
+            links[key] = str(value)
+    return {"application/json": links} if links else None
+
+
+def _phrase(status: int) -> str:
+    """The reason phrase of ``status`` (ninja's OpenAPI text when unknown)."""
+    try:
+        return http.HTTPStatus(status).phrase
+    except ValueError:
+        return "Unknown Status Code"
