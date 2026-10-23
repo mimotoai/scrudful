@@ -42,13 +42,11 @@ from .models import Role, new_etag
 
 #: The schema and context of the HTTP Schema Resource that OPTIONS answers
 #: with (the semantic-http spec requires Links on it; see ScrudfulRouter).
+#: Placeholders: the spec's 2019 draft publishes no resolvable URLs for these
+#: documents, so a real API points them at copies it serves.
 OPTIONS_LINKS = dict(
-    options_schema_link=(
-        "https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json"
-    ),
-    options_context_link=(
-        "https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld"
-    ),
+    options_schema_link="https://example.com/schemas/http-schema-resource.json",
+    options_context_link="https://example.com/contexts/http-schema-resource.jsonld",
 )
 
 

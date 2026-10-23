@@ -47,10 +47,8 @@ LIST_LINKS = dict(
 LIST_CONTENT = {
     "application/json": {"schema": "/schemas/items", "context": "/contexts/items"}
 }
-SCHEMA_RESOURCE = "https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json"
-CONTEXT_RESOURCE = (
-    "https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld"
-)
+SCHEMA_RESOURCE = "https://example.com/schemas/http-schema-resource.json"
+CONTEXT_RESOURCE = "https://example.com/contexts/http-schema-resource.jsonld"
 NOT_MODIFIED = {
     "description": "Not Modified: the representation matches the request's "
     "If-None-Match or If-Modified-Since validators."

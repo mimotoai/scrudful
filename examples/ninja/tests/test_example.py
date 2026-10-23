@@ -39,9 +39,9 @@ PRECONDITION_REQUIRED = {
 }
 PRECONDITION_FAILED = {"detail": "Precondition failed."}
 OPTIONS_LINK = (
-    "<https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json>; "
+    "<https://example.com/schemas/http-schema-resource.json>; "
     'rel="describedBy"; type="application/json", '
-    "<https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld>; "
+    "<https://example.com/contexts/http-schema-resource.jsonld>; "
     'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
 )
 MISSING = 999_999

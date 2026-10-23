@@ -218,7 +218,8 @@ OPTIONS
     A ``content`` is ``{"application/json": {"schema": <url>, "context":
     <url>}}``, with the entity's links; an entity without links (such as
     ``Entity()``) has none. Link callables are called with the request and
-    ``None``; the OPTIONS view is sync, so the callables of an async
+    ``obj=None`` (there is no loaded object), so they must accept ``None``;
+    the OPTIONS view is sync, so the callables of an async
     operation are run with ``asgiref.sync.async_to_sync``, as the operation
     runs them (ninja runs the view in a thread on a path with async
     operations). Methods whose operation is not scrudful get no content and
@@ -227,7 +228,10 @@ OPTIONS
     The response is JSON, with the Links of the ``options_schema_link`` and
     ``options_context_link`` of :class:`ScrudfulRouter` (the HTTP Schema
     Resource's own schema and context). Without them it has no Link, which
-    the spec does not allow.
+    the spec does not allow. The body follows the spec's 2019 draft, which
+    publishes no resolvable URLs for these two documents: point them at
+    copies the application serves. Alignment with the spec's 0.1 revision is
+    planned.
 
 The runtime response
     A handler parameter annotated :class:`ScrudfulResponse` receives a fresh
@@ -1022,7 +1026,9 @@ class ScrudfulRouter(Router):
     (see "OPTIONS" in the module docstring). An operation the implementer
     adds later whose methods include ``"OPTIONS"`` replaces it. The API's
     and routers' ``add_decorator`` decorators and throttles apply to it as to
-    any operation. Its URL name is ``scrudful_options`` on every path.
+    any operation. Its URL name is ``scrudful_options`` on every path. The
+    link callables of the operations it describes are called with
+    ``obj=None`` (there is no loaded object), so they must accept it.
 
     Use it for the routers holding scrudful operations, nested or not, and
     for the API's own operations (``default_router``); scrudful operations
@@ -1031,15 +1037,20 @@ class ScrudfulRouter(Router):
         api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
         items = ScrudfulRouter(
             options_schema_link=(
-                "https://w3id.org/semantic-http/0.1/"
-                "http-schema-resource.schema.json"
+                "https://example.com/schemas/http-schema-resource.json"
             ),
             options_context_link=(
-                "https://w3id.org/semantic-http/0.1/"
-                "http-schema-resource.context.jsonld"
+                "https://example.com/contexts/http-schema-resource.jsonld"
             ),
         )
         api.add_router("/items", items)
+
+    The semantic-http spec's 2019 draft, whose shape the OPTIONS body
+    follows (as DRF's ``ScrudfulMetadata``), publishes no resolvable URLs
+    for the HTTP Schema Resource's schema and context: point
+    ``options_schema_link`` and ``options_context_link`` at copies the
+    application serves (the URLs above are placeholders). Alignment with the
+    spec's 0.1 revision is planned.
 
     CORS preflight requests (an OPTIONS with ``Access-Control-Request-Method``)
     are sent by browsers without credentials and are meant to be answered by

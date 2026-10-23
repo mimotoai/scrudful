@@ -32,12 +32,8 @@ on the API itself, make the API's default router one too:
     from scrudful.ninja import ScrudfulRouter
 
     SCHEMA_RESOURCE = dict(
-        options_schema_link=(
-            "https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json"
-        ),
-        options_context_link=(
-            "https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld"
-        ),
+        options_schema_link="https://example.com/schemas/http-schema-resource.json",
+        options_context_link="https://example.com/contexts/http-schema-resource.jsonld",
     )
 
     api = NinjaAPI(auth=..., default_router=ScrudfulRouter(**SCHEMA_RESOURCE))
@@ -46,6 +42,13 @@ on the API itself, make the API's default router one too:
 
 Scrudful operations on a plain ``ninja.Router`` work, but get no OPTIONS
 operation (ninja answers 405).
+
+``options_schema_link`` and ``options_context_link`` are the Links of the
+OPTIONS response: the JSON Schema and JSON-LD context of the HTTP Schema
+Resource. The OPTIONS body follows the semantic-http spec's 2019 draft (the
+shape DRF's ``ScrudfulMetadata`` produces), which publishes no resolvable URLs
+for these documents, so the URLs above are placeholders: point them at copies
+your application serves. Alignment with the spec's 0.1 revision is planned.
 
 Single resources
 ----------------
@@ -355,8 +358,10 @@ the precondition headers of conditional writes. It is the same for everyone:
   the name can't be reversed to one path;
 * the reason phrases of extra statuses are ``http.HTTPStatus(code).phrase``,
   which can differ between Python versions (e.g. for 422);
+* link callables are called with the request and ``obj=None`` (there is no
+  loaded object, queryset or created item), so they must accept ``None``;
 * without ``options_schema_link`` / ``options_context_link`` the response has
-  no Link, which the semantic-http spec does not allow.
+  no Link, which the semantic-http spec does not allow (see Setup).
 
 CORS
 ~~~~
