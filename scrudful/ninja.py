@@ -288,7 +288,6 @@ Async operations
 from __future__ import annotations
 
 import functools
-import http
 import inspect
 import math
 import re
@@ -1937,9 +1936,10 @@ def _describe_operation(
     """Describe ``operation`` as ``method``; each link callable is a ``yield``.
 
     The description of :func:`scrudful._adapter.describe_read` /
-    :func:`~scrudful._adapter.describe_write` (DRF's), with the response
-    content of each status's entity and the statuses the operation declares.
-    Link callables are called with ``(request, None)``.
+    :func:`~scrudful._adapter.describe_write` (DRF's), with the statuses the
+    operation answers (see :func:`_answered_statuses`) and the response
+    content of each status's entity. Link callables are called with
+    ``(request, None)``.
     """
     config = getattr(operation.view_func, "_scrudful", None)
     if not isinstance(config, _Config):
@@ -1952,15 +1952,11 @@ def _describe_operation(
         if config.kind == "list"
         else config.evaluates_preconditions
     )
-    content = None
-    described = set()  # the statuses whose content is known
+    statuses = _answered_statuses(operation, config)
     if read:
-        if config is not None:
-            entity = _described_entity(config, 200, conditional)
-            content = yield from _media(entity, request)
-            described.add("200")
-        description = describe_read(content, conditional)
+        description = describe_read(None, conditional, statuses)
     else:
+        content = None
         if config is not None and method != "delete":
             # As DRF's: the item's unless declared (a create's is the item's).
             entity = config.entity if config.request is None else config.request
@@ -1971,25 +1967,35 @@ def _describe_operation(
             conditional,
             config is not None and config.has_etag,
             config is not None and config.has_last_modified,
+            statuses,
         )
 
     responses = description["responses"]
-    for code, model in operation.response_models.items():
-        if (
-            isinstance(code, int)
-            and not isinstance(code, bool)
-            and model is not NOT_SET
-        ):
-            responses.setdefault(str(code), {"description": _phrase(code)})
     if config is not None:
         for key, response in responses.items():
-            if key in described or key in ("204", "304"):
-                continue  # no content (204, 304), or already known
+            if key in ("204", "304"):
+                continue  # no content
             entity = _described_entity(config, int(key), conditional)
             content = yield from _media(entity, request)
             if content:
                 response["content"] = content
     return description
+
+
+def _answered_statuses(operation: Any, config: _Config | None) -> list[int]:
+    """The statuses ``operation`` answers with, for OPTIONS.
+
+    Those it declares in ``response=`` (with a 201 first for a create, whose
+    plain return value is a 201), else ninja's default, 200.
+    """
+    declared = [
+        code
+        for code, model in operation.response_models.items()
+        if isinstance(code, int) and not isinstance(code, bool) and model is not NOT_SET
+    ]
+    if config is not None and config.kind == "create":
+        return [201, *(code for code in declared if code != 201)]
+    return declared or [200]
 
 
 def _described_entity(config: _Config, status: int, conditional: bool) -> Any:
@@ -2024,11 +2030,3 @@ def _media(entity: Entity | None, request: HttpRequest) -> _Flow[Any]:
         if value:
             links[key] = str(value)
     return {"application/json": links} if links else None
-
-
-def _phrase(status: int) -> str:
-    """The reason phrase of ``status`` (ninja's OpenAPI text when unknown)."""
-    try:
-        return http.HTTPStatus(status).phrase
-    except ValueError:
-        return "Unknown Status Code"

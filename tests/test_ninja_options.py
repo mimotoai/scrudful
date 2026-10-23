@@ -486,6 +486,63 @@ def test_options_entities():
     }
 
 
+def test_options_statuses_are_those_the_operation_answers(store):
+    """A create answers 201, other operations their declared codes, else 200."""
+    router = ScrudfulRouter()
+
+    @router.post("/items/search", response=List[ItemOut])
+    @scrudful(**LINKS)
+    def search(request, payload: ItemIn):
+        return []
+
+    @router.post("/items/{pk}/archive", response={202: Message, 404: Message})
+    @scrudful(load=store.load, etag_func=etag)
+    def archive(request, pk: int, obj):
+        return Status(202, {"detail": "archiving"})
+
+    @router.delete("/items/{pk}", response=Message)
+    @scrudful(load=store.load, etag_func=etag, **LINKS)
+    def delete_item(request, pk: int, obj):
+        return {"detail": "deleted"}
+
+    @router.get("/items/{pk}")
+    @scrudful(**LINKS)
+    def get_item(request, pk: int):
+        return {}
+
+    @router.post("/items/{pk}", response={200: ItemOut, 400: Message})
+    def plain_post(request, pk: int, payload: ItemIn):
+        return {}
+
+    client = TestClient(router)
+    search_responses = options(client, "/items/search").json()["post"]["responses"]
+    assert search_responses == {"200": {"description": "OK", "content": ITEM_CONTENT}}
+    archive_responses = options(client, "/items/1/archive").json()["post"]["responses"]
+    assert archive_responses == {
+        "202": {"description": "Accepted"},
+        "404": {"description": "Not Found"},
+        "400": MALFORMED,
+        "412": FAILED,
+    }
+    body = options(client, "/items/1").json()
+    # The DELETE declares a 200 (with a body: the default entity), not a 204.
+    assert body["delete"]["responses"] == {
+        "200": {"description": "OK", "content": ITEM_CONTENT},
+        "400": MALFORMED,
+        "412": FAILED,
+        "428": REQUIRED,
+    }
+    # No ``response=``: ninja answers 200.
+    assert body["get"]["responses"] == {
+        "200": {"description": "OK", "content": ITEM_CONTENT}
+    }
+    # Not scrudful: the declared statuses, without content.
+    assert body["post"]["responses"] == {
+        "200": {"description": "OK"},
+        "400": {"description": "Bad Request"},
+    }
+
+
 def test_options_link_callables_get_the_request_and_none():
     router = ScrudfulRouter()
     calls = []
@@ -625,7 +682,8 @@ def test_options_mixed_operations(store):
             "404": {"description": "Not Found"},
         },
     }
-    assert body["delete"] == {"responses": {"204": {"description": "No Content"}}}
+    # No ``response=``: ninja answers 200 (with the handler's ``None``).
+    assert body["delete"] == {"responses": {"200": {"description": "OK"}}}
     # Scrudful without validators: links, no preconditions.
     assert body["patch"] == {
         "requestBody": {

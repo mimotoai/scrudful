@@ -7,9 +7,10 @@ everything that touches their framework's request and response objects.
 from __future__ import annotations
 
 import copy
+import http
 import inspect
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Protocol
 
 from scrudful.conditional import SAFE_METHODS, validator_headers
@@ -234,12 +235,36 @@ def resolve_annotation(annotation: Any, globalns: dict[str, Any]) -> Any:
 # none. ``conditional``: whether the method's preconditions are evaluated.
 
 
-def describe_read(content: dict[str, Any] | None, conditional: bool) -> dict[str, Any]:
-    """Describe a GET: its 200 and, when conditional, the 304, 400 and 412."""
-    ok: dict[str, Any] = {"description": "OK"}
-    if content:
-        ok["content"] = content
-    responses = {"200": ok}
+def reason_phrase(status: int) -> str:
+    """The reason phrase of ``status`` (django-ninja's OpenAPI text when unknown)."""
+    try:
+        return http.HTTPStatus(status).phrase
+    except ValueError:
+        return "Unknown Status Code"
+
+
+def _success_responses(
+    statuses: Iterable[int] | None, default: str
+) -> dict[str, dict[str, Any]]:
+    """The responses of ``statuses``, else of the ``default`` status (DRF's)."""
+    if statuses is None:
+        return {default: {"description": _STATUS_TEXT[default]}}
+    return {str(status): {"description": reason_phrase(status)} for status in statuses}
+
+
+def describe_read(
+    content: dict[str, Any] | None,
+    conditional: bool,
+    statuses: Iterable[int] | None = None,
+) -> dict[str, Any]:
+    """Describe a GET: its 200 and, when conditional, the 304, 400 and 412.
+
+    ``statuses`` replaces the 200 by the statuses the operation answers
+    (``content`` then goes on the 200, if listed).
+    """
+    responses = _success_responses(statuses, "200")
+    if content and "200" in responses:
+        responses["200"]["content"] = content
     if conditional:
         responses.update(copy.deepcopy(READ_RESPONSES))
     return {"responses": responses}
@@ -251,10 +276,13 @@ def describe_write(
     conditional: bool,
     has_etag: bool,
     has_last_modified: bool,
+    statuses: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Describe a ``post``, ``put``, ``patch`` or ``delete``.
 
-    ``content`` describes the request body (DELETE has none). A conditional
+    ``content`` describes the request body (DELETE has none). The success
+    status is DRF's (201 for POST, 204 for DELETE, else 200), unless
+    ``statuses`` lists the statuses the operation answers. A conditional
     POST gets the 400 and 412, since it is evaluated but never required to be
     conditional; the other methods also get the 428 and the precondition
     header ``parameters`` (see :func:`conditional_header_parameters`).
@@ -276,7 +304,7 @@ def describe_write(
         if content:
             request_body["content"] = content
         metadata["requestBody"] = request_body
-    metadata["responses"] = {status: {"description": _STATUS_TEXT[status]}}
+    metadata["responses"] = _success_responses(statuses, status)
     if conditional:
         if method == "post":
             metadata["responses"].update(

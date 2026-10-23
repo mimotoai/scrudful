@@ -526,6 +526,8 @@ def test_options_search(client):
     assert list(body) == ["post"]
     assert body["post"]["requestBody"]["content"] == content("role-search")
     assert body["post"]["responses"]["200"]["content"] == content("role-search-result")
+    # A search answers 200, not a create's 201.
+    assert set(body["post"]["responses"]) == {"200"}
 
 
 def test_cors_preflight_is_not_broken(client, role):
