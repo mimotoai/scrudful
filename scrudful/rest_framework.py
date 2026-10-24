@@ -67,7 +67,9 @@ Headers
     ``Link`` and ``Location`` the response carries (django-cors-headers
     replaces that header when ``CORS_EXPOSE_HEADERS`` is set; list the names
     there instead). Exceptions raised by the view (e.g. ``Http404``) propagate
-    unchanged and are rendered by DRF without these headers.
+    unchanged and are rendered by DRF without these headers, unless the
+    project's ``EXCEPTION_HANDLER`` is :func:`exception_handler`, which gives
+    them the Links of the view's ``error`` entity.
 
 OPTIONS
     With :class:`ScrudfulMetadata` (installed in place of DRF's default
@@ -94,6 +96,7 @@ from rest_framework.renderers import JSONRenderer
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.views import exception_handler as drf_exception_handler
 
 from scrudful._adapter import (
     DEFAULT_CONTEXT_REL,
@@ -113,6 +116,7 @@ from scrudful._adapter import (
     expose_headers,
     merge_links,
     options_links,
+    reason_phrase,
     set_validator_headers,
     validator_policy,
 )
@@ -133,6 +137,7 @@ __all__ = [
     "ScrudfulAPIViewMetadata",
     "ScrudfulMetadata",
     "ScrudfulViewFunc",
+    "exception_handler",
     "scrudful",
     "scrudful_api_view",
     "scrudful_viewset",
@@ -787,6 +792,7 @@ class ScrudfulMetadata(BaseMetadata):
     ) -> dict[str, Any]:
         content = None if method == "delete" else _content(handler, args, kwargs)
         conditional = _has_validators(handler)
+        error_content = _error_content(handler, args, kwargs)
         metadata = describe_write(
             method,
             content,
@@ -794,8 +800,15 @@ class ScrudfulMetadata(BaseMetadata):
             conditional and handler.etag_func is not None,
             conditional and handler.last_modified_func is not None,
             response_content=content,
-            error_content=_error_content(handler, args, kwargs),
+            error_content=error_content,
         )
+        if error_content:
+            # A write is also answered 400 when the serializer rejects the body
+            # (DRF's exception handler adds the error Links), conditional or not.
+            metadata["responses"].setdefault(
+                "400",
+                {"description": reason_phrase(400), "content": error_content},
+            )
         if "parameters" in metadata:
             # Through the method, so that a subclass overriding it is used.
             metadata["parameters"] = self.required_conditional_headers(handler)
@@ -882,6 +895,80 @@ def _conditional_response(
     )
     expose_headers(response)
     return response
+
+
+def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | None:
+    """DRF's exception handler, adding the Links of the view's ``error`` entity.
+
+    Errors that DRF itself raises (a serializer's 400, the 404 of
+    ``get_object()``, a 405, a 401 or 403 ...) are answered by DRF's
+    ``exception_handler``; when the view's handler for the request is a
+    :class:`ScrudfulViewFunc` with an ``error`` entity, the response also gets
+    that entity's Links and is served as JSON with the entity's ``media_type``
+    whatever the request's ``Accept`` (DRF's content negotiation is bypassed,
+    as for scrudful's own 400, 412 and 428), so that it agrees with the OPTIONS
+    body. Without an ``error`` entity, or when the view has no such handler,
+    the response is DRF's, unchanged; so is ``None`` for an exception DRF does
+    not handle.
+
+    The handler is looked up as :meth:`ScrudfulMetadata.get_method` does:
+    ``view.action`` (a viewset's), then the request method. A 405 has no
+    handler (the method is not routed): the first method the view allows whose
+    handler has an ``error`` entity supplies the Links. Its callables are called
+    as ``func(view, request, **url_kwargs)``.
+
+    Settings must name it, as the example project does::
+
+        REST_FRAMEWORK = {
+            "EXCEPTION_HANDLER": "scrudful.rest_framework.exception_handler",
+        }
+
+    Parameters
+    ----------
+    exc : Exception
+        The exception raised by the view.
+    context : dict
+        DRF's exception context (``view``, ``args``, ``kwargs``, ``request``).
+
+    Returns
+    -------
+    Response or None
+        DRF's response for ``exc``, with the error Links, or ``None``.
+    """
+    response = drf_exception_handler(exc, context)
+    view, request = context.get("view"), context.get("request")
+    if response is None or not isinstance(view, APIView):
+        return response
+    handler = _error_handler(view, request, response.status_code)
+    if handler is None or not isinstance(request, Request):
+        return response
+    args, kwargs = _callback_arguments((view, request), {}, 1)
+    link = merge_links(
+        response.get("Link"), *_entity_links(handler.error, args, kwargs)
+    )
+    if link is not None:
+        response["Link"] = link
+    request.accepted_renderer = JSONRenderer()
+    request.accepted_media_type = JSONRenderer.media_type
+    response.content_type = handler.error.media_type
+    expose_headers(response)
+    return response
+
+
+def _error_handler(view: APIView, request: Any, status: int) -> ScrudfulViewFunc | None:
+    """The handler with an ``error`` entity that an error of ``view`` belongs to."""
+    metadata = ScrudfulMetadata()
+    names = [getattr(view, "action", None), getattr(request, "method", None)]
+    if status == 405:
+        # Nothing handles the method: describe the error like the first one the
+        # view does allow.
+        allowed = {method.lower() for method in view.allowed_methods}
+        names += [method for method in METHOD_KEYS if method in allowed]
+    for name in names:
+        handler = metadata.get_method(view, name.lower()) if name else None
+        if handler is not None and handler.error is not None:
+            return handler
+    return None
 
 
 def _has_validators(handler: Any) -> bool:

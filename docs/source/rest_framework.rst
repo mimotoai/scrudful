@@ -14,6 +14,31 @@ or a project-wide ``DEFAULT_METADATA_CLASS`` is kept, so subclass or mix in
 ``ScrudfulMetadata`` if you use your own metadata class and want scrudful's
 OPTIONS output.
 
+A view that uses ``ScrudfulMetadata`` only through ``DEFAULT_METADATA_CLASS``,
+without scrudful decorators, gets DRF's ``Allow`` order, which differs from the
+body's.
+
+Errors DRF raises
+-----------------
+
+An ``error`` entity gives scrudful's own 400, 412 and 428 its Links. The errors
+DRF itself raises (a serializer's 400, the 404 of ``get_object()``, a 405, a 401
+or 403) need ``exception_handler``, which settings must name::
+
+    REST_FRAMEWORK = {
+        "EXCEPTION_HANDLER": "scrudful.rest_framework.exception_handler",
+    }
+
+It calls DRF's handler and, for a view whose handler for the request has an
+``error`` entity, adds that entity's Links and serves the response with the
+entity's media type, whatever the request's ``Accept``. The HTTP Schema Resource
+lists a write's 400 under that media type when the view has an ``error`` entity,
+conditional or not. Without the setting, or without an ``error`` entity, such
+errors are DRF's own, with no Link. The HTTP Schema Resource doesn't list 404 and
+405, so they have no entry to agree with. The example project
+(``examples/scrudful_rest_framework``) is conformant on the wire: its tests check
+every response against the Semantic HTTP 0.1 rules.
+
 An explicit ``@scrudful`` on ``update`` also applies to PATCH when
 ``partial_update`` is DRF's stock ``UpdateModelMixin.partial_update``.
 

@@ -63,6 +63,12 @@ DATABASES = {
     }
 }
 
+REST_FRAMEWORK = {
+    # Gives the errors DRF itself raises (a serializer's 400, a 404, a 405 ...)
+    # the Links of the views' error entity.
+    "EXCEPTION_HANDLER": "scrudful.rest_framework.exception_handler",
+}
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 LANGUAGE_CODE = "en-us"

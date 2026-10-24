@@ -22,7 +22,7 @@ from rest_framework.reverse import reverse
 
 from items.models import Item
 from items.serializers import ItemSerializer
-from scrudful.rest_framework import scrudful_api_view, scrudful_viewset
+from scrudful.rest_framework import Entity, scrudful_api_view, scrudful_viewset
 
 ITEM_SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -48,6 +48,45 @@ ITEM_CONTEXT = {
         "updated_at": "dateModified",
     }
 }
+
+
+ITEMS_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Items",
+    "type": "array",
+    "items": {"$ref": "item.json"},
+}
+
+STATS_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Item statistics",
+    "type": "object",
+    "properties": {
+        "count": {"type": "integer", "minimum": 0},
+        "latest_update": {"type": ["string", "null"], "format": "date-time"},
+    },
+    "required": ["count", "latest_update"],
+}
+
+STATS_CONTEXT = {
+    "@context": {
+        "@vocab": "https://schema.org/",
+        "count": "numberOfItems",
+        "latest_update": "dateModified",
+    }
+}
+
+# What DRF answers on an error: ``{"detail": "..."}``, or the serializer's
+# ``{"<field>": ["..."]}``.
+ERROR_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Error",
+    "type": "object",
+    "properties": {"detail": {"type": "string"}},
+    "additionalProperties": {"type": "array", "items": {"type": "string"}},
+}
+
+ERROR_CONTEXT = {"@context": {"@vocab": "https://schema.org/", "detail": "description"}}
 
 
 def _item_value(view, request, pk, field):
@@ -83,6 +122,44 @@ def item_context_url(view, request, **kwargs):
     return reverse("item-context", request=request)
 
 
+def items_schema_url(view, request, **kwargs):
+    return reverse("items-schema", request=request)
+
+
+def stats_schema_url(view, request, **kwargs):
+    return reverse("stats-schema", request=request)
+
+
+def stats_context_url(view, request, **kwargs):
+    return reverse("stats-context", request=request)
+
+
+# The body of every error: scrudful's own 400/412/428 and, through
+# ``scrudful.rest_framework.exception_handler`` (see the settings), DRF's.
+ERROR = Entity(
+    schema_link_or_func=lambda view, request, **kwargs: reverse(
+        "error-schema", request=request
+    ),
+    context_link_or_func=lambda view, request, **kwargs: reverse(
+        "error-context", request=request
+    ),
+)
+
+
+class ItemMeta:
+    """The configuration of both viewsets: items, and the list of items."""
+
+    etag_func = item_etag
+    last_modified_func = item_last_modified
+    schema_link_or_func = item_schema_url
+    context_link_or_func = item_context_url
+    error = ERROR
+    list_etag_func = collection_etag
+    list_schema_link_or_func = items_schema_url
+    list_context_link_or_func = item_context_url
+    list_error = ERROR
+
+
 @scrudful_viewset
 class ItemViewSet(viewsets.ModelViewSet):
     """Search, create, read, update and delete items.
@@ -94,13 +171,7 @@ class ItemViewSet(viewsets.ModelViewSet):
     serializer_class = ItemSerializer
     lookup_value_regex = "[0-9]+"
 
-    class Meta:
-        etag_func = item_etag
-        last_modified_func = item_last_modified
-        schema_link_or_func = item_schema_url
-        schema_type_or_func = "application/schema+json"
-        context_link_or_func = item_context_url
-        list_etag_func = collection_etag
+    Meta = ItemMeta
 
 
 @scrudful_viewset
@@ -111,16 +182,16 @@ class ReadOnlyItemViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ItemSerializer
     lookup_value_regex = "[0-9]+"
 
-    class Meta:
-        etag_func = item_etag
-        last_modified_func = item_last_modified
-        schema_link_or_func = item_schema_url
-        schema_type_or_func = "application/schema+json"
-        context_link_or_func = item_context_url
-        list_etag_func = collection_etag
+    Meta = ItemMeta
 
 
-@scrudful_api_view(["GET"], etag_func=collection_etag)
+@scrudful_api_view(
+    ["GET", "HEAD"],
+    etag_func=collection_etag,
+    schema_link_or_func=stats_schema_url,
+    context_link_or_func=stats_context_url,
+    error=ERROR,
+)
 def item_stats(request):
     """Number of items and the most recent modification."""
     latest = Item.objects.order_by("-updated_at").values_list("updated_at").first()
@@ -142,3 +213,33 @@ def item_schema(request):
 def item_context(request):
     """JSON-LD context of an item."""
     return Response(ITEM_CONTEXT, content_type="application/ld+json")
+
+
+@api_view(["GET"])
+def items_schema(request):
+    """JSON Schema of the list of items."""
+    return Response(ITEMS_SCHEMA, content_type="application/schema+json")
+
+
+@api_view(["GET"])
+def stats_schema(request):
+    """JSON Schema of the item statistics."""
+    return Response(STATS_SCHEMA, content_type="application/schema+json")
+
+
+@api_view(["GET"])
+def stats_context(request):
+    """JSON-LD context of the item statistics."""
+    return Response(STATS_CONTEXT, content_type="application/ld+json")
+
+
+@api_view(["GET"])
+def error_schema(request):
+    """JSON Schema of an error."""
+    return Response(ERROR_SCHEMA, content_type="application/schema+json")
+
+
+@api_view(["GET"])
+def error_context(request):
+    """JSON-LD context of an error."""
+    return Response(ERROR_CONTEXT, content_type="application/ld+json")

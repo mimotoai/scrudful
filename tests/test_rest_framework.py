@@ -13,7 +13,7 @@ from django.http import HttpResponse
 from django.test import override_settings
 from django.urls import include, path
 from rest_framework import views as drf_views
-from rest_framework import viewsets
+from rest_framework import serializers, viewsets
 from rest_framework.authentication import BasicAuthentication
 from rest_framework.decorators import (
     action,
@@ -24,6 +24,7 @@ from rest_framework.decorators import (
     throttle_classes,
 )
 from rest_framework.metadata import SimpleMetadata
+from rest_framework.exceptions import NotFound
 from rest_framework.mixins import UpdateModelMixin
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.renderers import JSONRenderer
@@ -37,6 +38,7 @@ from scrudful.rest_framework import (
     Entity,
     ScrudfulMetadata,
     ScrudfulViewFunc,
+    exception_handler,
     scrudful,
     scrudful_api_view,
     scrudful_viewset,
@@ -151,6 +153,8 @@ class ThingViewSetBase(viewsets.ViewSet):
 
     def retrieve(self, request, pk):
         """Return the thing."""
+        if pk == "0":
+            raise NotFound
         if not store.exists:
             return not_found()
         return Response({"id": pk, "version": store.version})
@@ -160,6 +164,8 @@ class ThingViewSetBase(viewsets.ViewSet):
             return not_found()
         if request.data.get("invalid"):
             return Response({"name": ["invalid"]}, status=400)
+        if request.data.get("raise"):
+            raise serializers.ValidationError({"name": ["This field is required."]})
         store.update()
         return Response({"id": pk, "version": store.version, "partial": partial})
 
@@ -332,6 +338,7 @@ class ErrorViewSet(ThingViewSetBase):
         )
 
 
+IF_MATCH = {"If-Match": '"v1"'}
 PROBLEM = Entity(
     "/schemas/problem",
     context_link_or_func="/contexts/problem",
@@ -1110,8 +1117,17 @@ def test_options_error_content(client):
             f"{BASE}/schemas/problem", f"{BASE}/contexts/problem"
         )["application/json"]
     }
-    # The create is not conditional: no early responses to describe.
-    assert set(listing["post"]["responses"]) == {"201"}
+    # The create is not conditional: no early responses to describe, but the
+    # serializer's 400 carries the error entity's Links.
+    assert set(listing["post"]["responses"]) == {"201", "400"}
+    assert listing["post"]["responses"]["400"] == {
+        "description": "Bad Request",
+        "content": {
+            "application/json": content(
+                f"{BASE}/schemas/error", f"{BASE}/contexts/error"
+            )["application/json"]
+        },
+    }
 
 
 def test_options_action_without_links(client):
@@ -1668,3 +1684,82 @@ def test_api_view_project_wide_metadata_class_is_kept(monkeypatch, project_wide)
 
     built = scrudful_api_view(["GET"], etag_func=lambda view, request: "x")(view)
     assert built.cls.metadata_class is project_wide
+
+
+# --- Exception handler --------------------------------------------------------
+
+
+def test_exception_handler_adds_error_links(client):
+    """Errors DRF itself raises carry the error entity's Links."""
+    responses = {
+        400: client.put(
+            "/errors/1/", {"raise": True}, format="json", headers={"If-Match": '"v1"'}
+        ),
+        404: client.get("/errors/0/"),
+        405: client.post("/errors/1/"),
+    }
+    for status, response in responses.items():
+        assert response.status_code == status
+        assert response["Link"] == ERROR_LINKS
+        assert response["Content-Type"] == "application/json"
+        assert response["Access-Control-Expose-Headers"] == "Link"
+        assert "detail" in response.json() or status == 400
+    assert responses[400].json() == {"name": ["This field is required."]}
+    assert responses[405]["Allow"] == "GET, PUT, PATCH, DELETE, HEAD, OPTIONS"
+
+
+def test_exception_handler_405_uses_the_first_allowed_handler_with_an_error(client):
+    """No handler runs for an unrouted method: the first allowed one supplies
+    the Links (here the list's, whose error entity differs from create's)."""
+    response = client.put("/errors/")
+    assert response.status_code == 405
+    assert response["Link"] == PROBLEM_LINKS
+    assert response["Content-Type"] == "application/problem+json"
+
+
+def test_exception_handler_without_error_unchanged(client):
+    for response in (
+        client.put("/things/1/", {"raise": True}, format="json", headers=IF_MATCH),
+        client.get("/things/0/"),
+        client.post("/things/1/"),
+        client.post("/links-only/1/"),
+    ):
+        assert "Link" not in response
+        assert "Access-Control-Expose-Headers" not in response
+        assert response["Content-Type"] == "application/json"
+    # Not served as an error media type: DRF's negotiation still applies.
+    response = client.get("/things/0/", headers={"Accept": "text/html"})
+    assert response["Content-Type"].startswith("text/html")
+
+
+def test_exception_handler_leaves_other_exceptions_alone():
+    assert exception_handler(RuntimeError("boom"), {}) is None
+
+
+def test_exception_handler_serves_the_error_media_type(client):
+    """The HSR lists the statuses under the error entity's media type."""
+    hsr = client.options("/problems/1/").json()
+    validate_http_schema_resource(hsr)
+    for accept in ("application/json", "text/html"):
+        response = client.put(
+            "/problems/1/",
+            {"raise": True},
+            format="json",
+            headers={"Accept": accept, **IF_MATCH},
+        )
+        assert response.status_code == 400
+        assert response["Content-Type"] == "application/problem+json"
+        assert response["Link"] == PROBLEM_LINKS
+        assert response.json() == {"name": ["This field is required."]}
+        problems = link_problems("PUT", 400, dict(response.items()), True, hsr)
+        assert problems == []
+    for response in (client.get("/problems/0/"), client.post("/problems/1/")):
+        assert response["Content-Type"] == "application/problem+json"
+        assert response["Link"] == PROBLEM_LINKS
+
+
+def test_exception_handler_keeps_the_headers_of_the_response(client):
+    """A 401 without an error entity is DRF's, WWW-Authenticate included."""
+    response = client.get("/api-authenticated/")
+    assert response.status_code == 401
+    assert "WWW-Authenticate" in response
