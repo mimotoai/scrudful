@@ -1,5 +1,6 @@
 """Mechanics of the ``scrudful.fastapi`` decorator, tested with tiny ad-hoc apps."""
 
+import dataclasses
 import inspect
 import threading
 import uuid
@@ -8,19 +9,29 @@ from typing import Annotated
 
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from scrudful import fastapi as fastapi_module
 from scrudful.fastapi import (
     CONDITIONAL_READ_RESPONSES,
     CONDITIONAL_WRITE_RESPONSES,
+    Entity,
     _annotation_is,
+    _EndpointConfig,
+    add_error_links,
     scrudful,
 )
 from tests import fastapi_future_annotations as future_endpoints
+from tests.semantic_http import link_problems, parse_links
 
 # Non-zero microseconds: the header is floored to whole seconds and conditional
 # requests echoing it must still match.
@@ -1479,3 +1490,403 @@ def test_repeated_expose_header_lines_are_all_kept(make_client, store):
     assert response.headers.get_list("access-control-expose-headers") == [
         "X-One, X-Two, ETag"
     ]
+
+
+# --- error Links, absolute links and add_error_links ---------------------------
+
+ERROR = Entity(
+    schema_link_or_func="/schemas/error",
+    context_link_or_func="http://example.com/error.jsonld",
+    media_type="application/problem+json",
+)
+ERROR_LINKS = (
+    '<http://testserver/schemas/error>; rel="describedby"; '
+    'type="application/schema+json", <http://example.com/error.jsonld>; '
+    'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
+)
+
+
+def _error_app(store, error=ERROR):
+    app = FastAPI()
+
+    @app.api_route("/items/{item_id}", methods=["GET", "PUT"])
+    @scrudful(etag_func=store.etag, schema_link_or_func=SCHEMA, error=error)
+    async def item(item_id: int):
+        return {}
+
+    return app
+
+
+def _exposed(response) -> list[str]:
+    value = response.headers.get("access-control-expose-headers", "")
+    return [name.strip() for name in value.split(",") if name.strip()]
+
+
+@pytest.mark.parametrize(
+    "method, headers, status",
+    [
+        ("PUT", {"If-Match": '"other"'}, 412),
+        ("PUT", {}, 428),
+        ("GET", {"If-None-Match": "v1"}, 400),
+        ("PUT", {"If-Match": "v1"}, 400),
+    ],
+)
+def test_error_links_on_early_responses(make_client, store, method, headers, status):
+    client = make_client(_error_app(store))
+    response = client.request(method, "/items/3", headers=headers)
+    assert response.status_code == status
+    assert response.headers["link"] == ERROR_LINKS
+    assert response.headers["content-type"] == "application/problem+json"
+    assert "Link" in _exposed(response)
+    assert link_problems(method, status, response.headers, True) == []
+    assert "endpoint" not in store.calls
+
+
+def test_304_gets_no_error_links(make_client, store):
+    response = make_client(_error_app(store)).get(
+        "/items/3", headers={"If-None-Match": '"v1"'}
+    )
+    assert response.status_code == 304
+    assert "link" not in response.headers
+    assert "content-type" not in response.headers
+
+
+def test_early_responses_without_error_are_unchanged(make_client, store):
+    response = make_client(_error_app(store, error=None)).put("/items/3")
+    assert response.status_code == 428
+    assert "link" not in response.headers
+    assert response.headers["content-type"] == "application/json"
+
+
+def test_error_link_callables_get_the_endpoint_kwargs(make_client, store):
+    app = FastAPI()
+    received = []
+
+    async def schema(item_id, **kwargs):
+        received.append((item_id, sorted(kwargs)))
+        return f"/schemas/error/{item_id}"
+
+    def context(**kwargs):
+        return "error.jsonld"
+
+    @app.put("/items/{item_id}")
+    @scrudful(
+        etag_func=store.etag,
+        error=Entity(schema_link_or_func=schema, context_link_or_func=context),
+    )
+    async def put_item(item_id: int, request: Request):
+        return {}
+
+    response = make_client(app).put("/items/3?x=1")
+    assert response.status_code == 428
+    assert response.headers["link"] == (
+        '<http://testserver/schemas/error/3>; rel="describedby"; '
+        'type="application/schema+json", <http://testserver/items/error.jsonld>; '
+        'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
+    )
+    assert response.headers["content-type"] == "application/json"
+    assert received == [(3, ["request"])]
+
+
+def test_error_must_be_a_json_entity():
+    for decorate in (lambda error: scrudful(error=error), _add_to_new_app):
+        with pytest.raises(ValueError, match="error"):
+            decorate(Entity(media_type="text/html"))
+        with pytest.raises(ValueError, match="error"):
+            decorate(Entity(media_type="application/ld+json"))
+        with pytest.raises(TypeError, match="Entity"):
+            decorate({"schema_link_or_func": SCHEMA})
+    with pytest.raises(TypeError, match="FastAPI"):
+        add_error_links(APIRouter(), ERROR)
+
+
+def _add_to_new_app(error):
+    add_error_links(FastAPI(), error)
+
+
+def test_dependency_link_is_not_copied_onto_early_errors(make_client, store):
+    """A dependency's Link describes the success representation."""
+    app = FastAPI()
+    dependency_link = (
+        '<http://example.com/other>; rel="describedby"; type="application/schema+json"'
+    )
+
+    def set_headers(response: Response):
+        response.headers["Link"] = dependency_link
+        response.set_cookie("session", "abc")
+
+    for path, error in (("/with-error", ERROR), ("/without-error", None)):
+
+        @app.api_route(
+            path, methods=["GET", "PUT"], dependencies=[Depends(set_headers)]
+        )
+        @scrudful(etag_func=store.etag, error=error)
+        async def item():
+            return {}
+
+    client = make_client(app)
+    response = client.put("/with-error", headers={"If-Match": '"other"'})
+    assert response.status_code == 412
+    assert response.headers["link"] == ERROR_LINKS
+    assert response.headers["set-cookie"] == "session=abc; Path=/; SameSite=lax"
+    response = client.put("/without-error", headers={"If-Match": '"other"'})
+    assert response.status_code == 412
+    assert "link" not in response.headers
+    assert response.headers["set-cookie"] == "session=abc; Path=/; SameSite=lax"
+    # A 304 keeps every dependency header, as a 200 would carry it.
+    response = client.get("/with-error", headers={"If-None-Match": '"v1"'})
+    assert response.status_code == 304
+    assert response.headers["link"] == dependency_link
+
+
+def test_relative_link_resolved(make_client):
+    app = FastAPI()
+
+    @app.get("/users/{user_id}")
+    @scrudful(
+        schema_link_or_func="/schemas/user",
+        context_link_or_func=lambda **kwargs: "context.jsonld",
+    )
+    async def get_user(user_id: int):
+        return {}
+
+    @app.get("/network-path")
+    @scrudful(schema_link_or_func="//cdn.example/schema.json")
+    async def network_path():
+        return JSONResponse({})
+
+    client = make_client(app)
+    response = client.get("/users/1?x=y")
+    assert response.headers["link"] == (
+        '<http://testserver/schemas/user>; rel="describedby"; '
+        'type="application/schema+json", <http://testserver/users/context.jsonld>; '
+        'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
+    )
+    assert link_problems("GET", 200, response.headers, True) == []
+    assert parse_links(client.get("/network-path").headers["link"])[0][0] == (
+        "http://cdn.example/schema.json"
+    )
+
+
+def test_view_link_not_duplicated(make_client):
+    app = FastAPI()
+    own_schema = '<http://example.com/own>; rel="DescribedBy"; type="text/plain"'
+    own_context = (
+        '<http://example.com/own.jsonld>; rel="http://www.w3.org/ns/json-ld#context"'
+    )
+    other = '<https://x/a,b>; rel="next"; title="a, b"'
+    links = dict(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+
+    @app.get("/own-schema")
+    @scrudful(**links)
+    async def schema(response: Response):
+        response.headers["Link"] = own_schema
+        return {}
+
+    @app.get("/own-context")
+    @scrudful(**links)
+    async def context():
+        return JSONResponse({}, headers={"Link": own_context})
+
+    @app.get("/other")
+    @scrudful(**links)
+    async def other_relation(response: Response):
+        response.headers["Link"] = other
+        return {}
+
+    client = make_client(app)
+    assert client.get("/own-schema").headers["link"] == f"{own_schema}, {CONTEXT_LINK}"
+    assert client.get("/own-context").headers["link"] == (
+        f"{own_context}, {SCHEMA_LINK}"
+    )
+    assert client.get("/other").headers["link"] == (
+        f"{other}, {SCHEMA_LINK}, {CONTEXT_LINK}"
+    )
+
+
+def test_endpoint_config_is_attached():
+    def etag(**kwargs):
+        return "x"
+
+    @scrudful(etag_func=etag, schema_link_or_func=SCHEMA, error=ERROR)
+    async def get_item(item_id: int, req: Request):
+        return {}
+
+    @scrudful()
+    async def plain():
+        return {}
+
+    assert get_item._scrudful == _EndpointConfig(
+        etag_func=etag,
+        last_modified_func=None,
+        schema_link_or_func=SCHEMA,
+        schema_rel_or_func=None,
+        schema_type_or_func=None,
+        context_link_or_func=None,
+        context_rel_or_func=None,
+        context_type_or_func=None,
+        error=ERROR,
+        request_name="req",
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        get_item._scrudful.error = None
+    assert plain._scrudful.request_name is None
+    assert plain._scrudful.error is None
+
+
+def _links_app():
+    app = FastAPI()
+
+    @app.get("/items/{item_id}")
+    @scrudful(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+    async def get_item(item_id: int):
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    return app
+
+
+@pytest.mark.parametrize(
+    "method, path, status",
+    [
+        ("GET", "/items/3", 404),
+        ("GET", "/items/x", 422),
+        ("POST", "/items/3", 405),
+        ("GET", "/nowhere", 404),
+    ],
+)
+def test_add_error_links_http_and_validation(make_client, method, path, status):
+    app = _links_app()
+    add_error_links(app, ERROR)
+    response = make_client(app).request(method, path)
+    plain = make_client(_links_app()).request(method, path)
+    assert response.status_code == plain.status_code == status
+    assert response.json() == plain.json()
+    assert response.headers.get("allow") == plain.headers.get("allow")
+    assert response.headers["link"] == ERROR_LINKS
+    assert response.headers["content-type"] == "application/problem+json"
+    assert "Link" in _exposed(response)
+    assert link_problems(method, status, response.headers, True) == []
+
+
+def test_add_error_links_wraps_the_defaults():
+    app = FastAPI()
+    add_error_links(app, ERROR)
+    handlers = app.exception_handlers
+    assert handlers[StarletteHTTPException].__wrapped__ is http_exception_handler
+    assert (
+        handlers[RequestValidationError].__wrapped__
+        is request_validation_exception_handler
+    )
+
+
+@pytest.mark.parametrize("key", [StarletteHTTPException, HTTPException, 404])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_add_error_links_keeps_custom_handler(make_client, key, asynchronous):
+    app = _links_app()
+
+    def handler(request, exc):
+        return JSONResponse(
+            {"error": exc.detail},
+            status_code=exc.status_code,
+            headers={"X-Custom": "1"},
+        )
+
+    async def async_handler(request, exc):
+        return handler(request, exc)
+
+    app.add_exception_handler(key, async_handler if asynchronous else handler)
+    add_error_links(app, ERROR)
+    response = make_client(app).get("/items/3")
+    assert response.status_code == 404
+    assert response.json() == {"error": "Item not found"}
+    assert response.headers["x-custom"] == "1"
+    assert response.headers["link"] == ERROR_LINKS
+    assert response.headers["content-type"] == "application/problem+json"
+
+
+def test_add_error_links_keeps_custom_validation_handler(make_client):
+    app = _links_app()
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid(request, exc):
+        return JSONResponse({"invalid": len(exc.errors())}, status_code=400)
+
+    add_error_links(app, ERROR)
+    response = make_client(app).get("/items/x")
+    assert response.status_code == 400
+    assert response.json() == {"invalid": 1}
+    assert response.headers["link"] == ERROR_LINKS
+
+
+def test_add_error_links_twice_does_not_double(make_client):
+    app = _links_app()
+    add_error_links(app, ERROR)
+    add_error_links(app, ERROR)
+    client = make_client(app)
+    assert client.get("/items/3").headers["link"] == ERROR_LINKS
+    assert client.get("/items/x").headers["link"] == ERROR_LINKS
+    # The latest call's entity replaces the earlier one.
+    app = _links_app()
+    add_error_links(app, ERROR)
+    add_error_links(app, Entity(schema_link_or_func="http://example.com/other"))
+    response = make_client(app).get("/items/3")
+    assert response.headers["link"] == (
+        '<http://example.com/other>; rel="describedby"; type="application/schema+json"'
+    )
+    assert response.headers["content-type"] == "application/json"
+    handler = app.exception_handlers[StarletteHTTPException]
+    assert handler.__wrapped__ is http_exception_handler
+
+
+def test_add_error_link_callables_get_only_the_request(make_client):
+    app = _links_app()
+    received = []
+
+    @app.get("/schemas/error", name="error_schema")
+    async def error_schema():
+        return {}
+
+    def schema(request):
+        received.append(type(request))
+        return request.url_for("error_schema")
+
+    async def context(*, request):
+        return "/contexts/error"
+
+    add_error_links(
+        app, Entity(schema_link_or_func=schema, context_link_or_func=context)
+    )
+    response = make_client(app).get("/items/3")
+    assert response.headers["link"] == (
+        '<http://testserver/schemas/error>; rel="describedby"; '
+        'type="application/schema+json", <http://testserver/contexts/error>; '
+        'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
+    )
+    assert received == [Request]
+
+
+def test_add_error_links_leaves_bodiless_and_non_json_responses(make_client):
+    app = FastAPI()
+
+    @app.get("/not-modified")
+    async def not_modified():
+        raise HTTPException(status_code=304)
+
+    @app.get("/teapot")
+    async def teapot():
+        raise HTTPException(status_code=418)
+
+    app.add_exception_handler(
+        418, lambda request, exc: PlainTextResponse("short and stout", 418)
+    )
+    add_error_links(app, ERROR)
+    client = make_client(app)
+    response = client.get("/not-modified")
+    assert response.status_code == 304
+    assert "link" not in response.headers
+    assert "content-type" not in response.headers
+    response = client.get("/teapot")
+    assert response.status_code == 418
+    assert response.text == "short and stout"
+    assert "link" not in response.headers
+    assert response.headers["content-type"].startswith("text/plain")
