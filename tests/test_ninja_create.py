@@ -280,7 +280,8 @@ def test_create_link_callables_get_created_object(store, counted):
 
     response = TestClient(router).post("/items", json={"name": "c"})
     assert response.headers["Link"] == (
-        '</schemas/item/3>; rel="describedby"; type="application/schema+json"'
+        '<http://testlocation/schemas/item/3>; rel="describedby"; '
+        'type="application/schema+json"'
     )
 
 
@@ -454,7 +455,8 @@ def test_create_http_response_body_explicit_entities_win(store, counted, item_sc
     response = client.post("/items", json={"name": "c"})
     assert response.status_code == 201
     assert response.headers["Link"] == (
-        '</schemas/accepted>; rel="describedby"; type="application/schema+json"'
+        '<http://testlocation/schemas/accepted>; rel="describedby"; '
+        'type="application/schema+json"'
     )
     assert seen == [None]
 
@@ -522,8 +524,8 @@ def test_create_without_a_created_object(store):
     assert response.headers["Location"] == "/items/3"
     assert response.headers["ETag"] == '"v1"'
     assert response.headers["Link"] == (
-        '</schemas/item/3>; rel="describedby"; type="application/schema+json", '
-        + CONTEXT_LINK
+        '<http://testlocation/schemas/item/3>; rel="describedby"; '
+        'type="application/schema+json", ' + CONTEXT_LINK
     )
     assert calls == ["location", "etag", "schema"]
 
@@ -551,7 +553,8 @@ def test_create_without_a_created_object_gets_responses_201(store):
     assert response.status_code == 201
     assert "Location" not in response.headers
     assert response.headers["Link"] == (
-        '</schemas/accepted>; rel="describedby"; type="application/schema+json"'
+        '<http://testlocation/schemas/accepted>; rel="describedby"; '
+        'type="application/schema+json"'
     )
     assert seen == [None]
 

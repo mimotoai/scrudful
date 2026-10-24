@@ -6,6 +6,8 @@ from typing import Any, List
 
 import pytest
 from asgiref.sync import async_to_sync
+from django.http import HttpResponse
+from django.urls import path
 from ninja import NinjaAPI, Router, Status
 from ninja.errors import HttpError
 from ninja.testing import TestAsyncClient, TestClient
@@ -13,6 +15,13 @@ from rest_framework import viewsets
 from rest_framework.response import Response
 from rest_framework.test import APIRequestFactory
 
+from scrudful._adapter import (
+    HSR_SCHEMA_URL,
+    SCHEMA_REL,
+    allow_header,
+    describe_options,
+    options_links,
+)
 from scrudful.ninja import (
     CONDITIONAL_READ_RESPONSES,
     CONDITIONAL_WRITE_RESPONSES,
@@ -36,19 +45,33 @@ from tests.test_ninja_adapter import (
     expose,
     modified,
 )
+from tests.semantic_http import (
+    link_problems,
+    parse_links,
+    validate_http_schema_resource,
+)
 
-ITEM_CONTENT = {
-    "application/json": {"schema": "/schemas/item", "context": "/contexts/item"}
-}
+# ninja's TestClient builds absolute URIs against this base.
+BASE = "http://testlocation"
+
+
+def content(schema: str, context: str | None = None) -> dict[str, Any]:
+    """The ``content`` of a JSON entity with these links, resolved."""
+    entry: dict[str, Any] = {"schema": {"$ref": f"{BASE}{schema}"}}
+    if context is not None:
+        entry["x-rdf-context"] = {
+            "href": f"{BASE}{context}",
+            "type": "application/ld+json",
+        }
+    return {"application/json": entry}
+
+
+ITEM_CONTENT = content("/schemas/item", "/contexts/item")
 LIST_LINKS = dict(
     list_schema_link_or_func="/schemas/items",
     list_context_link_or_func="/contexts/items",
 )
-LIST_CONTENT = {
-    "application/json": {"schema": "/schemas/items", "context": "/contexts/items"}
-}
-SCHEMA_RESOURCE = "https://example.com/schemas/http-schema-resource.json"
-CONTEXT_RESOURCE = "https://example.com/contexts/http-schema-resource.jsonld"
+LIST_CONTENT = content("/schemas/items", "/contexts/items")
 NOT_MODIFIED = {
     "description": "Not Modified: the representation matches the request's "
     "If-None-Match or If-Modified-Since validators."
@@ -175,6 +198,325 @@ def store() -> Store:
     return Store()
 
 
+# --- Semantic HTTP 0.1 ---------------------------------------------------------
+
+#: An error entity with both links, so that its JSON bodies conform.
+ERROR = Entity(
+    schema_link_or_func="/schemas/error", context_link_or_func="/contexts/error"
+)
+
+
+def described_router(store: Store) -> Router:
+    """One path of each kind: item, list and create, search, ``error``, no links."""
+    router = ScrudfulRouter()
+
+    # Before ``/items/{pk}``, which would match it too.
+    @router.post("/items/search", response=List[ItemOut])
+    @scrudful(
+        request=Entity(
+            schema_link_or_func="/schemas/search",
+            context_link_or_func="/contexts/search",
+        ),
+        **LINKS,
+    )
+    def search(request, payload: ItemIn):
+        return []
+
+    item_router(store, router, methods=("GET", "PUT", "PATCH", "DELETE"))
+    list_router(store, router)
+
+    @router.put("/jobs/{pk}", response={200: ItemOut, 404: Message})
+    @scrudful(load=store.load, etag_func=etag, error=ERROR, **LINKS)
+    def put_job(request, pk: int, payload: ItemIn, obj):
+        return obj
+
+    @router.get("/bare/{pk}")
+    @scrudful(request=Entity(), responses={200: Entity()})
+    def get_bare(request, pk: int):
+        return {}
+
+    return router
+
+
+DESCRIBED_PATHS = ("/items/1", "/items", "/items/search", "/jobs/1", "/bare/1")
+
+
+def conformance_router(store: Store) -> Router:
+    """The shape of the example project: an item GET/HEAD, PUT and PATCH with
+    ``error``, a collection create and an item with a relative schema URL."""
+    router = ScrudfulRouter()
+    item = dict(
+        load=store.load,
+        etag_func=etag,
+        last_modified_func=modified,
+        error=ERROR,
+        **LINKS,
+    )
+
+    @router.api_operation(["GET", "HEAD"], "/items/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    @router.put("/items/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def put_item(request, pk: int, payload: ItemIn, obj):
+        return obj
+
+    @router.patch("/items/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def patch_item(request, pk: int, payload: ItemIn, obj):
+        return obj
+
+    @router.post("/items", response={201: ItemOut})
+    @scrudful_create(
+        location_func=lambda request, item: f"/items/{item['id']}",
+        etag_func=etag,
+        **LINKS,
+    )
+    def create_item(request, payload: ItemIn):
+        return {"id": 3, "name": payload.name, "version": 1}
+
+    @router.get("/roles/{pk}")
+    @scrudful(
+        schema_link_or_func="/schemas/role", context_link_or_func="/contexts/role"
+    )
+    def get_role(request, pk: int):
+        return {}
+
+    return router
+
+
+def conformance_api() -> NinjaAPI:
+    api = NinjaAPI(urls_namespace="test-ninja-options")
+    api.add_router("", conformance_router(Store()))
+    return api
+
+
+# For Django's test client: real absolute URIs, and HEAD without content.
+urlpatterns = [path("api/", conformance_api().urls)]
+
+
+def test_options_body_is_valid_0_1(store):
+    client = TestClient(described_router(store))
+    bodies = {url: options(client, url).json() for url in DESCRIBED_PATHS}
+    for body in bodies.values():
+        validate_http_schema_resource(body)
+    assert {url: list(body) for url, body in bodies.items()} == {
+        "/items/1": ["get", "put", "delete", "options", "patch"],
+        "/items": ["get", "post", "options"],
+        "/items/search": ["post", "options"],
+        "/jobs/1": ["put", "options"],
+        "/bare/1": ["get", "options"],
+    }
+    assert bodies["/items/search"]["post"]["requestBody"]["content"] == content(
+        "/schemas/search", "/contexts/search"
+    )
+    assert "content" not in bodies["/bare/1"]["get"]["responses"]["200"]
+    assert store.calls == {}
+
+
+def test_options_headers(store):
+    client = TestClient(described_router(store))
+    for url in DESCRIBED_PATHS:
+        response = options(client, url)
+        assert response.status_code == 200, url
+        assert response.headers["Content-Type"] == "application/json"
+        assert response.headers["Link"] == options_links()
+        body = response.json()
+        assert response.headers["Allow"] == allow_header(body)
+        assert link_problems("OPTIONS", 200, response.headers, True, body) == []
+        assert expose(response) == {"Link"}
+
+
+def test_options_lists_options_and_head(store):
+    router = ScrudfulRouter()
+
+    @router.api_operation(["GET", "HEAD"], "/items/{pk}", response=ItemOut)
+    @scrudful(load=store.load, etag_func=etag, error=ERROR, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    response = options(TestClient(router), "/items/1")
+    body = response.json()
+    assert list(body) == ["get", "options", "head"]
+    assert response.headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert body["options"] == describe_options()
+    assert body["get"]["responses"]["200"]["content"]
+    assert set(body["head"]["responses"]) == set(body["get"]["responses"])
+    for response_ in body["head"]["responses"].values():
+        assert "content" not in response_
+    validate_http_schema_resource(body)
+
+
+@pytest.mark.urls(__name__)
+def test_relative_links_resolved(client, db):
+    body = client.options("/api/roles/1").json()
+    content = body["get"]["responses"]["200"]["content"]["application/json"]
+    assert content == {
+        "schema": {"$ref": "http://testserver/schemas/role"},
+        "x-rdf-context": {
+            "href": "http://testserver/contexts/role",
+            "type": "application/ld+json",
+        },
+    }
+    response = client.get("/api/roles/1")
+    assert [target for target, _ in parse_links(response.headers["Link"])] == [
+        "http://testserver/schemas/role",
+        "http://testserver/contexts/role",
+    ]
+    assert link_problems("GET", 200, response.headers, True, body) == []
+
+
+def test_mixed_path_agrees(store):
+    """Review Focus 5: a scrudful GET and a plain ninja PUT on one path."""
+    router = ScrudfulRouter()
+    item_router(store, router, methods=("GET",))
+
+    @router.put("/items/{pk}", response={200: ItemOut, 404: Message})
+    def plain_put(request, pk: int, payload: ItemIn):
+        raise HttpError(404, "Not Found")
+
+    response = options(TestClient(router), "/items/1")
+    body = response.json()
+    assert list(body) == ["get", "put", "options"]
+    assert response.headers["Allow"] == "GET, PUT, OPTIONS" == allow_header(body)
+    assert "requestBody" not in body["put"]
+    for response_ in body["put"]["responses"].values():
+        assert "content" not in response_
+    validate_http_schema_resource(body)
+
+
+@pytest.mark.urls(__name__)
+def test_agreement_on_responses(client, db):
+    item, collection = "/api/items/1", "/api/items"
+    hsr = client.options(item).json()
+    get = client.get(item)
+    etag_ = get.headers["ETag"]
+    payload = {"name": "a"}
+    write = dict(content_type="application/json")
+    responses = [
+        ("GET", get, hsr),
+        ("HEAD", client.head(item), hsr),
+        ("PUT", client.put(item, payload, **write, headers={"If-Match": etag_}), hsr),
+        (
+            "PATCH",
+            client.patch(item, payload, **write, headers={"If-Match": etag_}),
+            hsr,
+        ),
+        ("POST", client.post(collection, payload, **write), None),
+        ("PUT", client.put(item, payload, **write, headers={"If-Match": '"x"'}), hsr),
+        ("PUT", client.put(item, payload, **write), hsr),
+    ]
+    statuses = [response.status_code for _, response, _ in responses]
+    assert statuses == [200, 200, 200, 200, 201, 412, 428]
+    collection_hsr = client.options(collection).json()
+    for method, response, body in responses:
+        body = collection_hsr if body is None else body
+        has_content = bool(response.content)
+        assert has_content == (method != "HEAD")
+        problems = link_problems(
+            method, response.status_code, response.headers, has_content, hsr=body
+        )
+        assert problems == [], (method, response.status_code)
+
+
+def test_view_link_not_duplicated(store):
+    router = Router()
+
+    @router.get("/items/{pk}", response=ItemOut)
+    @scrudful(load=store.load, etag_func=etag, **LINKS)
+    def get_item(request, pk: int, obj, response: HttpResponse):
+        response["Link"] = '<https://o/s>; rel="describedby"'
+        return obj
+
+    response = TestClient(router).get("/items/1")
+    links = parse_links(response.headers["Link"])
+    described = [target for target, params in links if params["rel"] == SCHEMA_REL]
+    assert described == ["https://o/s"]
+    # The context link is still added.
+    assert [target for target, _ in links] == [
+        "https://o/s",
+        "http://testlocation/contexts/item",
+    ]
+
+
+def test_options_media_type_objects():
+    """Non-JSON entities: an ``x-schema``, and an ``x-rdf-context`` unless the
+    media type is in-band RDF; the Links agree with them."""
+    router = ScrudfulRouter()
+    csv = Entity(
+        "/schemas/rows",
+        schema_type_or_func="application/csvm+json",
+        context_link_or_func=lambda request, obj: "/contexts/rows",
+        context_type_or_func="application/csvm+json",
+        media_type="Text/CSV; header=present",
+    )
+    turtle = Entity(
+        "/shapes/graph", schema_type_or_func="text/turtle", media_type="text/turtle"
+    )
+
+    @router.get("/rows/{pk}")
+    @scrudful(responses={200: csv})
+    def get_rows(request, pk: int):
+        return HttpResponse("a,b\n", content_type="text/csv; header=present")
+
+    @router.get("/graphs/{pk}")
+    @scrudful(responses={200: turtle})
+    def get_graph(request, pk: int):
+        return HttpResponse("<a> <b> <c> .", content_type="text/turtle")
+
+    client = TestClient(router)
+    rows = options(client, "/rows/1").json()
+    graph = options(client, "/graphs/1").json()
+    for body in (rows, graph):
+        validate_http_schema_resource(body)
+    assert rows["get"]["responses"]["200"]["content"] == {
+        "text/csv; header=present": {
+            "x-schema": {
+                "href": f"{BASE}/schemas/rows",
+                "type": "application/csvm+json",
+            },
+            "x-rdf-context": {
+                "href": f"{BASE}/contexts/rows",
+                "type": "application/csvm+json",
+            },
+        }
+    }
+    assert graph["get"]["responses"]["200"]["content"] == {
+        "text/turtle": {
+            "x-schema": {"href": f"{BASE}/shapes/graph", "type": "text/turtle"}
+        }
+    }
+    for url, body in (("/rows/1", rows), ("/graphs/1", graph)):
+        response = client.get(url)
+        assert link_problems("GET", 200, response.headers, True, body) == [], url
+
+
+def test_options_trace_when_routed(store):
+    router = ScrudfulRouter()
+    item_router(store, router, methods=("GET",))
+
+    @router.api_operation(["TRACE"], "/items/{pk}", response={200: Message})
+    def trace(request, pk: int):
+        return {"detail": "trace"}
+
+    response = options(TestClient(router), "/items/1")
+    body = response.json()
+    assert list(body) == ["get", "options", "trace"]
+    assert response.headers["Allow"] == "GET, OPTIONS, TRACE"
+    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    validate_http_schema_resource(body)
+
+
+def test_router_rejects_options_links():
+    with pytest.raises(TypeError):
+        ScrudfulRouter(options_schema_link="x")
+    with pytest.raises(TypeError):
+        ScrudfulRouter(options_context_link="x")
+    assert not hasattr(ScrudfulRouter(), "options_schema_link")
+
+
 # --- the automatic operation -----------------------------------------------
 
 
@@ -183,17 +525,17 @@ def test_options_auto_added(store):
     assert response.status_code == 200
     assert response.headers["Content-Type"] == "application/json"
     body = response.json()
-    assert set(body) == {"get", "put", "delete"}
+    assert list(body) == ["get", "put", "delete", "options"]
+    assert response.headers["Allow"] == "GET, PUT, DELETE, OPTIONS"
     assert "If-Match" in [parameter["name"] for parameter in body["put"]["parameters"]]
-    assert body["put"]["requestBody"]["content"]["application/json"] == {
-        "schema": "/schemas/item",
-        "context": "/contexts/item",
-    }
+    assert body["put"]["requestBody"]["content"] == ITEM_CONTENT
     assert store.calls == {}
 
 
 def test_options_body(store):
     body = options(TestClient(item_router(store)), "/items/1").json()
+    validate_http_schema_resource(body)
+    assert list(body) == ["get", "put", "delete", "options"]
     assert body == {
         "get": {
             "responses": {
@@ -230,6 +572,7 @@ def test_options_body(store):
             },
             "parameters": BOTH_PARAMETERS,
         },
+        "options": describe_options(),
     }
 
 
@@ -246,7 +589,7 @@ def test_options_no_auth_no_load(store):
     client = TestClient(api_with_auth(store, item_router(store)))
     response = options(client, "/items/1")
     assert response.status_code == 200
-    assert set(response.json()) == {"get", "put", "delete"}
+    assert set(response.json()) == {"get", "put", "delete", "options"}
     assert store.calls == {}
     # The other operations still need credentials.
     assert client.get("/items/1").status_code == 401
@@ -263,42 +606,6 @@ def test_options_same_for_missing_and_hidden(store):
         assert response.json() == existing.json()
         assert dict(response.headers) == dict(existing.headers)
     assert store.calls == {}
-
-
-def test_options_links_configured_and_omitted(store):
-    response = options(
-        TestClient(
-            item_router(
-                store,
-                ScrudfulRouter(
-                    options_schema_link=SCHEMA_RESOURCE,
-                    options_context_link=CONTEXT_RESOURCE,
-                ),
-            )
-        ),
-        "/items/1",
-    )
-    assert response.headers["Link"] == (
-        f'<{SCHEMA_RESOURCE}>; rel="describedby"; type="application/schema+json", '
-        f'<{CONTEXT_RESOURCE}>; rel="http://www.w3.org/ns/json-ld#context"; '
-        'type="application/ld+json"'
-    )
-    assert expose(response) == {"Link"}
-
-    schema_only = options(
-        TestClient(
-            item_router(store, ScrudfulRouter(options_schema_link=SCHEMA_RESOURCE))
-        ),
-        "/items/1",
-    )
-    assert schema_only.headers["Link"] == (
-        f'<{SCHEMA_RESOURCE}>; rel="describedby"; type="application/schema+json"'
-    )
-
-    omitted = options(TestClient(item_router(store)), "/items/1")
-    assert omitted.status_code == 200
-    assert "Link" not in omitted.headers
-    assert "Access-Control-Expose-Headers" not in omitted.headers
 
 
 def test_cors_preflight_not_broken(store):
@@ -336,15 +643,15 @@ def test_options_with_path_converters(store):
         return {"name": name}
 
     client = TestClient(router)
-    for path in ("/ints/1", f"/uuids/{uuid.uuid4()}", "/files/a/b.txt"):
-        response = options(client, path)
-        assert response.status_code == 200, path
+    for url in ("/ints/1", f"/uuids/{uuid.uuid4()}", "/files/a/b.txt"):
+        response = options(client, url)
+        assert response.status_code == 200, url
         assert response.json()["get"]["responses"]["200"]["content"] == ITEM_CONTENT
 
 
 def test_options_default_router(store):
     api = NinjaAPI(
-        default_router=ScrudfulRouter(options_schema_link=SCHEMA_RESOURCE),
+        default_router=ScrudfulRouter(),
         urls_namespace=f"api-{uuid.uuid4().hex}",
     )
 
@@ -355,8 +662,8 @@ def test_options_default_router(store):
 
     response = options(TestClient(api), "/things/1")
     assert response.status_code == 200
-    assert set(response.json()) == {"get"}
-    assert response.headers["Link"].startswith(f"<{SCHEMA_RESOURCE}>")
+    assert list(response.json()) == ["get", "options"]
+    assert response.headers["Link"].startswith(f"<{HSR_SCHEMA_URL}>")
 
 
 def test_options_head_when_routed(store):
@@ -368,8 +675,16 @@ def test_options_head_when_routed(store):
         return obj
 
     body = options(TestClient(router), "/items/1").json()
-    assert set(body) == {"get", "head"}
-    assert body["head"] == body["get"]
+    assert list(body) == ["get", "options", "head"]
+    # Described like GET, but a HEAD response has no content.
+    assert body["head"] == {
+        "responses": {
+            "200": {"description": "OK"},
+            "304": NOT_MODIFIED,
+            "400": MALFORMED,
+            "412": FAILED,
+        }
+    }
     assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
 
 
@@ -393,7 +708,9 @@ def test_options_list_path(store):
             # A create is never evaluated: no 400/412, no parameters.
             "responses": {"201": {"description": "Created", "content": ITEM_CONTENT}},
         },
+        "options": describe_options(),
     }
+    validate_http_schema_resource(body)
     assert store.calls == {}
 
 
@@ -444,29 +761,23 @@ def test_options_entities():
         return {"id": 1}
 
     client = TestClient(router)
+    # Entities with a schema only are described as they are (not valid 0.1:
+    # JSON content needs a context too).
     body = options(client, "/jobs/1").json()
-    error_content = {"application/json": {"schema": "/schemas/error"}}
-    conflict_content = {"application/json": {"schema": "/schemas/conflict"}}
-    assert body["put"]["requestBody"]["content"] == {
-        "application/json": {
-            "schema": "/schemas/job-in",
-            "context": "/contexts/job-in",
-        }
-    }
+    error_content = content("/schemas/error")
+    conflict_content = content("/schemas/conflict")
+    assert body["put"]["requestBody"]["content"] == content(
+        "/schemas/job-in", "/contexts/job-in"
+    )
     assert body["put"]["responses"] == {
         "200": {"description": "OK"},
         # scrudful's own early responses carry the error entity's Links.
         "400": {**MALFORMED, "content": error_content},
         "412": {**FAILED, "content": error_content},
         "428": {**REQUIRED, "content": error_content},
-        "202": {
-            "description": "Accepted",
-            "content": {"application/json": {"schema": "/schemas/job"}},
-        },
-        "404": {
-            "description": "Not Found",
-            "content": {"application/json": {"context": "/contexts/missing"}},
-        },
+        "202": {"description": "Accepted", "content": content("/schemas/job")},
+        # A Media Type Object needs a schema: a context alone is not described.
+        "404": {"description": "Not Found"},
     }
     assert body["delete"]["responses"] == {
         "204": {"description": "No Content"},
@@ -479,10 +790,7 @@ def test_options_entities():
     assert post["responses"] == {
         "201": {"description": "Created", "content": ITEM_CONTENT},
         "400": {"description": "Bad Request"},
-        "409": {
-            "description": "Conflict",
-            "content": {"application/json": {"schema": "/schemas/conflict"}},
-        },
+        "409": {"description": "Conflict", "content": conflict_content},
     }
 
 
@@ -557,9 +865,7 @@ def test_options_link_callables_get_the_request_and_none():
         return {}
 
     body = options(TestClient(router), "/items/5").json()
-    assert body["get"]["responses"]["200"]["content"] == {
-        "application/json": {"schema": "/schemas/options"}
-    }
+    assert body["get"]["responses"]["200"]["content"] == content("/schemas/options")
     assert calls == [("OPTIONS", "/items/5", None)]
 
 
@@ -596,12 +902,8 @@ def test_options_async_operation_with_async_request_entity(store):
     response = async_to_sync(TestAsyncClient(router).request)("OPTIONS", "/items/1")
     assert response.status_code == 200
     body = response.json()
-    assert body["put"]["requestBody"]["content"] == {
-        "application/json": {"schema": "/schemas/item-in"}
-    }
-    assert body["put"]["responses"]["200"]["content"] == {
-        "application/json": {"schema": "/schemas/item"}
-    }
+    assert body["put"]["requestBody"]["content"] == content("/schemas/item-in")
+    assert body["put"]["responses"]["200"]["content"] == content("/schemas/item")
     assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
     assert sorted(calls) == [("async", None), ("sync", None)]
     assert store.calls == {}
@@ -667,8 +969,11 @@ def test_options_mixed_operations(store):
     def links_only_patch(request, pk: int, payload: ItemIn):
         return {}
 
-    body = options(TestClient(router), "/items/1").json()
-    assert set(body) == {"get", "put", "patch", "delete"}
+    response = options(TestClient(router), "/items/1")
+    body = response.json()
+    validate_http_schema_resource(body)
+    assert list(body) == ["get", "put", "delete", "options", "patch"]
+    assert response.headers["Allow"] == "GET, PUT, DELETE, OPTIONS, PATCH"
     assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
     # Not scrudful: no links and no precondition parameters, as in DRF, but
     # the declared statuses.
@@ -701,7 +1006,7 @@ def test_options_nested_router_api_auth(store):
     client = TestClient(api)
     response = options(client, "/shop/v1/items/1")
     assert response.status_code == 200
-    assert set(response.json()) == {"get", "put", "delete"}
+    assert set(response.json()) == {"get", "put", "delete", "options"}
     assert client.get("/shop/v1/items/1").status_code == 401
     assert client.put("/shop/v1/items/1", json={"name": "x"}).status_code == 401
     assert store.calls["load"] == 0
@@ -778,12 +1083,18 @@ def drf_options(actions: dict[str, str], **kwargs: Any) -> Any:
 
 
 def assert_superset(drf: Any, ninja: Any, path: tuple[str, ...] = ()) -> None:
-    """Every key path of ``drf`` exists in ``ninja``, with an equal value."""
+    """Every key path of ``drf`` exists in ``ninja``, with an equal value.
+
+    ``content`` maps are not compared: DRF's ``ScrudfulMetadata`` still has the
+    0.0 shape (``{"schema": <url>, "context": <url>}``), and neither is the
+    ``options`` entry, which only ninja's 0.1 body has.
+    """
     if isinstance(drf, dict):
         assert isinstance(ninja, dict), path
         for key, value in drf.items():
             assert key in ninja, path + (key,)
-            assert_superset(value, ninja[key], path + (key,))
+            if key != "content":
+                assert_superset(value, ninja[key], path + (key,))
     else:
         assert ninja == drf, path
 
@@ -803,7 +1114,7 @@ def test_options_superset_of_drf(store):
         pk="1",
     )
     ninja_detail = options(client, "/items/1").json()
-    assert set(ninja_detail) == set(detail)
+    assert set(ninja_detail) == set(detail) | {"options"}
     assert_superset(detail, ninja_detail)
     # The superset: response content on writes, declared statuses.
     assert "content" not in detail["put"]["responses"]["200"]
@@ -812,7 +1123,7 @@ def test_options_superset_of_drf(store):
 
     listing = drf_options({"get": "list", "post": "create"})
     ninja_listing = options(client, "/items").json()
-    assert set(ninja_listing) == set(listing)
+    assert set(ninja_listing) == set(listing) | {"options"}
     assert_superset(listing, ninja_listing)
     assert ninja_listing["post"]["responses"]["201"]["content"] == ITEM_CONTENT
     assert store.calls == {}

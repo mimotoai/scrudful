@@ -21,8 +21,10 @@ from referencing.jsonschema import DRAFT202012
 from roles.api import save_role
 from roles.models import Role
 
+from scrudful._adapter import allow_header, describe_options, options_links
 from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS
 from scrudful_ninja.api import api
+from tests.semantic_http import link_problems, validate_http_schema_resource
 
 pytestmark = pytest.mark.django_db
 
@@ -38,12 +40,6 @@ PRECONDITION_REQUIRED = {
     "accepted-precondition-headers": ["If-Match", "If-Unmodified-Since"],
 }
 PRECONDITION_FAILED = {"detail": "Precondition failed."}
-OPTIONS_LINK = (
-    "<https://example.com/schemas/http-schema-resource.json>; "
-    'rel="describedby"; type="application/schema+json", '
-    "<https://example.com/contexts/http-schema-resource.jsonld>; "
-    'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
-)
 MISSING = 999_999
 
 
@@ -60,8 +56,11 @@ def content(name):
     """The OPTIONS ``content`` of the documents ``name``."""
     return {
         "application/json": {
-            "schema": f"{API}/schemas/{name}",
-            "context": f"{API}/contexts/{name}",
+            "schema": {"$ref": f"{API}/schemas/{name}"},
+            "x-rdf-context": {
+                "href": f"{API}/contexts/{name}",
+                "type": "application/ld+json",
+            },
         }
     }
 
@@ -479,12 +478,20 @@ def options(client, path, **headers):
 def test_options_item(client, role):
     response = options(client, detail(role.pk))
     assert response.status_code == 200
-    assert response.headers["Link"] == OPTIONS_LINK
+    assert response.headers["Content-Type"] == "application/json"
+    assert response.headers["Link"] == options_links()
     body = response.json()
-    assert list(body) == ["get", "head", "put", "patch", "delete"]
+    validate_http_schema_resource(body)
+    assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
+    assert response.headers["Allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
+    assert response.headers["Allow"] == allow_header(body)
+    assert body["options"] == describe_options()
     assert body["get"]["responses"]["200"]["content"] == content("role")
     assert set(body["get"]["responses"]) == {"200", "304", "400", "412"}
-    assert body["head"] == body["get"]
+    # HEAD is described like GET, without content: its responses have none.
+    assert set(body["head"]["responses"]) == set(body["get"]["responses"])
+    for response_ in body["head"]["responses"].values():
+        assert "content" not in response_
     # The request bodies: PUT a whole role, PATCH a partial one.
     assert body["put"]["requestBody"]["content"] == content("role")
     assert body["patch"]["requestBody"]["content"] == content("role-patch")
@@ -512,8 +519,11 @@ def test_options_is_the_same_for_everyone(client, role, hidden):
 
 
 def test_options_collection(client):
-    body = options(client, "/api/roles").json()
-    assert list(body) == ["get", "post"]
+    response = options(client, "/api/roles")
+    body = response.json()
+    validate_http_schema_resource(body)
+    assert list(body) == ["get", "post", "options"]
+    assert response.headers["Allow"] == "GET, POST, OPTIONS"
     assert body["get"]["responses"]["200"]["content"] == content("roles")
     assert "304" in body["get"]["responses"]
     assert body["post"]["requestBody"]["content"] == content("role")
@@ -523,11 +533,55 @@ def test_options_collection(client):
 
 def test_options_search(client):
     body = options(client, "/api/roles/search").json()
-    assert list(body) == ["post"]
+    validate_http_schema_resource(body)
+    assert list(body) == ["post", "options"]
     assert body["post"]["requestBody"]["content"] == content("role-search")
     assert body["post"]["responses"]["200"]["content"] == content("role-search-result")
     # A search answers 200, not a create's 201.
     assert set(body["post"]["responses"]) == {"200"}
+
+
+def test_responses_agree_with_options(client, role):
+    """Every response's Links are the entry of the HTTP Schema Resource."""
+    item = options(client, detail(role.pk)).json()
+    collection = options(client, "/api/roles").json()
+    data = {"name": "owner", "rbac_context": "acme"}
+    current = {"If-Match": f'"{role.etag}"'}
+    stale = {"If-Match": '"stale"'}
+    responses = [
+        ("GET", client.get(detail(role.pk), headers=ACME), item),
+        ("HEAD", client.head(detail(role.pk), headers=ACME), item),
+        ("GET", client.get("/api/roles", headers=ACME), collection),
+        ("PUT", put(client, role.pk, data, **stale), item),
+        ("PUT", put(client, role.pk, data), item),
+        ("PUT", put(client, role.pk, data, **{"If-Match": "nope"}), item),
+        ("PUT", put(client, role.pk, {**data, "rbac_context": "x"}, **current), item),
+        ("PUT", put(client, role.pk, data, **current), item),
+    ]
+    role.refresh_from_db()
+    current = {"If-Match": f'"{role.etag}"'}
+    responses += [
+        ("PATCH", patch(client, role.pk, {"name": "x"}, **current), item),
+        (
+            "POST",
+            client.post(
+                "/api/roles",
+                {"name": "viewer", "rbac_context": "acme"},
+                content_type="application/json",
+                headers=ACME,
+            ),
+            collection,
+        ),
+    ]
+    statuses = [response.status_code for _, response, _ in responses]
+    assert statuses == [200, 200, 200, 412, 428, 400, 403, 200, 200, 201]
+    for method, response, hsr in responses:
+        has_content = bool(response.content)
+        assert has_content == (method != "HEAD")
+        problems = link_problems(
+            method, response.status_code, response.headers, has_content, hsr=hsr
+        )
+        assert problems == [], (method, response.status_code)
 
 
 def test_cors_preflight_is_not_broken(client, role):

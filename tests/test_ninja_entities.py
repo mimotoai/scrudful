@@ -28,20 +28,30 @@ from tests.test_ninja_adapter import (
 
 RESULTS = Entity("/schemas/results", context_link_or_func="/contexts/results")
 RESULTS_LINK = (
-    '</schemas/results>; rel="describedby"; type="application/schema+json", '
-    '</contexts/results>; rel="http://www.w3.org/ns/json-ld#context"; '
+    '<http://testlocation/schemas/results>; rel="describedby"; '
+    'type="application/schema+json", '
+    "<http://testlocation/contexts/results>; "
+    'rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
 )
 QUERY = Entity("/schemas/query", context_link_or_func="/contexts/query")
 ERROR = Entity("/schemas/error")
-ERROR_LINK = '</schemas/error>; rel="describedby"; type="application/schema+json"'
+ERROR_LINK = (
+    '<http://testlocation/schemas/error>; rel="describedby"; '
+    'type="application/schema+json"'
+)
 PROBLEM = Entity("/schemas/problem", context_link_or_func="/contexts/problem")
 PROBLEM_LINK = (
-    '</schemas/problem>; rel="describedby"; type="application/schema+json", '
-    '</contexts/problem>; rel="http://www.w3.org/ns/json-ld#context"; '
+    '<http://testlocation/schemas/problem>; rel="describedby"; '
+    'type="application/schema+json", '
+    "<http://testlocation/contexts/problem>; "
+    'rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
 )
-JOB_LINK = '</schemas/job>; rel="describedby"; type="application/schema+json"'
+JOB_LINK = (
+    '<http://testlocation/schemas/job>; rel="describedby"; '
+    'type="application/schema+json"'
+)
 
 
 class Query(Schema):
@@ -334,7 +344,8 @@ def test_runtime_entity_wins_and_gets_the_object(store):
 
     response = TestClient(router).get("/items/1")
     assert response.headers["Link"] == (
-        '</schemas/item/1>; rel="describedby"; type="application/schema+json"'
+        '<http://testlocation/schemas/item/1>; rel="describedby"; '
+        'type="application/schema+json"'
     )
     assert seen == [1]
 
@@ -460,7 +471,8 @@ def test_error_link_callables_get_the_loaded_object(store):
     response = client.put("/items/1")
     assert response.status_code == 428
     assert response.headers["Link"] == (
-        '</schemas/problem>; rel="profile"; type="application/schema+json"'
+        '<http://testlocation/schemas/problem>; rel="profile"; '
+        'type="application/schema+json"'
     )
     assert seen == [("PUT", 1)]
 
@@ -614,7 +626,8 @@ def test_async_operation_error_links(store):
     response = async_to_sync(TestAsyncClient(router).put)("/items/1")
     assert response.status_code == 428
     assert response.headers["Link"] == (
-        '</schemas/problem>; rel="describedby"; type="application/schema+json"'
+        '<http://testlocation/schemas/problem>; rel="describedby"; '
+        'type="application/schema+json"'
     )
 
 
@@ -685,7 +698,7 @@ def test_link_callables_get_the_reloaded_object_without_validators(store):
         response = client.request(method, "/items/1")
         assert response.status_code == 200
         assert response.headers["Link"] == (
-            f'</schemas/item/v{version}>; rel="describedby"; '
+            f'<http://testlocation/schemas/item/v{version}>; rel="describedby"; '
             'type="application/schema+json"'
         )
     assert seen == [2, 3]
@@ -744,7 +757,8 @@ def test_in_band_entity_sends_no_context_link():
 
     response = TestClient(router).post("/items/search", json={"q": "a"})
     assert response.headers["Link"] == (
-        '</schemas/graph>; rel="describedby"; type="application/schema+json"'
+        '<http://testlocation/schemas/graph>; rel="describedby"; '
+        'type="application/schema+json"'
     )
 
 
@@ -764,7 +778,9 @@ def test_csv_entity_uses_rdf_context_rel():
 
     response = TestClient(router).post("/items/search", json={"q": "a"})
     assert response.headers["Link"] == (
-        '</schemas/rows>; rel="describedby"; type="application/schema+json", '
-        '</contexts/rows>; rel="https://w3id.org/semantic-http/ns#rdf-context"; '
+        '<http://testlocation/schemas/rows>; rel="describedby"; '
+        'type="application/schema+json", '
+        "<http://testlocation/contexts/rows>; "
+        'rel="https://w3id.org/semantic-http/ns#rdf-context"; '
         'type="application/csvm+json"'
     )

@@ -33,9 +33,12 @@ from tests import ninja_future_annotations as future_endpoints
 # Non-zero microseconds: the header is floored to whole seconds.
 MODIFIED = datetime(2024, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)
 MODIFIED_HTTP = "Tue, 02 Jan 2024 03:04:05 GMT"
-SCHEMA_LINK = '</schemas/item>; rel="describedby"; type="application/schema+json"'
+SCHEMA_LINK = (
+    '<http://testlocation/schemas/item>; rel="describedby"; '
+    'type="application/schema+json"'
+)
 CONTEXT_LINK = (
-    '</contexts/item>; rel="http://www.w3.org/ns/json-ld#context"; '
+    '<http://testlocation/contexts/item>; rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
 )
 LINKS = dict(schema_link_or_func="/schemas/item", context_link_or_func="/contexts/item")
@@ -816,13 +819,15 @@ def test_link_callables_get_request_and_object(store):
     client = TestClient(router)
     response = client.get("/items/1")
     assert response.headers["Link"] == (
-        '</schemas/item/1>; rel="profile"; type="application/schema+json", '
-        '</contexts/item>; rel="http://www.w3.org/ns/json-ld#context"; '
+        '<http://testlocation/schemas/item/1>; rel="profile"; '
+        'type="application/schema+json", '
+        "<http://testlocation/contexts/item>; "
+        'rel="http://www.w3.org/ns/json-ld#context"; '
         'type="application/json"'
     )
     response = client.put("/items/1", headers={"If-Match": '"v1"'})
     # After a PUT the links describe the object loaded again.
-    assert response.headers["Link"].startswith("</schemas/item/2>")
+    assert response.headers["Link"].startswith("<http://testlocation/schemas/item/2>")
     assert seen == [("GET", 1), ("PUT", 2)]
 
 
@@ -841,7 +846,7 @@ def test_links_without_load(store):
     assert response.status_code == 200
     assert response.json() == {"obj": "x"}
     assert "ETag" not in response.headers
-    assert response.headers["Link"].startswith("</schemas/None>")
+    assert response.headers["Link"].startswith("<http://testlocation/schemas/None>")
 
 
 def test_load_without_validators_ignores_preconditions(store):

@@ -13,7 +13,7 @@ api = NinjaAPI(
     # Operations declared on the API itself (@api.get(...)) go to its default
     # router: a ScrudfulRouter, so scrudful ones get OPTIONS too. Scrudful
     # operations on a plain ninja Router get no OPTIONS (405).
-    default_router=ScrudfulRouter(**roles.OPTIONS_LINKS),
+    default_router=ScrudfulRouter(),
 )
 api.add_router("/roles", roles.router)
 api.add_router("", documents.router)

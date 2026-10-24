@@ -39,15 +39,6 @@ from scrudful.ninja import (
 
 from .models import Role, new_etag
 
-#: The schema and context of the HTTP Schema Resource that OPTIONS answers
-#: with (the semantic-http spec requires Links on it; see ScrudfulRouter).
-#: Placeholders: the spec's 2019 draft publishes no resolvable URLs for these
-#: documents, so a real API points them at copies it serves.
-OPTIONS_LINKS = dict(
-    options_schema_link="https://example.com/schemas/http-schema-resource.json",
-    options_context_link="https://example.com/contexts/http-schema-resource.jsonld",
-)
-
 
 class RbacContextHeader(APIKeyHeader):
     """Authentication: the ``X-Rbac-Context`` header, else 401.
@@ -174,7 +165,8 @@ def forbidden(request: HttpRequest, rbac_context: str) -> Status | None:
     return None
 
 
-router = ScrudfulRouter(tags=["roles"], **OPTIONS_LINKS)
+#: Answers OPTIONS on every path with the path's HTTP Schema Resource.
+router = ScrudfulRouter(tags=["roles"])
 
 
 # --- The collection: list and create ------------------------------------------------
