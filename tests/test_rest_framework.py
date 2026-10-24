@@ -352,6 +352,14 @@ PROBLEM_LINKS = (
 
 
 @scrudful_viewset
+class ErrorOnlyViewSet(ThingViewSetBase):
+    """An error entity and no validators."""
+
+    class Meta:
+        error = ERROR
+
+
+@scrudful_viewset
 class ProblemViewSet(ThingViewSetBase):
     """Errors described as problem details."""
 
@@ -618,6 +626,7 @@ for prefix, viewset in [
     ("post", PostViewSet),
     ("errors", ErrorViewSet),
     ("problems", ProblemViewSet),
+    ("error-only", ErrorOnlyViewSet),
     ("mixed-actions", MixedActionViewSet),
     ("own-describedby", OwnDescribedByViewSet),
 ]:
@@ -1763,3 +1772,34 @@ def test_exception_handler_keeps_the_headers_of_the_response(client):
     response = client.get("/api-authenticated/")
     assert response.status_code == 401
     assert "WWW-Authenticate" in response
+
+
+def test_without_the_exception_handler_nothing_is_added_or_described(client):
+    """Without the setting, a serializer 400 has no Link and is not described."""
+    with override_settings(REST_FRAMEWORK={}):
+        response = client.put(
+            "/errors/1/", {"raise": True}, format="json", headers=IF_MATCH
+        )
+        assert response.status_code == 400
+        assert "Link" not in response
+        listing = client.options("/errors/").json()
+        detail = client.options("/errors/1/").json()
+    validate_http_schema_resource(listing)
+    assert set(listing["post"]["responses"]) == {"201"}
+    # Scrudful's own 400 of the conditional PUT is still there.
+    assert "400" in detail["put"]["responses"]
+
+
+def test_a_non_conditional_delete_has_no_400_entry(client):
+    body = client.options("/errors/1/").json()
+    assert "400" in body["put"]["responses"]
+    body = client.options("/error-only/1/").json()
+    assert "400" in body["put"]["responses"]
+    assert set(body["delete"]["responses"]) == {"204"}
+    plain = client.options("/problems/1/").json()
+    assert "400" in plain["delete"]["responses"]  # conditional: scrudful's own
+
+
+def test_a_serializer_400_is_described_with_the_exception_handler(client):
+    listing = client.options("/errors/").json()
+    assert set(listing["post"]["responses"]) == {"201", "400"}

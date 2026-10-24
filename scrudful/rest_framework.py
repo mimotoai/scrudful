@@ -802,9 +802,15 @@ class ScrudfulMetadata(BaseMetadata):
             response_content=content,
             error_content=error_content,
         )
-        if error_content:
-            # A write is also answered 400 when the serializer rejects the body
-            # (DRF's exception handler adds the error Links), conditional or not.
+        view = args[0] if args else None
+        if (
+            error_content
+            and method != "delete"
+            and getattr(view, "get_exception_handler", None) is not None
+            and view.get_exception_handler() is exception_handler
+        ):
+            # The serializer's 400 carries the error Links only through
+            # :func:`exception_handler`, so only then is it described.
             metadata["responses"].setdefault(
                 "400",
                 {"description": reason_phrase(400), "content": error_content},

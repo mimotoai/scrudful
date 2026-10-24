@@ -32,8 +32,8 @@ or 403) need ``exception_handler``, which settings must name::
 It calls DRF's handler and, for a view whose handler for the request has an
 ``error`` entity, adds that entity's Links and serves the response with the
 entity's media type, whatever the request's ``Accept``. The HTTP Schema Resource
-lists a write's 400 under that media type when the view has an ``error`` entity,
-conditional or not. Without the setting, or without an ``error`` entity, such
+lists a PUT, PATCH or POST 400 under that media type (conditional or not) only
+when the view's exception handler is this one. Without the setting, or without an ``error`` entity, such
 errors are DRF's own, with no Link. The HTTP Schema Resource doesn't list 404 and
 405, so they have no entry to agree with. The example project
 (``examples/scrudful_rest_framework``) is conformant on the wire: its tests check
