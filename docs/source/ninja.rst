@@ -580,13 +580,16 @@ otherwise) and must not use the ORM there.
 **The error media type.** An error entity describes JSON bodies: its
 ``media_type`` must be ``application/json`` or another ``+json`` type (e.g.
 ``application/problem+json``), other than JSON-LD; anything else raises
-``ValueError``. scrudful's own 400, 412 and 428 are served with the ``error``
-entity's ``media_type`` as their ``Content-Type``. The other errors (those
-raised inside a scrudful operation and those of
-:func:`~scrudful.ninja.add_error_links`) are served as ninja renders them,
-``application/json``: only their Links are added, and the ``Content-Type`` is
-not relabelled. An ``error`` entity used there should therefore be
-``application/json`` for its Links to agree with the response.
+``ValueError``, from the decorators and from
+:func:`~scrudful.ninja.add_error_links`. An error response is served with the
+media type of the entity whose Links it carries, as the OPTIONS body lists it:
+scrudful's own 400, 412 and 428, and the responses the API's exception
+handlers make for the errors raised inside a scrudful operation and for those
+:func:`~scrudful.ninja.add_error_links` covers. ninja renders those
+``application/json``, and scrudful replaces that ``Content-Type`` with the
+entity's ``media_type`` whatever the handler chose, so every wrapped handler's
+JSON bodies must be content the entity describes. A handler's response with
+other content (e.g. ``text/plain``) keeps its ``Content-Type``.
 
 Not covered, since no ninja exception handler makes them:
 

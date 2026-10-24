@@ -413,7 +413,10 @@ scrudful follows `Semantic HTTP 0.1 <https://w3id.org/semantic-http/0.1/>`_
   ``head`` entry where HEAD is served);
 * scrudful's own 400, 412 and 428 carry the Links of the ``error`` entity you
   pass, and are served with its ``media_type``, which must be JSON content
-  (``application/json`` or ``+json``, other than JSON-LD).
+  (``application/json`` or ``+json``, other than JSON-LD). The same holds for
+  every JSON error response that gets an error entity's Links (from the
+  error-links helpers below, or raised inside a ninja scrudful operation): it
+  is served with that entity's ``media_type``.
 
 The application must still:
 

@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 from asgiref.sync import async_to_sync
-from django.http import Http404
+from django.http import Http404, HttpResponse
 from ninja import NinjaAPI, Router
 from ninja.errors import AuthenticationError, AuthorizationError, HttpError
 from ninja.testing import TestAsyncClient, TestClient
@@ -557,3 +557,80 @@ def test_error_media_type_must_be_json(media_type):
         scrudful(error=error)
     with pytest.raises(ValueError, match=media_type):
         scrudful_list(href_func=lambda request, item: "/", error=error)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_raised_error_is_served_as_the_error_media_type(store, asynchronous):
+    """A handler-raised 400 agrees with OPTIONS, which lists it as problem+json."""
+    router = ScrudfulRouter()
+    if asynchronous:
+
+        @router.get("/items/{pk}", response=ItemOut)
+        @scrudful(load=store.load, etag_func=etag, error=PROBLEM, **LINKS)
+        async def get_item(request, pk: int, obj):
+            raise HttpError(400, "bad")
+
+    else:
+
+        @router.get("/items/{pk}", response=ItemOut)
+        @scrudful(load=store.load, etag_func=etag, error=PROBLEM, **LINKS)
+        def get_item(request, pk: int, obj):
+            raise HttpError(400, "bad")
+
+    client = client_for(router, asynchronous)
+    options = client.request
+    if asynchronous:
+        options = async_to_sync(options)
+    hsr = options("OPTIONS", "/items/1").json()
+    validate_http_schema_resource(hsr)
+    assert list(hsr["get"]["responses"]["400"]["content"]) == [
+        "application/problem+json"
+    ]
+    response = get(client, "/items/1")
+    assert response.status_code == 400
+    assert response.json() == {"detail": "bad"}
+    assert response.headers["Content-Type"] == "application/problem+json"
+    assert response.headers["Link"] == PROBLEM_LINK
+    assert link_problems("GET", 400, response.headers, True, hsr=hsr) == []
+
+
+def test_add_error_links_serves_the_error_media_type(store):
+    api = error_api(store)
+    add_error_links(api, PROBLEM)
+    client = TestClient(api)
+    responses = {
+        422: client.put(
+            "/items/1", json={"name": 1}, headers={"If-Match": '"v1"', **ALICE}
+        ),
+        401: client.get("/items/1"),
+        404: client.put("/plain/1", json={"name": "a"}, headers=ALICE),
+    }
+    for status, response in responses.items():
+        assert response.status_code == status
+        assert response.headers["Content-Type"] == "application/problem+json"
+        assert response.headers["Link"] == PROBLEM_LINK
+        assert response.json()
+    # A success keeps its own media type.
+    response = client.get("/items/1", headers=ALICE)
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].startswith("application/json")
+
+
+def test_add_error_links_leaves_non_json_content_alone(store):
+    api = error_api(store)
+
+    @api.exception_handler(Http404)
+    def plain_not_found(request, exc):
+        return HttpResponse("gone", status=404, content_type="text/plain")
+
+    add_error_links(api, PROBLEM)
+    response = TestClient(api).put("/plain/1", json={"name": "a"}, headers=ALICE)
+    assert response.status_code == 404
+    assert response.headers["Content-Type"] == "text/plain"
+
+
+@pytest.mark.parametrize("media_type", ["text/csv", "text/turtle", "application/xml"])
+def test_add_error_links_media_type_must_be_json(store, media_type):
+    error = Entity("/schemas/error", media_type=media_type)
+    with pytest.raises(ValueError, match="scrudful's JSON error bodies"):
+        add_error_links(error_api(store), error)

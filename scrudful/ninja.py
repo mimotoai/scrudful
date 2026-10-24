@@ -147,7 +147,10 @@ Error responses
     the Links of the entity the operation's OPTIONS describes for its
     status: ``responses[status]`` (``error`` first for scrudful's own 400,
     412 and 428 when the operation evaluates the If-* headers), else
-    ``error``, else none. Link callables get ``None``. The errors ninja
+    ``error``, else none. Link callables get ``None``. A response with JSON
+    content (ninja's renderer's ``application/json``) is then served as that
+    entity's media type when it is JSON content too, e.g.
+    ``application/problem+json``, as OPTIONS lists it. The errors ninja
     answers before the operation runs (401, 422, 429, ...) and those of
     operations without an entity for them get Links from
     :func:`add_error_links`, the API-wide error entity.
@@ -432,6 +435,7 @@ from scrudful._adapter import (
     describe_read,
     describe_write,
     expose_headers,
+    is_json,
     merge_links,
     options_links,
     resolve_annotation,
@@ -791,7 +795,8 @@ def scrudful(
         callables then get ``None``). Without it, they carry no Link. Its
         ``media_type`` must be JSON content (``application/json`` or
         ``+json``, e.g. ``application/problem+json``), since scrudful's error
-        bodies are JSON objects; they are served with that Content-Type.
+        bodies are JSON objects; they, and the JSON responses to the errors
+        the operation raises, are served with that Content-Type.
 
     Raises
     ------
@@ -1092,7 +1097,8 @@ def scrudful_list(
         queryset. Also those of the response to an ``HttpError`` or
         ``Http404`` the operation raises, e.g. the 404 of a page past the
         last one; link callables then get ``None``. Its ``media_type`` must
-        be JSON content, as for :func:`scrudful`; scrudful's 400 and 412 are
+        be JSON content, as for :func:`scrudful`; scrudful's 400 and 412,
+        and the JSON responses to the errors the operation raises, are
         served with it.
 
     Raises
@@ -1251,10 +1257,16 @@ def add_error_links(api: NinjaAPI, error: Entity) -> None:
     their own (e.g. a later ``HttpError`` handler answers the 401, 403 and
     429 too, without Links): call this after registering your handlers.
 
+    A response with JSON content (an ``application/json`` or ``+json``
+    Content-Type, as ninja's renderer gives) is served as
+    ``error.media_type``, whatever the handler chose, so the JSON bodies of
+    every wrapped handler must be content that ``error`` describes. Other
+    content keeps its Content-Type.
+
     An error raised inside a scrudful operation gets that operation's
     entity for the status, if it has one (``responses[status]``, else its
-    ``error``): it describes the response, as the OPTIONS of the operation
-    does, and ``error`` here applies only otherwise.
+    ``error``), and its media type: it describes the response, as the
+    OPTIONS of the operation does, and ``error`` here applies only otherwise.
 
     Not covered: ninja's 405 for a method no operation of the path routes,
     which no exception handler makes, Django's own 404 for an unknown URL
@@ -1265,22 +1277,26 @@ def add_error_links(api: NinjaAPI, error: Entity) -> None:
     api : NinjaAPI
         The API whose exception handlers are wrapped.
     error : Entity
-        The schema and context of the error bodies. Its link callables are
-        called with the request and ``obj=None``. ninja's exception handlers
-        are sync, also in an async operation, where they run on the event
-        loop: the callables must be sync, and must not use the Django ORM
-        there.
+        The schema, context and media type of the error bodies. Its link
+        callables are called with the request and ``obj=None``. ninja's
+        exception handlers are sync, also in an async operation, where they
+        run on the event loop: the callables must be sync, and must not use
+        the Django ORM there.
 
     Raises
     ------
     TypeError
         If ``api`` isn't a ``NinjaAPI``, ``error`` isn't an :class:`Entity`
         or one of its values is an ``async def`` callable.
+    ValueError
+        If ``error``'s media type is not JSON content (``application/json``
+        or ``+json``, other than JSON-LD).
     """
     if not isinstance(api, NinjaAPI):
         raise TypeError(f"api must be a NinjaAPI, not {type(api).__name__}")
     if not isinstance(error, Entity):
         raise TypeError(f"error must be an Entity, not {type(error).__name__}")
+    check_error_media_type(error.media_type)
     for entity_field in fields(Entity):
         if _is_async_callable(getattr(error, entity_field.name)):
             raise TypeError(
@@ -1693,14 +1709,13 @@ def _raised_links(
 
     ``response`` is the API's answer to it; when it has content, it gets
     the entity :func:`_raised_entity` picks for its status, whose link
-    callables get ``None``.
+    callables get ``None``, and its media type (see :func:`_error_links`).
     """
     if not _carries_body(response):
         return
     entity = _raised_entity(config, request.method.lower(), response.status_code)
     if entity is not None:
-        yield from _add_links(response, entity, request, None)
-        expose_headers(response)
+        yield from _error_links(response, entity, request)
 
 
 def _raised_entity(config: _Config, method: str, status: int) -> Entity | None:
@@ -1740,11 +1755,27 @@ def _error_handler(
             # response, and :func:`_raised_links_run` adds it.
             return response
         if _carries_body(response):
-            _run_sync(_add_links(response, error, request, None))
-            expose_headers(response)
+            _run_sync(_error_links(response, error, request))
         return response
 
     return scrudful_handler
+
+
+def _error_links(
+    response: HttpResponseBase, entity: Entity, request: HttpRequest
+) -> _Flow[None]:
+    """Give the error ``response`` the Links and media type of ``entity``.
+
+    Its link callables get ``None``. A response with JSON content, as
+    ninja's renderer makes, is served as ``entity.media_type`` when that is
+    JSON content too (an ``error`` entity's always is), so that it agrees
+    with the OPTIONS body; other content keeps its Content-Type.
+    """
+    yield from _add_links(response, entity, request, None)
+    content_type = response.get("Content-Type")
+    if content_type and is_json(content_type) and is_json(entity.media_type):
+        response["Content-Type"] = entity.media_type
+    expose_headers(response)
 
 
 class _CollectionResponse(NamedTuple):

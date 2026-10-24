@@ -40,12 +40,11 @@ change, so clients and tests that compare them must be updated.
 * Error entities: ``error=`` for DRF (``Meta.error`` / ``Meta.list_error``)
   and FastAPI, as ninja already had. An ``error`` entity's ``media_type`` must
   be JSON content (``application/json`` or ``+json``, other than JSON-LD);
-  scrudful's own 400, 412 and 428 (all adapters), DRF's ``exception_handler``
-  and FastAPI's ``add_error_links`` serve their responses with ``Content-Type``
-  equal to ``error.media_type``. ninja's ``add_error_links`` and the errors
-  raised inside ninja operations only gain the Links and stay
-  ``application/json`` as ninja renders them, so use an ``application/json``
-  error entity there.
+  every error response that carries an error entity's Links is served with
+  ``Content-Type`` equal to its ``media_type``: scrudful's own 400, 412 and
+  428 (all adapters), the responses of DRF's ``exception_handler`` and of both
+  ``add_error_links`` helpers, and the errors raised inside a ninja scrudful
+  operation (with the entity OPTIONS describes for their status).
 * New helpers that give the errors a framework answers itself the error
   entity's Links: ``add_error_links(api, error)`` for django-ninja and
   ``add_error_links(app, error)`` for FastAPI, and
