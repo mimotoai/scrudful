@@ -30,26 +30,32 @@ on the API itself, make the API's default router one too:
 
     from ninja import NinjaAPI
 
-    from scrudful.ninja import ScrudfulRouter
+    from scrudful.ninja import ScrudfulRouter, add_error_links
 
-    SCHEMA_RESOURCE = dict(
-        options_schema_link="https://example.com/schemas/http-schema-resource.json",
-        options_context_link="https://example.com/contexts/http-schema-resource.jsonld",
-    )
-
-    api = NinjaAPI(auth=..., default_router=ScrudfulRouter(**SCHEMA_RESOURCE))
-    roles = ScrudfulRouter(**SCHEMA_RESOURCE)
+    api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
+    roles = ScrudfulRouter()
     api.add_router("/roles", roles)
+    add_error_links(api, ERROR)  # see "Error responses"
 
 Scrudful operations on a plain ``ninja.Router`` work, but get no OPTIONS
 operation (ninja answers 405).
 
-``options_schema_link`` and ``options_context_link`` are the Links of the
-OPTIONS response: the JSON Schema and JSON-LD context of the HTTP Schema
-Resource. The OPTIONS body follows the semantic-http spec's 2019 draft (the
-shape DRF's ``ScrudfulMetadata`` produces), which publishes no resolvable URLs
-for these documents, so the URLs above are placeholders: point them at copies
-your application serves. Alignment with the spec's 0.1 revision is planned.
+The Links of the OPTIONS response are fixed: the published JSON Schema and
+JSON-LD context of the Semantic HTTP 0.1 HTTP Schema Resource, at
+``https://w3id.org/semantic-http/0.1/``. The OPTIONS body follows that
+revision (see the "Semantic HTTP conformance" section of :doc:`usage`).
+
+HEAD is routed like any method: ninja answers 405 to HEAD on an operation
+declared with ``get``. Declare ``api_operation(["GET", "HEAD"], ...)`` for the
+paths that should serve it, as the example does for the item and the list.
+
+.. note::
+
+   The schema Link's default relation is ``describedby``, which is what
+   Semantic HTTP 0.1 requires of a Schema Link Header. If you override it
+   (``schema_rel_or_func="profile"``), the response's Link is no longer a Schema
+   Link Header, while the OPTIONS body still describes that schema as the
+   response's schema: the API is then not conformant. Use the default.
 
 Single resources
 ----------------
@@ -412,7 +418,7 @@ so ninja's validation and OpenAPI describe the real body:
      "next": "…?page=3", "last": "…?page=3",
      "content": [{"href": "https://…/roles/17", "etag": "\"…\"",
                   "last_modified": "Thu, 22 Oct 2026 21:09:56 GMT",
-                  "link": "</schemas/role>; rel=\"describedBy\"; …",
+                  "link": "</schemas/role>; rel=\"describedby\"; …",
                   "content": {"id": 17, "name": "admin"}}]}
 
 Each entry's ``etag``, ``last_modified`` and ``link`` come from the same item
@@ -453,8 +459,9 @@ OPTIONS
 -------
 
 The automatic OPTIONS operation answers, for each method the path serves, an
-OpenAPI-like description in the shape DRF's ``ScrudfulMetadata`` produces: the
-request and response ``content`` (``{"schema": <url>, "context": <url>}``),
+HTTP Schema Resource (Semantic HTTP 0.1), the shape DRF's ``ScrudfulMetadata``
+produces too: the request and response ``content`` (per media type, a
+``schema`` ``$ref`` and, for a non-in-band type, an ``x-rdf-context`` ``href``),
 the statuses and the precondition headers of conditional writes. The statuses
 are those the operation answers: the ones it declares in ``response=`` (200
 without one), plus 201 for a ``@scrudful_create`` operation, and scrudful's
@@ -475,8 +482,9 @@ every POST. It is the same for everyone:
   which can differ between Python versions (e.g. for 422);
 * link callables are called with the request and ``obj=None`` (there is no
   loaded object, queryset or created item), so they must accept ``None``;
-* without ``options_schema_link`` / ``options_context_link`` the response has
-  no Link, which the semantic-http spec does not allow (see Setup).
+* the response always has the two fixed HTTP Schema Resource Links, an
+  ``Allow`` header listing the body's methods and, for the paths that serve
+  it, a ``head`` entry without content.
 
 CORS
 ~~~~
@@ -569,6 +577,13 @@ ninja's exception handlers are sync, also for async operations, where they run
 on the event loop: the entity's link callables must be sync (``TypeError``
 otherwise) and must not use the ORM there.
 
+**The error media type.** An error entity describes JSON bodies: its
+``media_type`` must be ``application/json`` or another ``+json`` type (e.g.
+``application/problem+json``), other than JSON-LD; anything else raises
+``ValueError``. scrudful's own 400, 412 and 428 are served with the ``error``
+entity's ``media_type`` as their ``Content-Type``, and so are the responses of
+the helper above, which has content (a handler's JSON response is relabelled).
+
 Not covered, since no ninja exception handler makes them:
 
 * ninja's own 405 for a method that no operation of the path routes (e.g. a
@@ -594,6 +609,7 @@ Reference
 .. automodule:: scrudful.ninja
    :members:
    :member-order: bysource
+   :exclude-members: Entity
 
 .. automodule:: scrudful.collection
    :members: collection_schema, collection_context

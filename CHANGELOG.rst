@@ -2,6 +2,65 @@
 Changelog
 =========
 
+0.5.0 (since 0.4.0)
+===================
+
+Semantic HTTP 0.1 (breaking)
+----------------------------
+
+All three adapters now follow `Semantic HTTP 0.1
+<https://w3id.org/semantic-http/0.1/>`_ (#4). Responses and OPTIONS bodies
+change, so clients and tests that compare them must be updated.
+
+* The schema Link defaults changed: ``rel="describedby"`` (was ``describedBy``)
+  and ``type="application/schema+json"`` (was ``application/json``). The
+  context Link keeps ``rel="http://www.w3.org/ns/json-ld#context"`` and
+  ``type="application/ld+json"``. ``DEFAULT_SCHEMA_REL`` and the other
+  ``DEFAULT_*`` names remain. Overriding the schema ``rel`` makes the
+  response's Link no longer a Schema Link Header, while the OPTIONS body still
+  describes it as the schema: use the default to stay conformant.
+* OPTIONS (DRF's ``ScrudfulMetadata``, ``ScrudfulRouter``, FastAPI's
+  ``add_options``) answers the 0.1 HTTP Schema Resource, in place of the 2019
+  draft shape. The ``content`` of a request or response is a Media Type Object
+  (``schema`` ``$ref``, ``x-schema`` for a schema that is not JSON Schema, and
+  ``x-rdf-context`` for a non-in-band media type). The body has an ``options``
+  entry and a content-less ``head`` entry where HEAD is served. ``Allow`` lists
+  exactly the body's methods, and the response is ``application/json`` with the
+  two published HTTP Schema Resource Links (also for DRF's browsable API).
+* Removed ``options_schema_link`` and ``options_context_link`` from
+  ``ScrudfulRouter``: the OPTIONS Links are the fixed w3id.org 0.1 URLs.
+* Every URI scrudful sends or describes is absolute: relative link values are
+  resolved against the request. Links are de-duplicated: a ``describedby`` or
+  context Link that the view set itself suppresses scrudful's of that kind,
+  and a Link of another relation suppresses nothing.
+* ``Entity`` moved to ``scrudful.entity`` (still importable from the three
+  adapters) and gained ``media_type``, which decides the context Link's
+  defaults (none for in-band RDF media types, ``rdf-context`` for other
+  non-JSON ones).
+* Error entities: ``error=`` for DRF (``Meta.error`` / ``Meta.list_error``)
+  and FastAPI, as ninja already had. An ``error`` entity's ``media_type`` must
+  be JSON content (``application/json`` or ``+json``, other than JSON-LD);
+  scrudful's own 400, 412 and 428, and the responses of the helpers below, are
+  served with ``Content-Type`` equal to ``error.media_type``.
+* New helpers that give the errors a framework answers itself the error
+  entity's Links: ``add_error_links(api, error)`` for django-ninja and
+  ``add_error_links(app, error)`` for FastAPI, and
+  ``scrudful.rest_framework.exception_handler`` (named as DRF's
+  ``EXCEPTION_HANDLER``). Errors raised inside a ninja scrudful operation get
+  the Links of the entity OPTIONS describes for their status.
+* FastAPI: ``add_options(app)`` answers OPTIONS on every URL a scrudful
+  endpoint serves. A callable used outside the endpoint (by ``add_options``
+  and ``add_error_links``) gets only the URL's path parameters plus the request
+  under the name of the endpoint's ``Request`` parameter; the helpers check
+  every such callable when called and raise ``TypeError`` for one that can't
+  be called that way. Mounted apps need their own calls. The FastAPI adapter
+  has no request entity: a request body is described with the endpoint's
+  response links.
+* The ninja example (``examples/ninja``) calls ``add_error_links`` and serves
+  HEAD on the list; all three examples are tested against the 0.1 rules.
+* The documentation has a "Semantic HTTP conformance" section, builds without
+  warnings, and documents ``Entity`` once.
+
 0.4.0 (since 0.3.0)
 ===================
 

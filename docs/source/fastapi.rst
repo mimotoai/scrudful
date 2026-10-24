@@ -76,6 +76,11 @@ alone, so that their middleware (e.g. a ``CORSMiddleware``) still sees their
 requests: call ``add_options`` on a mounted app itself (the paths under a
 middleware-wrapped ``Mount`` or ``Router`` get no automatic OPTIONS).
 
+FastAPI endpoints have no request entity: for an endpoint that takes a body, the
+``requestBody`` of its method in the OPTIONS body is described with the same
+content as its responses (the endpoint's schema and context links), since the
+adapter only knows those.
+
 The callables' ``Request`` in the OPTIONS body is the OPTIONS request as the
 described route would get it: its ``path_params``, ``route`` and ``endpoint``
 are that route's.
@@ -129,10 +134,17 @@ HEAD
 ~~~~
 
 FastAPI routes HEAD only to a route that lists it. Stack ``@app.head(...)``
-with ``@app.get(...)`` above ``@scrudful(...)``, as above, or use
-``@app.api_route(path, methods=["GET", "HEAD"])``; FastAPI gives both methods
-of one ``api_route`` the same OpenAPI operation id, and warns about it.
+with ``@app.get(...)`` above ``@scrudful(...)``, as above, or
+use ``@app.api_route(path, methods=["GET", "HEAD"])``. The stacked decorators
+are the form that works on every FastAPI version: newer versions warn about the
+duplicate OpenAPI operation id that both methods of one ``api_route`` get, and
+the tests run with warnings as errors.
+
+Overriding the schema ``rel`` (e.g. ``schema_rel_or_func="profile"``) makes the
+response's Link no longer a Schema Link Header, while the OPTIONS body still
+describes it as the schema, so the API is not conformant. Use the default.
 
 .. automodule:: scrudful.fastapi
    :members:
    :member-order: bysource
+   :exclude-members: Entity
