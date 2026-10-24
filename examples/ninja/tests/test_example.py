@@ -522,8 +522,8 @@ def test_options_collection(client):
     response = options(client, "/api/roles")
     body = response.json()
     validate_http_schema_resource(body)
-    assert list(body) == ["get", "post", "options"]
-    assert response.headers["Allow"] == "GET, POST, OPTIONS"
+    assert list(body) == ["get", "post", "options", "head"]
+    assert response.headers["Allow"] == "GET, POST, OPTIONS, HEAD"
     assert body["get"]["responses"]["200"]["content"] == content("roles")
     assert "304" in body["get"]["responses"]
     assert body["post"]["requestBody"]["content"] == content("role")
@@ -582,6 +582,108 @@ def test_responses_agree_with_options(client, role):
             method, response.status_code, response.headers, has_content, hsr=hsr
         )
         assert problems == [], (method, response.status_code)
+
+
+ROLE_BODY = {"name": "owner", "rbac_context": "acme"}
+FOREIGN_BODY = {"name": "owner", "rbac_context": "globex"}
+# Placeholders in the arguments are filled in by the test: {pk} is the role's
+# pk, {etag} the quoted current ETag.
+ITEM = "/api/roles/{pk}"
+LIST = "/api/roles"
+SEARCH = "/api/roles/search"
+MATCH = {"If-Match": "{etag}", **ACME}
+STALE = {"If-Match": '"stale"', **ACME}
+MALFORMED = {"If-Match": "nope", **ACME}
+NOT_MODIFIED = {"If-None-Match": "{etag}", **ACME}
+# (method, path, request arguments, status).
+CONFORMANCE = [
+    ("get", ITEM, {"headers": ACME}, 200),
+    ("get", ITEM, {"headers": NOT_MODIFIED}, 304),
+    ("get", ITEM, {"headers": STALE}, 412),
+    ("get", ITEM, {"headers": {"If-None-Match": "nope", **ACME}}, 400),
+    ("get", ITEM, {"headers": {}}, 401),
+    ("get", "/api/roles/999999", {"headers": ACME}, 404),
+    ("head", ITEM, {"headers": ACME}, 200),
+    ("head", ITEM, {"headers": NOT_MODIFIED}, 304),
+    ("head", ITEM, {"headers": STALE}, 412),
+    ("head", ITEM, {"headers": {}}, 401),
+    ("head", "/api/roles/999999", {"headers": ACME}, 404),
+    ("put", ITEM, {"data": ROLE_BODY, "headers": MATCH}, 200),
+    ("put", ITEM, {"data": ROLE_BODY, "headers": ACME}, 428),
+    ("put", ITEM, {"data": ROLE_BODY, "headers": STALE}, 412),
+    ("put", ITEM, {"data": ROLE_BODY, "headers": MALFORMED}, 400),
+    ("put", ITEM, {"data": FOREIGN_BODY, "headers": MATCH}, 403),
+    ("put", ITEM, {"data": {"name": 1}, "headers": MATCH}, 422),
+    ("put", ITEM, {"data": ROLE_BODY, "headers": {}}, 401),
+    ("put", "/api/roles/999999", {"data": ROLE_BODY, "headers": MATCH}, 404),
+    ("patch", ITEM, {"data": {"name": "x"}, "headers": MATCH}, 200),
+    ("patch", ITEM, {"data": {"name": "x"}, "headers": ACME}, 428),
+    ("patch", ITEM, {"data": {"name": None}, "headers": MATCH}, 422),
+    ("delete", ITEM, {"headers": MATCH}, 204),
+    ("delete", ITEM, {"headers": ACME}, 428),
+    ("delete", ITEM, {"headers": STALE}, 412),
+    ("delete", ITEM, {"headers": MALFORMED}, 400),
+    ("delete", ITEM, {"headers": {}}, 401),
+    ("options", ITEM, {}, 200),
+    ("get", LIST, {"headers": ACME}, 200),
+    ("get", LIST, {"headers": {}}, 401),
+    ("get", LIST, {"headers": {"If-None-Match": "nope", **ACME}}, 400),
+    ("head", LIST, {"headers": ACME}, 200),
+    ("head", LIST, {"headers": {}}, 401),
+    ("post", LIST, {"data": ROLE_BODY, "headers": ACME}, 201),
+    ("post", LIST, {"data": FOREIGN_BODY, "headers": ACME}, 403),
+    ("post", LIST, {"data": {"name": 1}, "headers": ACME}, 422),
+    ("post", LIST, {"data": ROLE_BODY, "headers": {}}, 401),
+    ("options", LIST, {}, 200),
+    ("post", SEARCH, {"data": {"name": "adm"}, "headers": ACME}, 200),
+    ("post", SEARCH, {"data": {"name": 1}, "headers": ACME}, 422),
+    ("post", SEARCH, {"data": {"name": "adm"}, "headers": {}}, 401),
+    ("options", SEARCH, {}, 200),
+]
+# Statuses the OPTIONS bodies don't list, so there is no entry to agree with:
+# a 304 (a HEAD's too) has no content, and ninja's 404, 422 and 401 are not
+# described. Their Links are still checked by the rules that don't need the
+# body (and are those of the error entity: see below).
+NO_ENTRY = {304, 404, 422, 401}
+
+
+@pytest.mark.parametrize(
+    "method, path, arguments, status",
+    CONFORMANCE,
+    ids=[f"{m}-{p}-{s}-{i}" for i, (m, p, _, s) in enumerate(CONFORMANCE)],
+)
+def test_example_links_everywhere(client, role, method, path, arguments, status):
+    """Every response with content, and every HEAD, follows the Semantic HTTP
+    0.1 Link rules and agrees with the OPTIONS body of its path."""
+    path = path.format(pk=role.pk)
+    etag = f'"{role.etag}"'
+    arguments = {
+        **arguments,
+        "headers": {
+            name: value.format(etag=etag)
+            for name, value in arguments.get("headers", {}).items()
+        },
+    }
+    if "data" in arguments:
+        arguments["content_type"] = "application/json"
+        arguments["data"] = json.dumps(arguments["data"])
+    hsr = client.options(path).json()
+    response = getattr(client, method)(path, **arguments)
+    assert response.status_code == status
+    has_content = (
+        method != "head" and status not in (204, 304) and bool(response.content)
+    )
+    assert has_content == (method != "head" and status not in (204, 304))
+    problems = link_problems(
+        method.upper(),
+        status,
+        response.headers,
+        has_content,
+        None if status in NO_ENTRY else hsr,
+    )
+    assert problems == []
+    if status in NO_ENTRY - {304}:
+        assert response.headers["Link"] == links("error")
 
 
 def test_cors_preflight_is_not_broken(client, role):

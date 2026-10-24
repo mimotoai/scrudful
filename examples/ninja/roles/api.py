@@ -184,7 +184,8 @@ def roles_modified(roles: QuerySet[Role]) -> datetime | None:
     return roles.aggregate(Max("modified_at"))["modified_at__max"]
 
 
-@router.get(
+@router.api_operation(
+    ["GET", "HEAD"],
     "",
     response=List[RoleOut],
     openapi_extra={"responses": CONDITIONAL_READ_RESPONSES},
