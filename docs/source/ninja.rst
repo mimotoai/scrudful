@@ -112,7 +112,8 @@ GET and HEAD answer 304 to a matching ``If-None-Match`` / ``If-Modified-Since``
 and send the validators on 2xx. PUT, PATCH and DELETE get 428 without a
 precondition, 412 when it is stale, 400 for a malformed ``If-Match`` /
 ``If-None-Match``, and fresh validators on 2xx. With ``error=Entity(...)``
-scrudful's own 400, 412 and 428 bodies carry that entity's Links. ``load`` is
+scrudful's own 400, 412 and 428 bodies carry that entity's Links, and so do
+the errors the operation raises (see :ref:`ninja-errors`). ``load`` is
 required when ``etag_func`` or ``last_modified_func`` is set.
 
 The ``schema_*`` / ``context_*`` arguments are the default entity: its Links go
@@ -499,6 +500,78 @@ overwritten. An ``etag`` or ``last_modified`` set there on an operation that
 also has ``etag_func`` / ``last_modified_func`` must stay consistent with
 them: the preconditions of the next request are evaluated with the computed
 values.
+
+.. _ninja-errors:
+
+Error responses
+---------------
+
+The semantic-http spec asks for the schema and context Links on every response
+with content, error responses included. scrudful adds them in two places.
+
+**Errors a scrudful operation raises.** An ``HttpError`` (or a subclass) or
+``Http404`` raised by ``load``, a callback, the handler or a list's paging (the
+404 of a page past the last one) propagates as before, through
+``add_decorator(mode="operation")`` decorators (so a transaction still rolls
+back), and ninja answers it with the API's exception handler: the status and
+body are the API's, custom handlers included. That response then gets the Links
+of the entity the operation's OPTIONS describes for its status:
+``responses[status]`` if declared (``error`` first for scrudful's own 400, 412
+and 428 when the operation evaluates the ``If-*`` headers), else ``error``. So a
+404 a client gets agrees with the HTTP Schema Resource:
+
+.. code-block:: python
+
+    NOT_FOUND = Entity(schema_link_or_func="/schemas/not-found",
+                       context_link_or_func="/contexts/not-found")
+
+
+    @roles.get("/{int:pk}", response={200: RoleOut, 404: Message})
+    @scrudful(load=authorized_role, responses={404: NOT_FOUND}, error=ERROR,
+              **ROLE)
+    def get_role(request, pk: int, obj: Role):
+        return obj
+
+Their link callables are called with the request and ``obj=None``: nothing was
+loaded. A status the operation has no entity for gets no Link from it.
+
+**Errors ninja answers before the operation runs**, the 422 of a parameter that
+does not validate, the 401 of missing credentials, the 403 of an
+``AuthorizationError`` and the 429 of a throttle, come from the API's exception
+handlers. :func:`~scrudful.ninja.add_error_links` gives them an API-wide error
+entity:
+
+.. code-block:: python
+
+    from scrudful.ninja import add_error_links
+
+    api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
+    add_error_links(api, ERROR)
+
+It wraps the handler the API uses for ``ninja.errors.ValidationError``,
+``AuthenticationError``, ``AuthorizationError`` (when the installed ninja
+defines it), ``Throttled``, ``HttpError`` and ``Http404``, so it also covers
+the errors of plain ninja operations, and of scrudful operations without an
+entity for the status (a scrudful operation's own entity wins). Each wrapped
+handler keeps the original's status and body and adds the entity's Links when
+the response has content. A Link the handler set itself with a ``describedby``
+or a context relation suppresses scrudful's of that kind, so calling it twice,
+or on a response that already has scrudful's Links, sends no Link twice. Call
+it after registering your own exception handlers: it wraps the ones registered
+when it is called, and a handler registered later replaces the wrapped one.
+ninja's exception handlers are sync, also for async operations, where they run
+on the event loop: the entity's link callables must be sync (``TypeError``
+otherwise) and must not use the ORM there.
+
+Not covered, since no ninja exception handler makes them:
+
+* ninja's own 405 for a method that no operation of the path routes (e.g. a
+  POST on a path with only a GET);
+* Django's 404 for a URL no pattern matches, and Django's 500 page (or ninja's
+  traceback page for other exceptions with ``DEBUG = True``).
+
+Give those Links in Django: custom ``handler404`` / ``handler500`` views, or a
+middleware adding them to error responses.
 
 Async operations
 ----------------

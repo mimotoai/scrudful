@@ -20,7 +20,8 @@ Order of execution
 
     Exceptions raised by ``load``, the callbacks or the handler (e.g.
     ``Http404``, ``ninja.errors.HttpError``) go through ninja's exception
-    handlers, as for any operation.
+    handlers, as for any operation; the response of an ``HttpError`` or
+    ``Http404`` then gets the operation's Links (see "Error responses").
 
 Placement
     The decorator sits directly below the operation decorator. When ninja
@@ -134,6 +135,20 @@ Entities and Links
     validators, with the same consequence if it raises) when a validator
     callback is set or a value of the response's entity is callable, and not
     otherwise.
+
+Error responses
+    An ``HttpError`` (or a subclass) or ``Http404`` raised by ``load``, a
+    callback, the handler or a list's paging (the 404 of a page past the
+    last one) propagates out of the operation's function as for any
+    operation, and ninja answers it with the API's exception handler: its
+    status and body are the API's. When that response has content, it gets
+    the Links of the entity the operation's OPTIONS describes for its
+    status: ``responses[status]`` (``error`` first for scrudful's own 400,
+    412 and 428 when the operation evaluates the If-* headers), else
+    ``error``, else none. Link callables get ``None``. The errors ninja
+    answers before the operation runs (401, 422, 429, ...) and those of
+    operations without an entity for them get Links from
+    :func:`add_error_links`, the API-wide error entity.
 
 Create
     :func:`scrudful_create` decorates a POST on a collection that creates an
@@ -375,6 +390,7 @@ import re
 import types
 import warnings
 from collections.abc import Callable, Generator, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from typing import Any, NamedTuple, TypeVar, Union, get_args, get_origin
@@ -383,9 +399,16 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from asgiref.sync import async_to_sync, sync_to_async
 from django.core.paginator import UnorderedObjectListWarning
 from django.db.models import QuerySet
-from django.http import HttpRequest, HttpResponse, HttpResponseBase, JsonResponse
+from django.http import (
+    Http404,
+    HttpRequest,
+    HttpResponse,
+    HttpResponseBase,
+    JsonResponse,
+)
 from django.utils.encoding import iri_to_uri
-from ninja import Query, Router, Schema, Status
+from ninja import NinjaAPI, Query, Router, Schema, Status
+from ninja import errors as ninja_errors
 from ninja.constants import NOT_SET
 from ninja.errors import ConfigError, HttpError
 from ninja.signature.details import is_collection_type
@@ -436,6 +459,7 @@ __all__ = [
     "Entity",
     "ScrudfulResponse",
     "ScrudfulRouter",
+    "add_error_links",
     "scrudful",
     "scrudful_create",
     "scrudful_list",
@@ -754,10 +778,14 @@ def scrudful(
     responses : mapping of int to Entity, optional
         The response entity of each status, in place of the default one (the
         six arguments above) for that status, e.g. ``{404: Entity(...)}`` for
-        a ``Status(404, ...)`` the handler returns.
+        a ``Status(404, ...)`` the handler returns or an ``HttpError(404)``
+        it raises.
     error : Entity, optional
         The schema and context of scrudful's own 400, 412 and 428 bodies, sent
-        as Links on them. Without it, they carry no Link.
+        as Links on them, and of the response to an ``HttpError`` or
+        ``Http404`` the operation raises, unless ``responses`` declares its
+        status (see "Error responses" in the module docstring; link
+        callables then get ``None``). Without it, they carry no Link.
 
     Raises
     ------
@@ -883,9 +911,11 @@ def scrudful_create(
         create).
     responses : mapping of int to Entity, optional
         The response entity of each status, e.g. ``{400: Entity(...)}`` for a
-        ``Status(400, ...)`` the handler returns. ``responses[201]`` replaces
-        the item entity's Links on 201 responses. There is no ``error``
-        argument: a create produces no 400, 412 or 428 of its own.
+        ``Status(400, ...)`` the handler returns, or an ``HttpError(400)`` it
+        raises (see "Error responses" in the module docstring).
+        ``responses[201]`` replaces the item entity's Links on 201 responses.
+        There is no ``error`` argument: a create produces no 400, 412 or 428
+        of its own.
 
     Raises
     ------
@@ -1051,7 +1081,9 @@ def scrudful_list(
     error : Entity, optional
         The schema and context of scrudful's own 400 and 412 bodies (with a
         list validator set), sent as Links on them; link callables get the
-        queryset.
+        queryset. Also those of the response to an ``HttpError`` or
+        ``Http404`` the operation raises, e.g. the 404 of a page past the
+        last one; link callables then get ``None``.
 
     Raises
     ------
@@ -1186,6 +1218,73 @@ class ScrudfulRouter(Router):
                 response=NOT_SET,
                 include_in_schema=False,
             )
+
+
+def add_error_links(api: NinjaAPI, error: Entity) -> None:
+    """Give the error responses of ``api``'s exception handlers ``error``'s Links.
+
+    Wraps the handler ``api`` uses, when this is called, for each of
+    ``ninja.errors.ValidationError`` (422), ``AuthenticationError`` (401),
+    ``AuthorizationError`` (403, when the installed ninja defines it),
+    ``Throttled`` (429), ``HttpError`` and ``django.http.Http404``: the
+    responses ninja answers before an operation runs, and the errors any
+    operation raises. Each wrapped handler returns the response the original
+    makes, with the same status and body, and adds ``error``'s Links to it
+    when it has content, as :func:`scrudful` adds them (a Link the handler
+    set with a ``describedby`` or a context relation suppresses that kind;
+    see :func:`scrudful._adapter.merge_links`). So a custom handler
+    registered before the call is kept, and calling this twice adds no Link
+    twice. A handler registered after the call replaces the wrapped one.
+
+    An error raised inside a scrudful operation gets that operation's
+    entity for the status, if it has one (``responses[status]``, else its
+    ``error``): it describes the response, as the OPTIONS of the operation
+    does, and ``error`` here applies only otherwise.
+
+    Not covered: ninja's 405 for a method no operation of the path routes,
+    which no exception handler makes, Django's own 404 for an unknown URL
+    and Django's 500 page.
+
+    Parameters
+    ----------
+    api : NinjaAPI
+        The API whose exception handlers are wrapped.
+    error : Entity
+        The schema and context of the error bodies. Its link callables are
+        called with the request and ``obj=None``. ninja's exception handlers
+        are sync, also in an async operation, where they run on the event
+        loop: the callables must be sync, and must not use the Django ORM
+        there.
+
+    Raises
+    ------
+    TypeError
+        If ``api`` isn't a ``NinjaAPI``, ``error`` isn't an :class:`Entity`
+        or one of its values is an ``async def`` callable.
+    """
+    if not isinstance(api, NinjaAPI):
+        raise TypeError(f"api must be a NinjaAPI, not {type(api).__name__}")
+    if not isinstance(error, Entity):
+        raise TypeError(f"error must be an Entity, not {type(error).__name__}")
+    for entity_field in fields(Entity):
+        if _is_async_callable(getattr(error, entity_field.name)):
+            raise TypeError(
+                f"error.{entity_field.name} is async, but ninja's exception "
+                "handlers are sync"
+            )
+    # ninja's ``_lookup_exception_handler``: the handler of the nearest class
+    # in the MRO. All are looked up before any is replaced, so that a
+    # subclass falling back to its base's handler wraps it only once.
+    handlers = api._exception_handlers
+    originals = {
+        exc_class: next(
+            (handlers[cls] for cls in exc_class.__mro__ if cls in handlers), None
+        )
+        for exc_class in _ERROR_CLASSES
+    }
+    for exc_class, handler in originals.items():
+        if handler is not None:
+            api.add_exception_handler(exc_class, _error_handler(handler, error))
 
 
 def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
@@ -1359,13 +1458,21 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
 
                 @functools.wraps(handler)
                 async def wrapper(request: HttpRequest, **values: Any) -> Any:
-                    return await _run_async(flow(request, values, answers))
+                    try:
+                        return await _run_async(flow(request, values, answers))
+                    except (HttpError, Http404):
+                        _note_raised(config)
+                        raise
 
             else:
 
                 @functools.wraps(handler)
                 def wrapper(request: HttpRequest, **values: Any) -> Any:
-                    return _run_sync(flow(request, values, answers))
+                    try:
+                        return _run_sync(flow(request, values, answers))
+                    except (HttpError, Http404):
+                        _note_raised(config)
+                        raise
 
             wrapper.__signature__ = hidden.signature  # type: ignore[attr-defined]
             wrapper._scrudful = config  # type: ignore[attr-defined]
@@ -1409,6 +1516,15 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             operation.view_func = bind(
                 _Answers(_declared_status(operation), collection)
             )
+            # The Links of an error the wrapper raises go on the response of
+            # the API's exception handler, which ``Operation.run`` returns. It
+            # is wrapped as ``decorate_view`` wraps it, so that ninja's clones
+            # of the operation (one per mount) wrap theirs too.
+            run_decorator = _raised_links_run(asynchronous)
+            if not hasattr(operation, "_run_decorators"):
+                operation._run_decorators = []  # type: ignore[attr-defined]
+            operation.run = run_decorator(operation.run)  # type: ignore[method-assign]
+            operation._run_decorators.append(run_decorator)
 
         # Registered with ninja, which replaces it in each operation by the
         # wrapper :func:`bind_operation` binds (called directly, it declares
@@ -1468,6 +1584,151 @@ def _keep_handler_headers(early: HttpResponseBase, temporal: HttpResponse) -> No
                 early[name] = value
     early.cookies.update(temporal.cookies)
     expose_headers(early)
+
+
+# --- Raised errors -------------------------------------------------------------
+
+#: The exceptions whose handlers :func:`add_error_links` wraps.
+_ERROR_CLASSES: tuple[type[Exception], ...] = tuple(
+    exc_class
+    for exc_class in (
+        ninja_errors.ValidationError,
+        ninja_errors.AuthenticationError,
+        getattr(ninja_errors, "AuthorizationError", None),
+        ninja_errors.Throttled,
+        HttpError,
+        Http404,
+    )
+    if exc_class is not None
+)
+
+
+@dataclass(eq=False, slots=True)
+class _Raised:
+    """What the scrudful operation running ``Operation.run`` raised."""
+
+    #: The operation's, once its wrapper raised an ``HttpError`` or
+    #: ``Http404``.
+    config: _Config | None = None
+
+
+#: Set by :func:`_raised_links_run` while ``Operation.run`` runs. A mutable
+#: holder, so the wrapper's note reaches it from a copied context too.
+_RAISED: ContextVar[_Raised | None] = ContextVar("scrudful_raised", default=None)
+
+
+def _note_raised(config: _Config) -> None:
+    """Note that the operation of ``config`` raised the error being handled."""
+    raised = _RAISED.get()
+    if raised is not None:
+        raised.config = config
+
+
+def _raised_links_run(
+    asynchronous: bool,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """The ``Operation.run`` decorator adding the Links of a raised error.
+
+    The exception propagates out of the wrapper as before (through the
+    decorators added with ``add_decorator(mode="operation")``, e.g. one
+    rolling a transaction back), and ninja answers it with the API's
+    exception handler. The response ``run`` returns then gets the Links of
+    the operation's entity for its status, see :func:`_raised_entity`.
+    """
+
+    def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
+        if asynchronous:
+
+            @functools.wraps(run)
+            async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
+                raised = _Raised()
+                token = _RAISED.set(raised)
+                try:
+                    response = await run(request, *args, **kw)
+                finally:
+                    _RAISED.reset(token)
+                if raised.config is not None:
+                    await _run_async(_raised_links(raised.config, request, response))
+                return response
+
+        else:
+
+            @functools.wraps(run)
+            def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
+                raised = _Raised()
+                token = _RAISED.set(raised)
+                try:
+                    response = run(request, *args, **kw)
+                finally:
+                    _RAISED.reset(token)
+                if raised.config is not None:
+                    _run_sync(_raised_links(raised.config, request, response))
+                return response
+
+        return scrudful_run
+
+    return decorator
+
+
+def _raised_links(
+    config: _Config, request: HttpRequest, response: HttpResponseBase
+) -> _Flow[None]:
+    """Add the Links of an error the operation raised to ``response``.
+
+    ``response`` is the API's answer to it; when it has content, it gets
+    the entity :func:`_raised_entity` picks for its status, whose link
+    callables get ``None``.
+    """
+    if not _carries_body(response):
+        return
+    entity = _raised_entity(config, request.method.lower(), response.status_code)
+    if entity is not None:
+        yield from _add_links(response, entity, request, None)
+        expose_headers(response)
+
+
+def _raised_entity(config: _Config, method: str, status: int) -> Entity | None:
+    """The entity of the response to an error the operation raised.
+
+    The one the operation's OPTIONS describes for ``status`` (see
+    :func:`_described_entity`: ``responses[status]``, but ``error`` first
+    for scrudful's own early statuses), else ``error``. None below 400: an
+    operation decorator turned the error into another response, which is
+    its own to describe (a link callable of the default entity would get
+    ``None``, not the object).
+    """
+    if status < 400:
+        return None
+    entity = _described_entity(config, status, _is_conditional(config, method))
+    return config.error if entity is None else entity
+
+
+def _error_handler(
+    handler: Callable[[HttpRequest, Exception], HttpResponseBase], error: Entity
+) -> Callable[[HttpRequest, Exception], HttpResponseBase]:
+    """``handler``, an exception handler of the API, adding ``error``'s Links."""
+
+    @functools.wraps(handler)
+    def scrudful_handler(request: HttpRequest, exc: Exception) -> HttpResponseBase:
+        response = handler(request, exc)
+        raised = _RAISED.get()
+        if (
+            raised is not None
+            and raised.config is not None
+            and _raised_entity(
+                raised.config, request.method.lower(), response.status_code
+            )
+            is not None
+        ):
+            # A scrudful operation raised it: its entity describes the
+            # response, and :func:`_raised_links_run` adds it.
+            return response
+        if _carries_body(response):
+            _run_sync(_add_links(response, error, request, None))
+            expose_headers(response)
+        return response
+
+    return scrudful_handler
 
 
 class _CollectionResponse(NamedTuple):
@@ -2178,13 +2439,7 @@ def _describe_operation(
     if not isinstance(config, _Config):
         config = None
     read = method in ("get", "head")
-    # Whether the If-* headers are evaluated: a list's (after the handler,
-    # never required) only matter for GET/HEAD; a create never evaluates them.
-    conditional = config is not None and (
-        read and config.has_list_validators
-        if config.kind == "list"
-        else config.evaluates_preconditions
-    )
+    conditional = config is not None and _is_conditional(config, method)
     statuses = _answered_statuses(operation, config)
     if read:
         description = describe_read(None, conditional, statuses)
@@ -2217,6 +2472,17 @@ def _describe_operation(
             if content:
                 response["content"] = content
     return description
+
+
+def _is_conditional(config: _Config, method: str) -> bool:
+    """Whether the operation evaluates the If-* headers for ``method``.
+
+    A list's (after the handler, never required) only matter for GET/HEAD; a
+    create never evaluates them. ``method`` is lowercase.
+    """
+    if config.kind == "list":
+        return method in ("get", "head") and config.has_list_validators
+    return config.evaluates_preconditions
 
 
 def _answered_statuses(operation: Any, config: _Config | None) -> list[int]:
