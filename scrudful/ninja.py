@@ -383,6 +383,7 @@ from scrudful._adapter import (
     DEFAULT_SCHEMA_REL,
     DEFAULT_SCHEMA_TYPE,
     check_validators,
+    context_defaults,
     describe_read,
     describe_write,
     expose_headers,
@@ -400,6 +401,7 @@ from scrudful.conditional import (
     http_timestamp,
     quote_etag,
 )
+from scrudful.entity import Entity
 from scrudful.utils import join_links, link_content, merge_expose_headers
 
 __all__ = [
@@ -441,27 +443,6 @@ _Flow = Generator[tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any]], An
 #: The argument a list operation's query parameters ``page`` and ``page_size``
 #: are passed in (pydantic rejects names with a leading underscore).
 _PAGINATION = "scrudful_pagination"
-
-
-@dataclass(frozen=True)
-class Entity:
-    """The schema and JSON-LD context of a request or response body.
-
-    Each field is a value or a callable ``func(request, obj)``, with the same
-    meaning as the ``schema_*`` and ``context_*`` arguments of
-    :func:`scrudful`: without a link, no Link is sent; rel and type default to
-    ``"describedby"`` / ``"application/schema+json"`` for the schema and to
-    ``"http://www.w3.org/ns/json-ld#context"`` / ``"application/ld+json"`` for
-    the context. ``obj`` is the object the operation has at that point (the
-    loaded object, or ``None``).
-    """
-
-    schema_link_or_func: Any = None
-    schema_rel_or_func: Any = None
-    schema_type_or_func: Any = None
-    context_link_or_func: Any = None
-    context_rel_or_func: Any = None
-    context_type_or_func: Any = None
 
 
 class _Unset:
@@ -533,11 +514,11 @@ class ScrudfulResponse:
 class _Config:
     """What a scrudful decorator declared, set as ``view_func._scrudful``.
 
-    The six ``schema_*`` / ``context_*`` fields are the item entity, also
-    available as :attr:`entity`: the default entity of 2xx responses but 204
-    for an item operation, of 201 responses (the created item) for a create
-    operation, and the ``link`` of each entry of a list operation's envelope,
-    whose responses get :attr:`collection`.
+    The six ``schema_*`` / ``context_*`` fields and ``media_type`` are the
+    item entity, also available as :attr:`entity`: the default entity of 2xx
+    responses but 204 for an item operation, of 201 responses (the created
+    item) for a create operation, and the ``link`` of each entry of a list
+    operation's envelope, whose responses get :attr:`collection`.
     """
 
     #: ``"item"`` (:func:`scrudful`), ``"create"`` (:func:`scrudful_create`)
@@ -557,6 +538,7 @@ class _Config:
     context_link_or_func: Any = None
     context_rel_or_func: Any = None
     context_type_or_func: Any = None
+    media_type: str = "application/json"
     #: The request body's entity (described by OPTIONS; no header).
     request: Entity | None = None
     #: The response entity of each status, overriding :attr:`entity`.
@@ -1935,16 +1917,19 @@ def _links(entity: Entity, request: HttpRequest, obj: Any) -> _Flow[str | None]:
         ),
         (DEFAULT_SCHEMA_REL, DEFAULT_SCHEMA_TYPE),
     )
-    context = yield from _link(
-        request,
-        obj,
-        (
-            entity.context_link_or_func,
-            entity.context_rel_or_func,
-            entity.context_type_or_func,
-        ),
-        (DEFAULT_CONTEXT_REL, DEFAULT_CONTEXT_TYPE),
-    )
+    context = None
+    defaults = context_defaults(entity.media_type)
+    if defaults != (None, None):
+        context = yield from _link(
+            request,
+            obj,
+            (
+                entity.context_link_or_func,
+                entity.context_rel_or_func,
+                entity.context_type_or_func,
+            ),
+            defaults,
+        )
     return join_links(schema, context)
 
 
@@ -1952,7 +1937,7 @@ def _link(
     request: HttpRequest,
     obj: Any,
     values_or_funcs: tuple[Any, Any, Any],
-    defaults: tuple[str, str],
+    defaults: tuple[str | None, str | None],
 ) -> _Flow[str | None]:
     """Build one link-value from (url, rel, type) values or callables."""
 

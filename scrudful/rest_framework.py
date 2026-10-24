@@ -102,9 +102,11 @@ from scrudful.conditional import (
     http_timestamp,
     quote_etag,
 )
+from scrudful.entity import Entity
 from scrudful.utils import join_links, link_content
 
 __all__ = [
+    "Entity",
     "ScrudfulAPIViewMetadata",
     "ScrudfulMetadata",
     "ScrudfulViewFunc",

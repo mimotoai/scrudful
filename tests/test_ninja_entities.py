@@ -727,3 +727,44 @@ def test_operation_registered_on_several_paths(store):
         response = client.get("/y/1")
         assert response.status_code == 202
         assert response.headers["Link"] == RESULTS_LINK, order
+
+
+def test_in_band_entity_sends_no_context_link():
+    router = Router()
+
+    @router.post("/items/search")
+    @scrudful(
+        request=QUERY,
+        responses={
+            200: Entity(schema_link_or_func="/schemas/graph", media_type="text/turtle")
+        },
+    )
+    def search(request, query: Query):
+        return {"q": query.q}
+
+    response = TestClient(router).post("/items/search", json={"q": "a"})
+    assert response.headers["Link"] == (
+        '</schemas/graph>; rel="describedby"; type="application/schema+json"'
+    )
+
+
+def test_csv_entity_uses_rdf_context_rel():
+    router = Router()
+    csv = Entity(
+        "/schemas/rows",
+        context_link_or_func="/contexts/rows",
+        context_type_or_func="application/csvm+json",
+        media_type="text/csv",
+    )
+
+    @router.post("/items/search")
+    @scrudful(request=QUERY, responses={200: csv})
+    def search(request, query: Query):
+        return {"q": query.q}
+
+    response = TestClient(router).post("/items/search", json={"q": "a"})
+    assert response.headers["Link"] == (
+        '</schemas/rows>; rel="describedby"; type="application/schema+json", '
+        '</contexts/rows>; rel="https://w3id.org/semantic-http/ns#rdf-context"; '
+        'type="application/csvm+json"'
+    )

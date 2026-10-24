@@ -39,11 +39,13 @@ from scrudful.conditional import (
     http_timestamp,
     quote_etag,
 )
+from scrudful.entity import Entity
 from scrudful.utils import join_links, link_content, merge_expose_headers
 
 __all__ = [
     "CONDITIONAL_READ_RESPONSES",
     "CONDITIONAL_WRITE_RESPONSES",
+    "Entity",
     "scrudful",
 ]
 
