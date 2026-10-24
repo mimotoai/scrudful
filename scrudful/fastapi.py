@@ -22,6 +22,7 @@ from fastapi.exceptions import HTTPException as FastAPIHTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
+from starlette.applications import Starlette
 from starlette.datastructures import Headers, MutableHeaders, URLPath
 from starlette.exceptions import HTTPException
 from starlette.routing import BaseRoute, Match, Mount, NoMatchFound, Route, Router
@@ -460,9 +461,10 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
         URL's path parameters, plus the request under the name of the
         endpoint's ``Request`` parameter if it declares one (see "Callbacks"
         in :func:`scrudful`). Both are checked when this is called, against
-        the endpoints the app has then (including those of included routers
-        and of a ``Mount`` of routes; a mounted FastAPI app has its own
-        handlers: call this on it too).
+        the endpoints the app has then: those of included routers and under
+        any ``Mount`` or ``Host``, with or without middleware, since this
+        app's handlers serve them, but not those of a mounted Starlette or
+        FastAPI app, which has its own handlers: call this on that app too.
 
     Raises
     ------
@@ -646,10 +648,12 @@ def add_options(app: FastAPI | APIRouter) -> None:
     router (older FastAPI versions copy a router's routes when it is
     included). Prefer calling it on the app.
 
-    A mounted Starlette or FastAPI app, or a ``Mount`` with ``middleware``,
-    is left alone: answering for it from the outer app would skip its own
-    middleware (e.g. its ``CORSMiddleware``). Call this on a mounted app
-    itself; its OPTIONS answer then runs inside its middleware.
+    A mounted Starlette or FastAPI app, a ``Mount`` with ``middleware`` and
+    a ``Router`` with ``middleware`` are left alone: answering for them from
+    the outer app would skip their middleware (e.g. a ``CORSMiddleware``).
+    Call this on a mounted app itself, whose OPTIONS answer then runs inside
+    its middleware; the paths under a middleware-wrapped ``Mount`` or
+    ``Router`` get no automatic OPTIONS.
 
     The body lists the methods in the order ``get``, ``put``, ``post``,
     ``delete``, ``options``, ``head``, ``patch``, ``trace``:
@@ -763,27 +767,42 @@ def _flat(routes: Sequence[Any]) -> list[Any]:
     return list(_iter_route_contexts(routes))
 
 
-#: What :func:`_contents` returns for a ``Mount`` or ``Host`` of something
-#: other than a bare router: a mounted app (with its own middleware and
-#: handlers) or a middleware-wrapped router, which scrudful leaves alone.
-_OPAQUE: Sequence[Any] = ()
+#: What :func:`_contents` returns for a ``Mount`` or ``Host`` it doesn't look
+#: into (compared by identity).
+_OPAQUE: Any = object()
 
 
-def _contents(route: Any) -> Sequence[Any] | None:
+def _contents(route: Any, for_options: bool = True) -> Sequence[Any] | Any:
     """The routes a ``Mount`` or ``Host`` routes to, else ``None``.
 
-    Only those of a bare ``Router`` (``Mount(routes=...)``, a mounted
-    ``APIRouter``): a mounted Starlette or FastAPI app, or a router wrapped in
-    middleware, gives :data:`_OPAQUE`, since answering for it here would skip
-    its own middleware (e.g. its ``CORSMiddleware``); call
-    :func:`add_options` on a mounted app itself.
+    For OPTIONS (``for_options``), only those of a bare ``Router``
+    (``Mount(routes=...)``, a mounted ``APIRouter``) without middleware of its
+    own or of the Mount's: anything else (a mounted Starlette or FastAPI app,
+    a middleware-wrapped Mount or Router) gives :data:`_OPAQUE`, since
+    answering for it from outside would skip its middleware (e.g. its
+    ``CORSMiddleware``); call :func:`add_options` on a mounted app itself.
+
+    For the checks of :func:`add_error_links` (not ``for_options``), the
+    routes of anything but a mounted Starlette or FastAPI app, which has its
+    own exception handlers: the outer app's handlers serve the others,
+    middleware or not.
     """
     if isinstance(getattr(route, "original_route", route), Route):
         return None
     routes = getattr(route, "routes", None)
     if routes is None:
         return None
-    return routes if isinstance(getattr(route, "app", None), Router) else _OPAQUE
+    app = getattr(route, "app", None)
+    if not for_options:
+        return _OPAQUE if isinstance(app, Starlette) else routes
+    return routes if isinstance(app, Router) and _is_bare(app) else _OPAQUE
+
+
+def _is_bare(router: Router) -> bool:
+    """Whether ``router`` has no middleware of its own (``Router(middleware=)``,
+    Starlette >= 0.35; older routers have none)."""
+    stack = getattr(router, "middleware_stack", None)
+    return stack is None or stack == router.app
 
 
 def _path_param_names(route: Any) -> set[str]:
@@ -1011,18 +1030,22 @@ def _description_kwargs(config: _EndpointConfig, request: Request) -> dict[str, 
 
 
 def _endpoints(
-    routes: Sequence[Any], params: frozenset[str] = frozenset()
+    routes: Sequence[Any],
+    for_options: bool,
+    params: frozenset[str] = frozenset(),
 ) -> Iterator[tuple[Any, _EndpointConfig, frozenset[str]]]:
     """The scrudful endpoints under ``routes``, with their path parameter names.
 
-    Including those under a ``Mount`` or ``Host`` of a router, not those of a
-    mounted app (see :func:`_contents`), which has its own handlers.
+    Including those under the ``Mount``\\ s and ``Host``\\ s that
+    :func:`_contents` looks into for ``for_options``.
     """
     for route in _flat(routes):
         names = params | _path_param_names(route)
-        contents = _contents(route)
+        contents = _contents(route, for_options)
+        if contents is _OPAQUE:
+            continue
         if contents is not None:
-            yield from _endpoints(contents, names)
+            yield from _endpoints(contents, for_options, names)
             continue
         endpoint = getattr(route, "endpoint", None)
         config = _endpoint_config(endpoint)
@@ -1032,7 +1055,7 @@ def _endpoints(
 
 def _check_options_callables(routes: Sequence[Any]) -> None:
     """Check the callables an OPTIONS body calls (see :func:`add_options`)."""
-    for endpoint, config, names in _endpoints(routes):
+    for endpoint, config, names in _endpoints(routes, for_options=True):
         where = f"endpoint {_endpoint_name(endpoint)}"
         _check_call(config, "", where, _outside_names(config, names), "in OPTIONS")
         if config.error is not None and _is_conditional(config):
@@ -1056,7 +1079,7 @@ def _check_error_callables(routes: Sequence[Any], error: Entity) -> None:
         "the request",
         _ERROR_LINK_FIELDS,
     )
-    for endpoint, config, names in _endpoints(routes):
+    for endpoint, config, names in _endpoints(routes, for_options=False):
         if config.error is not None:
             _check_call(
                 config.error,

@@ -54,8 +54,10 @@ the Links of an error entity. The entity is the one passed to it, unless the
 request was routed to a scrudful endpoint with an ``error`` of its own: then
 the errors raised for that endpoint get the endpoint's ``error``, the entity
 its OPTIONS body describes. It raises ``RuntimeError`` once the app has served
-a request, since the exception handlers are fixed by then. A mounted FastAPI
-app has its own exception handlers: call it on that app too.
+a request, since the exception handlers are fixed by then. Its handlers serve
+the endpoints under any ``Mount`` (with or without middleware), whose callables
+it checks too; a mounted FastAPI (or Starlette) app has its own exception
+handlers: call it on that app too.
 
 :func:`~scrudful.fastapi.add_options` answers OPTIONS on every URL a scrudful
 endpoint serves (unless a route of yours serves OPTIONS there) with the URL's
@@ -69,9 +71,10 @@ Starlette routes the request, through included routers and
 a whole. The answer has no dependencies, so it needs no credentials. Given an
 ``APIRouter``, it describes each of the router's own paths; call it before
 including the router. Prefer calling it on the app. A mounted FastAPI (or
-Starlette) app, or a ``Mount`` with ``middleware``, is left alone, so that its
-own middleware (e.g. its ``CORSMiddleware``) still sees its requests: call
-``add_options`` (and ``add_error_links``) on the mounted app itself.
+Starlette) app, and a ``Mount`` or ``Router`` with ``middleware``, are left
+alone, so that their middleware (e.g. a ``CORSMiddleware``) still sees their
+requests: call ``add_options`` on a mounted app itself (the paths under a
+middleware-wrapped ``Mount`` or ``Router`` get no automatic OPTIONS).
 
 The callables' ``Request`` in the OPTIONS body is the OPTIONS request as the
 described route would get it: its ``path_params``, ``route`` and ``endpoint``

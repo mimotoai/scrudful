@@ -2698,5 +2698,101 @@ def test_options_request_carries_the_matched_route(make_client, mode):
     }
     [(path_params, route, endpoint)] = seen
     assert path_params == {"item_id": "7"}
-    assert route is router.routes[0]
+    # The router's route, or the app's copy of it (FastAPI < 0.134 copies).
+    assert route.endpoint is get_item
+    assert route.path == "/items/{item_id}"
     assert endpoint is get_item
+
+
+class _Tag:
+    """ASGI middleware tagging every HTTP response with ``x-mw: 1``."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        async def tagged(message):
+            if message["type"] == "http.response.start":
+                message["headers"] = [*message.get("headers", []), (b"x-mw", b"1")]
+            await send(message)
+
+        await self.app(scope, receive, tagged)
+
+
+def _mounted_item(error=None):
+    from fastapi.routing import APIRoute
+
+    def user():
+        return "alice"
+
+    async def item(item_id: int, who: str = Depends(user)):
+        raise HTTPException(status_code=404)
+
+    endpoint = scrudful(**ITEM_LINKS, error=error)(item)
+    return APIRoute("/items/{item_id}", endpoint, methods=["GET"])
+
+
+def test_add_error_links_checks_endpoints_under_a_middleware_mount(make_client):
+    """The outer app's handlers serve a Mount with middleware, so its endpoints
+    are checked, and their ``error`` applies."""
+    from starlette.middleware import Middleware
+
+    bad = Entity(
+        schema_link_or_func=lambda item_id, who: f"/e/{who}",
+        context_link_or_func=CONTEXT,
+    )
+    app = FastAPI()
+    app.router.routes.append(
+        Mount("/n", routes=[_mounted_item(bad)], middleware=[Middleware(_Tag)])
+    )
+    with pytest.raises(TypeError, match="error.schema_link_or_func"):
+        add_error_links(app, APP_ERROR)
+
+    good = Entity(
+        schema_link_or_func=lambda item_id: f"/e/{item_id}",
+        context_link_or_func=CONTEXT,
+    )
+    app = FastAPI()
+    app.router.routes.append(
+        Mount("/n", routes=[_mounted_item(good)], middleware=[Middleware(_Tag)])
+    )
+    add_error_links(app, APP_ERROR)
+    response = make_client(app).get("/n/items/1")
+    assert response.status_code == 404
+    assert parse_links(response.headers["link"])[0][0] == "http://testserver/e/1"
+
+
+def test_add_options_leaves_middleware_mounts_alone(make_client):
+    """OPTIONS under a Mount with middleware is not answered from outside it,
+    so that the middleware (here CORS) still runs."""
+    from starlette.middleware import Middleware
+
+    app = FastAPI()
+    cors = Middleware(
+        CORSMiddleware, allow_origins=["https://a.example"], allow_methods=["*"]
+    )
+    app.router.routes.append(Mount("/n", routes=[_mounted_item()], middleware=[cors]))
+    add_options(app)
+    client = make_client(app)
+    preflight = {"Origin": "https://a.example", "Access-Control-Request-Method": "GET"}
+    response = client.options("/n/items/1", headers=preflight)
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://a.example"
+    assert "allow" not in response.headers
+    assert client.options("/n/items/1").status_code == 405
+
+
+@pytest.mark.skipif(
+    "middleware" not in inspect.signature(Router).parameters,
+    reason="Router(middleware=...) needs a newer Starlette",
+)
+def test_add_options_leaves_middleware_routers_alone(make_client):
+    from starlette.middleware import Middleware
+
+    app = FastAPI()
+    inner = Router(routes=[_mounted_item()], middleware=[Middleware(_Tag)])
+    app.router.routes.append(Mount("/r", app=inner))
+    add_options(app)
+    # Routed into the inner Router (through its middleware), which has no
+    # OPTIONS route: its 405, not an answer from outside it.
+    assert make_client(app).options("/r/items/1").status_code == 405
