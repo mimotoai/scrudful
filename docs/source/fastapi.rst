@@ -54,20 +54,51 @@ the Links of an error entity. The entity is the one passed to it, unless the
 request was routed to a scrudful endpoint with an ``error`` of its own: then
 the errors raised for that endpoint get the endpoint's ``error``, the entity
 its OPTIONS body describes. It raises ``RuntimeError`` once the app has served
-a request, since the exception handlers are fixed by then.
+a request, since the exception handlers are fixed by then. A mounted FastAPI
+app has its own exception handlers: call it on that app too.
 
-:func:`~scrudful.fastapi.add_options` registers an OPTIONS route on every path
-with a scrudful endpoint (and no OPTIONS route of its own). It answers with
-the path's HTTP Schema Resource: an OpenAPI Path Item describing each method
-of the path, the content of its requests and responses, scrudful's own 304,
-400, 412 and 428 and the ``error`` content of the last three, with the
-``Link`` headers of the HTTP Schema Resource's published schema and context
-and an ``Allow`` listing its methods. The route has no dependencies, so it
-needs no credentials. For an ``APIRouter``, call it on the app that includes
-the router, or on the router before including it. The link callables of the
-endpoints it describes are called with the raw (string) path parameters, plus
-the request under the name of the endpoint's ``Request`` parameter if it
-declares one: they must not need the endpoint's other arguments.
+:func:`~scrudful.fastapi.add_options` answers OPTIONS on every URL a scrudful
+endpoint serves (unless a route of yours serves OPTIONS there) with the URL's
+HTTP Schema Resource: an OpenAPI Path Item describing each method, the
+content of its requests and responses, scrudful's own 304, 400, 412 and 428
+and the ``error`` content of the last three, with the ``Link`` headers of the
+HTTP Schema Resource's published schema and context and an ``Allow`` listing
+its methods. Given the app, it finds the endpoint of each method the way
+Starlette routes the request, through included routers, ``Mount``\ s and
+mounted FastAPI apps, so a path split across several routers is described as
+a whole. The answer has no dependencies, so it needs no credentials. Given an
+``APIRouter``, it describes each of the router's own paths; call it before
+including the router. Prefer calling it on the app.
+
+Callables inside and outside the endpoint
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Inside the endpoint, every callable of ``@scrudful(...)`` and of its ``error``
+gets the keyword arguments FastAPI resolved for the endpoint: path, query,
+body and dependency values, plus its ``Request`` and ``Response`` parameters
+if it declares them.
+
+Outside the endpoint, the helpers call some of them with much less:
+
+* :func:`~scrudful.fastapi.add_options` calls the endpoints' link callables
+  (schema and context URL and type), and their ``error``'s when the endpoint
+  is conditional, to build the OPTIONS body;
+* :func:`~scrudful.fastapi.add_error_links` calls the endpoint's ``error``
+  callables for the errors raised for it.
+
+There they get only the URL's path parameters as Starlette matched them
+(strings, unless the path uses a convertor such as ``{id:int}``), plus the
+request under the name of the endpoint's ``Request`` parameter when it
+declares one. The entity passed to ``add_error_links`` gets ``request=``
+only. Both helpers check every such callable when they are called and raise
+``TypeError`` for one that can't be called that way, naming the endpoint and
+the argument. To use a callable in both places, accept ``**kwargs`` or give
+the parameters only the endpoint gets defaults:
+
+.. code-block:: python
+
+    def item_schema(item_id, request, **kwargs):  # inside and outside
+        return request.url_for("item_schema")
 
 The error media type
 ~~~~~~~~~~~~~~~~~~~~

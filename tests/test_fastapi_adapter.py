@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Mount, Router
 
 from scrudful import fastapi as fastapi_module
 from scrudful.fastapi import (
@@ -2186,18 +2187,16 @@ def test_add_options_skips_existing_options(make_client):
         return {}
 
     add_options(app)
+    routes = list(app.routes)
     add_options(app)
+    assert app.routes == routes  # a second call adds nothing
     client = make_client(app)
     assert client.options("/items/3").json() == {"own": True}
     assert client.options("/plain").status_code == 405
+    assert client.options("/nowhere").status_code == 404
     assert client.options("/others").status_code == 200
-    options_routes = [
-        route
-        for route in app.routes
-        if getattr(route, "path", None) == "/others" and "OPTIONS" in route.methods
-    ]
-    assert len(options_routes) == 1
     assert "options" not in app.openapi()["paths"]["/others"]
+    assert app.url_path_for("get_item", item_id=3) == "/items/3"
 
 
 def test_add_options_mixed_path(make_client, store):
@@ -2382,3 +2381,200 @@ def test_add_options_skips_the_error_of_an_unconditional_endpoint(make_client):
     assert set(body["put"]["responses"]) == {"200"}
     assert body["put"]["requestBody"]["content"] == ITEM_CONTENT
     assert calls == []
+
+
+# --- callables used outside the endpoint are checked up front ------------------
+
+
+def _probe_app():
+    """A Task-7-valid endpoint whose callables need its resolved arguments."""
+    app = FastAPI()
+
+    def user():
+        return "alice"
+
+    error = Entity(
+        schema_link_or_func=lambda item_id, item, who: f"/errors/{who}",
+        context_link_or_func=CONTEXT,
+    )
+
+    @app.put("/items/{item_id}")
+    @scrudful(
+        etag_func=lambda item_id, item, who: '"v1"',
+        schema_link_or_func=lambda item_id, item, who: "/s.json",
+        context_link_or_func=CONTEXT,
+        error=error,
+    )
+    async def put_item(item_id: int, item: ItemIn, who: str = Depends(user)):
+        return {}
+
+    return app
+
+
+def test_add_options_rejects_callables_needing_endpoint_arguments():
+    with pytest.raises(TypeError, match="put_item") as raised:
+        add_options(_probe_app())
+    assert "schema_link_or_func" in str(raised.value)
+    assert "item_id" in str(raised.value)
+
+
+def test_add_error_links_rejects_endpoint_error_callables_needing_arguments():
+    with pytest.raises(TypeError, match="put_item") as raised:
+        add_error_links(_probe_app(), APP_ERROR)
+    assert "error.schema_link_or_func" in str(raised.value)
+
+
+def test_add_error_links_rejects_app_error_callables_needing_more_than_request():
+    error = Entity(
+        schema_link_or_func=lambda request, view: "/e", context_link_or_func=CONTEXT
+    )
+    with pytest.raises(TypeError, match="schema_link_or_func"):
+        add_error_links(FastAPI(), error)
+
+
+def test_outside_callables_with_kwargs_or_defaults_pass(make_client, store):
+    app = FastAPI()
+    received = []
+
+    def schema(item_id, item=None, **kwargs):
+        received.append((item_id, item))
+        return "/s.json"
+
+    def error_schema(**kwargs):
+        return f"/errors/{kwargs['item_id']}"
+
+    @app.put("/items/{item_id}")
+    @scrudful(
+        etag_func=store.etag,
+        schema_link_or_func=schema,
+        context_link_or_func=CONTEXT,
+        error=Entity(schema_link_or_func=error_schema, context_link_or_func=CONTEXT),
+    )
+    async def put_item(item_id: int, item: ItemIn):
+        if item_id == 4:
+            raise HTTPException(status_code=404)
+        return {}
+
+    add_error_links(app, APP_ERROR)
+    add_options(app)
+    client = make_client(app)
+    body = client.options("/items/3").json()
+    validate_http_schema_resource(body)
+    assert received == [("3", None)]  # the raw path parameter, no body
+    response = client.put("/items/4", json={"name": "x"}, headers={"If-Match": '"v1"'})
+    assert response.status_code == 404
+    assert parse_links(response.headers["link"])[0][0] == "http://testserver/errors/4"
+    response = client.put("/items/3", json={"name": "x"}, headers={"If-Match": '"v1"'})
+    assert response.status_code == 200
+    assert received[-1] == (3, ItemIn(name="x"))  # inside the endpoint: resolved
+
+
+# --- OPTIONS resolves each method the way Starlette routes it -------------------
+
+
+def test_add_options_path_split_across_routers(make_client):
+    links = dict(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+    reads, writes = APIRouter(), APIRouter()
+
+    @reads.get("/items/{i}")
+    @scrudful(**links)
+    async def read(i: int):
+        return {}
+
+    @writes.put("/items/{i}")
+    @scrudful(**links)
+    async def write(i: int):
+        return {}
+
+    app = FastAPI()
+    app.include_router(reads, prefix="/v1")
+    app.include_router(writes, prefix="/v1")
+
+    @app.delete("/v1/items/{i}")
+    @scrudful(**links)
+    async def remove(i: int):
+        return {}
+
+    add_options(app)
+    client = make_client(app)
+    options = client.options("/v1/items/1")
+    body = options.json()
+    validate_http_schema_resource(body)
+    assert options.headers["allow"] == "GET, PUT, DELETE, OPTIONS"
+    assert options.headers["allow"] == allow_header(body)
+    for method in ("GET", "PUT", "DELETE"):
+        response = client.request(method, "/v1/items/1")
+        assert response.status_code == 200
+        assert link_problems(method, 200, response.headers, True, body) == []
+
+
+def test_add_options_differently_named_parameters(make_client):
+    received = []
+
+    def schema(**kwargs):
+        received.append(kwargs)
+        return SCHEMA
+
+    links = dict(schema_link_or_func=schema, context_link_or_func=CONTEXT)
+    reads, writes = APIRouter(), APIRouter()
+
+    @reads.get("/items/{id}")
+    @scrudful(**links)
+    async def read(id: int):
+        return {}
+
+    @writes.put("/items/{item_id}")
+    @scrudful(**links)
+    async def write(item_id: int):
+        return {}
+
+    app = FastAPI()
+    app.include_router(reads)
+    app.include_router(writes)
+    add_options(app)
+    response = make_client(app).options("/items/5")
+    assert response.headers["allow"] == "GET, PUT, OPTIONS"
+    assert received == [{"id": "5"}, {"item_id": "5"}]
+
+
+def test_add_options_mount(make_client):
+    async def item(item_id: int):
+        return {}
+
+    endpoint = scrudful(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)(item)
+    from fastapi.routing import APIRoute
+
+    app = FastAPI()
+    app.mount(
+        "/m", Router(routes=[APIRoute("/items/{item_id}", endpoint, methods=["GET"])])
+    )
+    app.router.routes.append(
+        Mount("/n", routes=[APIRoute("/items/{item_id}", endpoint, methods=["PUT"])])
+    )
+    add_options(app)
+    client = make_client(app)
+    for path, allow, method in [
+        ("/m/items/1", "GET, OPTIONS", "GET"),
+        ("/n/items/1", "PUT, OPTIONS", "PUT"),
+    ]:
+        options = client.options(path)
+        assert options.status_code == 200
+        assert options.headers["allow"] == allow
+        response = client.request(method, path)
+        assert link_problems(method, 200, response.headers, True, options.json()) == []
+
+
+def test_add_options_mounted_fastapi_app(make_client):
+    sub = FastAPI()
+
+    @sub.get("/items/{item_id}")
+    @scrudful(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+    async def get_item(item_id: int):
+        return {}
+
+    app = FastAPI()
+    app.mount("/sub", sub)
+    add_options(app)
+    options = make_client(app).options("/sub/items/1")
+    assert options.status_code == 200
+    assert options.json()["get"]["responses"]["200"]["content"] == ITEM_CONTENT
