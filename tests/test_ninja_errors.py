@@ -7,7 +7,7 @@ import pytest
 from asgiref.sync import async_to_sync
 from django.http import Http404
 from ninja import NinjaAPI, Router
-from ninja.errors import AuthorizationError, HttpError
+from ninja.errors import AuthenticationError, AuthorizationError, HttpError
 from ninja.testing import TestAsyncClient, TestClient
 
 from scrudful.ninja import (
@@ -441,3 +441,35 @@ def test_raised_error_turned_into_a_success_gets_no_error_links(store):
     response = get(TestClient(router), "/items/1")
     assert response.status_code == 200
     assert "Link" not in response.headers
+
+
+def test_add_error_links_then_a_later_http_error_handler(store):
+    """A handler registered later replaces the wrapped one, subclasses included."""
+    api = error_api(store, throttle=Deny(store))
+    add_error_links(api, ERR)
+
+    @api.exception_handler(HttpError)
+    def teapot(request, exc):
+        return api.create_response(request, {"oops": str(exc)}, status=418)
+
+    client = TestClient(api)
+    for headers in ({}, ALICE):  # 401, then 429 (both HttpError subclasses)
+        response = client.get("/items/1", headers=headers)
+        assert response.status_code == 418
+        assert "Link" not in response.headers
+
+
+def test_add_error_links_wraps_an_exact_subclass_handler(store):
+    api = error_api(store)
+
+    @api.exception_handler(AuthenticationError)
+    def unauthorized(request, exc):
+        return api.create_response(request, {"login": True}, status=401)
+
+    add_error_links(api, ERR)
+    response = TestClient(api).get("/items/1")
+    assert response.status_code == 401
+    assert response.json() == {"login": True}
+    assert response.headers["Link"] == ERR_LINK
+    # The subclass entry is wrapped once, not also through HttpError's.
+    assert api._exception_handlers[AuthenticationError].__wrapped__ is unauthorized

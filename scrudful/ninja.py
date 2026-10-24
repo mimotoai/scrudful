@@ -1223,18 +1223,23 @@ class ScrudfulRouter(Router):
 def add_error_links(api: NinjaAPI, error: Entity) -> None:
     """Give the error responses of ``api``'s exception handlers ``error``'s Links.
 
-    Wraps the handler ``api`` uses, when this is called, for each of
+    Wraps the handlers registered, when this is called, for
     ``ninja.errors.ValidationError`` (422), ``AuthenticationError`` (401),
     ``AuthorizationError`` (403, when the installed ninja defines it),
     ``Throttled`` (429), ``HttpError`` and ``django.http.Http404``: the
     responses ninja answers before an operation runs, and the errors any
-    operation raises. Each wrapped handler returns the response the original
-    makes, with the same status and body, and adds ``error``'s Links to it
-    when it has content, as :func:`scrudful` adds them (a Link the handler
-    set with a ``describedby`` or a context relation suppresses that kind;
-    see :func:`scrudful._adapter.merge_links`). So a custom handler
-    registered before the call is kept, and calling this twice adds no Link
-    twice. A handler registered after the call replaces the wrapped one.
+    operation raises. Only a class with a handler of its own is wrapped;
+    one without (with ninja's defaults, the three ``HttpError`` subclasses)
+    keeps falling back to its base's handler, which is. Each wrapped handler
+    returns the response the original makes, with the same status and body,
+    and adds ``error``'s Links to it when it has content, as :func:`scrudful`
+    adds them (a Link the handler set with a ``describedby`` or a context
+    relation suppresses that kind; see :func:`scrudful._adapter.merge_links`).
+    So a custom handler registered before the call is kept, and calling this
+    twice adds no Link twice. A handler registered after the call replaces
+    the wrapped one, for its class and the subclasses without a handler of
+    their own (e.g. a later ``HttpError`` handler answers the 401, 403 and
+    429 too, without Links): call this after registering your handlers.
 
     An error raised inside a scrudful operation gets that operation's
     entity for the status, if it has one (``responses[status]``, else its
@@ -1272,19 +1277,17 @@ def add_error_links(api: NinjaAPI, error: Entity) -> None:
                 f"error.{entity_field.name} is async, but ninja's exception "
                 "handlers are sync"
             )
-    # ninja's ``_lookup_exception_handler``: the handler of the nearest class
-    # in the MRO. All are looked up before any is replaced, so that a
-    # subclass falling back to its base's handler wraps it only once.
+    # Only the classes with a handler of their own: the others (with ninja's
+    # defaults, AuthenticationError, AuthorizationError and Throttled) fall
+    # back to their base's through the MRO, as ninja's
+    # ``_lookup_exception_handler`` does, and so to the wrapped one, or to
+    # one the app registers for the base later.
     handlers = api._exception_handlers
-    originals = {
-        exc_class: next(
-            (handlers[cls] for cls in exc_class.__mro__ if cls in handlers), None
-        )
-        for exc_class in _ERROR_CLASSES
-    }
-    for exc_class, handler in originals.items():
-        if handler is not None:
-            api.add_exception_handler(exc_class, _error_handler(handler, error))
+    for exc_class in _ERROR_CLASSES:
+        if exc_class in handlers:
+            api.add_exception_handler(
+                exc_class, _error_handler(handlers[exc_class], error)
+            )
 
 
 def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:

@@ -548,17 +548,23 @@ entity:
     api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
     add_error_links(api, ERROR)
 
-It wraps the handler the API uses for ``ninja.errors.ValidationError``,
+It wraps the handlers registered for ``ninja.errors.ValidationError``,
 ``AuthenticationError``, ``AuthorizationError`` (when the installed ninja
 defines it), ``Throttled``, ``HttpError`` and ``Http404``, so it also covers
 the errors of plain ninja operations, and of scrudful operations without an
-entity for the status (a scrudful operation's own entity wins). Each wrapped
-handler keeps the original's status and body and adds the entity's Links when
-the response has content. A Link the handler set itself with a ``describedby``
-or a context relation suppresses scrudful's of that kind, so calling it twice,
-or on a response that already has scrudful's Links, sends no Link twice. Call
-it after registering your own exception handlers: it wraps the ones registered
-when it is called, and a handler registered later replaces the wrapped one.
+entity for the status (a scrudful operation's own entity wins). Only a class
+with a handler of its own is wrapped: with ninja's defaults,
+``AuthenticationError``, ``AuthorizationError`` and ``Throttled`` have none and
+fall back to the (wrapped) ``HttpError`` handler, as ninja looks handlers up.
+Each wrapped handler keeps the original's status and body and adds the entity's
+Links when the response has content. A Link the handler set itself with a
+``describedby`` or a context relation suppresses scrudful's of that kind, so
+calling it twice, or on a response that already has scrudful's Links, sends no
+Link twice. Call it after registering your own exception handlers: it wraps the
+ones registered when it is called, and a handler registered later replaces the
+wrapped one, for its class and for the subclasses without a handler of their
+own (a later ``HttpError`` handler answers the 401, 403 and 429 too, without
+Links).
 ninja's exception handlers are sync, also for async operations, where they run
 on the event loop: the entity's link callables must be sync (``TypeError``
 otherwise) and must not use the ORM there.
