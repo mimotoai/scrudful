@@ -38,7 +38,9 @@ Validators
     calling the view: 400/412/428 as a DRF ``Response`` (a ``JsonResponse`` for
     plain Django views) with a JSON body, 304 without a body or Link. With an
     ``error`` entity the 400/412/428 carry its Links and are served as JSON
-    with its media type, whatever the request's ``Accept``.
+    with its media type, whatever renderer DRF's content negotiation picked
+    (the browsable API's included): the view's first JSON renderer renders
+    them (DRF's ``JSONRenderer`` if it has none).
 
     After the view runs, 2xx responses to GET/HEAD get the validators computed
     for the precondition check, and 2xx responses to PUT/PATCH get freshly
@@ -73,11 +75,16 @@ Headers
 
 OPTIONS
     With :class:`ScrudfulMetadata` (installed in place of DRF's default
-    metadata class), OPTIONS is answered with a Semantic HTTP 0.1 HTTP Schema
+    metadata class by :func:`scrudful_viewset`, :func:`scrudful_api_view` and
+    a class-body :func:`scrudful` method, but not by :func:`scrudful` below
+    ``@api_view``), OPTIONS is answered with a Semantic HTTP 0.1 HTTP Schema
     Resource: a JSON body describing each method the view allows, the Links
     of the HTTP Schema Resource's own schema and JSON-LD context, and an
     ``Allow`` listing exactly the body's methods. It is ``application/json``
-    whatever the request's ``Accept``, the browsable API included.
+    whatever renderer DRF's content negotiation picked, the browsable API's
+    included. An ``Accept`` that none of the view's renderers serves (e.g.
+    ``text/html`` on a view without the browsable API) still gets DRF's 406,
+    raised before OPTIONS is handled.
 """
 
 from __future__ import annotations
@@ -114,6 +121,7 @@ from scrudful._adapter import (
     describe_read,
     describe_write,
     expose_headers,
+    is_json,
     merge_links,
     options_links,
     reason_phrase,
@@ -215,9 +223,11 @@ class ScrudfulViewFunc:
         JSON objects, so ``media_type`` must be JSON content
         (``application/json`` or ``+json``, e.g.
         ``application/problem+json``), and they are served as JSON with that
-        Content-Type whatever the request's ``Accept`` (DRF's content
-        negotiation, and so the browsable API, is bypassed for them). Without
-        ``error`` these responses carry no Link and are rendered as before.
+        Content-Type whatever renderer DRF's content negotiation picked (the
+        browsable API's included): the view's first JSON renderer (one of its
+        ``renderer_classes`` with an ``application/json`` or ``+json`` media
+        type, else DRF's ``JSONRenderer``) renders them. Without ``error``
+        these responses carry no Link and are rendered as before.
 
     Raises
     ------
@@ -264,6 +274,17 @@ class ScrudfulViewFunc:
         if obj is None:
             return self
         return types.MethodType(self, obj)
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        """Give an ``APIView`` with a class-body ``@scrudful`` method its OPTIONS.
+
+        As :func:`scrudful_viewset` and :func:`scrudful_api_view` do (see
+        :func:`_install_metadata`): DRF's stock ``SimpleMetadata`` and
+        ``APIView.options`` are replaced, anything the class chose is kept.
+        A class that is not an ``APIView`` is left alone.
+        """
+        if issubclass(owner, APIView):
+            _install_metadata(owner)
 
     @property
     def has_validators(self) -> bool:
@@ -333,8 +354,9 @@ class ScrudfulViewFunc:
         """scrudful's own 304, 400, 412 or 428.
 
         With ``error``, a 400/412/428 carries its Links and is served as JSON
-        with its media type, whatever the request's Accept (DRF's content
-        negotiation is bypassed), so that it agrees with the OPTIONS body.
+        with its media type, whatever renderer DRF's content negotiation
+        picked (see :func:`_render_as_json`), so that it agrees with the
+        OPTIONS body.
         """
         if result.body is None or self.error is None:
             return _conditional_response(result, request)
@@ -441,6 +463,14 @@ def scrudful(
     :class:`ScrudfulViewFunc`, and the behaviour in the module docstring.
     Decorating an ``async def`` view raises ``TypeError``: DRF views are
     synchronous.
+
+    In the body of an ``APIView`` (or viewset) class, the decorated method
+    also makes the class answer OPTIONS with :class:`ScrudfulMetadata`, as
+    :func:`scrudful_viewset` does: DRF's stock ``SimpleMetadata`` and
+    ``options`` are replaced, a class's own are kept. Below ``@api_view``
+    there is no class yet, and the view keeps DRF's ``SimpleMetadata``, so
+    its OPTIONS is no HTTP Schema Resource: use :func:`scrudful_api_view`
+    in place of ``@api_view`` + ``@scrudful`` for one.
     """
     options = {
         "etag_func": etag_func,
@@ -665,11 +695,12 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
     """``APIView.options``, answering with an HTTP Schema Resource.
 
     When the view's metadata class is :class:`ScrudfulMetadata` (or a
-    subclass), the 200 is rendered as JSON whatever the request's ``Accept``
-    (the browsable API included), and carries the HTTP Schema Resource's own
-    Links and an ``Allow`` listing the body's methods. Other responses, and
-    those of any other metadata class, are DRF's (``metadata_class = None``
-    gives a 405).
+    subclass), the 200 is rendered by DRF's ``JSONRenderer`` whatever renderer
+    DRF's content negotiation picked (the browsable API's included), and
+    carries the HTTP Schema Resource's own Links and an ``Allow`` listing the
+    body's methods. Other responses, and those of any other metadata class,
+    are DRF's (``metadata_class = None`` gives a 405; an ``Accept`` none of
+    the view's renderers serves, DRF's 406, raised before this runs).
     """
     response = APIView.options(self, request, *args, **kwargs)
     metadata_class = self.metadata_class
@@ -886,7 +917,8 @@ def _conditional_response(
 
     ``link`` and ``content_type`` (the error entity's) go on a 400, 412 or
     428. A DRF request's response is a DRF ``Response``: rendered by the
-    negotiated renderer, or by ``JSONRenderer`` with ``content_type``.
+    negotiated renderer, or, with ``content_type``, by the view's JSON
+    renderer (see :func:`_render_as_json`).
     """
     if result.body is None or not isinstance(request, Request):
         return django_conditional_response(result, link, content_type)
@@ -894,8 +926,7 @@ def _conditional_response(
     if link:
         headers["Link"] = link
     if content_type:
-        request.accepted_renderer = JSONRenderer()
-        request.accepted_media_type = JSONRenderer.media_type
+        _render_as_json(request, (request.parser_context or {}).get("view"))
     response = Response(
         result.body, status=result.status, headers=headers, content_type=content_type
     )
@@ -911,9 +942,10 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
     ``exception_handler``; when the view's handler for the request is a
     :class:`ScrudfulViewFunc` with an ``error`` entity, the response also gets
     that entity's Links and is served as JSON with the entity's ``media_type``
-    whatever the request's ``Accept`` (DRF's content negotiation is bypassed,
-    as for scrudful's own 400, 412 and 428), so that it agrees with the OPTIONS
-    body. Without an ``error`` entity, or when the view has no such handler,
+    whatever renderer DRF's content negotiation picked, rendered by the view's
+    first JSON renderer as scrudful's own 400, 412 and 428 are (see
+    :class:`ScrudfulViewFunc`), so that it agrees with the OPTIONS body.
+    Without an ``error`` entity, or when the view has no such handler,
     the response is DRF's, unchanged; so is ``None`` for an exception DRF does
     not handle.
 
@@ -954,11 +986,28 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
     )
     if link is not None:
         response["Link"] = link
-    request.accepted_renderer = JSONRenderer()
-    request.accepted_media_type = JSONRenderer.media_type
+    _render_as_json(request, view)
     response.content_type = handler.error.media_type
     expose_headers(response)
     return response
+
+
+def _render_as_json(request: Request, view: Any) -> None:
+    """Bypass DRF's content negotiation for an error served as its entity's type.
+
+    The response is rendered by the first of the view's ``renderer_classes``
+    whose media type is JSON content (``application/json`` or ``+json``), so
+    a project's own JSON renderer (camel-case keys, orjson ...) formats the
+    body as it does elsewhere; by DRF's ``JSONRenderer`` if there is none.
+    """
+    renderer: Any = JSONRenderer()
+    for renderer_class in getattr(view, "renderer_classes", ()):
+        media_type = getattr(renderer_class, "media_type", None)
+        if isinstance(media_type, str) and is_json(media_type):
+            renderer = renderer_class()
+            break
+    request.accepted_renderer = renderer
+    request.accepted_media_type = renderer.media_type
 
 
 def _error_handler(view: APIView, request: Any, status: int) -> ScrudfulViewFunc | None:

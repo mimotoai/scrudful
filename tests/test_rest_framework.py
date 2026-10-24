@@ -27,7 +27,7 @@ from rest_framework.metadata import SimpleMetadata
 from rest_framework.exceptions import NotFound
 from rest_framework.mixins import UpdateModelMixin
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.renderers import JSONRenderer
+from rest_framework.renderers import BrowsableAPIRenderer, JSONRenderer
 from rest_framework.response import Response
 from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient, APIRequestFactory
@@ -602,6 +602,58 @@ def django_view(request):
     return HttpResponse("plain django")
 
 
+class ThingAPIView(drf_views.APIView):
+    """An APIView with class-body @scrudful methods."""
+
+    @scrudful(
+        etag_func=etag_func,
+        schema_link_or_func=SCHEMA,
+        context_link_or_func=CONTEXT,
+        error=ERROR,
+    )
+    def get(self, request, pk):
+        return Response({"id": pk, "version": store.version})
+
+    @scrudful(
+        etag_func=etag_func,
+        schema_link_or_func=SCHEMA,
+        context_link_or_func=CONTEXT,
+        error=ERROR,
+    )
+    def put(self, request, pk):
+        store.update()
+        return Response({"id": pk, "version": store.version})
+
+
+class TaggingJSONRenderer(JSONRenderer):
+    """A project's own JSON renderer (as a camel-case or orjson one would be)."""
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        if isinstance(data, dict):
+            data = {"tagged": True, **data}
+        return super().render(data, accepted_media_type, renderer_context)
+
+
+@scrudful_viewset
+class CustomRendererViewSet(ThingViewSetBase):
+    """The browsable API first, then a custom JSON renderer."""
+
+    renderer_classes = [BrowsableAPIRenderer, TaggingJSONRenderer]
+
+    class Meta:
+        etag_func = etag_func
+        schema_link_or_func = "/schemas/thing"
+        context_link_or_func = "/contexts/thing"
+        error = PROBLEM
+
+
+@api_view(["GET"])
+@renderer_classes([BrowsableAPIRenderer, TaggingJSONRenderer])
+@scrudful(etag_func=lambda request, pk: f"v{store.version}", error=PROBLEM)
+def custom_renderer_function(request, pk):
+    return Response({"id": pk})
+
+
 router = SimpleRouter()
 for prefix, viewset in [
     ("things", ThingViewSet),
@@ -629,6 +681,7 @@ for prefix, viewset in [
     ("error-only", ErrorOnlyViewSet),
     ("mixed-actions", MixedActionViewSet),
     ("own-describedby", OwnDescribedByViewSet),
+    ("custom-renderer", CustomRendererViewSet),
 ]:
     router.register(prefix, viewset, basename=prefix)
 
@@ -648,6 +701,8 @@ urlpatterns = [
     path("django/", django_view),
     path("api-error/<int:pk>/", api_error),
     path("django-error/", django_error_view),
+    path("apiview/<int:pk>/", ThingAPIView.as_view()),
+    path("custom-renderer-function/<int:pk>/", custom_renderer_function),
 ]
 
 
@@ -1803,3 +1858,130 @@ def test_a_non_conditional_delete_has_no_400_entry(client):
 def test_a_serializer_400_is_described_with_the_exception_handler(client):
     listing = client.options("/errors/").json()
     assert set(listing["post"]["responses"]) == {"201", "400"}
+
+
+# --- APIView with class-body @scrudful ----------------------------------------
+
+
+def test_api_view_class_answers_options_with_the_http_schema_resource(client):
+    assert ThingAPIView.metadata_class is ScrudfulMetadata
+    for accept in ("application/json", "text/html"):
+        response = client.options("/apiview/1/", headers={"Accept": accept})
+        assert response.status_code == 200
+        assert response["Content-Type"] == "application/json"
+        assert response["Link"] == options_links()
+        body = response.json()
+        validate_http_schema_resource(body)
+        assert list(body) == ["get", "put", "options", "head"]
+        assert response["Allow"] == allow_header(body)
+        assert link_problems("OPTIONS", 200, dict(response.items()), True, body) == []
+    assert body["get"]["responses"]["200"]["content"] == content(SCHEMA, CONTEXT)
+    assert "412" in body["put"]["responses"]
+    # The OPTIONS body agrees with the responses.
+    response = client.put("/apiview/1/")
+    assert response.status_code == 428
+    assert response["Link"] == ERROR_LINKS
+    assert link_problems("PUT", 428, dict(response.items()), True, body) == []
+
+
+def test_api_view_class_keeps_its_own_metadata_class_and_options():
+    class OwnMetadata(drf_views.APIView):
+        metadata_class = CustomMetadata
+
+        @scrudful(etag_func=etag_func)
+        def get(self, request, pk):
+            return Response({})
+
+    class NoMetadata(drf_views.APIView):
+        metadata_class = None
+
+        @scrudful(etag_func=etag_func)
+        def get(self, request, pk):
+            return Response({})
+
+    class OwnOptions(drf_views.APIView):
+        @scrudful(etag_func=etag_func)
+        def get(self, request, pk):
+            return Response({})
+
+        def options(self, request, *args, **kwargs):
+            return Response({"own": True})
+
+    assert OwnMetadata.metadata_class is CustomMetadata
+    assert NoMetadata.metadata_class is None
+    assert OwnOptions.metadata_class is ScrudfulMetadata
+    response = OwnOptions.as_view()(APIRequestFactory().options("/"), pk="1")
+    assert response.data == {"own": True}
+    assert "Link" not in response
+
+
+def test_api_view_class_keeps_a_project_wide_metadata_class(monkeypatch):
+    monkeypatch.setattr(drf_views.APIView, "metadata_class", CustomMetadata)
+
+    class Project(drf_views.APIView):
+        @scrudful(etag_func=etag_func)
+        def get(self, request, pk):
+            return Response({})
+
+    assert Project.metadata_class is CustomMetadata
+
+
+def test_scrudful_method_of_a_class_that_is_not_a_view():
+    class NotAView:
+        @scrudful(etag_func=etag_func)
+        def get(self, request, pk):
+            return Response({})
+
+    assert "metadata_class" not in vars(NotAView)
+    assert "options" not in vars(NotAView)
+
+
+# --- The view's JSON renderer ---------------------------------------------------
+
+
+def test_bypassed_negotiation_uses_the_view_json_renderer(client):
+    hsr = client.options("/custom-renderer/1/").json()
+    validate_http_schema_resource(hsr)
+    write = dict(data={"raise": True}, format="json")
+    for accept in ("application/json", "text/html"):
+        headers = {"Accept": accept}
+        responses = [
+            (
+                "GET",
+                412,
+                client.get(
+                    "/custom-renderer/1/", headers={**headers, "If-Match": '"x"'}
+                ),
+            ),
+            ("PUT", 428, client.put("/custom-renderer/1/", **write, headers=headers)),
+            (
+                "PUT",
+                400,
+                client.put(
+                    "/custom-renderer/1/", **write, headers={**headers, **IF_MATCH}
+                ),
+            ),
+            (
+                "GET",
+                412,
+                client.get(
+                    "/custom-renderer-function/1/",
+                    headers={**headers, "If-Match": '"x"'},
+                ),
+            ),
+        ]
+        for method, status, response in responses:
+            assert response.status_code == status
+            assert response["Content-Type"] == "application/problem+json"
+            assert response["Link"] == PROBLEM_LINKS
+            assert response.json()["tagged"] is True
+            if not response.request["PATH_INFO"].startswith("/custom-renderer-f"):
+                problems = link_problems(
+                    method, status, dict(response.items()), True, hsr
+                )
+                assert problems == []
+    serializer_400 = responses[2][2].json()
+    assert serializer_400 == {"tagged": True, "name": ["This field is required."]}
+    # Without an error entity in play, DRF's negotiation still picks the renderer.
+    response = client.get("/custom-renderer/1/", headers={"Accept": "text/html"})
+    assert response["Content-Type"].startswith("text/html")
