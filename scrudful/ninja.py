@@ -22,6 +22,21 @@ Order of execution
     ``Http404``, ``ninja.errors.HttpError``) go through ninja's exception
     handlers, as for any operation.
 
+Placement
+    The decorator sits directly below the operation decorator. When ninja
+    builds the operation, the decorator replaces ``operation.view_func`` by a
+    wrapper bound to that operation's ``response=``, in a
+    ``_ninja_contribute_to_operation`` callback. A hook that wraps
+    ``operation.view_func`` the same way must be applied above the decorator,
+    so that its callback runs after the binding and wraps the bound wrapper.
+    Applied below it, the hook's callback runs first, and the binding would
+    discard its wrapper, as it would a decorator between the operation
+    decorator and this one: both raise ``ninja.errors.ConfigError`` when the
+    operation is built. Hooks that leave ``view_func`` alone (e.g.
+    ``ninja.decorators.decorate_view``, which wraps ``operation.run``) work
+    on either side, and ``add_decorator`` on the API or a router (either
+    mode) applies after the binding.
+
 Choosing what ``load`` returns
     ``load`` returns the object, ``None`` ("no current representation") or
     raises. Whatever it does decides what a client can observe: the adapter
@@ -730,6 +745,12 @@ def scrudful(
         ninja operation (the decorator sits above the operation decorator),
         or if the handler is sync and ``load``, a validator callback or a
         link callable (also inside an entity) is ``async def``.
+    ninja.errors.ConfigError
+        When the operation is built, if something replaced its ``view_func``
+        before the decorator bound it: a ``_ninja_contribute_to_operation``
+        callback contributed below the decorator, or a decorator between it
+        and the operation decorator (see "Placement" in the module
+        docstring).
     """
     check_validators(etag_func, last_modified_func)
     if load is not None and not callable(load):
@@ -851,6 +872,12 @@ def scrudful_create(
         operation decorator), or if the handler is sync and
         ``location_func``, a validator callback or a link callable (also
         inside an entity) is ``async def``.
+    ninja.errors.ConfigError
+        When the operation is built, if something replaced its ``view_func``
+        before the decorator bound it: a ``_ninja_contribute_to_operation``
+        callback contributed below the decorator, or a decorator between it
+        and the operation decorator (see "Placement" in the module
+        docstring).
     """
     if not callable(location_func):
         raise TypeError(
@@ -1017,7 +1044,9 @@ def scrudful_list(
         When the operation is built, if it declares no collection response
         (e.g. ``response=List[ItemOut]``), or one that is a union (e.g.
         ``Optional[List[ItemOut]]``: the envelope is never ``None``) or names
-        no item type (a bare ``list``).
+        no item type (a bare ``list``), or if something replaced its
+        ``view_func`` before the decorator bound it (see "Placement" in the
+        module docstring).
     """
     if not callable(href_func):
         raise TypeError(f"href_func must be callable, not {type(href_func).__name__}")
@@ -1358,7 +1387,27 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             may be registered on several paths, with different ``response=``:
             each operation runs its own wrapper, which ninja's clones of it
             (one per mount of the router) share, with its response models.
+
+            ``operation.view_func`` must still be the registered wrapper:
+            replacing what something else put there (a callback contributed
+            below the decorator, which runs first, or a decorator between it
+            and the operation decorator) would silently discard it.
+            ``add_decorator`` applies after the binding, and ``decorate_view``
+            wraps ``operation.run``, not ``view_func``.
             """
+            if operation.view_func is not wrapper:
+                raise ConfigError(
+                    f"{name}: operation {'/'.join(operation.methods)} "
+                    f"{operation.path!r} ({handler.__qualname__}()): "
+                    "operation.view_func is no longer the function "
+                    f"{name} returned, and binding the operation would discard "
+                    "what replaced it. A hook wrapping view_func (a "
+                    "_ninja_contribute_to_operation callback) must be applied "
+                    f"above {name}, and {name} must sit directly below the "
+                    "operation decorator (a decorator in between is discarded "
+                    "too); or use Router.add_decorator(mode='operation') or "
+                    "ninja.decorators.decorate_view."
+                )
             collection = (
                 _envelope_response(operation) if config.kind == "list" else None
             )

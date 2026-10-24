@@ -54,8 +54,17 @@ your application serves. Alignment with the spec's 0.1 revision is planned.
 Single resources
 ----------------
 
-``@scrudful(...)`` sits **below** the operation decorator (above it, ninja
-would register the undecorated function, so it raises ``TypeError``). ``load``
+``@scrudful(...)`` sits **directly below** the operation decorator (above it,
+ninja would register the undecorated function, so it raises ``TypeError``).
+When ninja builds the operation, scrudful replaces ``operation.view_func`` by a
+wrapper bound to that operation's ``response=``. A hook that wraps
+``operation.view_func`` from a ``_ninja_contribute_to_operation`` callback
+must be applied above ``@scrudful``: below it, the hook's callback runs before
+the binding, which would discard its wrapper, and so would a decorator between
+the operation decorator and ``@scrudful``. Both raise
+``ninja.errors.ConfigError`` when the operation is built.
+``decorate_view`` (it wraps ``operation.run``) works on either side, and
+``add_decorator`` on the API or a router applies after the binding. ``load``
 is the fetch-if-allowed callable; the validator callbacks are called with what
 it returns, and the handler receives it in the ``load_as`` parameter (``obj``
 by default), hidden from ninja's signature and OpenAPI:

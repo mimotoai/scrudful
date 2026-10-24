@@ -1,25 +1,29 @@
 """Single-resource operations of ``scrudful.ninja``, tested with small routers."""
 
+import functools
 import inspect
 import itertools
 import json
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, List
 
 import pytest
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from ninja import NinjaAPI, Router, Schema, Status
-from ninja.errors import HttpError
+from ninja.decorators import decorate_view
+from ninja.errors import ConfigError, HttpError
 from ninja.security import APIKeyHeader
 from ninja.throttling import BaseThrottle
 from ninja.testing import TestClient
+from ninja.utils import contribute_operation_callback
 
 from scrudful._adapter import READ_DESCRIPTIONS, WRITE_DESCRIPTIONS, resolved_signature
 from scrudful.ninja import (
     CONDITIONAL_READ_RESPONSES,
     CONDITIONAL_WRITE_RESPONSES,
+    ScrudfulRouter,
     scrudful,
     scrudful_create,
     scrudful_list,
@@ -992,3 +996,180 @@ def test_decorator_above_the_operation_decorator_raises(store, decorator, name):
         @router.get("/items/{pk}")
         def get_item(request, pk: int, obj=None):
             return {}
+
+
+def wrap_view_func(seen: list[str], label: str) -> Any:
+    """A third-party decorator wrapping ``operation.view_func`` when ninja
+    builds the operation (with a ``_ninja_contribute_to_operation``
+    callback)."""
+
+    def callback(operation: Any) -> None:
+        inner = operation.view_func
+
+        @functools.wraps(inner)
+        def outer(request: Any, **values: Any) -> Any:
+            seen.append(label)
+            return inner(request, **values)
+
+        operation.view_func = outer
+
+    def decorator(func: Any) -> Any:
+        contribute_operation_callback(func, callback)
+        return func
+
+    return decorator
+
+
+def recording(seen: list[str], label: str) -> Any:
+    """A plain decorator: ``func`` wrapped with ``functools.wraps``."""
+
+    def decorator(func: Any) -> Any:
+        @functools.wraps(func)
+        def inner(request: Any, *args: Any, **values: Any) -> Any:
+            seen.append(label)
+            return func(request, *args, **values)
+
+        return inner
+
+    return decorator
+
+
+SCRUDFUL_DECORATORS = [
+    pytest.param(
+        lambda store: scrudful(load=store.load, etag_func=etag),
+        "@scrudful",
+        id="scrudful",
+    ),
+    pytest.param(
+        lambda store: scrudful_create(location_func=lambda r, o: "/x"),
+        "@scrudful_create",
+        id="scrudful_create",
+    ),
+    pytest.param(
+        lambda store: scrudful_list(href_func=lambda r, o: "/x"),
+        "@scrudful_list",
+        id="scrudful_list",
+    ),
+]
+
+
+@pytest.mark.parametrize("decorator, name", SCRUDFUL_DECORATORS)
+def test_view_func_wrapper_below_the_decorator_raises(store, decorator, name):
+    """A callback contributed below the scrudful decorator runs before it
+    binds the operation: the binding would silently discard its wrapper."""
+    seen: list[str] = []
+    router = Router()
+    with pytest.raises(ConfigError) as raised:
+
+        @router.get("/items/{pk}", response={200: List[ItemOut]})
+        @decorator(store)
+        @wrap_view_func(seen, "below")
+        def get_item(request, pk: int, obj=None):
+            return []
+
+    message = str(raised.value)
+    assert f"{name}: operation GET '/items/{{pk}}' (" in message
+    assert "get_item())" in message
+    assert f"must be applied above {name}" in message
+    assert seen == []
+
+
+def test_decorator_between_operation_and_scrudful_raises(store):
+    """A plain decorator between the operation decorator and ``@scrudful``
+    would be discarded the same way."""
+    seen: list[str] = []
+    router = Router()
+    with pytest.raises(ConfigError, match=r"@scrudful: operation GET .*get_item"):
+
+        @router.get("/items/{pk}", response=ItemOut)
+        @recording(seen, "between")
+        @scrudful(load=store.load, etag_func=etag)
+        def get_item(request, pk: int, obj):
+            return obj
+
+    assert seen == []
+
+
+def test_view_func_wrapper_above_the_decorator_wraps_the_bound_operation(store):
+    """Above ``@scrudful``, the callback runs after the binding: it wraps the
+    wrapper bound to the operation's own declarations (here, 202)."""
+    seen: list[str] = []
+    router = Router()
+
+    @router.get("/items/{pk}", response={202: ItemOut})
+    @wrap_view_func(seen, "above")
+    @scrudful(load=store.load, etag_func=etag, **LINKS)
+    def get_item(request, pk: int, obj):
+        seen.append("handler")
+        return obj
+
+    response = TestClient(router).get("/items/1")
+    assert response.status_code == 202
+    assert response.headers["ETag"] == '"v1"'
+    assert response.headers["Link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+    assert seen == ["above", "handler"]
+
+
+def test_handler_callbacks_that_keep_view_func_still_run(store):
+    """Callbacks below ``@scrudful`` that don't replace ``view_func`` (here
+    ``decorate_view``, which wraps ``operation.run``) keep working."""
+    seen: list[str] = []
+    router = Router()
+
+    @router.get("/items/{pk}", response={203: ItemOut})
+    @scrudful(load=store.load, etag_func=etag)
+    @decorate_view(recording(seen, "run"))
+    def get_item(request, pk: int, obj):
+        return obj
+
+    response = TestClient(router).get("/items/1")
+    assert response.status_code == 203
+    assert response.headers["ETag"] == '"v1"'
+    assert seen == ["run"]
+
+
+def test_decorate_view_between_operation_and_scrudful(store):
+    seen: list[str] = []
+    router = Router()
+
+    @router.get("/items/{pk}", response={203: ItemOut})
+    @decorate_view(recording(seen, "run"))
+    @scrudful(load=store.load, etag_func=etag)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    response = TestClient(router).get("/items/1")
+    assert response.status_code == 203
+    assert response.headers["ETag"] == '"v1"'
+    assert seen == ["run"]
+
+
+@pytest.mark.parametrize("mode", ["operation", "view"])
+def test_router_add_decorator_wraps_the_bound_operations(store, mode):
+    """``add_decorator`` applies after the binding, on every mount: each
+    operation keeps its declared status and its validators."""
+    seen: list[str] = []
+
+    @scrudful(load=store.load, etag_func=etag, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    router = ScrudfulRouter()
+    router.get("/x/{pk}", response=ItemOut)(get_item)
+    router.get("/y/{pk}", response={202: ItemOut})(get_item)
+    router.add_decorator(recording(seen, mode), mode=mode)
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    api.add_router("/one", router, url_name_prefix="one")
+    api.add_router("/two", router, url_name_prefix="two")
+    client = TestClient(api)
+    for prefix in ("/one", "/two"):
+        response = client.get(f"{prefix}/x/1")
+        assert response.status_code == 200
+        assert response.headers["ETag"] == '"v1"'
+        assert response.headers["Link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+        response = client.get(f"{prefix}/y/1", headers={"If-None-Match": '"v1"'})
+        assert response.status_code == 304
+        response = client.get(f"{prefix}/y/1")
+        assert response.status_code == 202
+        assert response.headers["ETag"] == '"v1"'
+    assert seen == [mode] * 6
