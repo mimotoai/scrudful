@@ -27,6 +27,21 @@ change, so clients and tests that compare them must be updated.
   entry and a content-less ``head`` entry where HEAD is served. ``Allow`` lists
   exactly the body's methods, and the response is ``application/json`` with the
   two published HTTP Schema Resource Links (also for DRF's browsable API).
+  The body's keys follow the order ``get``, ``put``, ``post``, ``delete``,
+  ``options``, ``head``, ``patch``, ``trace``, and a write's ``requestBody`` is
+  omitted when it has no content (it was an entry without ``content``).
+* DRF: ``scrudful_viewset``, ``scrudful_api_view`` and now a ``@scrudful``
+  method in a class body replace a class's stock ``APIView.options`` (an
+  ``options`` the class defines is kept), as well as DRF's stock
+  ``SimpleMetadata``. So an ``APIView`` with ``@scrudful`` methods answers
+  OPTIONS with the HTTP Schema Resource; a plain ``@api_view`` +
+  ``@scrudful`` function view does not (use ``scrudful_api_view``).
+* DRF: scrudful's own 400, 412 and 428 with an ``error`` entity, and the
+  ``exception_handler`` responses of views with one, bypass DRF's content
+  negotiation, so the browsable API gets JSON for them. The view's first JSON
+  renderer renders them (DRF's ``JSONRenderer`` if it has none). The
+  browsable API's HTML responses are not conformant: drop
+  ``BrowsableAPIRenderer`` for full conformance.
 * Removed ``options_schema_link`` and ``options_context_link`` from
   ``ScrudfulRouter``: the OPTIONS Links are the fixed w3id.org 0.1 URLs.
 * Every URI scrudful sends or describes is absolute: relative link values are
@@ -56,11 +71,11 @@ change, so clients and tests that compare them must be updated.
   and ``add_error_links``) gets only the URL's path parameters plus the request
   under the name of the endpoint's ``Request`` parameter; the helpers check
   every such callable when called and raise ``TypeError`` for one that can't
-  be called that way. ``add_options`` leaves mounted apps and middleware Mounts and Routers to
-  themselves, and ``add_error_links`` covers the endpoints under middleware
-  Mounts but not mounted apps: those need their own calls. The FastAPI adapter
-  has no request entity: a request body is described with the endpoint's
-  response links.
+  be called that way. ``add_options`` leaves mounted apps and middleware
+  Mounts and Routers to themselves, and ``add_error_links`` covers the
+  endpoints under middleware Mounts but not mounted apps: those need their own
+  calls. The FastAPI adapter has no request entity: a request body is
+  described with the endpoint's response links.
 * The ninja example (``examples/ninja``) calls ``add_error_links`` and serves
   HEAD on the list; all three examples are tested against the 0.1 rules.
 * The documentation has a "Semantic HTTP conformance" section, builds without

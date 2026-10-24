@@ -59,6 +59,11 @@ the endpoints under any ``Mount`` (with or without middleware), whose callables
 it checks too; a mounted FastAPI (or Starlette) app has its own exception
 handlers: call it on that app too.
 
+scrudful's own 400, 412 and 428 are returned by the endpoint, not raised, so
+no exception handler sees them: they carry Links only from the decorator's
+``error``. Give every conditional ``@scrudful(...)`` an ``error=``, also with
+:func:`~scrudful.fastapi.add_error_links` installed.
+
 :func:`~scrudful.fastapi.add_options` answers OPTIONS on every URL a scrudful
 endpoint serves (unless a route of yours serves OPTIONS there) with the URL's
 HTTP Schema Resource: an OpenAPI Path Item describing each method, the

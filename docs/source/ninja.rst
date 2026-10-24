@@ -577,6 +577,11 @@ ninja's exception handlers are sync, also for async operations, where they run
 on the event loop: the entity's link callables must be sync (``TypeError``
 otherwise) and must not use the ORM there.
 
+scrudful's own 400, 412 and 428 are returned by the operation, not raised, so
+no exception handler sees them: they carry Links only from the decorator's
+``error``. Give every conditional ``@scrudful`` and ``@scrudful_list`` an
+``error=``, also with :func:`~scrudful.ninja.add_error_links` installed.
+
 **The error media type.** An error entity describes JSON bodies: its
 ``media_type`` must be ``application/json`` or another ``+json`` type (e.g.
 ``application/problem+json``), other than JSON-LD; anything else raises
