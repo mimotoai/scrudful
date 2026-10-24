@@ -2,6 +2,120 @@
 Changelog
 =========
 
+0.4.0 (since 0.3.0)
+===================
+
+django-ninja adapter
+--------------------
+
+* Added ``scrudful.ninja``, which makes django-ninja operations SCRUDful. Its
+  decorators wrap the operation's function, so everything runs after ninja's
+  authentication, throttling and parameter validation, and every validator
+  and precondition result is computed from what authorization approved:
+
+  * ``@scrudful(load=..., ...)`` for single resources (GET, HEAD, PUT, PATCH,
+    DELETE and POST actions): ``load(request, **params)`` is the
+    fetch-if-allowed callable; the validator callbacks and the handler get the
+    object it returns. It returns ``None`` for "no current representation"
+    (RFC 9110 semantics) or raises, through ninja's exception handlers.
+    ``load`` alone decides whether the resource exists: an object it returns
+    exists even when ``etag_func`` / ``last_modified_func`` return ``None``
+    for it, so an unconditional write gets 428, ``If-None-Match: *`` gets 412
+    and ``If-Match: *`` passes (RFC 9110 §13.1.1-2). 304, 400, 412 and 428 as
+    in the other adapters; fresh validators and Links after a 2xx PUT/PATCH
+    (``load`` is called again when a validator callback is set or a value of
+    the response's entity is callable; if that call raises, the client gets
+    the error although the write is committed). The default entity's Links
+    go on 2xx responses except a 204, which has no body; an explicit
+    ``responses[204]`` or ``ScrudfulResponse.entity`` still applies.
+  * ``@scrudful_create(...)``: 201 with ``Location``, the item's Links and the
+    created item's ``ETag`` and ``Last-Modified``. A 201 without a created
+    object (the handler returned ``None`` or an ``HttpResponse`` and set no
+    ``ScrudfulResponse.created``) gets no ``Location`` or validators, and
+    ``location_func`` and the validator callbacks are not called. If it has
+    a body (e.g. ``JsonResponse(item, status=201)``) it keeps the item's
+    Links when none of the link values is callable; with a link callable,
+    which would get ``None`` in place of the created item, or without a
+    body, it gets no item Links.
+  * ``@scrudful_list(...)``: the handler returns the authorized queryset; the
+    response is the paginated scrud list envelope (``page``, ``page_size``),
+    with per-item validators and Links equal to the detail GET's, a typed
+    envelope schema in OpenAPI, and optional collection validators. The
+    collection response must be a list, set or tuple of the item schema
+    (``ConfigError`` for ``Optional[List[...]]`` or a bare ``list``). In an
+    async operation with sync per-item callables, a page takes one
+    ``sync_to_async`` call.
+  * ``Entity`` declares request and per-status response entities (schema and
+    JSON-LD context Links) and the ``error`` entity carried as Links by
+    scrudful's own 400, 412 and 428 bodies (an argument of ``@scrudful`` and
+    ``@scrudful_list``; ``@scrudful_create`` has none, since a create
+    produces none of these responses); ``ScrudfulResponse`` is the
+    handler's place to set the status, ``Location``, validators, Links or
+    created object of one response.
+  * ``ScrudfulRouter`` answers OPTIONS on every path with a scrudful
+    operation, without ``auth``, with the semantic-http "HTTP Schema
+    Resource": a superset of DRF's ``ScrudfulMetadata`` output, except that
+    the statuses are those the operation answers (those it declares, else
+    200; 201 for a create), not DRF's fixed 201 for POST and 204 for DELETE.
+  * Sync and async operations; ``CONDITIONAL_READ_RESPONSES`` and
+    ``CONDITIONAL_WRITE_RESPONSES`` for OpenAPI. A function may be
+    registered on several paths with different ``response=``; each operation
+    keeps its own. Handlers in modules with ``from __future__ import
+    annotations`` work even when the hidden parameter's annotation is
+    imported only under ``TYPE_CHECKING``.
+  * The decorators sit directly below the operation decorator. Something
+    that replaces ``operation.view_func`` before scrudful binds the operation
+    (a ``_ninja_contribute_to_operation`` callback contributed below the
+    decorator, a decorator between it and the operation decorator, or a
+    second scrudful decorator) raises ``ConfigError`` when the operation is
+    built instead of being silently discarded. Authorization belongs in
+    ``load`` or ``auth=``, never in a decorator below scrudful's (it would
+    run after the preconditions); router- or API-wide decorators use
+    ``add_decorator(mode="operation")``. See "Placement of other decorators"
+    in the django-ninja documentation.
+  * It imports without Django REST Framework.
+
+  201 validators, entity declarations, error Links and load-based validators
+  are not in the DRF and FastAPI adapters yet.
+* ``scrudful.conditional.evaluate_preconditions`` takes a keyword-only
+  ``exists``: ``True`` or ``False`` says whether the target resource exists,
+  in place of inferring it from the validators (the default, ``None``, which
+  the DRF and FastAPI adapters keep using). With ``exists=True`` and no
+  validators, a 428 lists ``If-Match`` as the accepted precondition header.
+* Added ``scrudful.collection``: ``collection_schema()`` and
+  ``collection_context()`` build the JSON Schema (draft 2020-12) and the
+  JSON-LD context of the scrud list envelope. It is framework-neutral.
+* Added the example project ``examples/ninja``, a ``Role`` resource using the
+  three decorators, entities, error Links and OPTIONS.
+
+Internal
+--------
+
+* The OPTIONS description builder (``describe_read``, ``describe_write``,
+  ``conditional_header_parameters``) and the endpoint-signature helpers moved
+  to ``scrudful._adapter``, and the Django request/response helpers to
+  ``scrudful._django``, to be shared with the new adapter. No change to the
+  DRF or FastAPI adapters' behaviour or output.
+* ``CONDITIONAL_READ_RESPONSES``, ``CONDITIONAL_WRITE_RESPONSES`` and the
+  representation headers an early response drops are defined once, in
+  ``scrudful._adapter``; ``scrudful.fastapi`` and ``scrudful.ninja`` publish
+  the same objects under the same names. ``scrudful.rest_framework`` no longer
+  has the private aliases ``_READ_RESPONSES`` and ``_WRITE_RESPONSES``.
+
+Packaging
+---------
+
+* New extra ``scrudful[ninja]``: ``django>=4.2`` and
+  ``django-ninja>=1.7,<2``. The upper bound is there because the adapter
+  relies on private django-ninja internals (how operations are built and
+  their response models), which a major release may change.
+  The adapter's code also works with django-ninja 1.6, but the test suite
+  verifies 1.7.0 and newer only: 1.6's ``TestAsyncClient`` methods are not
+  ``async def``, so driving them with ``asgiref``'s ``async_to_sync`` warns,
+  which the tests treat as an error.
+* The package description names django-ninja (there is no django-ninja
+  classifier; ``Framework :: Django`` covers it).
+
 0.3.0 (since 0.2.0)
 ===================
 

@@ -66,21 +66,13 @@ Headers
 
 from __future__ import annotations
 
-import copy
 import functools
 import inspect
 import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from datetime import datetime
 from typing import Any
 
-from django.http import (
-    HttpRequest,
-    HttpResponseBase,
-    HttpResponseNotModified,
-    JsonResponse,
-)
-from django.utils import timezone
+from django.http import HttpRequest, HttpResponseBase
 from rest_framework.decorators import api_view
 from rest_framework.metadata import BaseMetadata, SimpleMetadata
 from rest_framework.mixins import UpdateModelMixin
@@ -93,14 +85,17 @@ from scrudful._adapter import (
     DEFAULT_CONTEXT_TYPE,
     DEFAULT_SCHEMA_REL,
     DEFAULT_SCHEMA_TYPE,
-    READ_DESCRIPTIONS,
-    WRITE_DESCRIPTIONS,
     check_validators,
+    conditional_header_parameters,
+    describe_read,
+    describe_write,
     expose_headers,
-    precondition_headers,
     set_validator_headers,
     validator_policy,
 )
+from scrudful._django import aware
+from scrudful._django import conditional_response as django_conditional_response
+from scrudful._django import precondition_headers as django_precondition_headers
 from scrudful.conditional import (
     ConditionalResult,
     evaluate_preconditions,
@@ -243,7 +238,7 @@ class ScrudfulViewFunc:
             etag, last_modified = self._validators(cb_args, cb_kwargs)
             result = evaluate_preconditions(
                 method,
-                _precondition_headers(request),
+                django_precondition_headers(request),
                 etag=etag,
                 last_modified=last_modified,
                 require_precondition=True,
@@ -275,9 +270,7 @@ class ScrudfulViewFunc:
         last_modified = None
         if self.last_modified_func is not None:
             value = self.last_modified_func(*args, **kwargs)
-            if isinstance(value, datetime) and timezone.is_naive(value):
-                value = timezone.make_aware(value, timezone.get_default_timezone())
-            last_modified = http_timestamp(value)
+            last_modified = http_timestamp(aware(value))
         return etag, last_modified
 
     def add_expose_headers(self, response: HttpResponseBase) -> None:
@@ -566,14 +559,6 @@ def _install_metadata(cls: type) -> None:
         cls.metadata_class = ScrudfulMetadata  # type: ignore[attr-defined]
 
 
-_READ_RESPONSES = {
-    str(status): {"description": text} for status, text in READ_DESCRIPTIONS.items()
-}
-_WRITE_RESPONSES = {
-    str(status): {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
-}
-
-
 class ScrudfulMetadata(BaseMetadata):
     """OPTIONS metadata describing the methods a SCRUDful view serves.
 
@@ -617,72 +602,47 @@ class ScrudfulMetadata(BaseMetadata):
     def determine_metadata_for_get(
         self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
     ) -> dict[str, Any]:
-        ok: dict[str, Any] = {"description": "OK"}
-        content = _content(handler, args, kwargs)
-        if content:
-            ok["content"] = content
-        responses = {"200": ok}
-        if _has_validators(handler):
-            responses.update(copy.deepcopy(_READ_RESPONSES))
-        return {"responses": responses}
+        return describe_read(_content(handler, args, kwargs), _has_validators(handler))
 
     def determine_metadata_for_post(
         self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return self._write(
-            handler, args, kwargs, "The content for the resource to be created.", "201"
-        )
+        return self._write("post", handler, args, kwargs)
 
     def determine_metadata_for_put(
         self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return self._write(
-            handler, args, kwargs, "The new content of the resource.", "200"
-        )
+        return self._write("put", handler, args, kwargs)
 
     def determine_metadata_for_patch(
         self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return self._write(
-            handler, args, kwargs, "The changes to apply to the resource.", "200"
-        )
+        return self._write("patch", handler, args, kwargs)
 
     def determine_metadata_for_delete(
         self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return self._write(handler, args, kwargs, None, "204")
+        return self._write("delete", handler, args, kwargs)
 
     def _write(
         self,
+        method: str,
         handler: Any,
         args: Sequence[Any],
         kwargs: Mapping[str, Any],
-        body_description: str | None,
-        status: str,
     ) -> dict[str, Any]:
-        metadata: dict[str, Any] = {}
-        if body_description is not None:
-            request_body: dict[str, Any] = {
-                "description": body_description,
-                "required": True,
-            }
-            content = _content(handler, args, kwargs)
-            if content:
-                request_body["content"] = content
-            metadata["requestBody"] = request_body
-        metadata["responses"] = {status: {"description": _STATUS_TEXT[status]}}
-        if _has_validators(handler):
-            if status == "201":
-                # POST is evaluated but never required to be conditional.
-                metadata["responses"].update(
-                    {
-                        code: copy.deepcopy(_WRITE_RESPONSES[code])
-                        for code in ("400", "412")
-                    }
-                )
-            else:
-                metadata["responses"].update(copy.deepcopy(_WRITE_RESPONSES))
-                metadata["parameters"] = self.required_conditional_headers(handler)
+        content = None if method == "delete" else _content(handler, args, kwargs)
+        conditional = _has_validators(handler)
+        metadata = describe_write(
+            method,
+            content,
+            conditional,
+            conditional and handler.etag_func is not None,
+            conditional and handler.last_modified_func is not None,
+        )
+        if "parameters" in metadata:
+            # Through the method, so that a subclass overriding it is used.
+            metadata["parameters"] = self.required_conditional_headers(handler)
         return metadata
 
     def required_conditional_headers(
@@ -693,40 +653,14 @@ class ScrudfulMetadata(BaseMetadata):
         One of them is required; a header is marked ``required`` when it is
         the only one accepted.
         """
-        headers = []
-        if method.etag_func is not None:
-            headers.append(
-                ("If-Match", "The entity-tag of the current representation.")
-            )
-        if method.last_modified_func is not None:
-            headers.append(
-                (
-                    "If-Unmodified-Since",
-                    "The Last-Modified date of the current representation.",
-                )
-            )
-        if not headers:
-            return None
-        either = " Either If-Match or If-Unmodified-Since is required."
-        return [
-            {
-                "in": "header",
-                "name": name,
-                "schema": {"type": "string"},
-                "required": len(headers) == 1,
-                "description": (
-                    description if len(headers) == 1 else description + either
-                ),
-            }
-            for name, description in headers
-        ]
+        return conditional_header_parameters(
+            method.etag_func is not None, method.last_modified_func is not None
+        )
 
 
 #: Kept for backwards compatibility; :class:`ScrudfulMetadata` now describes
 #: ``APIView`` function views too.
 ScrudfulAPIViewMetadata = ScrudfulMetadata
-
-_STATUS_TEXT = {"200": "OK", "201": "Created", "204": "No Content"}
 
 
 def _check_sync(view: Callable[..., Any]) -> None:
@@ -767,28 +701,10 @@ def _callback_arguments(
     return args, kwargs
 
 
-def _precondition_headers(request: HttpRequest | Request) -> dict[str, str]:
-    # WSGI/ASGI servers already combine repeated field lines with ",", so each
-    # field has at most one value.
-    def getlist(name: str) -> list[str]:
-        value = request.headers.get(name)
-        return [] if value is None else [value]
-
-    return precondition_headers(getlist)
-
-
 def _conditional_response(result: ConditionalResult, drf: bool) -> HttpResponseBase:
-    response: HttpResponseBase
-    if result.body is None:
-        response = HttpResponseNotModified()
-        for name, value in result.headers.items():
-            response[name] = value
-    elif drf:
-        response = Response(result.body, status=result.status, headers=result.headers)
-    else:
-        response = JsonResponse(result.body, status=result.status)
-        for name, value in result.headers.items():
-            response[name] = value
+    if result.body is None or not drf:
+        return django_conditional_response(result)
+    response = Response(result.body, status=result.status, headers=result.headers)
     expose_headers(response)
     return response
 

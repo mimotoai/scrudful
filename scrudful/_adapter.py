@@ -1,4 +1,4 @@
-"""Framework-neutral glue shared by the FastAPI and DRF adapters.
+"""Framework-neutral glue shared by the FastAPI, DRF and django-ninja adapters.
 
 Private, and stdlib-only like :mod:`scrudful.conditional`: the adapters keep
 everything that touches their framework's request and response objects.
@@ -6,7 +6,11 @@ everything that touches their framework's request and response objects.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import copy
+import http
+import inspect
+import sys
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Protocol
 
 from scrudful.conditional import SAFE_METHODS, validator_headers
@@ -42,6 +46,46 @@ WRITE_DESCRIPTIONS = {
     428: "Precondition Required: this request must be conditional "
     "(send If-Match or If-Unmodified-Since).",
 }
+
+#: :data:`READ_DESCRIPTIONS` as OpenAPI responses (int status keys), published
+#: by the FastAPI and django-ninja adapters as ``CONDITIONAL_READ_RESPONSES``.
+CONDITIONAL_READ_RESPONSES: dict[int, dict[str, str]] = {
+    status: {"description": text} for status, text in READ_DESCRIPTIONS.items()
+}
+#: :data:`WRITE_DESCRIPTIONS` as OpenAPI responses (int status keys), published
+#: as ``CONDITIONAL_WRITE_RESPONSES``.
+CONDITIONAL_WRITE_RESPONSES: dict[int, dict[str, str]] = {
+    status: {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
+}
+
+#: Representation metadata of the response an early one replaces: not copied
+#: onto the body-less (or differently typed) early response (RFC 9110 §15.4.5).
+BODY_HEADERS = frozenset(
+    {
+        "content-length",
+        "content-type",
+        "content-encoding",
+        "content-range",
+        "content-language",
+    }
+)
+
+#: :data:`READ_DESCRIPTIONS` as OPTIONS responses (string status keys).
+READ_RESPONSES = {
+    str(status): {"description": text} for status, text in READ_DESCRIPTIONS.items()
+}
+#: :data:`WRITE_DESCRIPTIONS` as OPTIONS responses (string status keys).
+WRITE_RESPONSES = {
+    str(status): {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
+}
+#: The request body description and success status of each write method.
+_WRITES = {
+    "post": ("The content for the resource to be created.", "201"),
+    "put": ("The new content of the resource.", "200"),
+    "patch": ("The changes to apply to the resource.", "200"),
+    "delete": (None, "204"),
+}
+_STATUS_TEXT = {"200": "OK", "201": "Created", "204": "No Content"}
 
 
 class Headers(Protocol):
@@ -105,3 +149,203 @@ def expose_headers(headers: Headers) -> None:
         headers["Access-Control-Expose-Headers"] = merge_expose_headers(
             headers.get("Access-Control-Expose-Headers"), names
         )
+
+
+def evaluated_signature(func: Callable[..., Any]) -> inspect.Signature:
+    """``func``'s signature with string annotations evaluated in its module.
+
+    For endpoints written with ``from __future__ import annotations``: a
+    framework reading the strings off an adapter's wrapper would evaluate them
+    in the wrapper's globals (the adapter module's), where the endpoint's names
+    are undefined. If an annotation can't be evaluated, the unevaluated
+    signature is returned.
+    """
+    try:
+        return inspect.signature(func, eval_str=True)
+    except NameError:
+        pass
+    try:
+        return inspect.signature(func)
+    except NameError:
+        # Python 3.14+: annotations naming objects imported only under
+        # TYPE_CHECKING can't be evaluated; FastAPI and ninja do the same.
+        if sys.version_info < (3, 14):
+            raise
+        from annotationlib import Format
+
+        return inspect.signature(func, annotation_format=Format.FORWARDREF)
+
+
+def resolved_signature(func: Callable[..., Any]) -> inspect.Signature:
+    """``func``'s signature with each string annotation evaluated in its module.
+
+    For endpoints written with ``from __future__ import annotations``, as
+    :func:`evaluated_signature`, but each annotation is evaluated on its own:
+    one that can't be (e.g. a name imported only under ``TYPE_CHECKING``) is
+    left as it is, and the others are still evaluated.
+    """
+    try:
+        signature = inspect.signature(func)
+    except NameError:
+        # Python 3.14+, see evaluated_signature.
+        if sys.version_info < (3, 14):
+            raise
+        from annotationlib import Format
+
+        signature = inspect.signature(func, annotation_format=Format.FORWARDREF)
+    globalns = getattr(inspect.unwrap(func), "__globals__", {})
+
+    def resolve(annotation: Any) -> Any:
+        if isinstance(annotation, str):
+            try:
+                return eval(annotation, globalns)  # same as typing/inspect
+            except Exception:
+                pass
+        return annotation
+
+    return signature.replace(
+        parameters=[
+            param.replace(annotation=resolve(param.annotation))
+            for param in signature.parameters.values()
+        ],
+        return_annotation=resolve(signature.return_annotation),
+    )
+
+
+def resolve_annotation(annotation: Any, globalns: dict[str, Any]) -> Any:
+    """Evaluate a string or forward-reference annotation in ``globalns``.
+
+    Other annotations are returned unchanged; ``None`` if evaluation fails.
+    """
+    if not isinstance(annotation, (str, type)):
+        annotation = getattr(annotation, "__forward_arg__", annotation)
+    if isinstance(annotation, str):
+        try:
+            return eval(annotation, globalns)  # same as typing/inspect
+        except Exception:
+            return None
+    return annotation
+
+
+# --- OPTIONS descriptions ----------------------------------------------------
+#
+# The operations of an OPTIONS body (an OpenAPI-like Path Item), shared by the
+# DRF and django-ninja adapters. ``content`` is a Media Type map such as
+# ``{"application/json": {"schema": <url>, "context": <url>}}``; falsy means
+# none. ``conditional``: whether the method's preconditions are evaluated.
+
+
+def reason_phrase(status: int) -> str:
+    """The reason phrase of ``status`` (django-ninja's OpenAPI text when unknown)."""
+    try:
+        return http.HTTPStatus(status).phrase
+    except ValueError:
+        return "Unknown Status Code"
+
+
+def _success_responses(
+    statuses: Iterable[int] | None, default: str
+) -> dict[str, dict[str, Any]]:
+    """The responses of ``statuses``, else of the ``default`` status (DRF's)."""
+    if statuses is None:
+        return {default: {"description": _STATUS_TEXT[default]}}
+    return {str(status): {"description": reason_phrase(status)} for status in statuses}
+
+
+def describe_read(
+    content: dict[str, Any] | None,
+    conditional: bool,
+    statuses: Iterable[int] | None = None,
+) -> dict[str, Any]:
+    """Describe a GET: its 200 and, when conditional, the 304, 400 and 412.
+
+    ``statuses`` replaces the 200 by the statuses the operation answers
+    (``content`` then goes on the 200, if listed).
+    """
+    responses = _success_responses(statuses, "200")
+    if content and "200" in responses:
+        responses["200"]["content"] = content
+    if conditional:
+        responses.update(copy.deepcopy(READ_RESPONSES))
+    return {"responses": responses}
+
+
+def describe_write(
+    method: str,
+    content: dict[str, Any] | None,
+    conditional: bool,
+    has_etag: bool,
+    has_last_modified: bool,
+    statuses: Iterable[int] | None = None,
+) -> dict[str, Any]:
+    """Describe a ``post``, ``put``, ``patch`` or ``delete``.
+
+    ``content`` describes the request body (DELETE has none). The success
+    status is DRF's (201 for POST, 204 for DELETE, else 200), unless
+    ``statuses`` lists the statuses the operation answers. A conditional
+    POST gets the 400 and 412, since it is evaluated but never required to be
+    conditional; the other methods also get the 428 and the precondition
+    header ``parameters`` (see :func:`conditional_header_parameters`).
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is not one of the four.
+    """
+    if method not in _WRITES:
+        raise ValueError(f"not a write method: {method!r}")
+    body_description, status = _WRITES[method]
+    metadata: dict[str, Any] = {}
+    if body_description is not None:
+        request_body: dict[str, Any] = {
+            "description": body_description,
+            "required": True,
+        }
+        if content:
+            request_body["content"] = content
+        metadata["requestBody"] = request_body
+    metadata["responses"] = _success_responses(statuses, status)
+    if conditional:
+        if method == "post":
+            metadata["responses"].update(
+                {code: copy.deepcopy(WRITE_RESPONSES[code]) for code in ("400", "412")}
+            )
+        else:
+            metadata["responses"].update(copy.deepcopy(WRITE_RESPONSES))
+            metadata["parameters"] = conditional_header_parameters(
+                has_etag, has_last_modified
+            )
+    return metadata
+
+
+def conditional_header_parameters(
+    has_etag: bool, has_last_modified: bool
+) -> list[dict[str, Any]] | None:
+    """Describe the precondition headers a conditional write accepts.
+
+    One of them is required; a header is marked ``required`` when it is the
+    only one accepted. ``None`` without validators.
+    """
+    headers = []
+    if has_etag:
+        headers.append(("If-Match", "The entity-tag of the current representation."))
+    if has_last_modified:
+        headers.append(
+            (
+                "If-Unmodified-Since",
+                "The Last-Modified date of the current representation.",
+            )
+        )
+    if not headers:
+        return None
+    either = " Either If-Match or If-Unmodified-Since is required."
+    return [
+        {
+            "in": "header",
+            "name": name,
+            "schema": {"type": "string"},
+            "required": len(headers) == 1,
+            "description": description if len(headers) == 1 else description + either,
+        }
+        for name, description in headers
+    ]

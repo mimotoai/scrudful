@@ -185,20 +185,157 @@ def test_response_descriptions():
 
 
 def test_adapters_render_shared_descriptions():
-    from scrudful import fastapi, rest_framework
+    from scrudful import fastapi
 
     for shared, fastapi_responses, drf_responses in (
         (
             _adapter.READ_DESCRIPTIONS,
             fastapi.CONDITIONAL_READ_RESPONSES,
-            rest_framework._READ_RESPONSES,
+            _adapter.READ_RESPONSES,
         ),
         (
             _adapter.WRITE_DESCRIPTIONS,
             fastapi.CONDITIONAL_WRITE_RESPONSES,
-            rest_framework._WRITE_RESPONSES,
+            _adapter.WRITE_RESPONSES,
         ),
     ):
         expected = {status: {"description": text} for status, text in shared.items()}
         assert fastapi_responses == expected
         assert drf_responses == {str(k): v for k, v in expected.items()}
+
+
+# --- OPTIONS descriptions ----------------------------------------------------
+
+SCHEMA = "http://example.com/schema.json"
+CONTEXT = "http://example.com/context.jsonld"
+ITEM_CONTENT = {"application/json": {"schema": SCHEMA, "context": CONTEXT}}
+ETAG_PARAMETER = {
+    "in": "header",
+    "name": "If-Match",
+    "schema": {"type": "string"},
+    "required": True,
+    "description": "The entity-tag of the current representation.",
+}
+LAST_MODIFIED_PARAMETER = {
+    "in": "header",
+    "name": "If-Unmodified-Since",
+    "schema": {"type": "string"},
+    "required": True,
+    "description": "The Last-Modified date of the current representation.",
+}
+EITHER = " Either If-Match or If-Unmodified-Since is required."
+BOTH_PARAMETERS = [
+    {**ETAG_PARAMETER, "required": False},
+    {**LAST_MODIFIED_PARAMETER, "required": False},
+]
+for _parameter in BOTH_PARAMETERS:
+    _parameter["description"] += EITHER
+READ_EARLY = {
+    "304": {
+        "description": "Not Modified: the representation matches the request's "
+        "If-None-Match or If-Modified-Since validators."
+    },
+    "400": {"description": "Malformed If-Match or If-None-Match header."},
+    "412": {"description": "Precondition Failed."},
+}
+WRITE_EARLY = {
+    "400": {"description": "Malformed If-Match or If-None-Match header."},
+    "412": {"description": "Precondition Failed."},
+    "428": {
+        "description": "Precondition Required: this request must be conditional "
+        "(send If-Match or If-Unmodified-Since)."
+    },
+}
+
+
+def test_adapter_describe_matches_drf():
+    """The ``ScrudfulMetadata`` expectations of ``tests/test_rest_framework.py``."""
+    describe_read = _adapter.describe_read
+    describe_write = _adapter.describe_write
+    # test_viewset_metadata_detail_and_list, test_metadata_for_action_routes
+    assert describe_read(ITEM_CONTENT, True) == {
+        "responses": {"200": {"description": "OK", "content": ITEM_CONTENT}}
+        | READ_EARLY
+    }
+    list_content = {
+        "application/json": {"schema": "http://example.com/list-schema.json"}
+    }
+    assert describe_read(list_content, False) == {
+        "responses": {"200": {"description": "OK", "content": list_content}}
+    }
+    assert describe_read(None, False) == {"responses": {"200": {"description": "OK"}}}
+    assert describe_read({}, False) == {"responses": {"200": {"description": "OK"}}}
+    # the list route's create, without and with validators
+    # (test_explicit_post_validators_are_evaluated)
+    post_body = {
+        "description": "The content for the resource to be created.",
+        "required": True,
+    }
+    assert describe_write("post", None, False, False, False) == {
+        "requestBody": post_body,
+        "responses": {"201": {"description": "Created"}},
+    }
+    assert describe_write("post", ITEM_CONTENT, True, True, True) == {
+        "requestBody": {**post_body, "content": ITEM_CONTENT},
+        "responses": {
+            "201": {"description": "Created"},
+            "400": WRITE_EARLY["400"],
+            "412": WRITE_EARLY["412"],
+        },
+    }
+    # test_metadata_describes_non_scrudful_methods
+    put_body = {"description": "The new content of the resource.", "required": True}
+    assert describe_write("put", None, False, False, False) == {
+        "requestBody": put_body,
+        "responses": {"200": {"description": "OK"}},
+    }
+    # test_api_view_options_metadata (etag only)
+    assert describe_write("put", ITEM_CONTENT, True, True, False) == {
+        "requestBody": {**put_body, "content": ITEM_CONTENT},
+        "responses": {"200": {"description": "OK"}} | WRITE_EARLY,
+        "parameters": [ETAG_PARAMETER],
+    }
+    # test_metadata_parameters_for_a_single_validator
+    assert describe_write("patch", None, True, False, True) == {
+        "requestBody": {
+            "description": "The changes to apply to the resource.",
+            "required": True,
+        },
+        "responses": {"200": {"description": "OK"}} | WRITE_EARLY,
+        "parameters": [LAST_MODIFIED_PARAMETER],
+    }
+    assert describe_write("put", None, True, True, True)["parameters"] == (
+        BOTH_PARAMETERS
+    )
+    assert describe_write("delete", ITEM_CONTENT, False, False, False) == {
+        "responses": {"204": {"description": "No Content"}}
+    }
+    assert describe_write("delete", None, True, True, True) == {
+        "responses": {"204": {"description": "No Content"}} | WRITE_EARLY,
+        "parameters": BOTH_PARAMETERS,
+    }
+
+
+def test_conditional_header_parameters():
+    parameters = _adapter.conditional_header_parameters
+    assert parameters(False, False) is None
+    assert parameters(True, False) == [ETAG_PARAMETER]
+    assert parameters(False, True) == [LAST_MODIFIED_PARAMETER]
+    assert parameters(True, True) == BOTH_PARAMETERS
+
+
+def test_describe_rejects_unknown_methods():
+    with pytest.raises(ValueError, match="'get'"):
+        _adapter.describe_write("get", None, False, False, False)
+
+
+def test_descriptions_do_not_share_the_module_dictionaries():
+    for describe in (
+        lambda: _adapter.describe_read(None, True),
+        lambda: _adapter.describe_write("put", None, True, True, False),
+    ):
+        first = describe()
+        for response in first["responses"].values():
+            response["description"] = "mutated"
+        first["parameters"] = None
+        assert describe()["responses"]["412"] == {"description": "Precondition Failed."}

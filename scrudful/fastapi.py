@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-import sys
 import types
 from collections.abc import Callable, Mapping
 from typing import Annotated, Any, TypeVar, get_args, get_origin
@@ -19,16 +18,18 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers, MutableHeaders
 
+from scrudful import _adapter
 from scrudful._adapter import (
+    BODY_HEADERS,
     DEFAULT_CONTEXT_REL,
     DEFAULT_CONTEXT_TYPE,
     DEFAULT_SCHEMA_REL,
     DEFAULT_SCHEMA_TYPE,
-    READ_DESCRIPTIONS,
-    WRITE_DESCRIPTIONS,
     check_validators,
+    evaluated_signature,
     expose_headers,
     precondition_headers,
+    resolve_annotation,
     set_validator_headers,
     validator_policy,
 )
@@ -50,27 +51,15 @@ __all__ = [
 #: without calling the endpoint. Pass it to the route decorator, e.g.
 #: ``@app.get("/items/{item_id}", responses=CONDITIONAL_READ_RESPONSES)``, or
 #: merge it with your own: ``responses={**CONDITIONAL_READ_RESPONSES, 404: ...}``.
-CONDITIONAL_READ_RESPONSES: dict[int | str, dict[str, Any]] = {
-    status: {"description": text} for status, text in READ_DESCRIPTIONS.items()
-}
+CONDITIONAL_READ_RESPONSES: dict[int | str, dict[str, Any]] = (
+    _adapter.CONDITIONAL_READ_RESPONSES  # type: ignore[assignment]
+)
 
 #: OpenAPI descriptions of the responses ``@scrudful`` can produce for
 #: PUT/PATCH/DELETE without calling the endpoint, e.g.
 #: ``@app.put("/items/{item_id}", responses=CONDITIONAL_WRITE_RESPONSES)``.
-CONDITIONAL_WRITE_RESPONSES: dict[int | str, dict[str, Any]] = {
-    status: {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
-}
-
-# Representation metadata: not for the body-less (or differently typed) early
-# response (RFC 9110 §15.4.5).
-_BODY_HEADERS = frozenset(
-    {
-        "content-length",
-        "content-type",
-        "content-encoding",
-        "content-range",
-        "content-language",
-    }
+CONDITIONAL_WRITE_RESPONSES: dict[int | str, dict[str, Any]] = (
+    _adapter.CONDITIONAL_WRITE_RESPONSES  # type: ignore[assignment]
 )
 
 Endpoint = TypeVar("Endpoint", bound=Callable[..., Any])
@@ -376,7 +365,7 @@ def _conditional_response(result: ConditionalResult, injected: Headers) -> Respo
                 headers[name] = merged
         elif (
             result.status == 304
-            and name not in _BODY_HEADERS
+            and name not in BODY_HEADERS
             and name.encode("latin-1") not in own
         ):
             headers.append(name, value)
@@ -451,7 +440,9 @@ def _wrapper_signature(
     unless the endpoint already declares one; the boolean flags tell whether
     the endpoint itself receives them.
     """
-    signature = _signature(endpoint)
+    # FastAPI < 0.124 evaluates string annotations (``from __future__ import
+    # annotations``) in the wrapper's globals (this module's).
+    signature = evaluated_signature(endpoint)
     params = list(signature.parameters.values())
     globalns = getattr(inspect.unwrap(endpoint), "__globals__", {})
     names = {param.name for param in params}
@@ -486,40 +477,13 @@ def _wrapper_signature(
     )
 
 
-def _signature(endpoint: Callable[..., Any]) -> inspect.Signature:
-    # Evaluate string annotations (``from __future__ import annotations``) in
-    # the endpoint's own module: FastAPI < 0.124 evaluates the strings it finds
-    # on the wrapper in the wrapper's globals (this module's), where the
-    # endpoint's names are undefined.
-    try:
-        return inspect.signature(endpoint, eval_str=True)
-    except NameError:
-        pass
-    try:
-        return inspect.signature(endpoint)
-    except NameError:
-        # Python 3.14+: annotations naming objects imported only under
-        # TYPE_CHECKING can't be evaluated; FastAPI does the same.
-        if sys.version_info < (3, 14):
-            raise
-        from annotationlib import Format
-
-        return inspect.signature(endpoint, annotation_format=Format.FORWARDREF)
-
-
 def _annotation_is(annotation: Any, cls: type, globalns: dict[str, Any]) -> bool:
     """Whether ``annotation`` is ``cls`` or a subclass.
 
     String / forward-reference annotations are evaluated in the endpoint's
     globals and ``Annotated[cls, ...]`` is unwrapped, as FastAPI does.
     """
-    if not isinstance(annotation, (str, type)):
-        annotation = getattr(annotation, "__forward_arg__", annotation)
-    if isinstance(annotation, str):
-        try:
-            annotation = eval(annotation, globalns)  # same as typing/inspect
-        except Exception:
-            return False
+    annotation = resolve_annotation(annotation, globalns)
     if get_origin(annotation) is Annotated:
         annotation = get_args(annotation)[0]
     # ``list[int]`` is a ``type`` instance on Python 3.10 but not a class.
