@@ -36,18 +36,26 @@ def precondition_headers(request: HttpRequest) -> dict[str, str]:
 
 
 def conditional_response(
-    result: ConditionalResult, link: str | None = None
+    result: ConditionalResult,
+    link: str | None = None,
+    content_type: str | None = None,
 ) -> HttpResponseBase:
     """Render a failed precondition: a bare 304, or a JSON body and status.
 
     ``link`` is the Link field value of a response with a body (the adapter's
-    error Links); a 304 gets none.
+    error Links) and ``content_type`` its Content-Type (default
+    ``application/json``; the media type of the adapter's error entity); a
+    304 gets neither.
     """
     response: HttpResponseBase
     if result.body is None:
         response = HttpResponseNotModified()
     else:
-        response = JsonResponse(result.body, status=result.status)
+        response = JsonResponse(
+            result.body,
+            status=result.status,
+            content_type=content_type or "application/json",
+        )
         if link:
             response["Link"] = link
     for name, value in result.headers.items():

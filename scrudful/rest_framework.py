@@ -36,8 +36,9 @@ Validators
     answered with 400, a failed precondition with 412 and a matching GET/HEAD
     with 304 carrying the validators. These responses are returned without
     calling the view: 400/412/428 as a DRF ``Response`` (a ``JsonResponse`` for
-    plain Django views) with a JSON body and the Links of the ``error``
-    entity, if one is configured, 304 without a body or Link.
+    plain Django views) with a JSON body, 304 without a body or Link. With an
+    ``error`` entity the 400/412/428 carry its Links and are served as JSON
+    with its media type, whatever the request's ``Accept``.
 
     After the view runs, 2xx responses to GET/HEAD get the validators computed
     for the precondition check, and 2xx responses to PUT/PATCH get freshly
@@ -101,6 +102,7 @@ from scrudful._adapter import (
     DEFAULT_SCHEMA_TYPE,
     METHOD_KEYS,
     allow_header,
+    check_error_media_type,
     check_validators,
     conditional_header_parameters,
     context_defaults,
@@ -204,14 +206,21 @@ class ScrudfulViewFunc:
         The schema and context of the bodies of scrudful's own 400, 412 and
         428 responses, which then carry its Links (a 304 has no body and gets
         none). Its link callables are called like the others; its
-        ``media_type`` decides the context link's defaults. Without it these
-        responses carry no Link.
+        ``media_type`` decides the context link's defaults. These bodies are
+        JSON objects, so ``media_type`` must be JSON content
+        (``application/json`` or ``+json``, e.g.
+        ``application/problem+json``), and they are served as JSON with that
+        Content-Type whatever the request's ``Accept`` (DRF's content
+        negotiation, and so the browsable API, is bypassed for them). Without
+        ``error`` these responses carry no Link and are rendered as before.
 
     Raises
     ------
     TypeError
         If a validator callback isn't callable, ``error`` isn't an
         :class:`Entity`, or the view is ``async def``.
+    ValueError
+        If ``error``'s media type is not JSON content.
     """
 
     def __init__(
@@ -287,10 +296,7 @@ class ScrudfulViewFunc:
                 require_precondition=True,
             )
             if result is not None:
-                link = None
-                if result.body is not None:
-                    link = self.error_link_header(*cb_args, **cb_kwargs)
-                return _conditional_response(result, isinstance(request, Request), link)
+                return self._early_response(result, request, cb_args, cb_kwargs)
 
         response = self.view_method(*args, **kwargs)
 
@@ -311,6 +317,28 @@ class ScrudfulViewFunc:
             response["Link"] = link
         self.add_expose_headers(response)
         return response
+
+    def _early_response(
+        self,
+        result: ConditionalResult,
+        request: HttpRequest | Request,
+        args: Sequence[Any],
+        kwargs: Mapping[str, Any],
+    ) -> HttpResponseBase:
+        """scrudful's own 304, 400, 412 or 428.
+
+        With ``error``, a 400/412/428 carries its Links and is served as JSON
+        with its media type, whatever the request's Accept (DRF's content
+        negotiation is bypassed), so that it agrees with the OPTIONS body.
+        """
+        if result.body is None or self.error is None:
+            return _conditional_response(result, request)
+        return _conditional_response(
+            result,
+            request,
+            self.error_link_header(*args, **kwargs),
+            self.error.media_type,
+        )
 
     def _validators(
         self, args: Sequence[Any], kwargs: Mapping[str, Any]
@@ -830,15 +858,28 @@ def _callback_arguments(
 
 
 def _conditional_response(
-    result: ConditionalResult, drf: bool, link: str | None = None
+    result: ConditionalResult,
+    request: HttpRequest | Request,
+    link: str | None = None,
+    content_type: str | None = None,
 ) -> HttpResponseBase:
-    """scrudful's own early response; ``link`` goes on a 400, 412 or 428."""
-    if result.body is None or not drf:
-        return django_conditional_response(result, link)
+    """scrudful's own early response.
+
+    ``link`` and ``content_type`` (the error entity's) go on a 400, 412 or
+    428. A DRF request's response is a DRF ``Response``: rendered by the
+    negotiated renderer, or by ``JSONRenderer`` with ``content_type``.
+    """
+    if result.body is None or not isinstance(request, Request):
+        return django_conditional_response(result, link, content_type)
     headers = dict(result.headers)
     if link:
         headers["Link"] = link
-    response = Response(result.body, status=result.status, headers=headers)
+    if content_type:
+        request.accepted_renderer = JSONRenderer()
+        request.accepted_media_type = JSONRenderer.media_type
+    response = Response(
+        result.body, status=result.status, headers=headers, content_type=content_type
+    )
     expose_headers(response)
     return response
 
@@ -858,8 +899,11 @@ def _handler(view: APIView, method: str) -> Any:
 
 
 def _check_error(error: Any) -> None:
-    if error is not None and not isinstance(error, Entity):
+    if error is None:
+        return
+    if not isinstance(error, Entity):
         raise TypeError(f"error must be an Entity, not {type(error).__name__}")
+    check_error_media_type(error.media_type)
 
 
 def _resolve(url: Any, args: Sequence[Any]) -> str:

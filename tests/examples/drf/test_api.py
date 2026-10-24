@@ -453,9 +453,10 @@ def test_readonly_viewset_rejects_writes_with_405(client, item, method, path):
 
 
 def test_readonly_viewset_options_lists_only_get(client, item):
-    methods = ["get", "options", "head"]
-    assert list(client.options(f"/readonly-items/{item.pk}/").json()) == methods
-    assert list(client.options("/readonly-items/").json()) == methods
+    for path_ in (f"/readonly-items/{item.pk}/", "/readonly-items/"):
+        body = client.options(path_).json()
+        validate_http_schema_resource(body)
+        assert list(body) == ["get", "options", "head"]
 
 
 # --- OPTIONS metadata ---------------------------------------------------------
@@ -465,6 +466,7 @@ def test_options_describes_the_detail_route(client, item):
     response = client.options(detail(item))
     assert response.status_code == 200
     metadata = response.json()
+    validate_http_schema_resource(metadata)
     assert list(metadata) == ["get", "put", "delete", "options", "head", "patch"]
     assert metadata["get"]["responses"]["200"] == {
         "description": "OK",
@@ -491,6 +493,7 @@ def test_options_describes_the_detail_route(client, item):
 
 def test_options_describes_the_list_route(client):
     metadata = client.options("/items/").json()
+    validate_http_schema_resource(metadata)
     assert list(metadata) == ["get", "post", "options", "head"]
     assert metadata["post"]["requestBody"]["description"] == (
         "The content for the resource to be created."
@@ -524,10 +527,12 @@ def test_options_valid_0_1(client, item, path):
 
 def test_options_write_response_content(client, item):
     metadata = client.options(detail(item)).json()
+    validate_http_schema_resource(metadata)
     for method in ("put", "patch"):
         assert metadata[method]["requestBody"]["content"] == ITEM_CONTENT
         assert metadata[method]["responses"]["200"]["content"] == ITEM_CONTENT
     listing = client.options("/items/").json()
+    validate_http_schema_resource(listing)
     assert listing["post"]["requestBody"]["content"] == ITEM_CONTENT
     assert listing["post"]["responses"]["201"]["content"] == ITEM_CONTENT
 
@@ -543,4 +548,6 @@ def test_stats_function_view(client, item):
     assert etag == client.get("/items/")["ETag"]
     assert client.get("/stats/", headers={"If-None-Match": etag}).status_code == 304
     assert client.post("/stats/").status_code == 405
-    assert list(client.options("/stats/").json()) == ["get", "options"]
+    body = client.options("/stats/").json()
+    validate_http_schema_resource(body)
+    assert list(body) == ["get", "options"]

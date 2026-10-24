@@ -17,7 +17,11 @@ from scrudful.ninja import (
     scrudful,
     scrudful_list,
 )
-from tests.semantic_http import link_problems, parse_links
+from tests.semantic_http import (
+    link_problems,
+    parse_links,
+    validate_http_schema_resource,
+)
 from tests.test_ninja_adapter import (
     ALICE,
     CONTEXT_LINK,
@@ -473,3 +477,83 @@ def test_add_error_links_wraps_an_exact_subclass_handler(store):
     assert response.headers["Link"] == ERR_LINK
     # The subclass entry is wrapped once, not also through HttpError's.
     assert api._exception_handlers[AuthenticationError].__wrapped__ is unauthorized
+
+
+# --- The error entity's media type --------------------------------------------
+
+PROBLEM = Entity(
+    "/schemas/problem",
+    context_link_or_func="/contexts/problem",
+    media_type="application/problem+json",
+)
+PROBLEM_LINK = (
+    '<http://testlocation/schemas/problem>; rel="describedby"; '
+    'type="application/schema+json", '
+    "<http://testlocation/contexts/problem>; "
+    'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
+)
+
+
+def test_early_errors_are_served_as_the_error_media_type(store):
+    router = ScrudfulRouter()
+
+    @router.get("/items/{pk}", response=ItemOut)
+    @scrudful(load=store.load, etag_func=etag, error=PROBLEM, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    @router.put("/items/{pk}", response=ItemOut)
+    @scrudful(load=store.load, etag_func=etag, error=PROBLEM, **LINKS)
+    def put_item(request, pk: int, payload: ItemIn, obj):
+        return obj
+
+    client = TestClient(router)
+    hsr = client.request("OPTIONS", "/items/1").json()
+    validate_http_schema_resource(hsr)
+    payload = {"name": "x"}
+    early = [
+        ("GET", client.get("/items/1", headers={"If-Match": '"x"'})),
+        ("PUT", client.put("/items/1", json=payload)),
+        ("PUT", client.put("/items/1", json=payload, headers={"If-Match": "x"})),
+        (
+            "GET",
+            client.get("/items/1", headers={"If-Match": '"x"', "Accept": "text/html"}),
+        ),
+    ]
+    assert [response.status_code for _, response in early] == [412, 428, 400, 412]
+    for method, response in early:
+        assert response.headers["Content-Type"] == "application/problem+json"
+        assert response.headers["Link"] == PROBLEM_LINK
+        assert "detail" in response.json()
+        problems = link_problems(
+            method, response.status_code, response.headers, True, hsr=hsr
+        )
+        assert problems == []
+    etag_ = client.get("/items/1").headers["ETag"]
+    not_modified = client.get("/items/1", headers={"If-None-Match": etag_})
+    assert not_modified.status_code == 304
+    assert "Content-Type" not in not_modified.headers
+    assert "Link" not in not_modified.headers
+
+
+def test_early_errors_without_error_are_json(store):
+    router = ScrudfulRouter()
+
+    @router.get("/items/{pk}", response=ItemOut)
+    @scrudful(load=store.load, etag_func=etag, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    response = TestClient(router).get("/items/1", headers={"If-Match": '"x"'})
+    assert response.status_code == 412
+    assert response.headers["Content-Type"] == "application/json"
+    assert "Link" not in response.headers
+
+
+@pytest.mark.parametrize("media_type", ["text/turtle", "text/csv", "application/xml"])
+def test_error_media_type_must_be_json(media_type):
+    error = Entity("/schemas/error", media_type=media_type)
+    with pytest.raises(ValueError, match="scrudful's JSON error bodies"):
+        scrudful(error=error)
+    with pytest.raises(ValueError, match=media_type):
+        scrudful_list(href_func=lambda request, item: "/", error=error)

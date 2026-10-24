@@ -308,6 +308,20 @@ def context_defaults(media_type: str) -> tuple[str | None, str | None]:
     return RDF_CONTEXT_REL, None
 
 
+def check_error_media_type(media_type: str) -> None:
+    """Raise ``ValueError`` unless an ``error`` entity's ``media_type`` is JSON.
+
+    The ``error`` entity describes scrudful's own 400, 412 and 428 bodies,
+    which are JSON objects served as ``media_type``.
+    """
+    if not is_json(media_type):
+        raise ValueError(
+            f"error has the media type {media_type!r}, but the error entity "
+            "describes scrudful's JSON error bodies (400, 412 and 428): use "
+            "application/json or a +json media type"
+        )
+
+
 def merge_links(
     existing: str | None, schema: str | None, context: str | None
 ) -> str | None:

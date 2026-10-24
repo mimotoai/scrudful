@@ -1083,7 +1083,9 @@ def drf_options(actions: dict[str, str], **kwargs: Any) -> Any:
     with override_settings(ALLOWED_HOSTS=["testlocation"]):
         response = view(request, **kwargs)
     assert response.status_code == 200
-    return json.loads(json.dumps(response.data))
+    body = json.loads(json.dumps(response.data))
+    validate_http_schema_resource(body)
+    return body
 
 
 def assert_superset(drf: Any, ninja: Any, path: tuple[str, ...] = ()) -> None:

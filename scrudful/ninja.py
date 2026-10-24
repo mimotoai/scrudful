@@ -87,8 +87,10 @@ Validators
     handler, as a ``JsonResponse`` (304 without a body), so the operation's
     ``response`` schema does not apply to them. With ``error=Entity(...)``
     the 400, 412 and 428 bodies carry that entity's Links (its link callables
-    get the loaded object); the 304 has no body and gets none, and without
-    ``error`` they carry no Link. Describe them in OpenAPI with
+    get the loaded object) and are served with its media type, which must be
+    JSON content (e.g. ``application/problem+json``); the 304 has no body and
+    gets none, and without ``error`` they carry no Link and are
+    ``application/json``. Describe them in OpenAPI with
     ``openapi_extra={"responses": CONDITIONAL_READ_RESPONSES}`` (or
     :data:`CONDITIONAL_WRITE_RESPONSES`). They are built fresh, without the
     headers and cookies of ninja's temporal response: with ninja's stock
@@ -422,6 +424,7 @@ from scrudful._adapter import (
     SCHEMA_REL,
     SCHEMA_TYPE,
     allow_header,
+    check_error_media_type,
     check_validators,
     context_defaults,
     describe_content,
@@ -785,7 +788,10 @@ def scrudful(
         as Links on them, and of the response to an ``HttpError`` or
         ``Http404`` the operation raises, unless ``responses`` declares its
         status (see "Error responses" in the module docstring; link
-        callables then get ``None``). Without it, they carry no Link.
+        callables then get ``None``). Without it, they carry no Link. Its
+        ``media_type`` must be JSON content (``application/json`` or
+        ``+json``, e.g. ``application/problem+json``), since scrudful's error
+        bodies are JSON objects; they are served with that Content-Type.
 
     Raises
     ------
@@ -798,6 +804,8 @@ def scrudful(
         ninja operation (the decorator sits above the operation decorator),
         or if the handler is sync and ``load``, a validator callback or a
         link callable (also inside an entity) is ``async def``.
+    ValueError
+        If ``error``'s media type is not JSON content.
     ninja.errors.ConfigError
         When the operation is built, if something replaced its ``view_func``
         before the decorator bound it: a ``_ninja_contribute_to_operation``
@@ -809,7 +817,7 @@ def scrudful(
     if load is not None and not callable(load):
         raise TypeError(f"load must be callable, not {type(load).__name__}")
     _check_entity("request", request)
-    _check_entity("error", error)
+    _check_error(error)
     config = _Config(
         kind="item",
         load=load,
@@ -1083,7 +1091,9 @@ def scrudful_list(
         list validator set), sent as Links on them; link callables get the
         queryset. Also those of the response to an ``HttpError`` or
         ``Http404`` the operation raises, e.g. the 404 of a page past the
-        last one; link callables then get ``None``.
+        last one; link callables then get ``None``. Its ``media_type`` must
+        be JSON content, as for :func:`scrudful`; scrudful's 400 and 412 are
+        served with it.
 
     Raises
     ------
@@ -1096,7 +1106,7 @@ def scrudful_list(
         a link callable (also inside ``error``) is ``async def``.
     ValueError
         If ``page_size`` is less than 1 or ``max_page_size`` less than
-        ``page_size``.
+        ``page_size``, or if ``error``'s media type is not JSON content.
     ninja.errors.ConfigError
         When the operation is built, if it declares no collection response
         (e.g. ``response=List[ItemOut]``), or one that is a union (e.g.
@@ -1124,7 +1134,7 @@ def scrudful_list(
             f"max_page_size ({max_page_size}) must be at least page_size "
             f"({page_size})"
         )
-    _check_entity("error", error)
+    _check_error(error)
     config = _Config(
         kind="list",
         href_func=href_func,
@@ -1558,11 +1568,14 @@ def _early_response(
     """scrudful's own response to a failed or short-circuited precondition.
 
     The 400, 412 and 428 bodies get the Links of ``config.error``, whose link
-    callables get ``obj``.
+    callables get ``obj``, and its media type as their Content-Type.
     """
-    early = conditional_response(result)
-    if result.body is not None and config.error is not None:
-        yield from _add_links(early, config.error, request, obj)
+    error = config.error
+    early = conditional_response(
+        result, content_type=None if error is None else error.media_type
+    )
+    if result.body is not None and error is not None:
+        yield from _add_links(early, error, request, obj)
         expose_headers(early)
     return early
 
@@ -2100,6 +2113,13 @@ def _check_entity(name: str, entity: Any) -> None:
     """Raise ``TypeError`` unless ``entity`` is ``None`` or an :class:`Entity`."""
     if entity is not None and not isinstance(entity, Entity):
         raise TypeError(f"{name} must be an Entity, not {type(entity).__name__}")
+
+
+def _check_error(error: Any) -> None:
+    """:func:`_check_entity` for ``error``, whose media type must be JSON."""
+    _check_entity("error", error)
+    if error is not None:
+        check_error_media_type(error.media_type)
 
 
 def _entities_by_status(

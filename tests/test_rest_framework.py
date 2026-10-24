@@ -59,6 +59,7 @@ CONTEXT_LINK = (
     f'<{CONTEXT}>; rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
 )
+LIST_CONTEXT = "http://example.com/list-context.jsonld"
 # APIClient builds absolute URIs against this base.
 BASE = "http://testserver"
 ERROR = Entity(
@@ -184,6 +185,7 @@ class ThingViewSet(ThingViewSetBase):
         context_rel_or_func = "my-context-rel"
         context_type_or_func = "application/x-context"
         list_schema_link_or_func = "http://example.com/list-schema.json"
+        list_context_link_or_func = LIST_CONTEXT
 
 
 @scrudful_viewset
@@ -284,7 +286,9 @@ class ActionViewSet(ThingViewSetBase):
         etag_func = etag_func
 
     @action(detail=True, methods=["get"])
-    @scrudful(etag_func=etag_func, schema_link_or_func=SCHEMA)
+    @scrudful(
+        etag_func=etag_func, schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT
+    )
     def below(self, request, pk):
         """Action decorated below @action."""
         return Response({"action": "below"})
@@ -295,7 +299,9 @@ class ActionViewSet(ThingViewSetBase):
         store.update()
         return Response({"action": "below_put"})
 
-    @scrudful(etag_func=etag_func, schema_link_or_func=SCHEMA)
+    @scrudful(
+        etag_func=etag_func, schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT
+    )
     @action(detail=True, methods=["get"])
     def above(self, request, pk):
         """Action decorated above @action."""
@@ -324,6 +330,29 @@ class ErrorViewSet(ThingViewSetBase):
             context_link_or_func=lambda view, request: "/contexts/problem",
             media_type="application/problem+json",
         )
+
+
+PROBLEM = Entity(
+    "/schemas/problem",
+    context_link_or_func="/contexts/problem",
+    media_type="application/problem+json",
+)
+PROBLEM_LINKS = (
+    f'<{BASE}/schemas/problem>; rel="describedby"; type="application/schema+json", '
+    f'<{BASE}/contexts/problem>; rel="http://www.w3.org/ns/json-ld#context"; '
+    'type="application/ld+json"'
+)
+
+
+@scrudful_viewset
+class ProblemViewSet(ThingViewSetBase):
+    """Errors described as problem details."""
+
+    class Meta:
+        etag_func = etag_func
+        schema_link_or_func = "/schemas/thing"
+        context_link_or_func = "/contexts/thing"
+        error = PROBLEM
 
 
 @scrudful_viewset
@@ -405,9 +434,15 @@ class NestedViewSet(viewsets.ViewSet):
         schema_link_or_func = staticmethod(
             lambda view, request, parent_pk, **kwargs: f"{SCHEMA}?parent={parent_pk}"
         )
+        context_link_or_func = staticmethod(
+            lambda view, request, parent_pk, **kwargs: f"{CONTEXT}?parent={parent_pk}"
+        )
         list_etag_func = nested_etag
         list_schema_link_or_func = staticmethod(
             lambda view, request, parent_pk: f"{SCHEMA}?list={parent_pk}"
+        )
+        list_context_link_or_func = staticmethod(
+            lambda view, request, parent_pk: f"{CONTEXT}?list={parent_pk}"
         )
 
     def list(self, request, parent_pk):
@@ -469,6 +504,7 @@ class PostViewSet(viewsets.ViewSet):
     ["GET", "PUT", "DELETE"],
     etag_func=etag_func,
     schema_link_or_func=lambda view, request, pk: f"{SCHEMA}?pk={pk}",
+    context_link_or_func=CONTEXT,
 )
 def api_thing(request, pk):
     """The api_thing docstring."""
@@ -530,7 +566,9 @@ def api_error(request, pk):
 
 @scrudful(
     etag_func=lambda request: f"v{store.version}",
-    error=Entity(lambda request: "/schemas/error"),
+    error=Entity(
+        lambda request: "/schemas/error", media_type="application/problem+json"
+    ),
 )
 def django_error_view(request):
     return HttpResponse("plain django")
@@ -572,6 +610,7 @@ for prefix, viewset in [
     ("lm-format", LastModifiedFormatViewSet),
     ("post", PostViewSet),
     ("errors", ErrorViewSet),
+    ("problems", ProblemViewSet),
     ("mixed-actions", MixedActionViewSet),
     ("own-describedby", OwnDescribedByViewSet),
 ]:
@@ -777,7 +816,9 @@ def test_explicit_post_validators_are_evaluated(client):
     response = client.post("/post/", headers={"If-Match": '"v1"'})
     assert response.status_code == 201
     assert "ETag" not in response
-    post = client.options("/post/").json()["post"]
+    body = client.options("/post/").json()
+    validate_http_schema_resource(body)
+    post = body["post"]
     assert set(post["responses"]) == {"201", "400", "412"}
     assert "parameters" not in post
 
@@ -786,7 +827,8 @@ def test_list_uses_the_list_configuration(client):
     response = client.get("/things/")
     assert response["Link"] == (
         '<http://example.com/list-schema.json>; rel="describedby"; '
-        'type="application/schema+json"'
+        f'type="application/schema+json", <{LIST_CONTEXT}>; '
+        'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
     )
     assert "ETag" not in response
     assert store.calls == []
@@ -882,12 +924,66 @@ def test_error_links_on_412_428_400(client):
     not_modified = client.get("/errors/1/", headers={"If-None-Match": '"v1"'})
     assert not_modified.status_code == 304
     assert "Link" not in not_modified
+    assert "Content-Type" not in not_modified
     assert store.version == 1
+
+
+def test_error_bodies_are_served_as_the_error_media_type(client):
+    hsr = client.options("/problems/1/").json()
+    validate_http_schema_resource(hsr)
+    write = dict(data={"name": "x"}, format="json")
+    for accept in ("application/json", "text/html"):
+        headers = {"Accept": accept}
+        early = [
+            ("GET", client.get("/problems/1/", headers={**headers, "If-Match": '"x"'})),
+            ("PUT", client.put("/problems/1/", **write, headers=headers)),
+            (
+                "PUT",
+                client.put(
+                    "/problems/1/", **write, headers={**headers, "If-Match": "x"}
+                ),
+            ),
+        ]
+        assert [response.status_code for _, response in early] == [412, 428, 400]
+        for method, response in early:
+            assert response["Content-Type"] == "application/problem+json"
+            assert response["Link"] == PROBLEM_LINKS
+            assert "detail" in response.json()
+            problems = link_problems(
+                method, response.status_code, dict(response.items()), True, hsr
+            )
+            assert problems == []
+    # application/json errors bypass the browsable API too.
+    response = client.put("/errors/1/", headers={"Accept": "text/html"})
+    assert response.status_code == 428
+    assert response["Content-Type"] == "application/json"
+    # Without an error entity, DRF's negotiation is unchanged.
+    response = client.put("/things/1/", headers={"Accept": "text/html"})
+    assert response.status_code == 428
+    assert response["Content-Type"].startswith("text/html")
+
+
+@pytest.mark.parametrize("media_type", ["text/turtle", "text/csv", "application/xml"])
+def test_error_media_type_must_be_json(media_type):
+    error = Entity("/schemas/error", media_type=media_type)
+    with pytest.raises(ValueError, match="scrudful's JSON error bodies"):
+        scrudful(error=error)
+    with pytest.raises(ValueError, match=media_type):
+        scrudful_api_view(["GET"], error=error)
+    with pytest.raises(ValueError, match=media_type):
+        ScrudfulViewFunc(lambda request: None, error=error)
+    with pytest.raises(ValueError, match=media_type):
+
+        @scrudful_viewset
+        class Invalid(ThingViewSetBase):
+            class Meta:
+                list_error = error
 
 
 def test_error_links_of_the_list_and_with_callables(client):
     response = client.get("/errors/", headers={"If-None-Match": "n1"})
     assert response.status_code == 400
+    assert response["Content-Type"] == "application/problem+json"
     assert response["Link"] == (
         f'<{BASE}/schemas/problem>; rel="describedby"; '
         'type="application/schema+json", '
@@ -909,7 +1005,8 @@ def test_error_links_of_the_list_and_with_callables(client):
 def test_error_links_on_a_plain_django_view(client):
     response = client.get("/django-error/", headers={"If-Match": '"v0"'})
     assert response.status_code == 412
-    assert response["Content-Type"] == "application/json"
+    assert response["Content-Type"] == "application/problem+json"
+    assert response.json() == {"detail": "Precondition failed."}
     assert response["Link"] == (
         f'<{BASE}/schemas/error>; rel="describedby"; type="application/schema+json"'
     )
@@ -966,6 +1063,7 @@ def test_options_json_for_browsable_accept(client):
 def test_options_headers_and_method_order(client):
     response = client.options("/things/1/")
     body = response.json()
+    validate_http_schema_resource(body)
     assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
     assert response["Allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
     assert response["Link"] == options_links()
@@ -983,11 +1081,13 @@ def test_options_headers_and_method_order(client):
 
 def test_options_write_response_content(client):
     detail = client.options("/things/1/").json()
+    validate_http_schema_resource(detail)
     for method in ("put", "patch"):
         assert detail[method]["requestBody"]["content"] == THING_CONTENT
         assert detail[method]["responses"]["200"]["content"] == THING_CONTENT
     assert "content" not in detail["delete"]["responses"]["204"]
     listing = client.options("/things/").json()
+    validate_http_schema_resource(listing)
     assert listing["post"]["responses"]["201"]["content"] == THING_CONTENT
 
 
@@ -1024,6 +1124,7 @@ def test_options_action_without_links(client):
     assert body["get"]["responses"]["200"]["content"] == content(SCHEMA, CONTEXT)
     assert body["put"] == {"responses": {"200": {"description": "OK"}}}
     plain = client.options("/actions/1/plain/")
+    validate_http_schema_resource(plain.json())
     assert plain.json() == {
         "get": {"responses": {"200": {"description": "OK"}}},
         "options": describe_options(),
@@ -1036,6 +1137,8 @@ def test_agreement_drf_item(client):
     options = client.options("/errors/1/")
     hsr = options.json()
     listing = client.options("/errors/").json()
+    validate_http_schema_resource(hsr)
+    validate_http_schema_resource(listing)
     write = dict(data={"name": "x"}, format="json")
     checks = [
         ("OPTIONS", options, hsr),
@@ -1048,10 +1151,12 @@ def test_agreement_drf_item(client):
             hsr,
         ),
         ("PUT", client.put("/errors/1/", **write, headers={"If-Match": '"x"'}), hsr),
+        ("PUT", client.put("/errors/1/", **write), hsr),
+        ("PUT", client.put("/errors/1/", **write, headers={"If-Match": "x"}), hsr),
         ("POST", client.post("/errors/", **write), listing),
     ]
     statuses = [response.status_code for _, response, _ in checks]
-    assert statuses == [200, 200, 200, 200, 200, 412, 201]
+    assert statuses == [200, 200, 200, 200, 200, 412, 428, 400, 201]
     for method, response, body in checks:
         has_content = bool(response.content)
         assert has_content == (method != "HEAD")
@@ -1099,7 +1204,7 @@ def test_actions_are_routable_in_either_decorator_order(client):
         assert response.status_code == 200
         assert response.json() == {"action": name}
         assert response["ETag"] == '"v1"'
-        assert response["Link"] == SCHEMA_LINK
+        assert response["Link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
         response = client.get(f"/actions/1/{name}/", headers={"If-None-Match": '"v1"'})
         assert response.status_code == 304
     assert ActionViewSet.above.__doc__ == "Action decorated above @action."
@@ -1190,9 +1295,9 @@ def test_api_view_method_list(client):
     response = client.get("/api/1/")
     assert response.status_code == 200
     assert response["ETag"] == '"v1"'
-    assert (
-        response["Link"]
-        == f'<{SCHEMA}?pk=1>; rel="describedby"; type="application/schema+json"'
+    assert response["Link"] == (
+        f'<{SCHEMA}?pk=1>; rel="describedby"; type="application/schema+json", '
+        f"{CONTEXT_LINK}"
     )
     assert client.put("/api/1/").status_code == 428
     response = client.put("/api/1/", headers={"If-Match": '"v1"'})
@@ -1247,7 +1352,8 @@ def test_api_view_options_metadata(client):
     assert list(metadata) == ["get", "put", "delete", "options"]
     assert response["Allow"] == "GET, PUT, DELETE, OPTIONS"
     assert response["Link"] == options_links()
-    item = content(f"{SCHEMA}?pk=7")
+    validate_http_schema_resource(metadata)
+    item = content(f"{SCHEMA}?pk=7", CONTEXT)
     assert metadata["get"]["responses"]["200"]["content"] == item
     assert metadata["put"]["requestBody"]["content"] == item
     assert metadata["put"]["parameters"] == [
@@ -1276,11 +1382,12 @@ def test_viewset_metadata_detail_and_list(client):
     assert list(detail) == ["get", "put", "delete", "options", "head", "patch"]
     assert detail["get"]["responses"]["200"]["content"] == THING_CONTENT
     listing = client.options("/things/").json()
+    validate_http_schema_resource(listing)
     assert list(listing) == ["get", "post", "options", "head"]
     assert listing["get"]["responses"] == {
         "200": {
             "description": "OK",
-            "content": content("http://example.com/list-schema.json"),
+            "content": content("http://example.com/list-schema.json", LIST_CONTEXT),
         }
     }
     assert listing["post"]["responses"] == {
@@ -1289,7 +1396,9 @@ def test_viewset_metadata_detail_and_list(client):
 
 
 def test_metadata_parameters_for_a_single_validator(client):
-    put = client.options("/lm-only/1/").json()["put"]
+    body = client.options("/lm-only/1/").json()
+    validate_http_schema_resource(body)
+    put = body["put"]
     assert put["parameters"] == [
         {
             "in": "header",
@@ -1311,9 +1420,14 @@ def test_metadata_parameters_for_a_single_validator(client):
 def test_metadata_for_nested_list_routes(client):
     """D-Minor: any URL kwarg used to mean "detail"."""
     metadata = client.options("/parents/5/children/").json()
+    validate_http_schema_resource(metadata)
     assert list(metadata) == ["get", "post", "options", "head"]
-    assert metadata["get"]["responses"]["200"]["content"] == content(f"{SCHEMA}?list=5")
-    assert metadata["post"]["requestBody"]["content"] == content(f"{SCHEMA}?parent=5")
+    assert metadata["get"]["responses"]["200"]["content"] == content(
+        f"{SCHEMA}?list=5", f"{CONTEXT}?list=5"
+    )
+    assert metadata["post"]["requestBody"]["content"] == content(
+        f"{SCHEMA}?parent=5", f"{CONTEXT}?parent=5"
+    )
     response = client.get("/parents/5/children/")
     assert response["ETag"] == '"list-5"'
     assert store.calls == [("nested_etag", 5)]
@@ -1321,8 +1435,9 @@ def test_metadata_for_nested_list_routes(client):
 
 def test_metadata_for_action_routes(client):
     metadata = client.options("/actions/1/below/").json()
+    validate_http_schema_resource(metadata)
     assert list(metadata) == ["get", "put", "options", "head"]
-    assert metadata["get"]["responses"]["200"]["content"] == content(SCHEMA)
+    assert metadata["get"]["responses"]["200"]["content"] == content(SCHEMA, CONTEXT)
     # The plain action: see test_options_action_without_links.
 
 
@@ -1378,6 +1493,7 @@ def test_metadata_can_be_called_directly():
     view = ThingViewSet.as_view({"get": "retrieve", "put": "update"})
     request = APIRequestFactory().options("/things/3/")
     response = view(request, pk="3")
+    validate_http_schema_resource(response.data)
     assert list(response.data) == ["get", "put", "options", "head"]
     assert response["Allow"] == "GET, PUT, OPTIONS, HEAD"
 
