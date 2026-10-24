@@ -1070,8 +1070,45 @@ def test_view_func_wrapper_below_the_decorator_raises(store, decorator, name):
     message = str(raised.value)
     assert f"{name}: operation GET '/items/{{pk}}' (" in message
     assert "get_item())" in message
-    assert f"must be applied above {name}" in message
+    assert "directly below the operation decorator" in message
     assert seen == []
+
+
+def test_view_func_error_steers_authorization_away_from_below(store):
+    """Following the message must not move an auth check below ``@scrudful``,
+    where it runs after ``load`` and the preconditions (a 304 leak)."""
+    router = Router()
+    with pytest.raises(ConfigError) as raised:
+
+        @router.get("/items/{pk}", response=ItemOut)
+        @scrudful(load=store.load, etag_func=etag)
+        @wrap_view_func([], "below")
+        def get_item(request, pk: int, obj):
+            return obj
+
+    message = str(raised.value)
+    assert "never move an authorization or caching decorator below @scrudful" in (
+        message
+    )
+    assert "runs after load and the preconditions" in message
+    assert "authorization in load or auth=" in message
+    assert "add_decorator(mode='operation')" in message
+    assert "Stacking two scrudful decorators is not supported" in message
+    assert '"Placement of other decorators"' in message
+
+
+def test_stacked_scrudful_decorators_raise(store):
+    """Not supported: the inner decorator's binding would replace the outer
+    one's wrapper. (With ``load``, the outer one already raises TypeError:
+    the inner one hides the ``obj`` parameter.)"""
+    router = Router()
+    with pytest.raises(ConfigError, match="Stacking two scrudful decorators"):
+
+        @router.get("/items/{pk}", response=ItemOut)
+        @scrudful(**LINKS)
+        @scrudful(**LINKS)
+        def get_item(request, pk: int):
+            return store.items[pk]
 
 
 def test_decorator_between_operation_and_scrudful_raises(store):

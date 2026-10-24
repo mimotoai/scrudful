@@ -63,13 +63,16 @@ django-ninja adapter
     keeps its own. Handlers in modules with ``from __future__ import
     annotations`` work even when the hidden parameter's annotation is
     imported only under ``TYPE_CHECKING``.
-  * The decorators sit directly below the operation decorator. A hook that
-    wraps ``operation.view_func`` must be applied above them: one applied
-    below them (its ``_ninja_contribute_to_operation`` callback runs before
-    scrudful binds the operation), or a decorator between them and the
-    operation decorator, raises ``ConfigError`` when the operation is built
-    instead of being silently discarded. ``decorate_view`` and
-    ``add_decorator`` keep working.
+  * The decorators sit directly below the operation decorator. Something
+    that replaces ``operation.view_func`` before scrudful binds the operation
+    (a ``_ninja_contribute_to_operation`` callback contributed below the
+    decorator, a decorator between it and the operation decorator, or a
+    second scrudful decorator) raises ``ConfigError`` when the operation is
+    built instead of being silently discarded. Authorization belongs in
+    ``load`` or ``auth=``, never in a decorator below scrudful's (it would
+    run after the preconditions); router- or API-wide decorators use
+    ``add_decorator(mode="operation")``. See "Placement of other decorators"
+    in the django-ninja documentation.
   * It imports without Django REST Framework.
 
   201 validators, entity declarations, error Links and load-based validators

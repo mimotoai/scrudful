@@ -55,16 +55,8 @@ Single resources
 ----------------
 
 ``@scrudful(...)`` sits **directly below** the operation decorator (above it,
-ninja would register the undecorated function, so it raises ``TypeError``).
-When ninja builds the operation, scrudful replaces ``operation.view_func`` by a
-wrapper bound to that operation's ``response=``. A hook that wraps
-``operation.view_func`` from a ``_ninja_contribute_to_operation`` callback
-must be applied above ``@scrudful``: below it, the hook's callback runs before
-the binding, which would discard its wrapper, and so would a decorator between
-the operation decorator and ``@scrudful``. Both raise
-``ninja.errors.ConfigError`` when the operation is built.
-``decorate_view`` (it wraps ``operation.run``) works on either side, and
-``add_decorator`` on the API or a router applies after the binding. ``load``
+ninja would register the undecorated function, so it raises ``TypeError``;
+see :ref:`ninja-placement` for other decorators). ``load``
 is the fetch-if-allowed callable; the validator callbacks are called with what
 it returns, and the handler receives it in the ``load_as`` parameter (``obj``
 by default), hidden from ninja's signature and OpenAPI:
@@ -304,6 +296,69 @@ usual. Set ``meta.created`` to get them all, or ``meta.location`` for the
     @scrudful_create(location_func=role_url, **ROLE)
     def create_role(request, payload: RoleIn, meta: ScrudfulResponse):
         meta.created = Role.objects.create(**payload.dict())
+
+.. _ninja-placement:
+
+Placement of other decorators
+-----------------------------
+
+When ninja builds an operation, the scrudful decorator replaces its
+``view_func`` by a wrapper bound to that operation's ``response=``. Where
+another decorator goes decides what it runs before:
+
+* **Never put an authorization or caching decorator below the scrudful
+  decorator.** A decorator on the handler runs after ``load`` and the
+  preconditions: a 304, 412 or 428, or an ``ETag``, may already be decided
+  (e.g. an unauthorized ``If-None-Match`` would get a 304 with the real
+  entity-tag).
+* **Per-operation authorization** goes in ``load`` (fetch-if-allowed) or in
+  ninja's ``auth=``.
+* **A decorator for every operation of a router or the API**:
+  ``router.add_decorator(decorator, mode="operation")`` (or the API's). It
+  wraps ``view_func``, so it runs inside ``Operation.run``, after ninja's
+  authentication and throttling and before ``load``, and its exceptions go
+  through ninja's exception handlers.
+* **A wrapper for one operation**, in that same place: a callback registered
+  with ``ninja.utils.contribute_operation_callback`` that wraps
+  ``operation.view_func``, contributed by a decorator applied *above* the
+  scrudful decorator, so that it runs after the binding:
+
+  .. code-block:: python
+
+      import functools
+
+      from ninja.utils import contribute_operation_callback
+
+      def audited(func):
+          def wrap(operation):
+              inner = operation.view_func
+
+              @functools.wraps(inner)
+              def view_func(request, **values):
+                  audit(request)
+                  return inner(request, **values)
+
+              operation.view_func = view_func
+
+          contribute_operation_callback(func, wrap)
+          return func
+
+      @roles.get("/{pk}", response=RoleOut)
+      @audited
+      @scrudful(load=load_role, **ROLE)
+      def get_role(request, pk: int, obj): ...
+
+* ``decorate_view`` (and ``add_decorator`` with ``mode="view"``) wraps
+  ``Operation.run``: it runs before ninja's authentication and outside its
+  exception handlers. It suits response-level concerns such as
+  ``cache_page``, not a check that raises.
+
+A ``view_func`` replaced before the binding would be discarded by it: such a
+callback contributed below the scrudful decorator, or any decorator between the
+operation decorator and the scrudful one, makes ninja raise
+``ninja.errors.ConfigError`` when the operation is built. Stacking two scrudful
+decorators on one handler is not supported: it raises ``ConfigError``, or
+``TypeError`` when the inner one has ``load``.
 
 General POST
 ------------
