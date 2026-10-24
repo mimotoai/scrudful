@@ -32,12 +32,19 @@ from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient, APIRequestFactory
 from rest_framework.throttling import BaseThrottle
 
+from scrudful._adapter import allow_header, describe_options, options_links
 from scrudful.rest_framework import (
+    Entity,
     ScrudfulMetadata,
     ScrudfulViewFunc,
     scrudful,
     scrudful_api_view,
     scrudful_viewset,
+)
+from tests.semantic_http import (
+    link_problems,
+    parse_links,
+    validate_http_schema_resource,
 )
 
 # The example settings enable ATOMIC_REQUESTS, so every request uses the DB.
@@ -52,6 +59,27 @@ CONTEXT_LINK = (
     f'<{CONTEXT}>; rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
 )
+# APIClient builds absolute URIs against this base.
+BASE = "http://testserver"
+ERROR = Entity(
+    schema_link_or_func="/schemas/error", context_link_or_func="/contexts/error"
+)
+ERROR_LINKS = (
+    f'<{BASE}/schemas/error>; rel="describedby"; type="application/schema+json", '
+    f'<{BASE}/contexts/error>; rel="http://www.w3.org/ns/json-ld#context"; '
+    'type="application/ld+json"'
+)
+
+
+def content(schema, context=None, context_type="application/ld+json"):
+    """The ``content`` of a JSON entity with these (absolute) links."""
+    entry = {"schema": {"$ref": schema}}
+    if context is not None:
+        entry["x-rdf-context"] = {"href": context, "type": context_type}
+    return {"application/json": entry}
+
+
+THING_CONTENT = content(SCHEMA, CONTEXT, "application/x-context")
 
 
 class Store:
@@ -278,6 +306,52 @@ class ActionViewSet(ThingViewSetBase):
         return Response({"action": "plain"})
 
 
+@scrudful_viewset
+class ErrorViewSet(ThingViewSetBase):
+    """Relative links, and an error entity for scrudful's 400, 412 and 428."""
+
+    class Meta:
+        etag_func = etag_func
+        last_modified_func = last_modified_func
+        schema_link_or_func = "/schemas/thing"
+        context_link_or_func = "/contexts/thing"
+        error = ERROR
+        list_etag_func = staticmethod(lambda view, request: f"n{store.version}")
+        list_schema_link_or_func = "/schemas/things"
+        list_context_link_or_func = "/contexts/things"
+        list_error = Entity(
+            schema_link_or_func=lambda view, request: "/schemas/problem",
+            context_link_or_func=lambda view, request: "/contexts/problem",
+            media_type="application/problem+json",
+        )
+
+
+@scrudful_viewset
+class MixedActionViewSet(viewsets.ViewSet):
+    """An action route whose PUT is not scrudful."""
+
+    @action(detail=True, methods=["get"])
+    @scrudful(
+        etag_func=etag_func, schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT
+    )
+    def mixed(self, request, pk):
+        return Response({"action": "mixed"})
+
+    @mixed.mapping.put
+    def mixed_put(self, request, pk):
+        return Response({"action": "mixed_put"})
+
+
+class OwnDescribedByViewSet(viewsets.ViewSet):
+    """A view that sets its own describedby link."""
+
+    @scrudful(
+        schema_link_or_func="/schemas/thing", context_link_or_func="/contexts/thing"
+    )
+    def retrieve(self, request, pk):
+        return Response({}, headers={"Link": '<https://o/s>; rel="describedby"'})
+
+
 class HeaderViewSet(viewsets.ViewSet):
     """Handlers that set the headers scrudful also sets."""
 
@@ -442,6 +516,26 @@ api_own_metadata = scrudful_api_view(["GET"], etag_func=lambda view, request: "x
 )
 
 
+@scrudful_api_view(
+    ["GET", "PUT"],
+    etag_func=etag_func,
+    error=Entity(
+        schema_link_or_func=lambda view, request, pk: f"/schemas/error?pk={pk}",
+        context_link_or_func="/contexts/error",
+    ),
+)
+def api_error(request, pk):
+    return Response({"id": pk})
+
+
+@scrudful(
+    etag_func=lambda request: f"v{store.version}",
+    error=Entity(lambda request: "/schemas/error"),
+)
+def django_error_view(request):
+    return HttpResponse("plain django")
+
+
 @api_view(["GET", "PUT"])
 @scrudful(etag_func=lambda request, pk: f"v{store.version}", schema_link_or_func=SCHEMA)
 def function_view(request, pk):
@@ -477,6 +571,9 @@ for prefix, viewset in [
     ("etag-format", ETagFormatViewSet),
     ("lm-format", LastModifiedFormatViewSet),
     ("post", PostViewSet),
+    ("errors", ErrorViewSet),
+    ("mixed-actions", MixedActionViewSet),
+    ("own-describedby", OwnDescribedByViewSet),
 ]:
     router.register(prefix, viewset, basename=prefix)
 
@@ -494,6 +591,8 @@ urlpatterns = [
     path("api-own-metadata/", api_own_metadata),
     path("function/<int:pk>/", function_view),
     path("django/", django_view),
+    path("api-error/<int:pk>/", api_error),
+    path("django-error/", django_error_view),
 ]
 
 
@@ -764,6 +863,205 @@ def test_link_url_is_percent_encoded(client):
     assert response["Link"].startswith("<http://example.com/schema?v=%C3%A9t%C3%A9>")
 
 
+# --- Error links and absolute links ------------------------------------------
+
+
+def test_error_links_on_412_428_400(client):
+    responses = {
+        412: client.put("/errors/1/", headers={"If-Match": '"v0"'}),
+        428: client.put("/errors/1/"),
+        400: client.put("/errors/1/", headers={"If-Match": "v1"}),
+    }
+    for status, response in responses.items():
+        assert response.status_code == status
+        assert response["Link"] == ERROR_LINKS
+        assert response["Access-Control-Expose-Headers"] == "Link"
+    get_412 = client.get("/errors/1/", headers={"If-Match": '"v0"'})
+    assert get_412.status_code == 412
+    assert get_412["Link"] == ERROR_LINKS
+    not_modified = client.get("/errors/1/", headers={"If-None-Match": '"v1"'})
+    assert not_modified.status_code == 304
+    assert "Link" not in not_modified
+    assert store.version == 1
+
+
+def test_error_links_of_the_list_and_with_callables(client):
+    response = client.get("/errors/", headers={"If-None-Match": "n1"})
+    assert response.status_code == 400
+    assert response["Link"] == (
+        f'<{BASE}/schemas/problem>; rel="describedby"; '
+        'type="application/schema+json", '
+        f'<{BASE}/contexts/problem>; rel="http://www.w3.org/ns/json-ld#context"; '
+        'type="application/ld+json"'
+    )
+    response = client.put("/api-error/7/", headers={"If-Match": '"v0"'})
+    assert response.status_code == 412
+    assert response["Link"] == (
+        f'<{BASE}/schemas/error?pk=7>; rel="describedby"; '
+        'type="application/schema+json", '
+        f'<{BASE}/contexts/error>; rel="http://www.w3.org/ns/json-ld#context"; '
+        'type="application/ld+json"'
+    )
+    # Without an error entity, scrudful's own errors carry no Link.
+    assert "Link" not in client.put("/things/1/")
+
+
+def test_error_links_on_a_plain_django_view(client):
+    response = client.get("/django-error/", headers={"If-Match": '"v0"'})
+    assert response.status_code == 412
+    assert response["Content-Type"] == "application/json"
+    assert response["Link"] == (
+        f'<{BASE}/schemas/error>; rel="describedby"; type="application/schema+json"'
+    )
+    assert response["Access-Control-Expose-Headers"] == "Link"
+    response = client.get("/django-error/", headers={"If-None-Match": '"v1"'})
+    assert response.status_code == 304
+    assert "Link" not in response
+
+
+def test_error_must_be_an_entity():
+    with pytest.raises(TypeError, match="error"):
+        scrudful(error="/schemas/error")
+    with pytest.raises(TypeError, match="error"):
+        ScrudfulViewFunc(lambda request: None, error={"schema": "/s"})
+
+
+def test_links_are_absolute(client):
+    response = client.get("/errors/1/")
+    assert response["Link"] == (
+        f'<{BASE}/schemas/thing>; rel="describedby"; type="application/schema+json", '
+        f'<{BASE}/contexts/thing>; rel="http://www.w3.org/ns/json-ld#context"; '
+        'type="application/ld+json"'
+    )
+
+
+def test_view_link_not_duplicated(client):
+    response = client.get("/own-describedby/1/")
+    links = parse_links(response["Link"])
+    described = [target for target, params in links if params["rel"] == "describedby"]
+    assert described == ["https://o/s"]
+    # The context link is still added.
+    assert [target for target, _ in links] == [
+        "https://o/s",
+        f"{BASE}/contexts/thing",
+    ]
+
+
+# --- Semantic HTTP 0.1 OPTIONS ------------------------------------------------
+
+
+def test_options_json_for_browsable_accept(client):
+    """Review Focus 4: the browsable API does not take over OPTIONS."""
+    for path_ in ("/things/1/", "/errors/", "/api-error/7/"):
+        response = client.options(path_, headers={"Accept": "text/html"})
+        assert response.status_code == 200
+        assert response["Content-Type"] == "application/json"
+        assert response["Link"] == options_links()
+        body = response.json()
+        validate_http_schema_resource(body)
+        assert response["Allow"] == allow_header(body)
+        assert response["Access-Control-Expose-Headers"] == "Link"
+
+
+def test_options_headers_and_method_order(client):
+    response = client.options("/things/1/")
+    body = response.json()
+    assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
+    assert response["Allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
+    assert response["Link"] == options_links()
+    assert body["options"] == describe_options()
+    assert body["head"] == {
+        "responses": {
+            key: value
+            for key, value in body["get"]["responses"].items()
+            if key != "200"
+        }
+        | {"200": {"description": "OK"}}
+    }
+    assert link_problems("OPTIONS", 200, dict(response.items()), True, body) == []
+
+
+def test_options_write_response_content(client):
+    detail = client.options("/things/1/").json()
+    for method in ("put", "patch"):
+        assert detail[method]["requestBody"]["content"] == THING_CONTENT
+        assert detail[method]["responses"]["200"]["content"] == THING_CONTENT
+    assert "content" not in detail["delete"]["responses"]["204"]
+    listing = client.options("/things/").json()
+    assert listing["post"]["responses"]["201"]["content"] == THING_CONTENT
+
+
+def test_options_error_content(client):
+    error = content(f"{BASE}/schemas/error", f"{BASE}/contexts/error")
+    detail = client.options("/errors/1/").json()
+    validate_http_schema_resource(detail)
+    for status in ("400", "412"):
+        assert detail["get"]["responses"][status]["content"] == error
+    assert "content" not in detail["get"]["responses"]["304"]
+    for method in ("put", "patch", "delete"):
+        for status in ("400", "412", "428"):
+            assert detail[method]["responses"][status]["content"] == error
+    for response in detail["head"]["responses"].values():
+        assert "content" not in response
+    listing = client.options("/errors/").json()
+    validate_http_schema_resource(listing)
+    assert listing["get"]["responses"]["400"]["content"] == {
+        "application/problem+json": content(
+            f"{BASE}/schemas/problem", f"{BASE}/contexts/problem"
+        )["application/json"]
+    }
+    # The create is not conditional: no early responses to describe.
+    assert set(listing["post"]["responses"]) == {"201"}
+
+
+def test_options_action_without_links(client):
+    """Review Focus 5: a route mixing scrudful and plain methods."""
+    response = client.options("/mixed-actions/1/mixed/")
+    body = response.json()
+    validate_http_schema_resource(body)
+    assert list(body) == ["get", "put", "options", "head"]
+    assert response["Allow"] == allow_header(body) == "GET, PUT, OPTIONS, HEAD"
+    assert body["get"]["responses"]["200"]["content"] == content(SCHEMA, CONTEXT)
+    assert body["put"] == {"responses": {"200": {"description": "OK"}}}
+    plain = client.options("/actions/1/plain/")
+    assert plain.json() == {
+        "get": {"responses": {"200": {"description": "OK"}}},
+        "options": describe_options(),
+        "head": {"responses": {"200": {"description": "OK"}}},
+    }
+    assert plain["Allow"] == "GET, OPTIONS, HEAD"
+
+
+def test_agreement_drf_item(client):
+    options = client.options("/errors/1/")
+    hsr = options.json()
+    listing = client.options("/errors/").json()
+    write = dict(data={"name": "x"}, format="json")
+    checks = [
+        ("OPTIONS", options, hsr),
+        ("GET", client.get("/errors/1/"), hsr),
+        ("HEAD", client.head("/errors/1/"), hsr),
+        ("PUT", client.put("/errors/1/", **write, headers={"If-Match": '"v1"'}), hsr),
+        (
+            "PATCH",
+            client.patch("/errors/1/", **write, headers={"If-Match": '"v2"'}),
+            hsr,
+        ),
+        ("PUT", client.put("/errors/1/", **write, headers={"If-Match": '"x"'}), hsr),
+        ("POST", client.post("/errors/", **write), listing),
+    ]
+    statuses = [response.status_code for _, response, _ in checks]
+    assert statuses == [200, 200, 200, 200, 200, 412, 201]
+    for method, response, body in checks:
+        has_content = bool(response.content)
+        assert has_content == (method != "HEAD")
+        headers = dict(response.items())
+        assert (
+            link_problems(method, response.status_code, headers, has_content, body)
+            == []
+        )
+
+
 # --- Decoration mechanics -----------------------------------------------------
 
 
@@ -945,10 +1243,13 @@ def test_api_view_options_metadata(client):
     response = client.options("/api/7/")
     assert response.status_code == 200
     metadata = response.json()
-    assert set(metadata) == {"get", "put", "delete"}
-    content = {"application/json": {"schema": f"{SCHEMA}?pk=7"}}
-    assert metadata["get"]["responses"]["200"]["content"] == content
-    assert metadata["put"]["requestBody"]["content"] == content
+    # api_view serves only the listed methods (and OPTIONS): no HEAD.
+    assert list(metadata) == ["get", "put", "delete", "options"]
+    assert response["Allow"] == "GET, PUT, DELETE, OPTIONS"
+    assert response["Link"] == options_links()
+    item = content(f"{SCHEMA}?pk=7")
+    assert metadata["get"]["responses"]["200"]["content"] == item
+    assert metadata["put"]["requestBody"]["content"] == item
     assert metadata["put"]["parameters"] == [
         {
             "in": "header",
@@ -971,21 +1272,20 @@ def test_api_view_metadata_class_can_be_overridden(client):
 
 def test_viewset_metadata_detail_and_list(client):
     detail = client.options("/things/1/").json()
-    assert set(detail) == {"get", "put", "patch", "delete"}
-    assert detail["get"]["responses"]["200"]["content"] == {
-        "application/json": {"schema": SCHEMA, "context": CONTEXT}
-    }
+    validate_http_schema_resource(detail)
+    assert list(detail) == ["get", "put", "delete", "options", "head", "patch"]
+    assert detail["get"]["responses"]["200"]["content"] == THING_CONTENT
     listing = client.options("/things/").json()
-    assert set(listing) == {"get", "post"}
+    assert list(listing) == ["get", "post", "options", "head"]
     assert listing["get"]["responses"] == {
         "200": {
             "description": "OK",
-            "content": {
-                "application/json": {"schema": "http://example.com/list-schema.json"}
-            },
+            "content": content("http://example.com/list-schema.json"),
         }
     }
-    assert listing["post"]["responses"] == {"201": {"description": "Created"}}
+    assert listing["post"]["responses"] == {
+        "201": {"description": "Created", "content": THING_CONTENT}
+    }
 
 
 def test_metadata_parameters_for_a_single_validator(client):
@@ -1011,13 +1311,9 @@ def test_metadata_parameters_for_a_single_validator(client):
 def test_metadata_for_nested_list_routes(client):
     """D-Minor: any URL kwarg used to mean "detail"."""
     metadata = client.options("/parents/5/children/").json()
-    assert set(metadata) == {"get", "post"}
-    assert metadata["get"]["responses"]["200"]["content"] == {
-        "application/json": {"schema": f"{SCHEMA}?list=5"}
-    }
-    assert metadata["post"]["requestBody"]["content"] == {
-        "application/json": {"schema": f"{SCHEMA}?parent=5"}
-    }
+    assert list(metadata) == ["get", "post", "options", "head"]
+    assert metadata["get"]["responses"]["200"]["content"] == content(f"{SCHEMA}?list=5")
+    assert metadata["post"]["requestBody"]["content"] == content(f"{SCHEMA}?parent=5")
     response = client.get("/parents/5/children/")
     assert response["ETag"] == '"list-5"'
     assert store.calls == [("nested_etag", 5)]
@@ -1025,12 +1321,9 @@ def test_metadata_for_nested_list_routes(client):
 
 def test_metadata_for_action_routes(client):
     metadata = client.options("/actions/1/below/").json()
-    assert set(metadata) == {"get", "put"}
-    assert metadata["get"]["responses"]["200"]["content"] == {
-        "application/json": {"schema": SCHEMA}
-    }
-    plain = client.options("/actions/1/plain/").json()
-    assert plain == {"get": {"responses": {"200": {"description": "OK"}}}}
+    assert list(metadata) == ["get", "put", "options", "head"]
+    assert metadata["get"]["responses"]["200"]["content"] == content(SCHEMA)
+    # The plain action: see test_options_action_without_links.
 
 
 def test_user_defined_options_is_kept(client):
@@ -1040,13 +1333,37 @@ def test_user_defined_options_is_kept(client):
 def test_user_defined_metadata_class_is_kept(client):
     assert OwnMetadataViewSet.metadata_class is CustomMetadata
     assert ThingViewSet.metadata_class is ScrudfulMetadata
-    assert client.options("/own-metadata/1/").json()["name"] == "Own Metadata Instance"
+    response = client.options("/own-metadata/1/")
+    assert response.json()["name"] == "Own Metadata Instance"
+    # Not an HTTP Schema Resource: no HSR Links.
+    assert "Link" not in response
+
+
+def test_scrudful_metadata_subclass_gets_the_options_response():
+    class Extended(ScrudfulMetadata):
+        def determine_metadata(self, request, view):
+            return {**super().determine_metadata(request, view), "x-extra": True}
+
+    @scrudful_viewset
+    class Sub(DefaultMetadataViewSet):
+        metadata_class = Extended
+
+    response = _options(Sub)
+    response.render()
+    assert response["Content-Type"] == "application/json"
+    assert response["Link"] == options_links()
+    assert response["Allow"] == "GET, OPTIONS, HEAD"
+    assert response.data["x-extra"] is True
 
 
 def test_metadata_describes_non_scrudful_methods(client):
-    metadata = client.options("/plain-metadata/1/").json()
-    assert set(metadata) == {"get", "put", "patch", "delete"}
+    response = client.options("/plain-metadata/1/")
+    metadata = response.json()
+    validate_http_schema_resource(metadata)
+    assert list(metadata) == ["get", "put", "delete", "options", "head", "patch"]
     assert metadata["put"] == {"responses": {"200": {"description": "OK"}}}
+    # The Links come with the options that scrudful_viewset installs.
+    assert "Link" not in response
 
 
 def test_get_method_finds_only_scrudful_handlers():
@@ -1061,7 +1378,8 @@ def test_metadata_can_be_called_directly():
     view = ThingViewSet.as_view({"get": "retrieve", "put": "update"})
     request = APIRequestFactory().options("/things/3/")
     response = view(request, pk="3")
-    assert set(response.data) == {"get", "put"}
+    assert list(response.data) == ["get", "put", "options", "head"]
+    assert response["Allow"] == "GET, PUT, OPTIONS, HEAD"
 
 
 def test_metadata_output_does_not_share_the_module_dictionaries():
@@ -1186,7 +1504,9 @@ def test_metadata_class_none_is_kept():
 
     assert NoMetadata.metadata_class is None
     # DRF answers OPTIONS with 405 when metadata is disabled.
-    assert _options(NoMetadata).status_code == 405
+    response = _options(NoMetadata)
+    assert response.status_code == 405
+    assert "Link" not in response
 
 
 def test_project_wide_metadata_class_is_kept(monkeypatch):

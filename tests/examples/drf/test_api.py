@@ -15,6 +15,9 @@ from items.models import Item
 from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient
 
+from scrudful._adapter import allow_header, describe_options, options_links
+from tests.semantic_http import link_problems, validate_http_schema_resource
+
 pytestmark = pytest.mark.django_db
 
 BASE = "http://testserver"
@@ -36,6 +39,15 @@ PRECONDITION_REQUIRED = {
     "accepted-precondition-headers": ["If-Match", "If-Unmodified-Since"],
 }
 PRECONDITION_FAILED = {"detail": "Precondition failed."}
+ITEM_CONTENT = {
+    "application/json": {
+        "schema": {"$ref": f"{BASE}/schemas/item.json"},
+        "x-rdf-context": {
+            "href": f"{BASE}/contexts/item.jsonld",
+            "type": "application/ld+json",
+        },
+    }
+}
 
 
 @pytest.fixture
@@ -418,7 +430,7 @@ def test_readonly_viewset_reads(client, item):
     response = client.get(f"/readonly-items/{item.pk}/")
     assert response.status_code == 200
     assert response["ETag"] == '"v1"'
-    assert response["Link"] == SCHEMA_LINK
+    assert response["Link"] == LINKS
     etag = client.get("/readonly-items/")["ETag"]
     response = client.get("/readonly-items/", headers={"If-None-Match": etag})
     assert response.status_code == 304
@@ -441,8 +453,9 @@ def test_readonly_viewset_rejects_writes_with_405(client, item, method, path):
 
 
 def test_readonly_viewset_options_lists_only_get(client, item):
-    assert set(client.options(f"/readonly-items/{item.pk}/").json()) == {"get"}
-    assert set(client.options("/readonly-items/").json()) == {"get"}
+    methods = ["get", "options", "head"]
+    assert list(client.options(f"/readonly-items/{item.pk}/").json()) == methods
+    assert list(client.options("/readonly-items/").json()) == methods
 
 
 # --- OPTIONS metadata ---------------------------------------------------------
@@ -452,20 +465,15 @@ def test_options_describes_the_detail_route(client, item):
     response = client.options(detail(item))
     assert response.status_code == 200
     metadata = response.json()
-    assert set(metadata) == {"get", "put", "patch", "delete"}
-    content = {
-        "application/json": {
-            "schema": f"{BASE}/schemas/item.json",
-            "context": f"{BASE}/contexts/item.jsonld",
-        }
-    }
+    assert list(metadata) == ["get", "put", "delete", "options", "head", "patch"]
     assert metadata["get"]["responses"]["200"] == {
         "description": "OK",
-        "content": content,
+        "content": ITEM_CONTENT,
     }
     assert set(metadata["get"]["responses"]) == {"200", "304", "400", "412"}
+    assert set(metadata["head"]["responses"]) == {"200", "304", "400", "412"}
     for method in ("put", "patch"):
-        assert metadata[method]["requestBody"]["content"] == content
+        assert metadata[method]["requestBody"]["content"] == ITEM_CONTENT
         assert set(metadata[method]["responses"]) == {"200", "400", "412", "428"}
     assert metadata["put"]["requestBody"]["description"] == (
         "The new content of the resource."
@@ -483,13 +491,45 @@ def test_options_describes_the_detail_route(client, item):
 
 def test_options_describes_the_list_route(client):
     metadata = client.options("/items/").json()
-    assert set(metadata) == {"get", "post"}
+    assert list(metadata) == ["get", "post", "options", "head"]
     assert metadata["post"]["requestBody"]["description"] == (
         "The content for the resource to be created."
     )
     assert set(metadata["post"]["responses"]) == {"201"}
     assert "parameters" not in metadata["post"]
     assert set(metadata["get"]["responses"]) == {"200", "304", "400", "412"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/items/{pk}/", "/items/", "/readonly-items/{pk}/", "/readonly-items/", "/stats/"],
+)
+def test_options_valid_0_1(client, item, path):
+    path = path.format(pk=item.pk)
+    response = client.options(path)
+    assert response.status_code == 200
+    assert response["Content-Type"] == "application/json"
+    body = response.json()
+    validate_http_schema_resource(body)
+    assert response["Link"] == options_links()
+    assert response["Allow"] == allow_header(body)
+    assert body["options"] == describe_options()
+    # The body lists exactly the methods the route serves: HEAD on the
+    # viewset routes, not on the stats view, which DRF's api_view(["GET"])
+    # answers 405.
+    assert ("head" in body) == (client.head(path).status_code != 405)
+    assert ("head" in body) == (path != "/stats/")
+    assert link_problems("OPTIONS", 200, dict(response.items()), True, body) == []
+
+
+def test_options_write_response_content(client, item):
+    metadata = client.options(detail(item)).json()
+    for method in ("put", "patch"):
+        assert metadata[method]["requestBody"]["content"] == ITEM_CONTENT
+        assert metadata[method]["responses"]["200"]["content"] == ITEM_CONTENT
+    listing = client.options("/items/").json()
+    assert listing["post"]["requestBody"]["content"] == ITEM_CONTENT
+    assert listing["post"]["responses"]["201"]["content"] == ITEM_CONTENT
 
 
 # --- Function view ------------------------------------------------------------
@@ -503,4 +543,4 @@ def test_stats_function_view(client, item):
     assert etag == client.get("/items/")["ETag"]
     assert client.get("/stats/", headers={"If-None-Match": etag}).status_code == 304
     assert client.post("/stats/").status_code == 405
-    assert set(client.options("/stats/").json()) == {"get"}
+    assert list(client.options("/stats/").json()) == ["get", "options"]

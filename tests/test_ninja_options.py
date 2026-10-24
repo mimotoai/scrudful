@@ -7,6 +7,7 @@ from typing import Any, List
 import pytest
 from asgiref.sync import async_to_sync
 from django.http import HttpResponse
+from django.test import override_settings
 from django.urls import path
 from ninja import NinjaAPI, Router, Status
 from ninja.errors import HttpError
@@ -1076,27 +1077,37 @@ class ItemViewSet(viewsets.ViewSet):
 
 
 def drf_options(actions: dict[str, str], **kwargs: Any) -> Any:
+    """DRF's HTTP Schema Resource, with its links resolved against ``BASE``."""
     view = ItemViewSet.as_view(actions)
-    response = view(APIRequestFactory().options("/"), **kwargs)
+    request = APIRequestFactory().options("/", HTTP_HOST="testlocation")
+    with override_settings(ALLOWED_HOSTS=["testlocation"]):
+        response = view(request, **kwargs)
     assert response.status_code == 200
     return json.loads(json.dumps(response.data))
 
 
 def assert_superset(drf: Any, ninja: Any, path: tuple[str, ...] = ()) -> None:
-    """Every key path of ``drf`` exists in ``ninja``, with an equal value.
-
-    ``content`` maps are not compared: DRF's ``ScrudfulMetadata`` still has the
-    0.0 shape (``{"schema": <url>, "context": <url>}``), and neither is the
-    ``options`` entry, which only ninja's 0.1 body has.
-    """
+    """Every key path of ``drf`` exists in ``ninja``, with an equal value."""
     if isinstance(drf, dict):
         assert isinstance(ninja, dict), path
         for key, value in drf.items():
             assert key in ninja, path + (key,)
-            if key != "content":
-                assert_superset(value, ninja[key], path + (key,))
+            assert_superset(value, ninja[key], path + (key,))
     else:
         assert ninja == drf, path
+
+
+def without_head(drf: dict[str, Any]) -> dict[str, Any]:
+    """``drf`` without its ``head``: a DRF viewset answers HEAD on every GET
+    route (``ViewSetMixin`` maps it to the GET action), while ninja answers
+    it only where an operation declares it, which ``item_router`` doesn't."""
+    assert drf["head"] == {
+        "responses": {
+            status: {"description": response["description"]}
+            for status, response in drf["get"]["responses"].items()
+        }
+    }
+    return {key: value for key, value in drf.items() if key != "head"}
 
 
 def test_options_superset_of_drf(store):
@@ -1114,16 +1125,19 @@ def test_options_superset_of_drf(store):
         pk="1",
     )
     ninja_detail = options(client, "/items/1").json()
-    assert set(ninja_detail) == set(detail) | {"options"}
+    detail = without_head(detail)
+    assert list(ninja_detail) == list(detail)
     assert_superset(detail, ninja_detail)
-    # The superset: response content on writes, declared statuses.
-    assert "content" not in detail["put"]["responses"]["200"]
-    assert ninja_detail["put"]["responses"]["200"]["content"] == ITEM_CONTENT
+    assert detail["put"]["responses"]["200"]["content"] == ITEM_CONTENT
+    # The superset: the statuses ninja's operations declare.
     assert "409" in ninja_detail["put"]["responses"]
+    assert "409" not in detail["put"]["responses"]
 
     listing = drf_options({"get": "list", "post": "create"})
     ninja_listing = options(client, "/items").json()
-    assert set(ninja_listing) == set(listing) | {"options"}
+    listing = without_head(listing)
+    assert list(ninja_listing) == list(listing)
     assert_superset(listing, ninja_listing)
-    assert ninja_listing["post"]["responses"]["201"]["content"] == ITEM_CONTENT
+    assert listing["get"]["responses"]["200"]["content"] == LIST_CONTENT
+    assert listing["post"]["responses"]["201"]["content"] == ITEM_CONTENT
     assert store.calls == {}

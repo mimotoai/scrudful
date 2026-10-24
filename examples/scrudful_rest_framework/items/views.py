@@ -116,6 +116,7 @@ class ReadOnlyItemViewSet(viewsets.ReadOnlyModelViewSet):
         last_modified_func = item_last_modified
         schema_link_or_func = item_schema_url
         schema_type_or_func = "application/schema+json"
+        context_link_or_func = item_context_url
         list_etag_func = collection_etag
 
 

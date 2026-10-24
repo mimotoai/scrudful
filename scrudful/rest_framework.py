@@ -36,7 +36,8 @@ Validators
     answered with 400, a failed precondition with 412 and a matching GET/HEAD
     with 304 carrying the validators. These responses are returned without
     calling the view: 400/412/428 as a DRF ``Response`` (a ``JsonResponse`` for
-    plain Django views) with a JSON body, 304 without a body.
+    plain Django views) with a JSON body and the Links of the ``error``
+    entity, if one is configured, 304 without a body or Link.
 
     After the view runs, 2xx responses to GET/HEAD get the validators computed
     for the precondition check, and 2xx responses to PUT/PATCH get freshly
@@ -56,12 +57,24 @@ Concurrency
 
 Headers
     The Link header is added to every response the view returns and is appended
-    to any Link value the view set. ``Access-Control-Expose-Headers`` is
-    extended with whichever of ``ETag``, ``Link`` and ``Location`` the response
-    carries (django-cors-headers replaces that header when ``CORS_EXPOSE_HEADERS``
-    is set; list the names there instead). Exceptions raised by the view (e.g.
-    ``Http404``) propagate unchanged and are rendered by DRF without these
-    headers.
+    to any Link value the view set; a Link of the view's with a ``describedby``
+    relation replaces the schema link, and one with a JSON-LD (or RDF) context
+    relation the context link. Every link URL is resolved against the
+    request's absolute URI (``request.build_absolute_uri()``), so relative
+    values such as ``"/schemas/item"`` are sent absolute.
+    ``Access-Control-Expose-Headers`` is extended with whichever of ``ETag``,
+    ``Link`` and ``Location`` the response carries (django-cors-headers
+    replaces that header when ``CORS_EXPOSE_HEADERS`` is set; list the names
+    there instead). Exceptions raised by the view (e.g. ``Http404``) propagate
+    unchanged and are rendered by DRF without these headers.
+
+OPTIONS
+    With :class:`ScrudfulMetadata` (installed in place of DRF's default
+    metadata class), OPTIONS is answered with a Semantic HTTP 0.1 HTTP Schema
+    Resource: a JSON body describing each method the view allows, the Links
+    of the HTTP Schema Resource's own schema and JSON-LD context, and an
+    ``Allow`` listing exactly the body's methods. It is ``application/json``
+    whatever the request's ``Accept``, the browsable API included.
 """
 
 from __future__ import annotations
@@ -69,13 +82,14 @@ from __future__ import annotations
 import functools
 import inspect
 import types
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from django.http import HttpRequest, HttpResponseBase
 from rest_framework.decorators import api_view
 from rest_framework.metadata import BaseMetadata, SimpleMetadata
 from rest_framework.mixins import UpdateModelMixin
+from rest_framework.renderers import JSONRenderer
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -85,11 +99,18 @@ from scrudful._adapter import (
     DEFAULT_CONTEXT_TYPE,
     DEFAULT_SCHEMA_REL,
     DEFAULT_SCHEMA_TYPE,
+    METHOD_KEYS,
+    allow_header,
     check_validators,
     conditional_header_parameters,
+    context_defaults,
+    describe_content,
+    describe_options,
     describe_read,
     describe_write,
     expose_headers,
+    merge_links,
+    options_links,
     set_validator_headers,
     validator_policy,
 )
@@ -103,7 +124,7 @@ from scrudful.conditional import (
     quote_etag,
 )
 from scrudful.entity import Entity
-from scrudful.utils import join_links, link_content
+from scrudful.utils import join_links, link_content, resolve_uri
 
 __all__ = [
     "Entity",
@@ -128,6 +149,9 @@ _LINK_OPTIONS = (
     "context_type_or_func",
 )
 _VALIDATOR_OPTIONS = ("etag_func", "last_modified_func")
+_ERROR_OPTIONS = ("error",)
+#: The media type of the content a view's own links describe.
+_VIEW_MEDIA_TYPE = "application/json"
 
 
 class ScrudfulViewFunc:
@@ -160,20 +184,34 @@ class ScrudfulViewFunc:
         (``settings.TIME_ZONE``), as Django does. Sub-second precision is
         discarded.
     schema_link_or_func : str or callable, optional
-        URL of the schema of the response body. If no value is given, no
-        schema link is sent.
+        URL of the schema of the request and response bodies, resolved
+        against the request's absolute URI (a relative URL such as
+        ``"/schemas/item"`` works). If no value is given, no schema link is
+        sent.
     schema_rel_or_func : str or callable, optional
         ``rel`` of the schema link. Defaults to ``"describedby"``.
     schema_type_or_func : str or callable, optional
         ``type`` of the schema link. Defaults to ``"application/schema+json"``.
     context_link_or_func : str or callable, optional
-        URL of the JSON-LD context of the response body. If no value is given,
-        no context link is sent.
+        URL of the JSON-LD context of the bodies, resolved like the schema
+        URL. If no value is given, no context link is sent.
     context_rel_or_func : str or callable, optional
         ``rel`` of the context link. Defaults to
         ``"http://www.w3.org/ns/json-ld#context"``.
     context_type_or_func : str or callable, optional
         ``type`` of the context link. Defaults to ``"application/ld+json"``.
+    error : Entity, optional
+        The schema and context of the bodies of scrudful's own 400, 412 and
+        428 responses, which then carry its Links (a 304 has no body and gets
+        none). Its link callables are called like the others; its
+        ``media_type`` decides the context link's defaults. Without it these
+        responses carry no Link.
+
+    Raises
+    ------
+    TypeError
+        If a validator callback isn't callable, ``error`` isn't an
+        :class:`Entity`, or the view is ``async def``.
     """
 
     def __init__(
@@ -188,8 +226,10 @@ class ScrudfulViewFunc:
         context_link_or_func: Any = None,
         context_rel_or_func: Any = None,
         context_type_or_func: Any = None,
+        error: Entity | None = None,
     ) -> None:
         check_validators(etag_func, last_modified_func)
+        _check_error(error)
         _check_sync(view_method)
         # Copies __name__, __doc__, __wrapped__ and the wrapped view's
         # attributes (e.g. @action's mapping); our own attributes come after.
@@ -203,6 +243,7 @@ class ScrudfulViewFunc:
         self.context_link_or_func = context_link_or_func
         self.context_rel_or_func = context_rel_or_func
         self.context_type_or_func = context_type_or_func
+        self.error = error
         self._from_viewset = False
 
     def __get__(self, obj: Any, objtype: type | None = None) -> Any:
@@ -246,7 +287,10 @@ class ScrudfulViewFunc:
                 require_precondition=True,
             )
             if result is not None:
-                return _conditional_response(result, isinstance(request, Request))
+                link = None
+                if result.body is not None:
+                    link = self.error_link_header(*cb_args, **cb_kwargs)
+                return _conditional_response(result, isinstance(request, Request), link)
 
         response = self.view_method(*args, **kwargs)
 
@@ -256,7 +300,13 @@ class ScrudfulViewFunc:
                 etag, last_modified = self._validators(cb_args, cb_kwargs)
             if send:
                 set_validator_headers(response, etag, last_modified)
-        link = join_links(response.get("Link"), self.link_header(*cb_args, **cb_kwargs))
+        # A Link the view set with a describedby (context) relation replaces
+        # the schema (context) link; one with another relation replaces none.
+        link = merge_links(
+            response.get("Link"),
+            self.schema_link_header(*cb_args, **cb_kwargs),
+            self.context_link_header(*cb_args, **cb_kwargs),
+        )
         if link is not None:
             response["Link"] = link
         self.add_expose_headers(response)
@@ -288,8 +338,12 @@ class ScrudfulViewFunc:
         return _evaluate(self.context_link_or_func, args, kwargs) or None
 
     def schema_link_header(self, *args: Any, **kwargs: Any) -> str | None:
-        """Return the schema link-value, or ``None``."""
-        return self._link_value(
+        """Return the schema link-value, or ``None``.
+
+        The URL is resolved against the absolute URI of the request among
+        ``args``.
+        """
+        return _link_value(
             self.schema_link(*args, **kwargs),
             (self.schema_rel_or_func, self.schema_type_or_func),
             (DEFAULT_SCHEMA_REL, DEFAULT_SCHEMA_TYPE),
@@ -298,8 +352,11 @@ class ScrudfulViewFunc:
         )
 
     def context_link_header(self, *args: Any, **kwargs: Any) -> str | None:
-        """Return the JSON-LD context link-value, or ``None``."""
-        return self._link_value(
+        """Return the JSON-LD context link-value, or ``None``.
+
+        The URL is resolved like the schema URL.
+        """
+        return _link_value(
             self.context_link(*args, **kwargs),
             (self.context_rel_or_func, self.context_type_or_func),
             (DEFAULT_CONTEXT_REL, DEFAULT_CONTEXT_TYPE),
@@ -314,19 +371,11 @@ class ScrudfulViewFunc:
             self.context_link_header(*args, **kwargs),
         )
 
-    @staticmethod
-    def _link_value(
-        url: Any,
-        rel_and_type: tuple[Any, Any],
-        defaults: tuple[str, str],
-        args: Sequence[Any],
-        kwargs: Mapping[str, Any],
-    ) -> str | None:
-        if not url:
+    def error_link_header(self, *args: Any, **kwargs: Any) -> str | None:
+        """Return the Link field value of ``error``'s links, or ``None``."""
+        if self.error is None:
             return None
-        rel = _evaluate(rel_and_type[0], args, kwargs) or defaults[0]
-        content_type = _evaluate(rel_and_type[1], args, kwargs) or defaults[1]
-        return link_content(url, rel, content_type)
+        return join_links(*_entity_links(self.error, args, kwargs))
 
 
 def scrudful(
@@ -339,6 +388,7 @@ def scrudful(
     context_link_or_func: Any = None,
     context_rel_or_func: Any = None,
     context_type_or_func: Any = None,
+    error: Entity | None = None,
 ) -> Callable[[Callable[..., Any]], ScrudfulViewFunc]:
     """Decorate a view method or function view to make it SCRUDful.
 
@@ -368,8 +418,10 @@ def scrudful(
         "context_link_or_func": context_link_or_func,
         "context_rel_or_func": context_rel_or_func,
         "context_type_or_func": context_type_or_func,
+        "error": error,
     }
     check_validators(etag_func, last_modified_func)
+    _check_error(error)
 
     def decorator(view_method: Callable[..., Any]) -> ScrudfulViewFunc:
         return ScrudfulViewFunc(view_method, **options)
@@ -388,6 +440,7 @@ def scrudful_api_view(
     context_link_or_func: Any = None,
     context_rel_or_func: Any = None,
     context_type_or_func: Any = None,
+    error: Entity | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Like DRF's ``api_view``, for a SCRUDful function view.
 
@@ -403,6 +456,9 @@ def scrudful_api_view(
     ``metadata_class`` attribute of the function, or ``DEFAULT_METADATA_CLASS``)
     is something other than DRF's default ``SimpleMetadata``; a custom class
     (or ``None``) is kept, so subclass :class:`ScrudfulMetadata` to combine them.
+    With :class:`ScrudfulMetadata` (or a subclass) the OPTIONS response is an
+    HTTP Schema Resource (see :class:`ScrudfulMetadata`). DRF's ``api_view``
+    serves only the listed methods: list ``"HEAD"`` too for HEAD requests.
     ::
 
         @scrudful_api_view(["GET", "PUT"], etag_func=settings_etag)
@@ -429,6 +485,7 @@ def scrudful_api_view(
         context_link_or_func=context_link_or_func,
         context_rel_or_func=context_rel_or_func,
         context_type_or_func=context_type_or_func,
+        error=error,
     )
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -456,15 +513,17 @@ def scrudful_viewset(cls: type) -> type:
     inherited). ``retrieve``, ``update``, ``partial_update`` and ``destroy``
     are wrapped with the item configuration below, ``list`` with the
     ``list_*`` configuration, and ``create`` with the item *link*
-    configuration only: its target is the collection, so the item validators
-    do not apply to it. Methods the class doesn't have are not added, and
-    methods decorated with :func:`scrudful` explicitly are left alone. OPTIONS
-    is answered by :class:`ScrudfulMetadata` only when the class's
-    ``metadata_class`` is DRF's default ``SimpleMetadata``; any other value
-    (``None``, or a class set on the viewset, a base class or
+    configuration (and ``error``) only: its target is the collection, so the
+    item validators do not apply to it. Methods the class doesn't have are not
+    added, and methods decorated with :func:`scrudful` explicitly are left
+    alone. OPTIONS is answered by :class:`ScrudfulMetadata` only when the
+    class's ``metadata_class`` is DRF's default ``SimpleMetadata``; any other
+    value (``None``, or a class set on the viewset, a base class or
     ``DEFAULT_METADATA_CLASS``) is kept, so subclass or mix in
-    :class:`ScrudfulMetadata` to combine it with a custom metadata class. A
-    user-defined ``options`` is kept.
+    :class:`ScrudfulMetadata` to combine it with a custom metadata class. With
+    :class:`ScrudfulMetadata` (or a subclass) the OPTIONS response is an HTTP
+    Schema Resource (see :class:`ScrudfulMetadata`). A user-defined
+    ``options`` is kept.
 
     Decorating a subclass of a decorated viewset again re-wraps the original
     methods with the subclass's configuration.
@@ -508,26 +567,31 @@ def scrudful_viewset(cls: type) -> type:
         Item schema link.
     context_link_or_func, context_rel_or_func, context_type_or_func : optional
         Item JSON-LD context link.
+    error : Entity, optional
+        Schema and context of the item routes' (and the create's) 400, 412
+        and 428 bodies (see :class:`ScrudfulViewFunc`).
     list_etag_func, list_last_modified_func : callable, optional
         Validators of the ``list`` response.
     list_schema_link_or_func, list_schema_rel_or_func, list_schema_type_or_func
         Schema link of the ``list`` response.
     list_context_link_or_func, list_context_rel_or_func, list_context_type_or_func
         JSON-LD context link of the ``list`` response.
+    list_error : Entity, optional
+        Schema and context of the ``list`` response's 400 and 412 bodies.
     """
     meta = getattr(cls, "Meta", None)
 
     def options(prefix: str, names: Sequence[str]) -> dict[str, Any]:
         return {name: getattr(meta, prefix + name, None) for name in names}
 
-    item = options("", _VALIDATOR_OPTIONS + _LINK_OPTIONS)
+    item = options("", _VALIDATOR_OPTIONS + _LINK_OPTIONS + _ERROR_OPTIONS)
     configs = {
-        "create": options("", _LINK_OPTIONS),
+        "create": options("", _LINK_OPTIONS + _ERROR_OPTIONS),
         "retrieve": item,
         "update": item,
         "partial_update": item,
         "destroy": item,
-        "list": options("list_", _VALIDATOR_OPTIONS + _LINK_OPTIONS),
+        "list": options("list_", _VALIDATOR_OPTIONS + _LINK_OPTIONS + _ERROR_OPTIONS),
     }
     for name, config in configs.items():
         method = getattr(cls, name, None)
@@ -555,56 +619,116 @@ def _install_metadata(cls: type) -> None:
 
     Only DRF's stock default, ``SimpleMetadata``, is replaced: ``None`` and any
     other class (set on the class, a base class or ``DEFAULT_METADATA_CLASS``)
-    are the project's choice and are kept.
+    are the project's choice and are kept. DRF's stock ``APIView.options`` is
+    replaced by :func:`_options`; an ``options`` the class defines is kept.
     """
     if getattr(cls, "metadata_class", None) is SimpleMetadata:
         cls.metadata_class = ScrudfulMetadata  # type: ignore[attr-defined]
+    if getattr(cls, "options", None) is APIView.options:
+        cls.options = _options  # type: ignore[attr-defined]
+
+
+def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
+    """``APIView.options``, answering with an HTTP Schema Resource.
+
+    When the view's metadata class is :class:`ScrudfulMetadata` (or a
+    subclass), the 200 is rendered as JSON whatever the request's ``Accept``
+    (the browsable API included), and carries the HTTP Schema Resource's own
+    Links and an ``Allow`` listing the body's methods. Other responses, and
+    those of any other metadata class, are DRF's (``metadata_class = None``
+    gives a 405).
+    """
+    response = APIView.options(self, request, *args, **kwargs)
+    metadata_class = self.metadata_class
+    if not (
+        isinstance(metadata_class, type)
+        and issubclass(metadata_class, ScrudfulMetadata)
+        and response.status_code == 200
+    ):
+        return response
+    request.accepted_renderer = JSONRenderer()
+    request.accepted_media_type = JSONRenderer.media_type
+    # A fresh Response: there is no Link of the view's to keep.
+    response["Link"] = options_links()
+    allow = allow_header(response.data)
+    response["Allow"] = allow
+    # DRF's finalize_response sets the view's own headers, Allow among them.
+    headers = getattr(self, "headers", None)
+    if isinstance(headers, dict):
+        headers["Allow"] = allow
+    expose_headers(response)
+    return response
 
 
 class ScrudfulMetadata(BaseMetadata):
-    """OPTIONS metadata describing the methods a SCRUDful view serves.
+    """OPTIONS metadata: the HTTP Schema Resource (Semantic HTTP 0.1) of a view.
 
-    The body maps each method the route serves (``get``, ``post``, ``put``,
-    ``patch``, ``delete``) to an OpenAPI-like operation: the request body and
-    its schema/context links, the responses, and for conditional writes the
-    precondition header parameters. The routed methods are taken from the
-    viewset's action map (so list, detail, nested and ``@action`` routes are
-    each described correctly), or from the view's allowed methods. Link
+    The body is an OpenAPI Path Item with one operation for each method the
+    view allows (``view.allowed_methods``), in the order ``get``, ``put``,
+    ``post``, ``delete``, ``options``, ``head``, ``patch``, ``trace``:
+
+    - ``get``, ``post``, ``put``, ``patch`` and ``delete``: the request body,
+      the success response (201 for POST, 204 for DELETE, else 200) and, for
+      conditional methods, scrudful's own 304/400/412/428 responses and the
+      precondition header parameters. A request body and a success response
+      (but the 204) have the content of the view's links (``application/json``,
+      a ``schema`` ``$ref`` and an ``x-rdf-context``), and the 400, 412 and
+      428 the content of its ``error`` entity;
+    - ``head``: the same responses as ``get``, without content;
+    - ``options``: this response, whose content is the HTTP Schema Resource;
+    - any other method: a 200.
+
+    The handler of each method is the view's (a viewset's action map routes
+    list, detail, nested and ``@action`` routes each to their own). Link
     callbacks are called with the same arguments as for the request
-    (``func(view, request, **url_kwargs)``). Methods that are not SCRUDful are
-    described without links or preconditions.
+    (``func(view, request, **url_kwargs)``), and every URL is resolved against
+    the request's absolute URI. Methods that are not SCRUDful are described
+    without content or preconditions.
+
+    The Links, ``Allow`` and JSON rendering of the OPTIONS response are added
+    by the ``options`` that :func:`scrudful_viewset` and
+    :func:`scrudful_api_view` install; a view that only sets
+    ``metadata_class = ScrudfulMetadata`` gets the body alone.
     """
 
     def determine_metadata(self, request: Request, view: APIView) -> dict[str, Any]:
         args = (view, request, *getattr(view, "args", ()))
         kwargs = dict(getattr(view, "kwargs", None) or {})
+        allowed = {method.lower() for method in view.allowed_methods}
         metadata = {}
-        for method, handler in self._handlers(view):
-            describe = getattr(self, f"determine_metadata_for_{method}")
-            metadata[method] = describe(handler, args, kwargs)
+        for method in METHOD_KEYS:
+            if method not in allowed:
+                continue
+            describe = getattr(self, f"determine_metadata_for_{method}", None)
+            if describe is None:
+                metadata[method] = {"responses": {"200": {"description": "OK"}}}
+            else:
+                metadata[method] = describe(_handler(view, method), args, kwargs)
         return metadata
-
-    @staticmethod
-    def _handlers(view: APIView) -> Iterator[tuple[str, Any]]:
-        action_map = getattr(view, "action_map", None)
-        if action_map is None:
-            action_map = {name: name for name in view.http_method_names}
-        for method in ("get", "post", "put", "patch", "delete"):
-            name = action_map.get(method)
-            handler = getattr(view, name, None) if name else None
-            if handler is not None:
-                yield method, getattr(handler, "__func__", handler)
 
     def get_method(self, view: APIView, name: str) -> ScrudfulViewFunc | None:
         """Return the :class:`ScrudfulViewFunc` behind ``view.<name>``, if any."""
-        handler = getattr(view, name, None)
-        handler = getattr(handler, "__func__", handler)
+        handler = _handler(view, name)
         return handler if isinstance(handler, ScrudfulViewFunc) else None
 
     def determine_metadata_for_get(
         self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return describe_read(_content(handler, args, kwargs), _has_validators(handler))
+        return describe_read(
+            _content(handler, args, kwargs),
+            _has_validators(handler),
+            error_content=_error_content(handler, args, kwargs),
+        )
+
+    def determine_metadata_for_head(
+        self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return describe_read(None, _has_validators(handler))
+
+    def determine_metadata_for_options(
+        self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return describe_options()
 
     def determine_metadata_for_post(
         self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
@@ -641,6 +765,8 @@ class ScrudfulMetadata(BaseMetadata):
             conditional,
             conditional and handler.etag_func is not None,
             conditional and handler.last_modified_func is not None,
+            response_content=content,
+            error_content=_error_content(handler, args, kwargs),
         )
         if "parameters" in metadata:
             # Through the method, so that a subclass overriding it is used.
@@ -703,10 +829,16 @@ def _callback_arguments(
     return args, kwargs
 
 
-def _conditional_response(result: ConditionalResult, drf: bool) -> HttpResponseBase:
+def _conditional_response(
+    result: ConditionalResult, drf: bool, link: str | None = None
+) -> HttpResponseBase:
+    """scrudful's own early response; ``link`` goes on a 400, 412 or 428."""
     if result.body is None or not drf:
-        return django_conditional_response(result)
-    response = Response(result.body, status=result.status, headers=result.headers)
+        return django_conditional_response(result, link)
+    headers = dict(result.headers)
+    if link:
+        headers["Link"] = link
+    response = Response(result.body, status=result.status, headers=headers)
     expose_headers(response)
     return response
 
@@ -715,16 +847,121 @@ def _has_validators(handler: Any) -> bool:
     return isinstance(handler, ScrudfulViewFunc) and handler.has_validators
 
 
+def _handler(view: APIView, method: str) -> Any:
+    """``view.<method>`` as a function (a :class:`ScrudfulViewFunc`, if it is one).
+
+    A viewset routes each method of the action map to its action as
+    ``view.<method>``.
+    """
+    handler = getattr(view, method, None)
+    return getattr(handler, "__func__", handler)
+
+
+def _check_error(error: Any) -> None:
+    if error is not None and not isinstance(error, Entity):
+        raise TypeError(f"error must be an Entity, not {type(error).__name__}")
+
+
+def _resolve(url: Any, args: Sequence[Any]) -> str:
+    """``url`` resolved against the absolute URI of the request among ``args``."""
+    for arg in args:
+        if isinstance(arg, (Request, HttpRequest)):
+            return resolve_uri(url, arg.build_absolute_uri())
+    return str(url)
+
+
+def _link_value(
+    url: Any,
+    rel_and_type: tuple[Any, Any],
+    defaults: tuple[str | None, str | None],
+    args: Sequence[Any],
+    kwargs: Mapping[str, Any],
+) -> str | None:
+    """One link-value; the URL is resolved as in the OPTIONS body."""
+    if not url:
+        return None
+    rel = _evaluate(rel_and_type[0], args, kwargs) or defaults[0]
+    content_type = _evaluate(rel_and_type[1], args, kwargs) or defaults[1]
+    return link_content(_resolve(url, args), rel, content_type)
+
+
+def _entity_links(
+    entity: Entity, args: Sequence[Any], kwargs: Mapping[str, Any]
+) -> tuple[str | None, str | None]:
+    """The schema and the context link-values of ``entity`` (``None`` if unset).
+
+    The context link's defaults come from ``entity.media_type``; in-band RDF
+    has none.
+    """
+    schema = _link_value(
+        _evaluate(entity.schema_link_or_func, args, kwargs),
+        (entity.schema_rel_or_func, entity.schema_type_or_func),
+        (DEFAULT_SCHEMA_REL, DEFAULT_SCHEMA_TYPE),
+        args,
+        kwargs,
+    )
+    context = None
+    defaults = context_defaults(entity.media_type)
+    if defaults != (None, None):
+        context = _link_value(
+            _evaluate(entity.context_link_or_func, args, kwargs),
+            (entity.context_rel_or_func, entity.context_type_or_func),
+            defaults,
+            args,
+            kwargs,
+        )
+    return schema, context
+
+
 def _content(
     handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
 ) -> dict[str, Any] | None:
+    """The ``content`` of the view's own links (JSON), or ``None``."""
     if not isinstance(handler, ScrudfulViewFunc):
         return None
-    links = {}
-    schema = handler.schema_link(*args, **kwargs)
-    if schema:
-        links["schema"] = str(schema)
-    context = handler.context_link(*args, **kwargs)
+    return _media(handler, _VIEW_MEDIA_TYPE, args, kwargs)
+
+
+def _error_content(
+    handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """The ``content`` of the handler's ``error`` entity, or ``None``."""
+    if not isinstance(handler, ScrudfulViewFunc) or handler.error is None:
+        return None
+    return _media(handler.error, handler.error.media_type, args, kwargs)
+
+
+def _media(
+    source: ScrudfulViewFunc | Entity,
+    media_type: str,
+    args: Sequence[Any],
+    kwargs: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """The ``content`` of ``source``'s links: its Media Type Object, or ``None``.
+
+    Built by :func:`scrudful._adapter.describe_content` from the schema and
+    context URLs and types of ``source`` (a view or an :class:`Entity`), which
+    are evaluated as for its Links (the context only when ``media_type`` takes
+    one), and with the URLs resolved the same way, so that the entry agrees
+    with the Links of the responses it describes. ``None`` without a schema
+    URL.
+    """
+    schema = _evaluate(source.schema_link_or_func, args, kwargs)
+    if not schema:
+        return None
+    schema_type = _evaluate(source.schema_type_or_func, args, kwargs)
+    context = context_type = None
+    rel, default_type = context_defaults(media_type)
+    if rel is not None:  # not in-band RDF
+        context = _evaluate(source.context_link_or_func, args, kwargs)
     if context:
-        links["context"] = str(context)
-    return {"application/json": links} if links else None
+        context_type = (
+            _evaluate(source.context_type_or_func, args, kwargs) or default_type
+        )
+    return describe_content(
+        media_type,
+        _resolve(schema, args),
+        str(schema_type or DEFAULT_SCHEMA_TYPE),
+        _resolve(context, args) if context else None,
+        None if context_type is None else str(context_type),
+    )
