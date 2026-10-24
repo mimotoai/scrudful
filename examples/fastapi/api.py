@@ -6,6 +6,12 @@ Run it with ``python examples/fastapi/api.py`` and try, for example::
     curl -i http://localhost:8000/users/1 -H 'If-None-Match: "user-1-v1"'
     curl -i -X PUT http://localhost:8000/users/1 -H 'If-Match: "user-1-v1"' \\
         -H 'Content-Type: application/json' -d '{"name": "John", "age": 23}'
+    curl -i -X OPTIONS http://localhost:8000/users/1
+
+Every response with content carries the ``Link`` headers of its schema and
+JSON-LD context (Semantic HTTP 0.1): the user's on success, the error's on
+scrudful's own 400, 412 and 428 and on the errors FastAPI answers (404, 405,
+422). OPTIONS answers with the path's HTTP Schema Resource.
 """
 
 from __future__ import annotations
@@ -20,6 +26,9 @@ from pydantic import BaseModel, Field
 from scrudful.fastapi import (
     CONDITIONAL_READ_RESPONSES,
     CONDITIONAL_WRITE_RESPONSES,
+    Entity,
+    add_error_links,
+    add_options,
     scrudful,
 )
 
@@ -110,6 +119,50 @@ def user_context_link(request: Request, **kwargs: Any) -> Any:
     return request.url_for("user_context")
 
 
+def error_schema_link(request: Request, **kwargs: Any) -> Any:
+    return request.url_for("error_schema")
+
+
+def error_context_link(request: Request, **kwargs: Any) -> Any:
+    return request.url_for("error_context")
+
+
+# The body of every error: scrudful's own 400/412/428 (``{"detail": "..."}``,
+# with the accepted headers on a 428) and, through ``add_error_links`` below,
+# FastAPI's (``{"detail": "..."}``, or a list of validation errors on a 422).
+# Its link callables get the request: as ``request=`` from the app's exception
+# handlers, and as the endpoints' ``request`` parameter otherwise (which is why
+# ``delete_user`` declares one).
+ERROR = Entity(
+    schema_link_or_func=error_schema_link, context_link_or_func=error_context_link
+)
+ERROR_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Error",
+    "type": "object",
+    "properties": {
+        "detail": {
+            "anyOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "object"}},
+            ]
+        },
+        "accepted-precondition-headers": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+}
+ERROR_CONTEXT = {"@context": {"@vocab": "https://schema.org/", "detail": "description"}}
+USER_LINKS: dict[str, Any] = dict(
+    schema_link_or_func=user_schema_link,
+    context_link_or_func=user_context_link,
+    error=ERROR,
+)
+USER_VALIDATORS: dict[str, Any] = dict(
+    etag_func=user_etag, last_modified_func=user_last_modified
+)
+
 NOT_FOUND: dict[int | str, dict[str, Any]] = {404: {"description": "User not found"}}
 READ_RESPONSES = {**CONDITIONAL_READ_RESPONSES, **NOT_FOUND}
 WRITE_RESPONSES = {**CONDITIONAL_WRITE_RESPONSES, **NOT_FOUND}
@@ -135,12 +188,18 @@ async def get_user_context() -> dict[str, Any]:
     }
 
 
+@app.get("/schemas/error.json", name="error_schema")
+async def get_error_schema() -> dict[str, Any]:
+    return ERROR_SCHEMA
+
+
+@app.get("/contexts/error.jsonld", name="error_context")
+async def get_error_context() -> dict[str, Any]:
+    return ERROR_CONTEXT
+
+
 @app.post("/users", status_code=status.HTTP_201_CREATED, response_model=User)
-@scrudful(
-    schema_link_or_func=user_schema_link,
-    schema_type_or_func="application/schema+json",
-    context_link_or_func=user_context_link,
-)
+@scrudful(**USER_LINKS)
 async def create_user(request: Request, response: Response, user: UserIn) -> User:
     global _next_id
     now = _now()
@@ -151,28 +210,20 @@ async def create_user(request: Request, response: Response, user: UserIn) -> Use
     return created
 
 
-# ``@scrudful`` goes below the route decorator. The endpoints declare ``request``
-# only so that the link callbacks receive it.
+# ``@scrudful`` goes below the route decorators. The endpoints declare
+# ``request`` only so that the link callbacks receive it. FastAPI routes HEAD
+# only to a route that lists it: ``@app.head`` serves it with the GET endpoint
+# (an ``api_route(..., methods=["GET", "HEAD"])`` would too, but FastAPI would
+# give both methods the same OpenAPI operation id, and warn).
 @app.get("/users/{user_id}", response_model=User, responses=READ_RESPONSES)
-@scrudful(
-    etag_func=user_etag,
-    last_modified_func=user_last_modified,
-    schema_link_or_func=user_schema_link,
-    schema_type_or_func="application/schema+json",
-    context_link_or_func=user_context_link,
-)
+@app.head("/users/{user_id}", response_model=User, responses=READ_RESPONSES)
+@scrudful(**USER_VALIDATORS, **USER_LINKS)
 async def get_user(request: Request, user_id: int) -> User:
     return _get_record(user_id).user
 
 
 @app.put("/users/{user_id}", response_model=User, responses=WRITE_RESPONSES)
-@scrudful(
-    etag_func=user_etag,
-    last_modified_func=user_last_modified,
-    schema_link_or_func=user_schema_link,
-    schema_type_or_func="application/schema+json",
-    context_link_or_func=user_context_link,
-)
+@scrudful(**USER_VALIDATORS, **USER_LINKS)
 async def replace_user(request: Request, user_id: int, user: UserIn) -> User:
     record = _get_record(user_id)
     record.user = record.user.model_copy(
@@ -183,13 +234,7 @@ async def replace_user(request: Request, user_id: int, user: UserIn) -> User:
 
 
 @app.patch("/users/{user_id}", response_model=User, responses=WRITE_RESPONSES)
-@scrudful(
-    etag_func=user_etag,
-    last_modified_func=user_last_modified,
-    schema_link_or_func=user_schema_link,
-    schema_type_or_func="application/schema+json",
-    context_link_or_func=user_context_link,
-)
+@scrudful(**USER_VALIDATORS, **USER_LINKS)
 async def update_user(request: Request, user_id: int, patch: UserPatch) -> User:
     record = _get_record(user_id)
     changes = patch.model_dump(exclude_unset=True)
@@ -203,13 +248,16 @@ async def update_user(request: Request, user_id: int, patch: UserPatch) -> User:
     status_code=status.HTTP_204_NO_CONTENT,
     responses=WRITE_RESPONSES,
 )
-@scrudful(
-    etag_func=user_etag,
-    last_modified_func=user_last_modified,
-)
-async def delete_user(user_id: int) -> None:
+@scrudful(**USER_VALIDATORS, error=ERROR)
+async def delete_user(request: Request, user_id: int) -> None:
     _get_record(user_id)
     del _records[user_id]
+
+
+# Before the app serves requests: the errors FastAPI answers get ERROR's Links,
+# and every path with a scrudful endpoint answers OPTIONS.
+add_error_links(app, ERROR)
+add_options(app)
 
 
 if __name__ == "__main__":
