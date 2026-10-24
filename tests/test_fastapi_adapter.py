@@ -2565,7 +2565,12 @@ def test_add_options_mount(make_client):
 
 
 def test_add_options_mounted_fastapi_app(make_client):
+    """A mounted app keeps its own middleware: ``add_options`` on the outer app
+    leaves it alone, and on the sub-app covers it inside that middleware."""
     sub = FastAPI()
+    sub.add_middleware(
+        CORSMiddleware, allow_origins=["https://a.example"], allow_methods=["*"]
+    )
 
     @sub.get("/items/{item_id}")
     @scrudful(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
@@ -2575,6 +2580,123 @@ def test_add_options_mounted_fastapi_app(make_client):
     app = FastAPI()
     app.mount("/sub", sub)
     add_options(app)
-    options = make_client(app).options("/sub/items/1")
+    client = make_client(app)
+    preflight = {"Origin": "https://a.example", "Access-Control-Request-Method": "GET"}
+    assert client.options("/sub/items/1").status_code == 405
+    response = client.options("/sub/items/1", headers=preflight)
+    assert response.headers["access-control-allow-origin"] == "https://a.example"
+    add_options(sub)
+    options = client.options("/sub/items/1")
     assert options.status_code == 200
     assert options.json()["get"]["responses"]["200"]["content"] == ITEM_CONTENT
+    response = client.options("/sub/items/1", headers=preflight)
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://a.example"
+    assert "allow" not in response.headers  # CORSMiddleware's answer
+
+
+def test_add_error_links_rejects_rel_callables_needing_arguments():
+    """The handlers call the rels too (OPTIONS does not)."""
+
+    def user():
+        return "alice"
+
+    app = FastAPI()
+    error = Entity(
+        schema_link_or_func="/e.json",
+        schema_rel_or_func=lambda item_id, who: "describedby",
+        context_link_or_func=CONTEXT,
+    )
+
+    @app.get("/items/{item_id}")
+    @scrudful(**ITEM_LINKS, error=error)
+    async def get_item(item_id: int, who: str = Depends(user)):
+        raise HTTPException(status_code=404)
+
+    add_options(app)  # the rels are not called in OPTIONS
+    with pytest.raises(TypeError, match="error.schema_rel_or_func"):
+        add_error_links(app, APP_ERROR)
+    app_error = Entity(
+        schema_link_or_func="/e.json",
+        context_link_or_func=CONTEXT,
+        context_rel_or_func=lambda request, view: "x",
+    )
+    with pytest.raises(TypeError, match="context_rel_or_func"):
+        add_error_links(FastAPI(), app_error)
+
+
+def test_mount_callables_get_the_path_parameters_that_reach_them(make_client):
+    """A Mount's own ``{path:path}`` is not a path parameter of its routes."""
+    from fastapi.routing import APIRoute
+
+    def schema(item_id):
+        return f"/s/{item_id}.json"
+
+    async def item(item_id: int):
+        raise HTTPException(status_code=404)
+
+    error = Entity(
+        schema_link_or_func=lambda item_id: f"/e/{item_id}",
+        context_link_or_func=CONTEXT,
+    )
+    endpoint = scrudful(
+        etag_func=lambda **kwargs: "v1",
+        schema_link_or_func=schema,
+        context_link_or_func=CONTEXT,
+        error=error,
+    )(item)
+    app = FastAPI()
+    app.router.routes.append(
+        Mount("/n", routes=[APIRoute("/items/{item_id}", endpoint, methods=["GET"])])
+    )
+    add_error_links(app, APP_ERROR)
+    add_options(app)
+    client = make_client(app)
+    body = client.options("/n/items/1").json()
+    assert body["get"]["responses"]["200"]["content"] == {
+        "application/json": {
+            "schema": {"$ref": "http://testserver/s/1.json"},
+            "x-rdf-context": {"href": CONTEXT, "type": "application/ld+json"},
+        }
+    }
+    assert body["get"]["responses"]["400"]["content"]["application/json"]["schema"] == {
+        "$ref": "http://testserver/e/1"
+    }
+    response = client.get("/n/items/1")
+    assert response.status_code == 404
+    assert parse_links(response.headers["link"])[0][0] == "http://testserver/e/1"
+
+
+@pytest.mark.parametrize("mode", ["app", "router"])
+def test_options_request_carries_the_matched_route(make_client, mode):
+    seen = []
+
+    def schema(req, **kwargs):
+        seen.append(
+            (dict(req.path_params), req.scope.get("route"), req.scope.get("endpoint"))
+        )
+        return f"/s/{req.path_params['item_id']}.json"
+
+    router = APIRouter()
+
+    @router.get("/items/{item_id}")
+    @scrudful(schema_link_or_func=schema, context_link_or_func=CONTEXT)
+    async def get_item(item_id: int, req: Request):
+        return {}
+
+    app = FastAPI()
+    if mode == "router":
+        add_options(router)
+    app.include_router(router)
+    if mode == "app":
+        add_options(app)
+    response = make_client(app).options("/items/7")
+    assert response.status_code == 200
+    content = response.json()["get"]["responses"]["200"]["content"]
+    assert content["application/json"]["schema"] == {
+        "$ref": "http://testserver/s/7.json"
+    }
+    [(path_params, route, endpoint)] = seen
+    assert path_params == {"item_id": "7"}
+    assert route is router.routes[0]
+    assert endpoint is get_item

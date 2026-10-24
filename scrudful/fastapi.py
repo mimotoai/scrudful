@@ -24,8 +24,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers, MutableHeaders, URLPath
 from starlette.exceptions import HTTPException
-from starlette.applications import Starlette
-from starlette.routing import BaseRoute, Match, NoMatchFound, Route, Router
+from starlette.routing import BaseRoute, Match, Mount, NoMatchFound, Route, Router
 from starlette.types import Receive, Scope, Send
 
 from scrudful import _adapter
@@ -608,6 +607,9 @@ _OUTSIDE = (
     "the URL's path parameters, and the request under the name of the "
     "endpoint's Request parameter if it declares one"
 )
+#: The fields of an entity whose callables :func:`add_error_links`'s handlers
+#: call (via :func:`_entity_links`).
+_ERROR_LINK_FIELDS = (*_LINK_FIELDS, "schema_rel_or_func", "context_rel_or_func")
 #: Where the OPTIONS route keeps the routes it resolved, in the request scope.
 _SERVED_KEY = "scrudful.options"
 
@@ -634,8 +636,8 @@ def add_options(app: FastAPI | APIRouter) -> None:
     Given a ``FastAPI`` app, the body describes, for each method, the
     endpoint the app routes that method of the URL to, found the way
     Starlette routes it: by matching the request against the app's routes,
-    those of the routers included in it, and the routes of a ``Mount`` (or a
-    mounted FastAPI app) the URL is under. So a path served by several
+    those of the routers included in it, and the routes of a
+    ``Mount(routes=...)`` the URL is under. So a path served by several
     routers, by the app and a router, or under differently named path
     parameters (``/items/{id}`` and ``/items/{item_id}``), is described as a
     whole, and ``Allow`` lists every method. Given an ``APIRouter``, it adds
@@ -643,6 +645,11 @@ def add_options(app: FastAPI | APIRouter) -> None:
     route, describing the routes on that path; call it before including the
     router (older FastAPI versions copy a router's routes when it is
     included). Prefer calling it on the app.
+
+    A mounted Starlette or FastAPI app, or a ``Mount`` with ``middleware``,
+    is left alone: answering for it from the outer app would skip its own
+    middleware (e.g. its ``CORSMiddleware``). Call this on a mounted app
+    itself; its OPTIONS answer then runs inside its middleware.
 
     The body lists the methods in the order ``get``, ``put``, ``post``,
     ``delete``, ``options``, ``head``, ``patch``, ``trace``:
@@ -756,11 +763,39 @@ def _flat(routes: Sequence[Any]) -> list[Any]:
     return list(_iter_route_contexts(routes))
 
 
-def _sub_routes(route: Any) -> Sequence[Any] | None:
-    """The routes of a ``Mount`` or ``Host`` (or of a mounted app), else ``None``."""
+#: What :func:`_contents` returns for a ``Mount`` or ``Host`` of something
+#: other than a bare router: a mounted app (with its own middleware and
+#: handlers) or a middleware-wrapped router, which scrudful leaves alone.
+_OPAQUE: Sequence[Any] = ()
+
+
+def _contents(route: Any) -> Sequence[Any] | None:
+    """The routes a ``Mount`` or ``Host`` routes to, else ``None``.
+
+    Only those of a bare ``Router`` (``Mount(routes=...)``, a mounted
+    ``APIRouter``): a mounted Starlette or FastAPI app, or a router wrapped in
+    middleware, gives :data:`_OPAQUE`, since answering for it here would skip
+    its own middleware (e.g. its ``CORSMiddleware``); call
+    :func:`add_options` on a mounted app itself.
+    """
     if isinstance(getattr(route, "original_route", route), Route):
         return None
-    return getattr(route, "routes", None)
+    routes = getattr(route, "routes", None)
+    if routes is None:
+        return None
+    return routes if isinstance(getattr(route, "app", None), Router) else _OPAQUE
+
+
+def _path_param_names(route: Any) -> set[str]:
+    """The names of the path parameters ``route`` adds to ``path_params``.
+
+    A ``Mount`` matches its remainder as a ``path`` parameter, which it
+    removes again.
+    """
+    names = set(getattr(route, "param_convertors", None) or ())
+    if isinstance(getattr(route, "original_route", route), Mount):
+        names.discard("path")
+    return names
 
 
 def _is_automatic(route: Any) -> bool:
@@ -771,10 +806,12 @@ def _is_automatic(route: Any) -> bool:
 
 
 def _match(routes: Sequence[Any], scope: Scope) -> tuple[Any, Scope] | None:
-    """The route that serves ``scope`` among ``routes``, and its child scope.
+    """The route that serves ``scope`` among ``routes``, and the scope it gets.
 
     As Starlette routes: the first route that fully matches, and within a
-    ``Mount`` or ``Host`` that does, the route of its own routes that does.
+    ``Mount`` or ``Host`` of a router that does, the route of its own routes
+    that does; the scope is ``scope`` updated with each child scope on the
+    way. A ``Mount`` of an app is returned itself (see :func:`_contents`).
     The automatic OPTIONS routes are skipped.
     """
     for route in _flat(routes):
@@ -783,20 +820,24 @@ def _match(routes: Sequence[Any], scope: Scope) -> tuple[Any, Scope] | None:
         match, child_scope = route.matches(scope)
         if match != Match.FULL:
             continue
-        sub_routes = _sub_routes(route)
-        if sub_routes is not None:
-            return _match(sub_routes, {**scope, **child_scope})
-        return route, child_scope
+        routed = {**scope, **child_scope}
+        contents = _contents(route)
+        if contents is not None and contents is not _OPAQUE:
+            return _match(contents, routed)
+        routed.setdefault("route", getattr(route, "original_route", route))
+        return route, routed
     return None
 
 
 def _resolve(
     routes: Sequence[Any], scope: Scope
-) -> dict[str, tuple[Any, Any, dict[str, Any]]] | None:
-    """The ``(route, endpoint, path_params)`` serving each method of the URL.
+) -> dict[str, tuple[Any, Any, Scope]] | None:
+    """The ``(route, endpoint, scope)`` serving each method of the URL.
 
-    ``None`` when another route serves OPTIONS for it, or no scrudful
-    endpoint serves any of its methods.
+    The scope is the one the route would get for that method (its
+    ``path_params``, ``route`` and ``endpoint``). ``None`` when another route
+    (or a mounted app) serves OPTIONS for the URL, or no scrudful endpoint
+    serves any of its methods.
     """
     served = {}
     for method in METHOD_KEYS:
@@ -806,10 +847,9 @@ def _resolve(
                 return None
             continue
         if found is not None:
-            route, child_scope = found
-            endpoint = child_scope.get("endpoint", getattr(route, "endpoint", None))
-            path_params = dict(child_scope.get("path_params") or {})
-            served[method] = (route, endpoint, path_params)
+            route, routed = found
+            endpoint = routed.get("endpoint", getattr(route, "endpoint", None))
+            served[method] = (route, endpoint, routed)
     if not any(_endpoint_config(endpoint) for _, endpoint, _ in served.values()):
         return None
     return served
@@ -861,7 +901,8 @@ def _options_endpoint(router: APIRouter, path: str) -> Callable[[Request], Any]:
                 None,
             )
             if route is not None and method != "options":
-                served[method] = (route, route.endpoint, dict(request.path_params))
+                routed = {**request.scope, "route": route, "endpoint": route.endpoint}
+                served[method] = (route, route.endpoint, routed)
         return _options_response(await _describe(request, served))
 
     scrudful_options._scrudful_options = True  # type: ignore[attr-defined]
@@ -878,7 +919,7 @@ def _options_response(body: dict[str, Any]) -> Response:
 
 
 async def _describe(
-    request: Request, served: Mapping[str, tuple[Any, Any, dict[str, Any]]]
+    request: Request, served: Mapping[str, tuple[Any, Any, Scope]]
 ) -> dict[str, Any]:
     """The HTTP Schema Resource of the methods ``served``, and ``options``."""
     body: dict[str, Any] = {}
@@ -886,9 +927,9 @@ async def _describe(
         if method == "options":
             body[method] = describe_options()
         elif method in served:
-            route, endpoint, path_params = served[method]
+            route, endpoint, routed = served[method]
             body[method] = await _describe_route(
-                method, route, endpoint, path_params, request
+                method, route, endpoint, routed, request
             )
     return body
 
@@ -897,14 +938,19 @@ async def _describe_route(
     method: str,
     route: Any,
     endpoint: Any,
-    path_params: Mapping[str, Any],
+    routed: Scope,
     request: Request,
 ) -> Any:
-    """Describe ``route`` as the operation of ``method`` (see :func:`add_options`)."""
+    """Describe ``route`` as the operation of ``method`` (see :func:`add_options`).
+
+    The callables get a ``Request`` of the OPTIONS request with the scope
+    ``routed``, the route's (its ``path_params``, ``route`` and ``endpoint``).
+    """
     config = _endpoint_config(endpoint)
     if config is None:
         return {"responses": {"200": {"description": "OK"}}}
-    kwargs = _description_kwargs(config, request, path_params)
+    routed_request = Request({**routed, "method": request.method}, request.receive)
+    kwargs = _description_kwargs(config, routed_request)
     base = str(request.url)
     status = int(getattr(route, "status_code", None) or 200)
     conditional = _is_conditional(config)
@@ -949,17 +995,13 @@ def _endpoint_config(endpoint: Any) -> _EndpointConfig | None:
     return config if isinstance(config, _EndpointConfig) else None
 
 
-def _description_kwargs(
-    config: _EndpointConfig,
-    request: Request,
-    path_params: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
+def _description_kwargs(config: _EndpointConfig, request: Request) -> dict[str, Any]:
     """The kwargs of an endpoint's callables outside the endpoint.
 
-    The path parameters (the request's by default), plus the request under
-    the name of the endpoint's ``Request`` parameter, when it declares one.
+    The request's path parameters, plus the request under the name of the
+    endpoint's ``Request`` parameter, when it declares one.
     """
-    kwargs = dict(request.path_params if path_params is None else path_params)
+    kwargs = dict(request.path_params)
     if config.request_name is not None:
         kwargs[config.request_name] = request
     return kwargs
@@ -969,18 +1011,18 @@ def _description_kwargs(
 
 
 def _endpoints(
-    routes: Sequence[Any], params: frozenset[str] = frozenset(), apps: bool = True
+    routes: Sequence[Any], params: frozenset[str] = frozenset()
 ) -> Iterator[tuple[Any, _EndpointConfig, frozenset[str]]]:
     """The scrudful endpoints under ``routes``, with their path parameter names.
 
-    ``apps``: whether to look into mounted Starlette (and FastAPI) apps too.
+    Including those under a ``Mount`` or ``Host`` of a router, not those of a
+    mounted app (see :func:`_contents`), which has its own handlers.
     """
     for route in _flat(routes):
-        names = params | set(getattr(route, "param_convertors", None) or ())
-        sub_routes = _sub_routes(route)
-        if sub_routes is not None:
-            if apps or not isinstance(getattr(route, "app", None), Starlette):
-                yield from _endpoints(sub_routes, names, apps)
+        names = params | _path_param_names(route)
+        contents = _contents(route)
+        if contents is not None:
+            yield from _endpoints(contents, names)
             continue
         endpoint = getattr(route, "endpoint", None)
         config = _endpoint_config(endpoint)
@@ -1006,9 +1048,15 @@ def _check_options_callables(routes: Sequence[Any]) -> None:
 def _check_error_callables(routes: Sequence[Any], error: Entity) -> None:
     """Check the callables :func:`add_error_links`'s handlers call."""
     _check_call(
-        error, "", "add_error_links", {"request"}, "in its handlers", "the request"
+        error,
+        "",
+        "add_error_links",
+        {"request"},
+        "in its handlers",
+        "the request",
+        _ERROR_LINK_FIELDS,
     )
-    for endpoint, config, names in _endpoints(routes, apps=False):
+    for endpoint, config, names in _endpoints(routes):
         if config.error is not None:
             _check_call(
                 config.error,
@@ -1016,6 +1064,7 @@ def _check_error_callables(routes: Sequence[Any], error: Entity) -> None:
                 f"endpoint {_endpoint_name(endpoint)}",
                 _outside_names(config, names),
                 "in add_error_links's handlers",
+                fields=_ERROR_LINK_FIELDS,
             )
 
 
@@ -1031,10 +1080,11 @@ def _check_call(
     names: set[str],
     purpose: str,
     meaning: str = _OUTSIDE,
+    fields: Sequence[str] = _LINK_FIELDS,
 ) -> None:
-    """Raise ``TypeError`` unless each callable of ``source``'s link fields can
+    """Raise ``TypeError`` unless each callable of ``source``'s ``fields`` can
     be called with the keyword arguments ``names`` alone (``meaning``)."""
-    for field in _LINK_FIELDS:
+    for field in fields:
         func = getattr(source, field)
         if not callable(func):
             continue

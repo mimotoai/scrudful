@@ -64,11 +64,18 @@ content of its requests and responses, scrudful's own 304, 400, 412 and 428
 and the ``error`` content of the last three, with the ``Link`` headers of the
 HTTP Schema Resource's published schema and context and an ``Allow`` listing
 its methods. Given the app, it finds the endpoint of each method the way
-Starlette routes the request, through included routers, ``Mount``\ s and
-mounted FastAPI apps, so a path split across several routers is described as
+Starlette routes the request, through included routers and
+``Mount(routes=...)``, so a path split across several routers is described as
 a whole. The answer has no dependencies, so it needs no credentials. Given an
 ``APIRouter``, it describes each of the router's own paths; call it before
-including the router. Prefer calling it on the app.
+including the router. Prefer calling it on the app. A mounted FastAPI (or
+Starlette) app, or a ``Mount`` with ``middleware``, is left alone, so that its
+own middleware (e.g. its ``CORSMiddleware``) still sees its requests: call
+``add_options`` (and ``add_error_links``) on the mounted app itself.
+
+The callables' ``Request`` in the OPTIONS body is the OPTIONS request as the
+described route would get it: its ``path_params``, ``route`` and ``endpoint``
+are that route's.
 
 Callables inside and outside the endpoint
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
