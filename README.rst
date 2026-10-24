@@ -180,8 +180,9 @@ configure the list response):
 
 For single methods use ``@scrudful(...)`` on a view method or function view
 (below ``@api_view``), and ``@scrudful_api_view(["GET", "PUT"], ...)`` as a
-replacement for ``@api_view``. OPTIONS requests are answered with the Semantic HTTP 0.1 HTTP Schema Resource
-of the methods the route serves (``ScrudfulMetadata``). Set ``error=`` (or
+replacement for ``@api_view``. OPTIONS requests are answered with the Semantic
+HTTP 0.1 HTTP Schema Resource of the methods the route serves
+(``ScrudfulMetadata``). Set ``error=`` (or
 ``Meta.error``) and name ``scrudful.rest_framework.exception_handler`` as DRF's
 ``EXCEPTION_HANDLER`` so that the errors DRF raises itself carry the error
 entity's Links too. See ``examples/scrudful_rest_framework`` for a complete
@@ -312,6 +313,7 @@ and so does the handler. It does not need Django REST Framework.
     from scrudful.ninja import (
         CONDITIONAL_READ_RESPONSES,
         CONDITIONAL_WRITE_RESPONSES,
+        Entity,
         ScrudfulRouter,
         add_error_links,
         scrudful,
@@ -322,6 +324,8 @@ and so does the handler. It does not need Django REST Framework.
     api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
     roles = ScrudfulRouter()  # adds OPTIONS to every path with a scrudful operation
     api.add_router("/roles", roles)
+    ERROR = Entity(schema_link_or_func="/schemas/error",
+                   context_link_or_func="/contexts/error")
     add_error_links(api, ERROR)  # the 422, 401, ... get the error entity's Links
 
 
@@ -414,11 +418,12 @@ scrudful follows `Semantic HTTP 0.1 <https://w3id.org/semantic-http/0.1/>`_
 The application must still:
 
 * **Install the error-links helper:** ``add_error_links(api, ERROR)`` for
-  django-ninja and FastAPI (``add_options(app)`` too, for FastAPI), and DRF's
-  ``exception_handler`` as ``EXCEPTION_HANDLER``, so the errors the framework
-  answers (422, 401, 404, 405, ...) carry Links.
+  django-ninja and FastAPI, and DRF's ``exception_handler`` as
+  ``EXCEPTION_HANDLER``, so the errors the framework answers (422, 401, 404,
+  405, ...) carry Links.
+* **Install the OPTIONS helper in FastAPI:** ``add_options(app)``.
 * **Give every entity a schema and a context** (only a schema for in-band types
-  such as JSON-LD or Turtle), and keep the default ``describedby`` relation:
+  such as JSON-LD or Turtle; for JSON, a JSON-LD 1.1 context), and keep the default ``describedby`` relation:
   another one is no Schema Link Header while the OPTIONS body still describes
   it as the schema.
 * **Serve the linked documents:** scrudful sends the URLs, not the documents.

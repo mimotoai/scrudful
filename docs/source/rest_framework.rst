@@ -11,10 +11,10 @@ function view. See :doc:`usage` for the behaviour table, the caveats of
 OPTIONS requests are answered with a Semantic HTTP 0.1 HTTP Schema Resource
 (``Content-Type: application/json``, the two published HTTP Schema Resource
 Links and an ``Allow`` listing the body's methods) by ``ScrudfulMetadata``, but
-only when the view's ``metadata_class`` is DRF's default ``SimpleMetadata``. A custom class, ``None``,
-or a project-wide ``DEFAULT_METADATA_CLASS`` is kept, so subclass or mix in
-``ScrudfulMetadata`` if you use your own metadata class and want scrudful's
-OPTIONS output.
+only when the view's ``metadata_class`` is DRF's default ``SimpleMetadata``. A
+custom class, ``None``, or a project-wide ``DEFAULT_METADATA_CLASS`` is kept,
+so subclass or mix in ``ScrudfulMetadata`` if you use your own metadata class
+and want scrudful's OPTIONS output.
 
 A view that uses ``ScrudfulMetadata`` only through ``DEFAULT_METADATA_CLASS``,
 without scrudful decorators, gets DRF's ``Allow`` order, which differs from the

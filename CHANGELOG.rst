@@ -40,8 +40,12 @@ change, so clients and tests that compare them must be updated.
 * Error entities: ``error=`` for DRF (``Meta.error`` / ``Meta.list_error``)
   and FastAPI, as ninja already had. An ``error`` entity's ``media_type`` must
   be JSON content (``application/json`` or ``+json``, other than JSON-LD);
-  scrudful's own 400, 412 and 428, and the responses of the helpers below, are
-  served with ``Content-Type`` equal to ``error.media_type``.
+  scrudful's own 400, 412 and 428 (all adapters), DRF's ``exception_handler``
+  and FastAPI's ``add_error_links`` serve their responses with ``Content-Type``
+  equal to ``error.media_type``. ninja's ``add_error_links`` and the errors
+  raised inside ninja operations only gain the Links and stay
+  ``application/json`` as ninja renders them, so use an ``application/json``
+  error entity there.
 * New helpers that give the errors a framework answers itself the error
   entity's Links: ``add_error_links(api, error)`` for django-ninja and
   ``add_error_links(app, error)`` for FastAPI, and
@@ -53,7 +57,9 @@ change, so clients and tests that compare them must be updated.
   and ``add_error_links``) gets only the URL's path parameters plus the request
   under the name of the endpoint's ``Request`` parameter; the helpers check
   every such callable when called and raise ``TypeError`` for one that can't
-  be called that way. Mounted apps need their own calls. The FastAPI adapter
+  be called that way. ``add_options`` leaves mounted apps and middleware Mounts and Routers to
+  themselves, and ``add_error_links`` covers the endpoints under middleware
+  Mounts but not mounted apps: those need their own calls. The FastAPI adapter
   has no request entity: a request body is described with the endpoint's
   response links.
 * The ninja example (``examples/ninja``) calls ``add_error_links`` and serves

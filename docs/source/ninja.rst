@@ -581,8 +581,12 @@ otherwise) and must not use the ORM there.
 ``media_type`` must be ``application/json`` or another ``+json`` type (e.g.
 ``application/problem+json``), other than JSON-LD; anything else raises
 ``ValueError``. scrudful's own 400, 412 and 428 are served with the ``error``
-entity's ``media_type`` as their ``Content-Type``, and so are the responses of
-the helper above, which has content (a handler's JSON response is relabelled).
+entity's ``media_type`` as their ``Content-Type``. The other errors (those
+raised inside a scrudful operation and those of
+:func:`~scrudful.ninja.add_error_links`) are served as ninja renders them,
+``application/json``: only their Links are added, and the ``Content-Type`` is
+not relabelled. An ``error`` entity used there should therefore be
+``application/json`` for its Links to agree with the response.
 
 Not covered, since no ninja exception handler makes them:
 
