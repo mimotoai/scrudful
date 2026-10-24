@@ -28,20 +28,20 @@ from tests.test_ninja_adapter import (
 
 RESULTS = Entity("/schemas/results", context_link_or_func="/contexts/results")
 RESULTS_LINK = (
-    '</schemas/results>; rel="describedBy"; type="application/json", '
+    '</schemas/results>; rel="describedby"; type="application/schema+json", '
     '</contexts/results>; rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
 )
 QUERY = Entity("/schemas/query", context_link_or_func="/contexts/query")
 ERROR = Entity("/schemas/error")
-ERROR_LINK = '</schemas/error>; rel="describedBy"; type="application/json"'
+ERROR_LINK = '</schemas/error>; rel="describedby"; type="application/schema+json"'
 PROBLEM = Entity("/schemas/problem", context_link_or_func="/contexts/problem")
 PROBLEM_LINK = (
-    '</schemas/problem>; rel="describedBy"; type="application/json", '
+    '</schemas/problem>; rel="describedby"; type="application/schema+json", '
     '</contexts/problem>; rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
 )
-JOB_LINK = '</schemas/job>; rel="describedBy"; type="application/json"'
+JOB_LINK = '</schemas/job>; rel="describedby"; type="application/schema+json"'
 
 
 class Query(Schema):
@@ -334,7 +334,7 @@ def test_runtime_entity_wins_and_gets_the_object(store):
 
     response = TestClient(router).get("/items/1")
     assert response.headers["Link"] == (
-        '</schemas/item/1>; rel="describedBy"; type="application/json"'
+        '</schemas/item/1>; rel="describedby"; type="application/schema+json"'
     )
     assert seen == [1]
 
@@ -460,7 +460,7 @@ def test_error_link_callables_get_the_loaded_object(store):
     response = client.put("/items/1")
     assert response.status_code == 428
     assert response.headers["Link"] == (
-        '</schemas/problem>; rel="profile"; type="application/json"'
+        '</schemas/problem>; rel="profile"; type="application/schema+json"'
     )
     assert seen == [("PUT", 1)]
 
@@ -614,7 +614,7 @@ def test_async_operation_error_links(store):
     response = async_to_sync(TestAsyncClient(router).put)("/items/1")
     assert response.status_code == 428
     assert response.headers["Link"] == (
-        '</schemas/problem>; rel="describedBy"; type="application/json"'
+        '</schemas/problem>; rel="describedby"; type="application/schema+json"'
     )
 
 
@@ -685,7 +685,8 @@ def test_link_callables_get_the_reloaded_object_without_validators(store):
         response = client.request(method, "/items/1")
         assert response.status_code == 200
         assert response.headers["Link"] == (
-            f'</schemas/item/v{version}>; rel="describedBy"; type="application/json"'
+            f'</schemas/item/v{version}>; rel="describedby"; '
+            'type="application/schema+json"'
         )
     assert seen == [2, 3]
     assert store.calls["load"] == 4

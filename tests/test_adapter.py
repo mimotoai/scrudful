@@ -7,12 +7,32 @@ import pytest
 
 from scrudful import _adapter
 from scrudful._adapter import (
+    CONTEXT_TYPE,
+    HSR_CONTEXT_URL,
+    HSR_SCHEMA_URL,
+    JSON_LD_CONTEXT_REL,
+    RDF_CONTEXT_REL,
+    SCHEMA_TYPE,
+    allow_header,
     check_validators,
+    context_defaults,
+    describe_content,
+    describe_options,
+    describe_read,
+    describe_write,
+    essence,
     expose_headers,
+    is_in_band,
+    is_json,
+    media_type_key,
+    merge_links,
+    options_links,
     precondition_headers,
     set_validator_headers,
     validator_policy,
 )
+from scrudful.utils import link_content
+from tests.semantic_http import validate_http_schema_resource
 
 # --- framework independence ------------------------------------------------
 
@@ -36,8 +56,8 @@ def test_imports_no_framework():
 def test_adapters_expose_link_defaults(module):
     adapter = __import__(module, fromlist=["_"])
     for name, value in {
-        "DEFAULT_SCHEMA_REL": "describedBy",
-        "DEFAULT_SCHEMA_TYPE": "application/json",
+        "DEFAULT_SCHEMA_REL": "describedby",
+        "DEFAULT_SCHEMA_TYPE": "application/schema+json",
         "DEFAULT_CONTEXT_REL": "http://www.w3.org/ns/json-ld#context",
         "DEFAULT_CONTEXT_TYPE": "application/ld+json",
     }.items():
@@ -272,7 +292,6 @@ def test_adapter_describe_matches_drf():
         "required": True,
     }
     assert describe_write("post", None, False, False, False) == {
-        "requestBody": post_body,
         "responses": {"201": {"description": "Created"}},
     }
     assert describe_write("post", ITEM_CONTENT, True, True, True) == {
@@ -286,7 +305,6 @@ def test_adapter_describe_matches_drf():
     # test_metadata_describes_non_scrudful_methods
     put_body = {"description": "The new content of the resource.", "required": True}
     assert describe_write("put", None, False, False, False) == {
-        "requestBody": put_body,
         "responses": {"200": {"description": "OK"}},
     }
     # test_api_view_options_metadata (etag only)
@@ -297,10 +315,6 @@ def test_adapter_describe_matches_drf():
     }
     # test_metadata_parameters_for_a_single_validator
     assert describe_write("patch", None, True, False, True) == {
-        "requestBody": {
-            "description": "The changes to apply to the resource.",
-            "required": True,
-        },
         "responses": {"200": {"description": "OK"}} | WRITE_EARLY,
         "parameters": [LAST_MODIFIED_PARAMETER],
     }
@@ -339,3 +353,219 @@ def test_descriptions_do_not_share_the_module_dictionaries():
             response["description"] = "mutated"
         first["parameters"] = None
         assert describe()["responses"]["412"] == {"description": "Precondition Failed."}
+
+
+# --- Semantic HTTP 0.1 vocabulary -------------------------------------------
+
+SCHEMA_LINK = link_content("https://h/s", "describedby", SCHEMA_TYPE)
+CONTEXT_LINK = link_content("https://h/c", JSON_LD_CONTEXT_REL, CONTEXT_TYPE)
+IN_BAND = [
+    "application/ld+json",
+    "text/turtle",
+    "application/n-triples",
+    "application/n-quads",
+    "application/trig",
+    "application/rdf+xml",
+]
+
+
+def test_defaults_are_0_1():
+    assert _adapter.DEFAULT_SCHEMA_REL == "describedby"
+    assert _adapter.DEFAULT_SCHEMA_TYPE == "application/schema+json"
+
+
+def test_merge_links_view_describedby_drops_schema_link():
+    view = '<https://h/v>; rel="DescribedBy"'
+    assert merge_links(view, SCHEMA_LINK, CONTEXT_LINK) == (f"{view}, {CONTEXT_LINK}")
+
+
+def test_merge_links_other_relation_keeps_both():
+    view = '<https://h/n>; rel="next"'
+    assert merge_links(view, SCHEMA_LINK, CONTEXT_LINK) == (
+        f"{view}, {SCHEMA_LINK}, {CONTEXT_LINK}"
+    )
+
+
+@pytest.mark.parametrize("rel", [JSON_LD_CONTEXT_REL, RDF_CONTEXT_REL])
+def test_merge_links_view_context_drops_context_link(rel):
+    view = link_content("https://h/v", rel, "text/turtle")
+    assert merge_links(view, SCHEMA_LINK, CONTEXT_LINK) == f"{view}, {SCHEMA_LINK}"
+
+
+def test_merge_links_nothing():
+    assert merge_links(None, None, None) is None
+
+
+def test_media_type_key():
+    assert (
+        media_type_key(" Application/JSON; charset=UTF-8 ")
+        == "application/json; charset=UTF-8"
+    )
+    assert media_type_key("Text/CSV") == "text/csv"
+
+
+@pytest.mark.parametrize("value", ["text", "/json", "text/", ""])
+def test_media_type_key_rejects_malformed(value):
+    with pytest.raises(ValueError):
+        media_type_key(value)
+
+
+def test_essence():
+    assert essence("Application/JSON; charset=UTF-8") == "application/json"
+
+
+@pytest.mark.parametrize(
+    "media_type, expected",
+    [
+        ("application/json", True),
+        ("application/problem+json", True),
+        ("application/json; charset=utf-8", True),
+        ("Application/JSON", True),
+        ("application/ld+json", False),
+        ("text/csv", False),
+    ],
+)
+def test_is_json(media_type, expected):
+    assert is_json(media_type) is expected
+
+
+@pytest.mark.parametrize("media_type", IN_BAND)
+def test_is_in_band(media_type):
+    assert is_in_band(media_type)
+    assert is_in_band(media_type.upper())
+    assert is_in_band(f"{media_type}; charset=utf-8")
+
+
+def test_is_not_in_band():
+    assert not is_in_band("application/json")
+    assert not is_in_band("text/csv")
+
+
+def test_context_defaults():
+    assert context_defaults("application/json") == (JSON_LD_CONTEXT_REL, CONTEXT_TYPE)
+    assert context_defaults("application/problem+json; charset=utf-8") == (
+        JSON_LD_CONTEXT_REL,
+        CONTEXT_TYPE,
+    )
+    assert context_defaults("text/turtle") == (None, None)
+    assert context_defaults("application/ld+json") == (None, None)
+    assert context_defaults("text/csv") == (RDF_CONTEXT_REL, None)
+
+
+def test_describe_content_json_schema():
+    assert describe_content(
+        "application/json", "https://h/s", SCHEMA_TYPE, "https://h/c", None
+    ) == {
+        "application/json": {
+            "schema": {"$ref": "https://h/s"},
+            "x-rdf-context": {"href": "https://h/c", "type": "application/ld+json"},
+        }
+    }
+
+
+def test_describe_content_x_schema():
+    content = describe_content(
+        "application/xml", "https://h/s", "application/xml", "https://h/c", "text/x"
+    )
+    assert content == {
+        "application/xml": {
+            "x-schema": {"href": "https://h/s", "type": "application/xml"},
+            "x-rdf-context": {"href": "https://h/c", "type": "text/x"},
+        }
+    }
+
+
+def test_describe_content_keeps_parameters():
+    content = describe_content(
+        "Application/JSON; charset=UTF-8", "https://h/s", SCHEMA_TYPE, None, None
+    )
+    assert content == {
+        "application/json; charset=UTF-8": {"schema": {"$ref": "https://h/s"}}
+    }
+
+
+def test_describe_content_in_band():
+    content = describe_content(
+        "application/ld+json", "https://h/s", SCHEMA_TYPE, "https://h/c", None
+    )
+    assert content == {"application/ld+json": {"schema": {"$ref": "https://h/s"}}}
+
+
+def test_describe_content_no_schema():
+    assert describe_content("application/json", None, SCHEMA_TYPE, "x", None) is None
+    assert describe_content("application/json", "", SCHEMA_TYPE, None, None) is None
+
+
+CONTENT = {"application/json": {"schema": {"$ref": "https://h/s"}}}
+ERRORS = {"application/problem+json": {"schema": {"$ref": "https://h/e"}}}
+
+
+def test_describe_write_omits_request_body_without_content():
+    metadata = describe_write("put", None, False, False, False)
+    assert "requestBody" not in metadata
+    with_content = describe_write("put", CONTENT, False, False, False)
+    assert with_content["requestBody"]["content"] == CONTENT
+
+
+def test_describe_write_response_content():
+    put = describe_write("put", CONTENT, False, False, False, response_content=CONTENT)
+    assert put["responses"]["200"]["content"] == CONTENT
+    post = describe_write("post", None, False, False, False, response_content=CONTENT)
+    assert post["responses"]["201"]["content"] == CONTENT
+    delete = describe_write("delete", None, False, False, False, None, CONTENT)
+    assert "content" not in delete["responses"]["204"]
+    multiple = describe_write(
+        "post", None, False, False, False, [200, 202, 204], CONTENT
+    )
+    assert "content" in multiple["responses"]["200"]
+    assert "content" in multiple["responses"]["202"]
+    assert "content" not in multiple["responses"]["204"]
+
+
+def test_describe_error_content():
+    read = describe_read(None, True, error_content=ERRORS)
+    assert read["responses"]["400"]["content"] == ERRORS
+    assert read["responses"]["412"]["content"] == ERRORS
+    assert "content" not in read["responses"]["304"]
+    put = describe_write("put", None, True, True, False, error_content=ERRORS)
+    for code in ("400", "412", "428"):
+        assert put["responses"][code]["content"] == ERRORS
+    post = describe_write("post", None, True, True, False, error_content=ERRORS)
+    assert post["responses"]["412"]["content"] == ERRORS
+    assert "428" not in post["responses"]
+
+
+def test_describe_error_content_not_shared_between_calls():
+    first = describe_read(None, True, error_content=ERRORS)
+    first["responses"]["400"]["content"].clear()
+    assert ERRORS
+
+
+def test_describe_options_valid():
+    body = {"options": describe_options()}
+    validate_http_schema_resource(body)
+    assert body["options"]["responses"]["200"]["content"] == {
+        "application/json": {
+            "schema": {"$ref": HSR_SCHEMA_URL},
+            "x-rdf-context": {"href": HSR_CONTEXT_URL, "type": CONTEXT_TYPE},
+        }
+    }
+
+
+def test_describe_options_is_fresh():
+    describe_options()["responses"].clear()
+    assert describe_options()["responses"]
+
+
+def test_allow_header():
+    body = {"get": {}, "head": {}, "options": {}, "x-a": 1}
+    assert allow_header(body) == "GET, HEAD, OPTIONS"
+
+
+def test_options_links():
+    assert options_links() == (
+        "<https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json>;"
+        ' rel="describedby"; type="application/schema+json", '
+        "<https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld>;"
+        ' rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
+    )

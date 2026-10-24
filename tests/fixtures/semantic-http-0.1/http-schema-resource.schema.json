@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json",
+  "title": "HTTP Schema Resource",
+  "description": "An HTTP Schema Resource describes the HTTP methods of a Semantic HTTP Resource that are available to the requester. It is an OpenAPI 3.1 Path Item Object with extra constraints: every request and response media type links to a schema and, unless the media type carries RDF in-band, to an RDF context.",
+  "$ref": "#/$defs/PathItem",
+  "$defs": {
+    "AbsoluteUri": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:[^\\s<>\"{}|\\\\^`]*$",
+      "description": "An absolute URI: a URI with a scheme, not a relative reference. It may have a fragment. It contains no space and none of the characters < > \" { } | \\ ^ `, which a URI cannot contain."
+    },
+    "PathItem": {
+      "type": "object",
+      "description": "The methods of a Semantic HTTP Resource that are available to the requester. Only the OpenAPI Path Item fields listed here are allowed, plus x- extensions. A $ref Path Item is not allowed. An x- extension key MUST NOT contain a colon, because JSON-LD reads such a key as an IRI.",
+      "propertyNames": { "not": { "pattern": "^x-[^:]*:" } },
+      "properties": {
+        "get": { "$ref": "#/$defs/Operation" },
+        "put": { "$ref": "#/$defs/Operation" },
+        "post": { "$ref": "#/$defs/Operation" },
+        "delete": { "$ref": "#/$defs/Operation" },
+        "options": { "$ref": "#/$defs/Operation" },
+        "head": { "$ref": "#/$defs/Operation" },
+        "patch": { "$ref": "#/$defs/Operation" },
+        "trace": { "$ref": "#/$defs/Operation" },
+        "summary": { "type": "string" },
+        "description": { "type": "string" },
+        "parameters": { "type": "array" }
+      },
+      "patternProperties": {
+        "^x-": {}
+      },
+      "additionalProperties": false
+    },
+    "Operation": {
+      "type": "object",
+      "description": "An HTTP method available to the requester. It MUST list its responses. Only the OpenAPI 3.1 Operation fields listed here are allowed, plus x- extensions, as in Request Body, Response and Media Type: JSON-LD would lift some other keys, such as @context, an IRI or a context term. Neither an Operation-level servers field nor a $ref member is allowed, so it cannot be a Reference Object. An x- extension key MUST NOT contain a colon, because JSON-LD reads such a key as an IRI.",
+      "propertyNames": { "not": { "pattern": "^x-[^:]*:" } },
+      "properties": {
+        "tags": {},
+        "summary": { "type": "string" },
+        "description": { "type": "string" },
+        "externalDocs": {},
+        "operationId": {},
+        "parameters": { "type": "array" },
+        "requestBody": { "$ref": "#/$defs/RequestBody" },
+        "responses": { "$ref": "#/$defs/Responses" },
+        "callbacks": {},
+        "deprecated": {},
+        "security": {}
+      },
+      "patternProperties": {
+        "^x-": {}
+      },
+      "additionalProperties": false,
+      "required": ["responses"],
+      "not": {
+        "anyOf": [
+          { "required": ["servers"] },
+          { "required": ["$ref"] }
+        ]
+      }
+    },
+    "RequestBody": {
+      "type": "object",
+      "description": "The content a client may send with the method. It MUST list its media types. Only the OpenAPI 3.1 Request Body fields listed here are allowed, plus x- extensions. A $ref member is not allowed, so it cannot be a Reference Object. An x- extension key MUST NOT contain a colon, because JSON-LD reads such a key as an IRI.",
+      "propertyNames": { "not": { "pattern": "^x-[^:]*:" } },
+      "properties": {
+        "description": { "type": "string" },
+        "content": { "$ref": "#/$defs/Content" },
+        "required": { "type": "boolean" }
+      },
+      "patternProperties": {
+        "^x-": {}
+      },
+      "additionalProperties": false,
+      "required": ["content"],
+      "not": { "required": ["$ref"] }
+    },
+    "Responses": {
+      "type": "object",
+      "description": "Responses keyed by a three digit status code, a range such as 2XX, or default. There MUST be at least one key and every key MUST be one of these; x- extension keys are not allowed, because the RDF context reads every key as a status code.",
+      "patternProperties": {
+        "^([1-5][0-9]{2}|[1-5]XX|default)$": { "$ref": "#/$defs/Response" }
+      },
+      "additionalProperties": false,
+      "minProperties": 1
+    },
+    "Response": {
+      "type": "object",
+      "description": "A response the method may return. Only the OpenAPI 3.1 Response fields listed here are allowed, plus x- extensions. A $ref member is not allowed, so it cannot be a Reference Object. An x- extension key MUST NOT contain a colon, because JSON-LD reads such a key as an IRI.",
+      "propertyNames": { "not": { "pattern": "^x-[^:]*:" } },
+      "properties": {
+        "description": { "type": "string" },
+        "headers": {},
+        "content": { "$ref": "#/$defs/Content" },
+        "links": {}
+      },
+      "patternProperties": {
+        "^x-": {}
+      },
+      "additionalProperties": false,
+      "required": ["description"],
+      "not": { "required": ["$ref"] }
+    },
+    "Content": {
+      "type": "object",
+      "description": "Media types keyed by media type. The type and subtype of every key MUST be lowercase; parameters after the first ; may have any case. The six RDF media types that carry RDF in-band (with optional parameters) MUST NOT have an x-rdf-context; every other media type MUST have one.",
+      "propertyNames": { "pattern": "^[^A-Z;]*(;.*)?$" },
+      "patternProperties": {
+        "^(application/ld\\+json|text/turtle|application/n-triples|application/n-quads|application/trig|application/rdf\\+xml)\\s*(;.*)?$": {
+          "$ref": "#/$defs/MediaType",
+          "not": { "required": ["x-rdf-context"] }
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/MediaType",
+        "required": ["x-rdf-context"]
+      }
+    },
+    "MediaType": {
+      "type": "object",
+      "description": "A media type with exactly one of schema or x-schema, and an x-rdf-context where Content requires one. Only the OpenAPI 3.1 Media Type fields listed here are allowed, plus x- extensions. A $ref member is not allowed on the media type itself, so it cannot be a Reference Object; a JSON Schema is referenced by the $ref inside schema. An x- extension key MUST NOT contain a colon, because JSON-LD reads such a key as an IRI.",
+      "propertyNames": { "not": { "pattern": "^x-[^:]*:" } },
+      "properties": {
+        "schema": {
+          "type": "object",
+          "description": "A reference to an external schema, as a $ref to an absolute URI, which may have a fragment. Inline schemas are not allowed.",
+          "properties": {
+            "$ref": { "$ref": "#/$defs/AbsoluteUri" }
+          },
+          "required": ["$ref"],
+          "additionalProperties": false
+        },
+        "x-schema": {
+          "description": "A link to a schema that is not a JSON Schema, such as an XML Schema.",
+          "$ref": "#/$defs/LinkTarget"
+        },
+        "x-rdf-context": {
+          "description": "A link to the RDF context that gives the content its RDF meaning.",
+          "$ref": "#/$defs/LinkTarget"
+        },
+        "example": {},
+        "examples": {},
+        "encoding": {}
+      },
+      "patternProperties": {
+        "^x-": {}
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["schema"], "not": { "required": ["x-schema"] } },
+        { "required": ["x-schema"], "not": { "required": ["schema"] } }
+      ],
+      "not": { "required": ["$ref"] }
+    },
+    "LinkTarget": {
+      "type": "object",
+      "description": "A link to a document: its absolute URI, which may have a fragment, and its media type, and no other members.",
+      "properties": {
+        "href": { "$ref": "#/$defs/AbsoluteUri" },
+        "type": { "type": "string" }
+      },
+      "required": ["href", "type"],
+      "additionalProperties": false
+    }
+  }
+}

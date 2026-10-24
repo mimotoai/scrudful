@@ -279,7 +279,7 @@ def test_options_links_configured_and_omitted(store):
         "/items/1",
     )
     assert response.headers["Link"] == (
-        f'<{SCHEMA_RESOURCE}>; rel="describedBy"; type="application/json", '
+        f'<{SCHEMA_RESOURCE}>; rel="describedby"; type="application/schema+json", '
         f'<{CONTEXT_RESOURCE}>; rel="http://www.w3.org/ns/json-ld#context"; '
         'type="application/ld+json"'
     )
@@ -292,7 +292,7 @@ def test_options_links_configured_and_omitted(store):
         "/items/1",
     )
     assert schema_only.headers["Link"] == (
-        f'<{SCHEMA_RESOURCE}>; rel="describedBy"; type="application/json"'
+        f'<{SCHEMA_RESOURCE}>; rel="describedby"; type="application/schema+json"'
     )
 
     omitted = options(TestClient(item_router(store)), "/items/1")
@@ -475,7 +475,7 @@ def test_options_entities():
         "428": REQUIRED,
     }
     post = options(client, "/jobs").json()["post"]
-    assert "content" not in post["requestBody"]
+    assert "requestBody" not in post
     assert post["responses"] == {
         "201": {"description": "Created", "content": ITEM_CONTENT},
         "400": {"description": "Bad Request"},
@@ -673,10 +673,6 @@ def test_options_mixed_operations(store):
     # Not scrudful: no links and no precondition parameters, as in DRF, but
     # the declared statuses.
     assert body["put"] == {
-        "requestBody": {
-            "description": "The new content of the resource.",
-            "required": True,
-        },
         "responses": {
             "200": {"description": "OK"},
             "404": {"description": "Not Found"},

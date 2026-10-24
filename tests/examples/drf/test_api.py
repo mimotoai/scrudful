@@ -24,7 +24,7 @@ MODIFIED = datetime(2024, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)
 MODIFIED_HTTP = "Tue, 02 Jan 2024 03:04:05 GMT"
 EARLIER_HTTP = "Tue, 02 Jan 2024 03:04:04 GMT"
 SCHEMA_LINK = (
-    f'<{BASE}/schemas/item.json>; rel="describedBy"; type="application/schema+json"'
+    f'<{BASE}/schemas/item.json>; rel="describedby"; type="application/schema+json"'
 )
 CONTEXT_LINK = (
     f'<{BASE}/contexts/item.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; '

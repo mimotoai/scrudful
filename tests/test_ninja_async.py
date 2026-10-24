@@ -362,8 +362,8 @@ def test_callbacks_sync_or_async(store, kind):
         etag_func=kind(etag),
         last_modified_func=kind(modified),
         schema_link_or_func=kind(link),
-        schema_rel_or_func=kind(lambda request, obj: "describedBy"),
-        schema_type_or_func=kind(lambda request, obj: "application/json"),
+        schema_rel_or_func=kind(lambda request, obj: "describedby"),
+        schema_type_or_func=kind(lambda request, obj: "application/schema+json"),
         context_link_or_func=kind(lambda request, obj: "/contexts/item"),
     )
     async def item(request, pk: int, obj):

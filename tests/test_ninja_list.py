@@ -37,7 +37,7 @@ LIST_LINKS = dict(
     list_context_link_or_func="/contexts/items",
 )
 LIST_LINK = (
-    '</schemas/items>; rel="describedBy"; type="application/json", '
+    '</schemas/items>; rel="describedby"; type="application/schema+json", '
     '</contexts/items>; rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
 )
@@ -266,7 +266,7 @@ def test_list_link_callables_get_queryset_and_item(items):
 
     response = TestClient(router).get("/items")
     assert response.headers["Link"] == (
-        '</schemas/items>; rel="describedBy"; type="application/json"'
+        '</schemas/items>; rel="describedby"; type="application/schema+json"'
     )
     assert [kind for kind, _ in seen] == ["item", "item", "item", "list"]
     assert [obj for kind, obj in seen if kind == "item"] == items
@@ -662,7 +662,7 @@ def test_async_list_async_per_item_callable(db, hops):
     assert response.status_code == 200
     assert [entry["etag"] for entry in response.json()["content"]] == ['"a1"'] * 3
     assert [entry["link"] for entry in response.json()["content"]] == [
-        f'</schemas/item/{item.pk}>; rel="describedBy"; type="application/json"'
+        f'</schemas/item/{item.pk}>; rel="describedby"; type="application/schema+json"'
         for item in items
     ]
     # The slice, then href_func and the link callable of each item.

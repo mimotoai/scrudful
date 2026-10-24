@@ -40,7 +40,7 @@ PRECONDITION_REQUIRED = {
 PRECONDITION_FAILED = {"detail": "Precondition failed."}
 OPTIONS_LINK = (
     "<https://example.com/schemas/http-schema-resource.json>; "
-    'rel="describedBy"; type="application/json", '
+    'rel="describedby"; type="application/schema+json", '
     "<https://example.com/contexts/http-schema-resource.jsonld>; "
     'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
 )
@@ -50,7 +50,7 @@ MISSING = 999_999
 def links(name):
     """The Link header value of the documents ``name``."""
     return (
-        f'<{API}/schemas/{name}>; rel="describedBy"; type="application/json", '
+        f'<{API}/schemas/{name}>; rel="describedby"; type="application/schema+json", '
         f'<{API}/contexts/{name}>; rel="http://www.w3.org/ns/json-ld#context"; '
         'type="application/ld+json"'
     )

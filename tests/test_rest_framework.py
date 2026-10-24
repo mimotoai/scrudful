@@ -47,7 +47,7 @@ MODIFIED = datetime(2024, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)
 MODIFIED_HTTP = "Tue, 02 Jan 2024 03:04:05 GMT"
 SCHEMA = "http://example.com/schema.json"
 CONTEXT = "http://example.com/context.jsonld"
-SCHEMA_LINK = f'<{SCHEMA}>; rel="describedBy"; type="application/json"'
+SCHEMA_LINK = f'<{SCHEMA}>; rel="describedby"; type="application/schema+json"'
 CONTEXT_LINK = (
     f'<{CONTEXT}>; rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
@@ -686,8 +686,8 @@ def test_explicit_post_validators_are_evaluated(client):
 def test_list_uses_the_list_configuration(client):
     response = client.get("/things/")
     assert response["Link"] == (
-        '<http://example.com/list-schema.json>; rel="describedBy"; '
-        'type="application/json"'
+        '<http://example.com/list-schema.json>; rel="describedby"; '
+        'type="application/schema+json"'
     )
     assert "ETag" not in response
     assert store.calls == []
@@ -755,7 +755,7 @@ def test_link_url_cannot_inject_links(client):
     )
     assert response["Link"] == (
         "<http://example.com/schema?v=a%3E;%20rel=%22next%22,%20"
-        '%3Chttps://evil.example>; rel="describedBy"; type="application/json"'
+        '%3Chttps://evil.example>; rel="describedby"; type="application/schema+json"'
     )
 
 
@@ -894,7 +894,7 @@ def test_api_view_method_list(client):
     assert response["ETag"] == '"v1"'
     assert (
         response["Link"]
-        == f'<{SCHEMA}?pk=1>; rel="describedBy"; type="application/json"'
+        == f'<{SCHEMA}?pk=1>; rel="describedby"; type="application/schema+json"'
     )
     assert client.put("/api/1/").status_code == 428
     response = client.put("/api/1/", headers={"If-Match": '"v1"'})
@@ -1046,13 +1046,7 @@ def test_user_defined_metadata_class_is_kept(client):
 def test_metadata_describes_non_scrudful_methods(client):
     metadata = client.options("/plain-metadata/1/").json()
     assert set(metadata) == {"get", "put", "patch", "delete"}
-    assert metadata["put"] == {
-        "requestBody": {
-            "description": "The new content of the resource.",
-            "required": True,
-        },
-        "responses": {"200": {"description": "OK"}},
-    }
+    assert metadata["put"] == {"responses": {"200": {"description": "OK"}}}
 
 
 def test_get_method_finds_only_scrudful_handlers():

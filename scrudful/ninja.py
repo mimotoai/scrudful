@@ -450,7 +450,7 @@ class Entity:
     Each field is a value or a callable ``func(request, obj)``, with the same
     meaning as the ``schema_*`` and ``context_*`` arguments of
     :func:`scrudful`: without a link, no Link is sent; rel and type default to
-    ``"describedBy"`` / ``"application/json"`` for the schema and to
+    ``"describedby"`` / ``"application/schema+json"`` for the schema and to
     ``"http://www.w3.org/ns/json-ld#context"`` / ``"application/ld+json"`` for
     the context. ``obj`` is the object the operation has at that point (the
     loaded object, or ``None``).
@@ -729,9 +729,9 @@ def scrudful(
         again, which it is when a validator callback is set or a value of the
         response's entity is callable.
     schema_rel_or_func : str or callable, optional
-        ``rel`` of the schema link. Defaults to ``"describedBy"``.
+        ``rel`` of the schema link. Defaults to ``"describedby"``.
     schema_type_or_func : str or callable, optional
-        ``type`` of the schema link. Defaults to ``"application/json"``.
+        ``type`` of the schema link. Defaults to ``"application/schema+json"``.
     context_link_or_func : str or callable, optional
         URL of the JSON-LD context of the response body. If no value is given,
         no context link is sent.
@@ -859,9 +859,9 @@ def scrudful_create(
         :func:`scrudful`. Link callables get the created object; without
         one they are not called (see ``location_func``).
     schema_rel_or_func : str or callable, optional
-        ``rel`` of the schema link. Defaults to ``"describedBy"``.
+        ``rel`` of the schema link. Defaults to ``"describedby"``.
     schema_type_or_func : str or callable, optional
-        ``type`` of the schema link. Defaults to ``"application/json"``.
+        ``type`` of the schema link. Defaults to ``"application/schema+json"``.
     context_link_or_func : str or callable, optional
         URL of the item's JSON-LD context, sent on 201 responses.
     context_rel_or_func : str or callable, optional
@@ -999,9 +999,9 @@ def scrudful_list(
         Link value is an entry's ``link`` (``null`` without links); link
         callables get the item.
     schema_rel_or_func : str or callable, optional
-        ``rel`` of the item schema link. Defaults to ``"describedBy"``.
+        ``rel`` of the item schema link. Defaults to ``"describedby"``.
     schema_type_or_func : str or callable, optional
-        ``type`` of the item schema link. Defaults to ``"application/json"``.
+        ``type`` of the item schema link. Defaults to ``"application/schema+json"``.
     context_link_or_func : str or callable, optional
         URL of the item's JSON-LD context.
     context_rel_or_func : str or callable, optional
@@ -1161,8 +1161,8 @@ class ScrudfulRouter(Router):
     ----------
     options_schema_link : str, optional
         URL of the JSON Schema of the HTTP Schema Resource, sent as the
-        OPTIONS response's schema Link (``rel="describedBy"``,
-        ``type="application/json"``). Omitted when unset, which the
+        OPTIONS response's schema Link (``rel="describedby"``,
+        ``type="application/schema+json"``). Omitted when unset, which the
         semantic-http spec does not allow.
     options_context_link : str, optional
         URL of the JSON-LD context of the HTTP Schema Resource, sent as the

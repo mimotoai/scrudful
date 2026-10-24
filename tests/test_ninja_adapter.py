@@ -33,7 +33,7 @@ from tests import ninja_future_annotations as future_endpoints
 # Non-zero microseconds: the header is floored to whole seconds.
 MODIFIED = datetime(2024, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)
 MODIFIED_HTTP = "Tue, 02 Jan 2024 03:04:05 GMT"
-SCHEMA_LINK = '</schemas/item>; rel="describedBy"; type="application/json"'
+SCHEMA_LINK = '</schemas/item>; rel="describedby"; type="application/schema+json"'
 CONTEXT_LINK = (
     '</contexts/item>; rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
@@ -816,7 +816,7 @@ def test_link_callables_get_request_and_object(store):
     client = TestClient(router)
     response = client.get("/items/1")
     assert response.headers["Link"] == (
-        '</schemas/item/1>; rel="profile"; type="application/json", '
+        '</schemas/item/1>; rel="profile"; type="application/schema+json", '
         '</contexts/item>; rel="http://www.w3.org/ns/json-ld#context"; '
         'type="application/json"'
     )

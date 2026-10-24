@@ -1,0 +1,95 @@
+{
+  "get": {
+    "responses": {
+      "200": {
+        "description": "OK",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "https://example.com/schemas/person.schema.json" },
+            "x-rdf-context": {
+              "href": "https://example.com/contexts/person.context.jsonld",
+              "type": "application/ld+json"
+            }
+          }
+        }
+      }
+    }
+  },
+  "head": {
+    "responses": {
+      "200": {
+        "description": "OK"
+      }
+    }
+  },
+  "put": {
+    "requestBody": {
+      "description": "The updated content for the resource.",
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": { "$ref": "https://example.com/schemas/person.schema.json" },
+          "x-rdf-context": {
+            "href": "https://example.com/contexts/person.context.jsonld",
+            "type": "application/ld+json"
+          }
+        }
+      }
+    },
+    "responses": {
+      "200": {
+        "description": "OK",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "https://example.com/schemas/person.schema.json" },
+            "x-rdf-context": {
+              "href": "https://example.com/contexts/person.context.jsonld",
+              "type": "application/ld+json"
+            }
+          }
+        }
+      },
+      "400": {
+        "description": "BAD REQUEST: The request was malformed or missing required content.",
+        "content": {
+          "application/problem+json": {
+            "schema": { "$ref": "https://example.com/schemas/problem.schema.json" },
+            "x-rdf-context": {
+              "href": "https://example.com/contexts/problem.context.jsonld",
+              "type": "application/ld+json"
+            }
+          }
+        }
+      },
+      "401": {
+        "description": "UNAUTHORIZED: The request requires authentication."
+      },
+      "403": {
+        "description": "FORBIDDEN: The request requires permissions the current authenticated user does not have."
+      }
+    }
+  },
+  "delete": {
+    "responses": {
+      "204": {
+        "description": "NO CONTENT: The resource was deleted."
+      }
+    }
+  },
+  "options": {
+    "responses": {
+      "200": {
+        "description": "OK",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json" },
+            "x-rdf-context": {
+              "href": "https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld",
+              "type": "application/ld+json"
+            }
+          }
+        }
+      }
+    }
+  }
+}

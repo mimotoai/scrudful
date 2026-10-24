@@ -30,7 +30,7 @@ EARLIER_HTTP = "Tue, 02 Jan 2024 03:04:04 GMT"
 IST = timezone(timedelta(hours=5, minutes=30))
 SCHEMA = "http://example.com/schema.json"
 CONTEXT = "http://example.com/context.jsonld"
-SCHEMA_LINK = f'<{SCHEMA}>; rel="describedBy"; type="application/json"'
+SCHEMA_LINK = f'<{SCHEMA}>; rel="describedby"; type="application/schema+json"'
 CONTEXT_LINK = (
     f'<{CONTEXT}>; rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
@@ -348,7 +348,7 @@ def test_callbacks_receive_a_declared_request(make_client):
 
     response = make_client(app).get("/items/3")
     assert response.headers["link"] == (
-        '<http://testserver/schema>; rel="describedBy"; type="application/json"'
+        '<http://testserver/schema>; rel="describedby"; type="application/schema+json"'
     )
 
 
@@ -704,7 +704,8 @@ def test_link_values_are_escaped(make_client):
 
     response = make_client(app).get('/items/a>; rel="next')
     assert response.headers["link"] == (
-        '<http://x/a%3E;%20rel=%22next>; rel="describedBy"; type="application/json"'
+        '<http://x/a%3E;%20rel=%22next>; rel="describedby"; '
+        'type="application/schema+json"'
     )
 
 

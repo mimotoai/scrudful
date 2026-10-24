@@ -176,9 +176,9 @@ def scrudful(
         URL of the schema of the response body. If no value is given, no
         schema link is sent.
     schema_rel_or_func : str or callable, optional
-        ``rel`` of the schema link. Defaults to ``"describedBy"``.
+        ``rel`` of the schema link. Defaults to ``"describedby"``.
     schema_type_or_func : str or callable, optional
-        ``type`` of the schema link. Defaults to ``"application/json"``.
+        ``type`` of the schema link. Defaults to ``"application/schema+json"``.
     context_link_or_func : str or callable, optional
         URL of the JSON-LD context of the response body. If no value is given,
         no context link is sent.

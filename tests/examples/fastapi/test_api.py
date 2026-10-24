@@ -12,7 +12,7 @@ from examples.fastapi import api
 
 BASE = "http://testserver"
 SCHEMA_LINK = (
-    f'<{BASE}/schemas/user.json>; rel="describedBy"; type="application/schema+json"'
+    f'<{BASE}/schemas/user.json>; rel="describedby"; type="application/schema+json"'
 )
 CONTEXT_LINK = (
     f'<{BASE}/contexts/user.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; '
