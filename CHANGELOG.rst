@@ -31,8 +31,12 @@ django-ninja adapter
   * ``@scrudful_create(...)``: 201 with ``Location``, the item's Links and the
     created item's ``ETag`` and ``Last-Modified``. A 201 without a created
     object (the handler returned ``None`` or an ``HttpResponse`` and set no
-    ``ScrudfulResponse.created``) gets none of them, and ``location_func``
-    and the item callables are not called.
+    ``ScrudfulResponse.created``) gets no ``Location`` or validators, and
+    ``location_func`` and the validator callbacks are not called. If it has
+    a body (e.g. ``JsonResponse(item, status=201)``) it keeps the item's
+    Links when none of the link values is callable; with a link callable,
+    which would get ``None`` in place of the created item, or without a
+    body, it gets no item Links.
   * ``@scrudful_list(...)``: the handler returns the authorized queryset; the
     response is the paginated scrud list envelope (``page``, ``page_size``),
     with per-item validators and Links equal to the detail GET's, a typed

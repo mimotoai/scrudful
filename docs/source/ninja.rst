@@ -278,9 +278,15 @@ The operation must declare ``response={201: ...}`` (or ``...``): with
 The created object is the handler's return value, or what it sets as
 ``ScrudfulResponse.created``. A handler that returns ``None`` (e.g. with
 ``response={201: None}``) or an ``HttpResponse`` has created no object as far
-as scrudful knows: its 201 gets no ``Location``, validators or item Links, and
-``location_func``, the validator callbacks and the item's link callables are
-not called. Set ``meta.created`` to get them all, or ``meta.location`` for the
+as scrudful knows: its 201 gets no ``Location`` or validators, and
+``location_func`` and the validator callbacks are not called. A body still
+gets Links: an ``HttpResponse`` with content (e.g.
+``JsonResponse(item, status=201)``) gets the item's Links when none of the six
+link values is callable. A link callable would be called with ``None`` in place
+of the created item, so with one it is not called and the 201 gets no item
+Links. A ``None`` body or an empty ``HttpResponse`` gets no item Links.
+``responses[201]`` and ``ScrudfulResponse.entity`` replace the item entity as
+usual. Set ``meta.created`` to get them all, or ``meta.location`` for the
 ``Location`` alone:
 
 .. code-block:: python

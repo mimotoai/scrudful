@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 from asgiref.sync import async_to_sync
-from django.http import HttpResponse, JsonResponse
+from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
 from ninja import Router, Status
 from ninja.errors import ConfigError
 from ninja.testing import TestAsyncClient, TestClient
@@ -297,18 +297,173 @@ def test_create_http_response_needs_meta_created(store, counted):
 
     client = TestClient(router)
     # A returned HttpResponse is not the created object: without one, the
-    # 201 gets no Location, validators or item Links.
+    # 201 gets no Location or validators. Its body still gets the item
+    # entity's Links, which are all static here.
     response = client.post("/items", json={"name": "c"})
     assert response.status_code == 201
     assert "Location" not in response.headers
     assert "ETag" not in response.headers
-    assert "Link" not in response.headers
+    assert response.headers["Link"] == ITEM_LINK
     assert counted.calls == {}
 
     response = client.post("/items?meta=1", json={"name": "c"})
     assert response.headers["Location"] == "/items/3"
     assert response.headers["ETag"] == '"v1"'
     assert response.headers["Link"] == ITEM_LINK
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        lambda item: JsonResponse({"id": item["id"]}, status=201),
+        lambda item: HttpResponse(b"created", status=201),
+        lambda item: StreamingHttpResponse(iter([b"created"]), status=201),
+    ],
+    ids=["json", "http", "streaming"],
+)
+def test_create_http_response_body_gets_static_item_links(store, counted, body):
+    """No created object, but a body: the item entity's static Links."""
+    router = Router()
+
+    @router.post("/items")
+    @scrudful_create(location_func=counted.location, etag_func=counted.etag, **LINKS)
+    def create_item(request, payload: ItemIn):
+        return body(new_item(store, payload.name))
+
+    response = TestClient(router).post("/items", json={"name": "c"})
+    assert response.status_code == 201
+    assert response.headers["Link"] == ITEM_LINK
+    assert expose(response) == {"Link"}
+    for name in ("Location", "ETag", "Last-Modified"):
+        assert name not in response.headers
+    assert counted.calls == {}
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "schema_link_or_func",
+        "schema_rel_or_func",
+        "schema_type_or_func",
+        "context_link_or_func",
+        "context_rel_or_func",
+        "context_type_or_func",
+    ],
+)
+def test_create_http_response_body_with_link_callables_gets_no_links(
+    store, counted, field
+):
+    """A callable would get ``None`` for the created item: it isn't called,
+    and the 201 gets none of the item entity's Links."""
+    calls = []
+
+    def value(request, item):
+        calls.append(item)
+        return "x"
+
+    router = Router()
+
+    @router.post("/items")
+    @scrudful_create(
+        location_func=counted.location,
+        etag_func=counted.etag,
+        **{**LINKS, field: value},
+    )
+    def create_item(request, payload: ItemIn):
+        item = new_item(store, payload.name)
+        return JsonResponse({"id": item["id"]}, status=201)
+
+    response = TestClient(router).post("/items", json={"name": "c"})
+    assert response.status_code == 201
+    for name in ("Location", "ETag", "Link"):
+        assert name not in response.headers
+    assert calls == []
+    assert counted.calls == {}
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        lambda item: None,
+        lambda item: Status(201, None),
+        lambda item: HttpResponse(status=201),
+    ],
+    ids=["none", "status-none", "empty-http-response"],
+)
+def test_create_without_a_body_gets_no_static_item_links(store, counted, result):
+    """No created object and no body: nothing for the item entity to describe."""
+    router = Router()
+
+    @router.post("/items", response={201: None})
+    @scrudful_create(location_func=counted.location, etag_func=counted.etag, **LINKS)
+    def create_item(request, payload: ItemIn):
+        return result(new_item(store, payload.name))
+
+    response = TestClient(router).post("/items", json={"name": "c"})
+    assert response.status_code == 201
+    for name in ("Location", "ETag", "Link"):
+        assert name not in response.headers
+    assert counted.calls == {}
+
+
+def test_create_meta_created_none_with_a_body_gets_static_item_links(store, counted):
+    """``meta.created = None`` names no created object; the body still gets
+    the item entity's static Links."""
+    router = Router()
+
+    @router.post("/items", response={201: ItemOut})
+    @scrudful_create(location_func=counted.location, etag_func=counted.etag, **LINKS)
+    def create_item(request, payload: ItemIn, meta: ScrudfulResponse):
+        meta.created = None
+        return new_item(store, payload.name)
+
+    response = TestClient(router).post("/items", json={"name": "c"})
+    assert response.status_code == 201
+    assert response.headers["Link"] == ITEM_LINK
+    assert "Location" not in response.headers
+    assert "ETag" not in response.headers
+    assert counted.calls == {}
+
+
+@pytest.mark.parametrize("item_schema", ["/schemas/item", lambda request, obj: "/x"])
+def test_create_http_response_body_explicit_entities_win(store, counted, item_schema):
+    """``meta.entity`` and ``responses[201]`` replace the item entity, static
+    or not; their callables get ``None`` (no created object)."""
+    seen = []
+
+    def accepted(request, obj):
+        seen.append(obj)
+        return "/schemas/accepted"
+
+    router = Router()
+
+    @router.post("/items")
+    @scrudful_create(
+        location_func=counted.location,
+        responses={201: Entity(schema_link_or_func=accepted)},
+        schema_link_or_func=item_schema,
+        context_link_or_func="/contexts/item",
+    )
+    def create_item(request, payload: ItemIn, meta: ScrudfulResponse):
+        item = new_item(store, payload.name)
+        if request.GET.get("meta"):
+            meta.entity = ERROR
+        return JsonResponse({"id": item["id"]}, status=201)
+
+    client = TestClient(router)
+    response = client.post("/items", json={"name": "c"})
+    assert response.status_code == 201
+    assert response.headers["Link"] == (
+        '</schemas/accepted>; rel="describedBy"; type="application/json"'
+    )
+    assert seen == [None]
+
+    response = client.post("/items?meta=1", json={"name": "c"})
+    assert response.status_code == 201
+    assert response.headers["Link"] == ERROR_LINK
+    assert seen == [None]
+    assert "Location" not in response.headers
+    assert counted.calls == {}
 
 
 def test_create_without_a_created_object(store):

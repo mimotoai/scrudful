@@ -132,12 +132,19 @@ Create
     - the item entity's Links (``responses[201]``, if declared, replaces it);
       link callables get the created object.
 
-    Any other status (e.g. a ``Status(400, ...)``), and a 201 without a
-    created object, gets none of these (``location_func``, the validator
-    callbacks and the item entity's callables are not called), only the
-    Links of ``responses[status]``; their link callables get
-    ``ScrudfulResponse.created``, or ``None`` if unset. The values set on
-    ``ScrudfulResponse`` and headers the handler set win, as below.
+    A 201 without a created object gets no Location and no validators
+    (``location_func`` and the validator callbacks are not called). If it
+    has a body (an ``HttpResponse`` with non-empty or streaming content, or a
+    body other than ``None`` with ``ScrudfulResponse.created = None``), it
+    gets the item entity's Links when none of the entity's six values is
+    callable; a callable would be called with ``None``, not the created
+    item, so with one the 201 gets no item Links and no item callable is
+    called. Without a body (``None``, or an empty ``HttpResponse``) it gets
+    no item Links. Any other status (e.g. a ``Status(400, ...)``) gets none
+    of these. ``responses[status]`` replaces the item entity on any of them
+    (its link callables get ``ScrudfulResponse.created``, or ``None`` if
+    unset), and the values set on ``ScrudfulResponse`` and headers the
+    handler set win, as below.
 
 Collections
     :func:`scrudful_list` decorates a GET on a collection. It works like
@@ -475,9 +482,11 @@ class ScrudfulResponse:
     created : object
         The object a :func:`scrudful_create` operation created, whose
         Location, validators and item Links a 201 gets. Unset by default: the
-        handler's return value is used (the value of a returned ``Status``).
-        ``None`` (also a ``None`` return value) is no created object: the 201
-        gets none of them. Ignored by :func:`scrudful`.
+        handler's return value is used (the value of a returned ``Status``;
+        a returned ``HttpResponse`` is none). ``None`` (also a ``None``
+        return value) is no created object: the 201 gets no Location and no
+        validators, and the item Links only if it has a body and none of the
+        item entity's values is callable. Ignored by :func:`scrudful`.
     """
 
     status: int | None = None
@@ -796,7 +805,9 @@ def scrudful_create(
         ``obj``, as an IRI (encoded as a URI), or ``None`` for no Location.
         Not called without a created object (a handler returning ``None`` or
         an ``HttpResponse`` sets ``ScrudfulResponse.created`` or
-        ``ScrudfulResponse.location``).
+        ``ScrudfulResponse.location``). Such a 201 gets the item entity's
+        Links only if it has a body and none of the six link values is
+        callable (a callable would get ``None``).
     etag_func : callable, optional
         ``etag_func(obj)``: the entity-tag of the created object, as for
         :func:`scrudful` (no ``load`` is needed: the validators are computed
@@ -807,7 +818,8 @@ def scrudful_create(
     schema_link_or_func : str or callable, optional
         URL of the item's schema, sent on 201 responses: this argument and the
         five after it are the item entity, with the meaning they have for
-        :func:`scrudful`. Link callables get the created object.
+        :func:`scrudful`. Link callables get the created object; without
+        one they are not called (see ``location_func``).
     schema_rel_or_func : str or callable, optional
         ``rel`` of the schema link. Defaults to ``"describedBy"``.
     schema_type_or_func : str or callable, optional
@@ -1288,8 +1300,17 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 entity = meta.entity
             elif config.kind == "create" and obj is None:
                 # The item entity describes the created object: without one,
-                # only an explicit ``responses[status]``.
+                # an explicit ``responses[status]``, else the item entity's
+                # Links for a 201 body when they are all static (a callable
+                # would get None, not the created item).
                 entity = config.responses.get(status)
+                if (
+                    entity is None
+                    and status == 201
+                    and _carries_body(content)
+                    and not _has_callables(config.entity)
+                ):
+                    entity = config.entity
             else:
                 entity = config.response_entity(status)
             if config.kind == "list":
@@ -1632,6 +1653,19 @@ def _body(content: Any) -> Any:
     if isinstance(content, tuple) and len(content) == 2:
         return content[1]
     return content
+
+
+def _carries_body(content: Any) -> bool:
+    """Whether the response of the handler's return value ``content`` has a body.
+
+    An ``HttpResponse`` with non-empty content or a streaming one, else a
+    body other than ``None``.
+    """
+    if isinstance(content, HttpResponseBase):
+        return getattr(content, "streaming", False) or bool(
+            getattr(content, "content", b"")
+        )
+    return _body(content) is not None
 
 
 def _created_headers(
