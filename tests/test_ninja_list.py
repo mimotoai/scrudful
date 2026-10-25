@@ -17,7 +17,7 @@ from ninja.testing import TestAsyncClient, TestClient
 from referencing import Registry, Resource
 
 from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS, collection_schema
-from scrudful.ninja import Entity, scrudful, scrudful_list
+from scrudful.ninja import Entity, ScrudfulRouter, scrudful, scrudful_list
 from tests.test_ninja_adapter import (
     ALICE,
     CONTEXT_LINK,
@@ -304,6 +304,33 @@ def test_list_validators_304(items):
     response = client.get("/items", headers={"If-Match": '"n2"'})
     assert response.status_code == 412
     assert "Link" not in response.headers
+
+
+def test_list_trace_ignores_preconditions(items):
+    """A TRACE's content is no representation of the collection."""
+    router = ScrudfulRouter()
+    calls = []
+
+    def list_etag(qs):
+        calls.append("etag")
+        return "n3"
+
+    @router.api_operation(["GET", "TRACE"], "/items", response=list[ItemOut])
+    @scrudful_list(href_func=href, list_etag_func=list_etag, **LIST_LINKS)
+    def list_items(request):
+        return Item.objects.all()
+
+    client = TestClient(router)
+    for headers in ({"If-Match": '"nope"'}, {"If-None-Match": '"n3"'}, {}):
+        response = client.request("TRACE", "/items", headers=headers)
+        assert response.status_code == 200, headers
+        assert "ETag" not in response.headers
+        assert "Last-Modified" not in response.headers
+    assert calls == []
+    assert client.get("/items", headers={"If-Match": '"nope"'}).status_code == 412
+    body = client.request("OPTIONS", "/items").json()
+    assert set(body["trace"]["responses"]) == {"200"}
+    assert "412" in body["get"]["responses"]
 
 
 def test_list_early_responses_keep_handler_headers(items):

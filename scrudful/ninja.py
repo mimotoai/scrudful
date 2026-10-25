@@ -1410,7 +1410,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 # The queryset is the authorized object: the collection's
                 # preconditions are evaluated now, then the page is built.
                 obj = _body(content)
-                if config.has_list_validators:
+                if config.has_list_validators and evaluates_preconditions(method):
                     list_etag, list_last_modified = yield from _validators(
                         config.list_etag_func, config.list_last_modified_func, obj
                     )
