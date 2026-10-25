@@ -21,10 +21,12 @@ DRF parity (#2)
   refreshed object. A handler calling ``get_object()`` after saving gets the
   pre-save instance. ``@scrudful(object_validators=True)`` on a function view
   raises ``TypeError`` at request time.
-* DRF: creates describe the new resource. ``creates=True`` (set by
-  ``scrudful_viewset`` for ``create``) sends ``ETag`` and ``Last-Modified`` on
+* DRF: creates describe the new resource. With ``object_validators`` (which
+  needs ``etag_func`` or ``last_modified_func``), ``creates=True`` (set by
+  ``scrudful_viewset`` for ``create``; without ``object_validators`` it gets
+  only links and the error entity) sends ``ETag`` and ``Last-Modified`` on
   the 201, and ``location_func(view, request, obj)``
-  (``Meta.location_func``; needs ``creates=True``) sends ``Location``. A custom
+  (``Meta.location_func``; needs ``creates=True`` and ``object_validators``) sends ``Location``. A custom
   ``create()`` that bypasses ``perform_create`` gets none of them, and OPTIONS
   describes the 201 without the validator headers, as ninja does.
 * DRF: ``ScrudfulPagination`` lists in the scrud envelope django-ninja's
@@ -44,8 +46,9 @@ Error bodies
   scrudful's own 400, 412 and 428, on DRF (``@scrudful``, ``scrudful_viewset``
   with ``Meta.error_body_func`` and ``Meta.list_error_body_func``), ninja
   (``scrudful``, ``scrudful_list``) and FastAPI (``scrudful``). It must be a
-  plain function, also in async endpoints; status, headers, Links and
-  Content-Type are unchanged and a 304 never calls it.
+  plain function, also in async ninja and FastAPI endpoints (DRF views are
+  sync); ``scrudful_viewset`` does not apply it to ``create``. Status, headers,
+  Links and Content-Type are unchanged and a 304 never calls it.
 * New ``scrudful.problem`` module: ``problem_details`` returns RFC 9457 problem
   details for those responses and ``PROBLEM_JSON`` is the media type for the
   ``error`` entity.

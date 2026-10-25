@@ -270,11 +270,15 @@ saving gets the pre-save instance. On a function view
 ``@scrudful(object_validators=True)`` raises ``TypeError`` when the request
 arrives, as there is no ``get_object()``.
 
-**Creates.** For ``create`` (``scrudful_viewset`` sets ``creates=True``; set
-``creates=True`` on an explicit ``@scrudful`` create) no precondition is
+**Creates.** With ``object_validators`` (which needs ``etag_func`` or
+``last_modified_func``), ``scrudful_viewset`` sets ``creates=True`` for
+``create``; without it, ``create`` gets only the links and error entity. Set
+``creates=True`` on an explicit ``@scrudful`` create (it needs
+``object_validators``). No precondition is
 evaluated and the 201 gets ``ETag`` and ``Last-Modified`` from the saved
 instance, plus ``Location`` from ``Meta.location_func(view, request, obj)``
-(``location_func=`` on the decorator; it requires ``creates=True``). A header
+(``location_func=`` on the decorator; it requires ``creates=True`` and
+``object_validators``). A header
 the view set is never replaced. The 201 is built in ``perform_create``, so a
 custom ``create()`` that bypasses it gets no validators. OPTIONS describes the
 201 without the validator headers, as django-ninja does.
@@ -282,13 +286,18 @@ custom ``create()`` that bypasses it gets no validators. OPTIONS describes the
 **Error bodies (``error_body_func``).** ``error_body_func(request, result)``,
 also ``Meta.error_body_func`` and ``Meta.list_error_body_func`` (the list
 response's), returns the dict used as the body of scrudful's own 400, 412 and
-428. It must be a plain function, also under ``async`` views; status, headers,
-Links and Content-Type are unchanged and it is not called for a 304.
+428. It must be a plain function. ``scrudful_viewset`` does not apply it to
+``create``. Status, headers, Links and Content-Type are unchanged and it is not
+called for a 304.
 
 .. code-block:: python
 
     from scrudful.problem import PROBLEM_JSON, problem_details
     from scrudful.rest_framework import Entity
+
+
+    def item_location(view, request, obj):
+        return f"/items/{obj.pk}"
 
 
     @scrudful_viewset
