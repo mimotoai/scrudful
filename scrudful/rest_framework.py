@@ -340,6 +340,8 @@ class ScrudfulViewFunc:
             return self._handle(request, args, kwargs, index)
         finally:
             setattr(request, _ACTIVE_ATTR, False)
+            if self.object_validators and index > 0:
+                _forget_object(args[0])
 
     def _handle(
         self,
@@ -358,6 +360,9 @@ class ScrudfulViewFunc:
                 # Authorization comes first: an exception propagates as the
                 # view's own, and no validator is computed.
                 obj = _load_object(view)
+                # The handler gets this very instance, whether or not the
+                # class memoizes get_object (scrudful_viewset does).
+                view.get_object = lambda: obj
                 etag, last_modified = self._validators((obj,), {})
                 exists = True
             else:
@@ -380,6 +385,7 @@ class ScrudfulViewFunc:
             if refresh and self.object_validators:
                 etag = last_modified = None
                 try:
+                    _forget_object(view)
                     obj = _load_object(view, fresh=True)
                 except (Http404, PermissionDenied, APIException):
                     pass
@@ -778,6 +784,11 @@ def _memoize_get_object(cls: type) -> None:
 
     get_object._scrudful_memo = True  # type: ignore[attr-defined]
     cls.get_object = get_object  # type: ignore[attr-defined]
+
+
+def _forget_object(view: Any) -> None:
+    """Drop the per-call ``get_object`` override of :meth:`ScrudfulViewFunc._handle`."""
+    view.__dict__.pop("get_object", None)
 
 
 def _load_object(view: Any, fresh: bool = False) -> Any:

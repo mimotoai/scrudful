@@ -2,13 +2,19 @@
 
 import pytest
 from django.urls import include, path
-from rest_framework import serializers, viewsets
+from rest_framework import generics, serializers, viewsets
 from rest_framework.permissions import BasePermission
 from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient
 
 from items.models import Item
-from scrudful.rest_framework import scrudful_api_view, scrudful_viewset
+from scrudful.rest_framework import (
+    Entity,
+    exception_handler,
+    scrudful,
+    scrudful_api_view,
+    scrudful_viewset,
+)
 
 pytestmark = [pytest.mark.urls(__name__), pytest.mark.django_db]
 
@@ -70,10 +76,43 @@ class LegacyViewSet(viewsets.ModelViewSet):
         etag_func = legacy_etag
 
 
+class ExplicitView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = Item.objects.all()
+    serializer_class = ItemSerializer
+    permission_classes = [HideHidden]
+    seen: list = []
+
+    @scrudful(etag_func=object_etag, object_validators=True)
+    def put(self, request, *args, **kwargs):
+        self.seen.append(self.get_object())
+        return super().put(request, *args, **kwargs)
+
+
+ERROR = Entity(schema_link_or_func="/schemas/error")
+
+
+@scrudful_viewset
+class ErrorViewSet(viewsets.ModelViewSet):
+    queryset = Item.objects.all()
+    serializer_class = ItemSerializer
+
+    def get_exception_handler(self):
+        return exception_handler
+
+    class Meta:
+        object_validators = True
+        etag_func = object_etag
+        error = ERROR
+
+
 router = SimpleRouter()
+router.register("errors", ErrorViewSet, basename="error")
 router.register("objects", ObjectViewSet, basename="object")
 router.register("legacy", LegacyViewSet, basename="legacy")
-urlpatterns = [path("", include(router.urls))]
+urlpatterns = [
+    path("", include(router.urls)),
+    path("explicit/<int:pk>/", ExplicitView.as_view()),
+]
 
 
 @pytest.fixture
@@ -206,3 +245,31 @@ def test_object_validators_needs_get_object():
             class Meta:
                 object_validators = True
                 etag_func = object_etag
+
+
+def test_explicit_decorator_handler_gets_the_same_instance(client, item):
+    ExplicitView.seen.clear()
+    response = client.put(
+        f"/explicit/{item.pk}/",
+        {"name": "two"},
+        format="json",
+        HTTP_IF_MATCH='"v1"',
+    )
+    assert response.status_code == 200
+    assert response["ETag"] == '"v2"'
+    # One load for the precondition (reused by the handler's calls), one fresh.
+    assert len(object_checks) == 2
+    assert ExplicitView.seen == [object_checks[0]]
+    assert ExplicitView.seen[0] is object_checks[0]
+    # The override does not leak to later requests.
+    assert client.get(f"/explicit/{item.pk}/").status_code == 200
+    assert len(object_checks) == 3
+
+
+def test_object_validators_missing_object_404_carries_error_links(client):
+    for response in (
+        client.get("/errors/999/"),
+        client.put("/errors/999/", {"name": "x"}, format="json"),
+    ):
+        assert response.status_code == 404
+        assert "/schemas/error" in response["Link"]
