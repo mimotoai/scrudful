@@ -115,8 +115,21 @@ or ``+json``) renders them, so a project's own JSON renderer (camel-case keys,
 orjson ...) formats them as it formats the rest, and DRF's ``JSONRenderer``
 does when the view has none.
 
-The browsable API
------------------
+Callbacks
+---------
+
+Every callback gets ``(view, request, **url_kwargs)``: every URL kwarg, among
+them DRF's ``format`` on the format-suffix routes a router adds
+(``/items/1.json``). Accept ``**kwargs`` (``def item_etag(view, request, pk,
+**kwargs)``), or ``/items/1.json`` answers 500.
+
+For a schema or context URL, return a path from ``django.urls.reverse(name,
+kwargs=...)``: scrudful makes it absolute against the request. DRF's
+``reverse(..., request=request)`` keeps the request's ``?format=`` in the URL,
+so the linked document would answer 404.
+
+The browsable API and form bodies
+---------------------------------
 
 DRF's browsable API is not conformant: a ``GET`` with ``Accept: text/html``
 gets an HTML page carrying the Links of the JSON content (the JSON schema and
@@ -130,11 +143,19 @@ responses follow DRF's content negotiation. For full conformance, drop
 
     REST_FRAMEWORK = {
         "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+        "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
         "EXCEPTION_HANDLER": "scrudful.rest_framework.exception_handler",
     }
 
 An ``Accept`` none of the view's renderers serves then gets DRF's 406, for
 OPTIONS too.
+
+DRF's default parsers also accept ``application/x-www-form-urlencoded`` and
+``multipart/form-data`` request bodies, which the HTTP Schema Resource doesn't
+list: it describes JSON bodies only, and no lifting to RDF covers form data.
+For conformance, set ``DEFAULT_PARSER_CLASSES`` (as above) or the view's
+``parser_classes`` to ``JSONParser`` only; another body then gets DRF's 415. The
+example project does both.
 
 An explicit ``@scrudful`` on ``update`` also applies to PATCH when
 ``partial_update`` is DRF's stock ``UpdateModelMixin.partial_update``, which

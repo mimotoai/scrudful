@@ -1,10 +1,12 @@
 """SCRUDful views of :class:`items.models.Item`.
 
-Validator callbacks are called as ``func(view, request, **url_kwargs)`` and
-return ``None`` when the item does not exist, so that the view itself answers
-404. They run before the view's own lookup and permission checks, so they look
-the item up in ``view.get_queryset()``: an item the view would not show must
-not reveal its validators (304) or its existence (412/428 instead of 404).
+Validator callbacks are called as ``func(view, request, **url_kwargs)``, with
+every URL kwarg (DRF's ``format`` too, on the format-suffix routes the router
+adds: hence the ``**kwargs``), and return ``None`` when the item does not
+exist, so that the view itself answers 404. They run before the view's own
+lookup and permission checks, so they look the item up in
+``view.get_queryset()``: an item the view would not show must not reveal its
+validators (304) or its existence (412/428 instead of 404).
 
 Settings enable ``ATOMIC_REQUESTS``: the callbacks and the write run in one
 transaction, and on PUT/PATCH/DELETE the callbacks lock the row with
@@ -17,8 +19,8 @@ import hashlib
 
 from rest_framework import viewsets
 from rest_framework.decorators import api_view
+from django.urls import reverse
 from rest_framework.response import Response
-from rest_framework.reverse import reverse
 
 from items.models import Item
 from items.serializers import ItemSerializer
@@ -97,16 +99,16 @@ def _item_value(view, request, pk, field):
     return items.values_list(field, flat=True).first()
 
 
-def item_etag(view, request, pk):
+def item_etag(view, request, pk, **kwargs):
     version = _item_value(view, request, pk, "version")
     return None if version is None else f"v{version}"
 
 
-def item_last_modified(view, request, pk):
+def item_last_modified(view, request, pk, **kwargs):
     return _item_value(view, request, pk, "updated_at")
 
 
-def collection_etag(view, request):
+def collection_etag(view, request, **kwargs):
     """An ETag that changes whenever an item is created, changed or deleted."""
     # Viewsets list their own queryset; the stats function view covers all items.
     items = view.get_queryset() if hasattr(view, "get_queryset") else Item.objects
@@ -114,35 +116,34 @@ def collection_etag(view, request):
     return hashlib.sha256(repr(rows).encode()).hexdigest()[:32]
 
 
+# Django's ``reverse`` gives a path, which scrudful resolves against the
+# request. DRF's ``reverse(..., request=request)`` would keep the request's
+# ``?format=`` in the link targets, which then answer 404.
 def item_schema_url(view, request, **kwargs):
-    return reverse("item-schema", request=request)
+    return reverse("item-schema")
 
 
 def item_context_url(view, request, **kwargs):
-    return reverse("item-context", request=request)
+    return reverse("item-context")
 
 
 def items_schema_url(view, request, **kwargs):
-    return reverse("items-schema", request=request)
+    return reverse("items-schema")
 
 
 def stats_schema_url(view, request, **kwargs):
-    return reverse("stats-schema", request=request)
+    return reverse("stats-schema")
 
 
 def stats_context_url(view, request, **kwargs):
-    return reverse("stats-context", request=request)
+    return reverse("stats-context")
 
 
 # The body of every error: scrudful's own 400/412/428 and, through
 # ``scrudful.rest_framework.exception_handler`` (see the settings), DRF's.
 ERROR = Entity(
-    schema_link_or_func=lambda view, request, **kwargs: reverse(
-        "error-schema", request=request
-    ),
-    context_link_or_func=lambda view, request, **kwargs: reverse(
-        "error-context", request=request
-    ),
+    schema_link_or_func=lambda view, request, **kwargs: reverse("error-schema"),
+    context_link_or_func=lambda view, request, **kwargs: reverse("error-context"),
 )
 
 

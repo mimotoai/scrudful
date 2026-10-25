@@ -143,8 +143,16 @@ def not_found():
 # --- Views --------------------------------------------------------------------
 
 
+# The example settings, this module's, render JSON only (as conformance
+# asks); the views whose negotiation the tests exercise serve DRF's default
+# renderers, the browsable API's among them.
+BROWSABLE = [JSONRenderer, BrowsableAPIRenderer]
+
+
 class ThingViewSetBase(viewsets.ViewSet):
     """Like ModelViewSet, without a model."""
+
+    renderer_classes = BROWSABLE
 
     def list(self, request):
         return Response([{"id": 1}])
@@ -632,6 +640,7 @@ api_own_metadata = scrudful_api_view(["GET"], etag_func=lambda view, request: "x
         context_link_or_func="/contexts/error",
     ),
 )
+@renderer_classes(BROWSABLE)
 def api_error(request, pk):
     return Response({"id": pk})
 
@@ -678,6 +687,8 @@ def django_view(request):
 
 class ThingAPIView(drf_views.APIView):
     """An APIView with class-body @scrudful methods."""
+
+    renderer_classes = BROWSABLE
 
     @scrudful(
         etag_func=etag_func,
@@ -1061,7 +1072,9 @@ def test_write_response_has_fresh_validators(client):
 
 
 def test_failed_write_gets_no_validators(client):
-    response = client.put("/things/1/", {"invalid": True}, headers={"If-Match": '"v1"'})
+    response = client.put(
+        "/things/1/", {"invalid": True}, format="json", headers={"If-Match": '"v1"'}
+    )
     assert response.status_code == 400
     assert "ETag" not in response
     assert "Last-Modified" not in response
@@ -1072,7 +1085,9 @@ def test_only_a_success_with_content_gets_the_links(client):
     response = client.get("/things/1/")
     assert response.status_code == 200
     assert response["Link"].startswith(SCHEMA_LINK)
-    response = client.put("/things/1/", {"invalid": True}, headers={"If-Match": '"v1"'})
+    response = client.put(
+        "/things/1/", {"invalid": True}, format="json", headers={"If-Match": '"v1"'}
+    )
     assert response.status_code == 400
     assert "Link" not in response
     response = client.delete("/things/1/", headers={"If-Match": '"v1"'})

@@ -127,6 +127,12 @@ change, so clients and tests that compare them must be updated.
   described with the endpoint's response links.
 * The ninja example (``examples/ninja``) calls ``add_error_links`` and serves
   HEAD on the list; all three examples are tested against the 0.1 rules.
+* The DRF example (``examples/scrudful_rest_framework``) renders and parses
+  JSON only (no browsable API, no form bodies, which OPTIONS can't describe),
+  its callbacks accept ``**kwargs`` (the router's format-suffix routes pass
+  ``format``), and its link callables return ``django.urls.reverse`` paths,
+  so ``?format=`` stays out of the link targets. The README's DRF snippet
+  does the same.
 * The documentation has a "Semantic HTTP conformance" section, builds without
   warnings, and documents ``Entity`` once.
 

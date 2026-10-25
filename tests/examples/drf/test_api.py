@@ -669,3 +669,47 @@ def test_example_links_are_served_with_the_documents(client, item, path):
     links += parse_links(client.put(path, **BODY, headers=IF_MATCH).get("Link"))
     for target, _ in links:
         assert client.get(target.removeprefix(BASE)).status_code == 200
+
+
+# --- Conformance settings and routes ----------------------------------------
+
+
+def test_format_suffix_routes(client, item):
+    """The router's ``.json`` routes: the callables take DRF's ``format`` too."""
+    for url in (f"/items/{item.pk}.json", "/items.json"):
+        hsr = client.options(url).json()
+        validate_http_schema_resource(hsr)
+        response = client.get(url)
+        assert response.status_code == 200, url
+        assert "ETag" in response
+        assert link_problems("GET", 200, dict(response.items()), True, hsr) == []
+    response = client.get(f"/items/{item.pk}.json")
+    assert response["Link"] == LINKS
+    response = client.put(f"/items/{item.pk}.json", {"name": "Two"}, format="json")
+    assert response.status_code == 428
+
+
+def test_format_query_parameter_stays_out_of_the_links(client, item):
+    """``?format=json`` is negotiation, not part of the linked documents' URLs."""
+    response = client.get(detail(item) + "?format=json")
+    assert response.status_code == 200
+    assert response["Link"] == LINKS
+    response = client.put(detail(item) + "?format=json", {"name": "Two"}, format="json")
+    assert response.status_code == 428
+    for target, _ in parse_links(response["Link"]):
+        assert "?" not in target
+        assert client.get(target.removeprefix(BASE)).status_code == 200
+
+
+def test_only_json_is_served_and_accepted(client, item):
+    """No browsable API, and no form bodies, which OPTIONS can't describe."""
+    response = client.get(detail(item), headers={"Accept": "text/html"})
+    assert response.status_code == 406
+    response = client.post("/items/", {"name": "Two"}, format="multipart")
+    assert response.status_code == 415
+    response = client.post(
+        "/items/", "name=Two", content_type="application/x-www-form-urlencoded"
+    )
+    assert response.status_code == 415
+    hsr = client.options("/items/").json()
+    assert list(hsr["post"]["requestBody"]["content"]) == ["application/json"]

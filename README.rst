@@ -153,14 +153,15 @@ Starlette's ``CORSMiddleware``, ``CORS_EXPOSE_HEADERS`` for django-cors-headers.
 Django REST Framework
 =====================
 
-Callbacks are called as ``func(view, request, **url_kwargs)``. ``@scrudful_viewset``
-reads its configuration from an inner ``Meta`` class (``list_*`` options
-configure the list response):
+Callbacks are called as ``func(view, request, **url_kwargs)``, with every URL
+kwarg, DRF's ``format`` among them on the format-suffix routes a router adds:
+accept ``**kwargs``. ``@scrudful_viewset`` reads its configuration from an inner
+``Meta`` class (``list_*`` options configure the list response):
 
 .. code-block:: python
 
+    from django.urls import reverse
     from rest_framework import viewsets
-    from rest_framework.reverse import reverse
 
     from scrudful.rest_framework import scrudful_viewset
 
@@ -169,19 +170,21 @@ configure the list response):
 
 
     # The callbacks run before the view's lookup: use its queryset.
-    def item_etag(view, request, pk):
+    def item_etag(view, request, pk, **kwargs):
         items = view.get_queryset().filter(pk=pk)
         version = items.values_list("version", flat=True).first()
         return None if version is None else f"v{version}"
 
 
-    def item_last_modified(view, request, pk):
+    def item_last_modified(view, request, pk, **kwargs):
         items = view.get_queryset().filter(pk=pk)
         return items.values_list("updated_at", flat=True).first()
 
 
+    # A path: scrudful makes it absolute. DRF's reverse(..., request=request)
+    # would keep the request's ?format= in it.
     def item_schema_url(view, request, **kwargs):
-        return reverse("item-schema", request=request)
+        return reverse("item-schema")
 
 
     @scrudful_viewset
@@ -473,10 +476,15 @@ The application must still:
   ``@scrudful`` ``update`` behind the stock ``put`` of a
   ``RetrieveUpdateAPIView`` is evaluated, but OPTIONS describes ``put`` and
   ``patch`` as bare 200s.
+* **Accept JSON request bodies only (DRF):** DRF's default parsers also take
+  form and multipart bodies, which the HTTP Schema Resource doesn't list (no
+  lifting to RDF covers form data). Set ``DEFAULT_PARSER_CLASSES`` (or the
+  view's ``parser_classes``) to ``JSONParser`` only, as the example does.
 * **Leave the browsable API out (DRF):** its HTML responses (``Accept:
   text/html``) carry the Links of the JSON content, so they are not
   conformant. For full conformance, drop ``BrowsableAPIRenderer`` from
-  ``DEFAULT_RENDERER_CLASSES`` (or the view's ``renderer_classes``).
+  ``DEFAULT_RENDERER_CLASSES`` (or the view's ``renderer_classes``), as the
+  example does.
 * **Give every entity a schema and a context** (only a schema for in-band
   types such as JSON-LD or Turtle). The spec requires the context of JSON
   content to be a JSON-LD 1.1 context. Keep the default ``describedby``
