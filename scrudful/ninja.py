@@ -431,6 +431,7 @@ from scrudful._adapter import (
     check_error_media_type,
     check_validators,
     context_defaults,
+    context_link_type,
     describe_content,
     describe_options,
     describe_read,
@@ -2260,6 +2261,7 @@ def _entity_links(
                 entity.context_type_or_func,
             ),
             defaults,
+            context_of=entity.media_type,
         )
     return schema, context
 
@@ -2276,18 +2278,24 @@ def _link(
     obj: Any,
     values_or_funcs: tuple[Any, Any, Any],
     defaults: tuple[str | None, str | None],
+    context_of: str | None = None,
 ) -> _Flow[str | None]:
     """Build one link-value from (url, rel, type) values or callables.
 
     The URL is resolved against the request's absolute URI, as in the OPTIONS
-    body (see :func:`_media`).
+    body (see :func:`_media`). The context link of ``context_of`` content
+    takes its type from :func:`scrudful._adapter.context_link_type`, as the
+    OPTIONS body does.
     """
     url_or_func, rel_or_func, type_or_func = values_or_funcs
     url = yield from _value(url_or_func, request, obj)
     if not url:
         return None
     rel = (yield from _value(rel_or_func, request, obj)) or defaults[0]
-    content_type = (yield from _value(type_or_func, request, obj)) or defaults[1]
+    content_type = yield from _value(type_or_func, request, obj)
+    if context_of is not None:
+        content_type = context_link_type(context_of, content_type)
+    content_type = content_type or defaults[1]
     return link_content(
         resolve_uri(url, request.build_absolute_uri()), rel, content_type
     )

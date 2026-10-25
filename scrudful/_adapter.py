@@ -328,6 +328,29 @@ def context_defaults(media_type: str) -> tuple[str | None, str | None]:
     return RDF_CONTEXT_REL, None
 
 
+def context_link_type(media_type: str, value: Any) -> str:
+    """The ``type`` of the context link of ``media_type`` content.
+
+    ``value``, the evaluated ``context_type_or_func``, unless it is empty;
+    else the default of :func:`context_defaults` (JSON-LD, for JSON content).
+    The Link header and the OPTIONS body both take the type from here, so
+    they agree, and fail alike.
+
+    Raises
+    ------
+    ValueError
+        If neither gives one: a ``context_type_or_func`` callable returned
+        nothing for content that is not JSON. A context Link without a type
+        would not say how to lift the content.
+    """
+    if value:
+        return str(value)
+    default = context_defaults(media_type)[1]
+    if default is None:
+        raise ValueError(f"the context of {media_type!r} needs a type")
+    return default
+
+
 def check_error_media_type(media_type: str) -> None:
     """Raise ``ValueError`` unless an ``error`` entity's ``media_type`` is JSON.
 
@@ -414,9 +437,7 @@ def describe_content(
     else:
         entry = {"x-schema": {"href": schema, "type": schema_type}}
     if context and not is_in_band(media_type):
-        context_type = context_type or (CONTEXT_TYPE if is_json(media_type) else None)
-        if not context_type:
-            raise ValueError(f"the context of {media_type!r} needs a type")
+        context_type = context_link_type(media_type, context_type)
         entry["x-rdf-context"] = {"href": context, "type": context_type}
     return {key: entry}
 

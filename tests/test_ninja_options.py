@@ -494,6 +494,44 @@ def test_options_media_type_objects():
         assert link_problems("GET", 200, response.headers, True, body) == [], url
 
 
+@pytest.mark.parametrize("context_type", [None, "", "application/csvm+json"])
+def test_a_context_type_callable_of_non_json_content(context_type):
+    """It must give a type: without one, GET and OPTIONS fail the same way."""
+    csv = Entity(
+        "/schemas/rows",
+        schema_type_or_func="application/csvm+json",
+        context_link_or_func="/contexts/rows",
+        context_type_or_func=lambda request, obj: context_type,
+        media_type="text/csv",
+    )
+    router = ScrudfulRouter()
+
+    @router.get("/rows/{pk}")
+    @scrudful(responses={200: csv})
+    def get_rows(request, pk: int):
+        return HttpResponse("a,b\n", content_type="text/csv")
+
+    client = TestClient(router)
+    if not context_type:
+        for request in (
+            lambda: client.get("/rows/1"),
+            lambda: options(client, "/rows/1"),
+        ):
+            with pytest.raises(
+                ValueError, match="the context of 'text/csv' needs a type"
+            ):
+                request()
+        return
+    body = options(client, "/rows/1").json()
+    response = client.get("/rows/1")
+    assert response.headers["Link"].endswith(
+        "<http://testlocation/contexts/rows>; "
+        'rel="https://w3id.org/semantic-http/ns#rdf-context"; '
+        'type="application/csvm+json"'
+    )
+    assert link_problems("GET", 200, response.headers, True, body) == []
+
+
 def test_options_trace_when_routed(store):
     router = ScrudfulRouter()
     item_router(store, router, methods=("GET",))

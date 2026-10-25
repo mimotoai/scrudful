@@ -2219,6 +2219,29 @@ def test_trace_ignores_preconditions(make_client, store):
     assert "412" in body["get"]["responses"]
 
 
+def test_a_context_type_callable_returning_none_takes_the_default(make_client):
+    """JSON content: the Links and OPTIONS both fall back to JSON-LD."""
+    app = FastAPI()
+
+    @app.get("/items/{item_id}")
+    @scrudful(
+        schema_link_or_func=SCHEMA,
+        context_link_or_func=CONTEXT,
+        context_type_or_func=lambda **kwargs: None,
+    )
+    async def get_item(item_id: int):
+        return {}
+
+    add_options(app)
+    client = make_client(app)
+    body = client.options("/items/3").json()
+    content = body["get"]["responses"]["200"]["content"]["application/json"]
+    assert content["x-rdf-context"] == {"href": CONTEXT, "type": "application/ld+json"}
+    response = client.get("/items/3")
+    assert response.headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+    assert link_problems("GET", 200, response.headers, True, body) == []
+
+
 def test_add_options_success_content_only_on_a_2xx(make_client):
     """A redirect gets no Links on the wire, and no content in OPTIONS."""
     app = FastAPI()

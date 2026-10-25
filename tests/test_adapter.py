@@ -16,6 +16,7 @@ from scrudful._adapter import (
     allow_header,
     check_validators,
     context_defaults,
+    context_link_type,
     describe_content,
     describe_options,
     describe_read,
@@ -569,3 +570,17 @@ def test_options_links():
         "<https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld>;"
         ' rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
     )
+
+
+def test_context_link_type():
+    """The one rule the Links and the OPTIONS body share."""
+    assert context_link_type("application/json", None) == CONTEXT_TYPE
+    assert context_link_type("application/problem+json", "") == CONTEXT_TYPE
+    assert context_link_type("text/csv", "application/csvm+json") == (
+        "application/csvm+json"
+    )
+    for value in (None, ""):
+        with pytest.raises(ValueError, match="the context of 'text/csv' needs a type"):
+            context_link_type("text/csv", value)
+        with pytest.raises(ValueError, match="the context of 'text/csv' needs a type"):
+            describe_content("text/csv", "http://s", SCHEMA_TYPE, "http://c", value)

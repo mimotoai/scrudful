@@ -46,7 +46,11 @@ class Entity:
           the content carries its own RDF, so no context link is sent;
         - any other content (e.g. ``text/csv``): rel
           ``"https://w3id.org/semantic-http/ns#rdf-context"``, and the type
-          of the lifting description must be given.
+          of the lifting description must be given. A
+          ``context_type_or_func`` callable that returns nothing for it is a
+          programming error: building the response's Links raises
+          ``ValueError``, as building its OPTIONS description does, rather
+          than send a context Link without a type.
 
         An explicit ``context_rel_or_func`` or ``context_type_or_func`` wins
         over these defaults.

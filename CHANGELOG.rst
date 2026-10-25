@@ -53,7 +53,10 @@ change, so clients and tests that compare them must be updated.
 * ``Entity`` moved to ``scrudful.entity`` (still importable from the three
   adapters) and gained ``media_type``, which decides the context Link's
   defaults (none for in-band RDF media types, ``rdf-context`` for other
-  non-JSON ones).
+  non-JSON ones). For other non-JSON content a ``context_type_or_func``
+  callable must return a type: one that returns nothing raises
+  ``ValueError`` on the Links as in OPTIONS, rather than send a context Link
+  without a type.
 * DRF and FastAPI: the view's (endpoint's) schema and context Links go only
   on a 2xx response other than 204 that it returns, as in django-ninja. A
   204, a redirect, or an error the view returns gets no Links from scrudful

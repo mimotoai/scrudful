@@ -121,6 +121,7 @@ from scrudful._adapter import (
     check_validators,
     conditional_header_parameters,
     context_defaults,
+    context_link_type,
     describe_content,
     describe_options,
     describe_read,
@@ -1132,12 +1133,20 @@ def _link_value(
     defaults: tuple[str | None, str | None],
     args: Sequence[Any],
     kwargs: Mapping[str, Any],
+    context_of: str | None = None,
 ) -> str | None:
-    """One link-value; the URL is resolved as in the OPTIONS body."""
+    """One link-value; the URL is resolved as in the OPTIONS body.
+
+    The context link of ``context_of`` content takes its type from
+    :func:`scrudful._adapter.context_link_type`, as the OPTIONS body does.
+    """
     if not url:
         return None
     rel = _evaluate(rel_and_type[0], args, kwargs) or defaults[0]
-    content_type = _evaluate(rel_and_type[1], args, kwargs) or defaults[1]
+    content_type = _evaluate(rel_and_type[1], args, kwargs)
+    if context_of is not None:
+        content_type = context_link_type(context_of, content_type)
+    content_type = content_type or defaults[1]
     return link_content(_resolve(url, args), rel, content_type)
 
 
@@ -1165,6 +1174,7 @@ def _entity_links(
             defaults,
             args,
             kwargs,
+            context_of=entity.media_type,
         )
     return schema, context
 
