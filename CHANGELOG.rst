@@ -51,16 +51,18 @@ change, so clients and tests that compare them must be updated.
   ``BrowsableAPIRenderer`` for full conformance.
 * Removed ``options_schema_link`` and ``options_context_link`` from
   ``ScrudfulRouter``: the OPTIONS Links are the fixed w3id.org 0.1 URLs.
-* Every Link header target scrudful sends and every URI in the OPTIONS
-  document is absolute: relative link values are resolved against the
-  request. A ``Location`` (from ``location_func`` or
-  ``ScrudfulResponse.location``, which RFC 9110 allows to be relative) and a
-  list entry's ``href`` (from ``href_func``) are sent as given: return
-  absolute ones from those callables if you want them. Links are de-duplicated: a Link that the view
-  set itself with the relation scrudful's schema (context) link has, compared
-  case-insensitively (``describedby`` and the JSON-LD context with the
-  defaults, or an overridden ``*_rel_or_func``'s), suppresses scrudful's, and
-  a Link of another relation suppresses nothing.
+* Every Link header target scrudful sends and every URI in the OPTIONS document
+  is absolute: relative link values are resolved against the request. A
+  ``Location`` (from ``location_func`` or ``ScrudfulResponse.location``, which
+  RFC 9110 allows to be relative) and a list entry's ``href`` (from
+  ``href_func``) are sent as given: return absolute ones from those callables
+  if you want them. Links are de-duplicated: a Link that the view set itself
+  with the relation of scrudful's schema link (``describedby`` by default, or
+  an overridden ``schema_rel_or_func``'s) suppresses that link; one with either
+  context relation (JSON-LD or ``rdf-context``, a single slot) suppresses
+  scrudful's context link of either, and an overridden context relation is
+  matched exactly. Relations are compared case-insensitively, and a Link of
+  another relation suppresses nothing.
 * ``Entity`` moved to ``scrudful.entity`` (still importable from the three
   adapters) and gained ``media_type``, which decides the context Link's
   defaults (none for in-band RDF media types, ``rdf-context`` for other

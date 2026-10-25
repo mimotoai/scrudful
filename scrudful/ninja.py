@@ -356,10 +356,12 @@ Headers
     none). Headers the handler set itself are never overwritten, neither by
     computed values nor by those set on ``ScrudfulResponse``. The Links are
     appended to any Link value the handler set, except that a handler's link
-    with the relation of the schema (context) link replaces that link
-    (``describedby`` and the JSON-LD or the rdf-context one by default,
-    compared case-insensitively); a link with another relation (e.g.
-    ``next``) replaces nothing.
+    with the relation of the schema link (``describedby`` by default)
+    replaces that link, and one with either context relation (the JSON-LD
+    or the rdf-context one, a single slot) replaces the context link, when
+    it has one of those; an overridden relation is matched exactly.
+    Relations are compared case-insensitively; a link with another relation
+    (e.g. ``next``) replaces nothing.
     The Link URLs are resolved against the request's absolute URI
     (``request.build_absolute_uri()``), so a relative one such as
     ``"/schemas/item"`` is sent absolute.
@@ -2220,9 +2222,11 @@ def _add_links(
 ) -> _Flow[None]:
     """Append the Links of ``entity`` to the Link header of ``headers``.
 
-    A Link the handler set with the relation of the schema (context) link
-    replaces that link; one with another relation (e.g. ``next``) replaces
-    nothing (see :func:`scrudful._adapter.merge_links`).
+    A Link the handler set with the relation of the schema link replaces
+    that link, and one with either context relation (JSON-LD or
+    ``rdf-context``, one slot) the context link; one with another relation
+    (e.g. ``next``) replaces nothing (see
+    :func:`scrudful._adapter.merge_links`).
     """
     schema, context = yield from _entity_links(entity, request, obj)
     link = merge_links(headers.get("Link"), schema, context)

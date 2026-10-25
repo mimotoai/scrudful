@@ -230,9 +230,10 @@ def scrudful(
     keeps any Link the endpoint set. Raise an error (``HTTPException``)
     rather than return it to give it Links, through :func:`add_error_links`.
     The Link header is appended to any Link value the endpoint (or a
-    dependency) set; a Link it set with the relation of the schema
-    (context) link, ``describedby`` (the JSON-LD context) by default,
-    replaces that link (see :func:`scrudful._adapter.merge_links`). Link
+    dependency) set; a Link it set with the relation of the schema link
+    (``describedby`` by default) replaces that link, and one with either
+    context relation (JSON-LD or ``rdf-context``, one slot) the context link
+    (see :func:`scrudful._adapter.merge_links`). Link
     URLs are resolved against the request's URL (``str(request.url)``), so
     a relative value such as ``"/schemas/item"`` is sent absolute.
     ``Access-Control-Expose-Headers`` is extended with whichever of

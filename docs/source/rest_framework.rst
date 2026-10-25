@@ -136,6 +136,14 @@ calls ``update``: the OPTIONS body describes PATCH as that ``update``, and
 ``exception_handler`` gives a PATCH's errors its ``error`` Links. A
 ``partial_update`` of your own is described, and handled, only as itself.
 
+On DRF's generic views (``GenericAPIView``, ``RetrieveUpdateAPIView`` ...) the
+stock ``get``, ``put`` and ``patch`` delegate to ``retrieve``, ``update`` and
+``partial_update``. A ``@scrudful`` on ``update`` there is evaluated on the
+wire (a PUT without ``If-Match`` gets the 428), but OPTIONS looks at the HTTP
+method handlers and describes ``put`` and ``patch`` as bare 200s. Decorate the
+HTTP method handlers (``get``, ``put``, ``patch`` ...) of a generic view, or
+use a viewset with ``scrudful_viewset``.
+
 .. note::
 
    The schema Link's default relation is ``describedby``, which Semantic HTTP

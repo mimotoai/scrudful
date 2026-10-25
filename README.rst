@@ -123,8 +123,11 @@ Rules worth knowing:
   link to ``rel="http://www.w3.org/ns/json-ld#context"`` and
   ``type="application/ld+json"``. Relative values are resolved to absolute URIs
   against the request, and a Link that your view set itself with the relation
-  of scrudful's schema (context) link suppresses that link: ``describedby``
-  with the defaults, ``profile`` with ``schema_rel_or_func="profile"``.
+  of scrudful's schema link suppresses that link: ``describedby`` with the
+  defaults, ``profile`` with ``schema_rel_or_func="profile"``. The JSON-LD
+  context and ``rdf-context`` relations are one slot (a response has at most
+  one RDF Context Link Header): your Link with either suppresses scrudful's
+  context Link of either. An overridden context relation is matched exactly.
   Relations are compared case-insensitively, each of a multi-relation ``rel``.
 
 Concurrency
@@ -202,8 +205,7 @@ makes the function view SCRUDful, but there is no class to install
 ``ScrudfulMetadata`` on when it runs: that view keeps DRF's ``SimpleMetadata``
 and gets no HTTP Schema Resource, and the errors it raises get no error Links
 (only scrudful's own 400, 412 and 428 do), so use ``scrudful_api_view``
-instead. Set
-``error=`` (or ``Meta.error``) and name
+instead. Set ``error=`` (or ``Meta.error``) and name
 ``scrudful.rest_framework.exception_handler`` as DRF's ``EXCEPTION_HANDLER`` so
 that the errors DRF raises itself for those views carry the error entity's
 Links too. See ``examples/scrudful_rest_framework`` for a complete project.
@@ -466,6 +468,11 @@ The application must still:
   ``@api_view`` with ``@scrudful`` keeps DRF's OPTIONS, which is no HTTP
   Schema Resource, and ``exception_handler`` can't find its ``error``: the
   errors it raises get no Links, only scrudful's own 400, 412 and 428 do.
+* **Decorate the HTTP method handlers of a DRF generic view** (``get``,
+  ``put``, ``patch`` ...), or use a viewset with ``scrudful_viewset``: a
+  ``@scrudful`` ``update`` behind the stock ``put`` of a
+  ``RetrieveUpdateAPIView`` is evaluated, but OPTIONS describes ``put`` and
+  ``patch`` as bare 200s.
 * **Leave the browsable API out (DRF):** its HTML responses (``Accept:
   text/html``) carry the Links of the JSON content, so they are not
   conformant. For full conformance, drop ``BrowsableAPIRenderer`` from

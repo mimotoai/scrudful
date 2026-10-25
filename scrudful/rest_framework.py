@@ -66,8 +66,10 @@ Headers
     view set. Raise an error rather than return it to give it the ``error``
     entity's Links, through :func:`exception_handler`. The Link header is
     appended to any Link value the view set; a Link of the view's with the
-    relation of the schema (context) link, ``describedby`` (the JSON-LD
-    context) by default, replaces that link. Every link URL is resolved
+    relation of the schema link (``describedby`` by default) replaces that
+    link, and one with either context relation (JSON-LD or ``rdf-context``,
+    one slot) the context link (see :func:`scrudful._adapter.merge_links`).
+    Every link URL is resolved
     against the request's absolute URI (``request.build_absolute_uri()``),
     so relative values such as ``"/schemas/item"`` are sent absolute.
     ``Access-Control-Expose-Headers`` is extended with whichever of ``ETag``,
@@ -345,11 +347,11 @@ class ScrudfulViewFunc:
             if send:
                 set_validator_headers(response, etag, last_modified)
         if has_default_entity(method, response.status_code):
-            # A Link the view set with the relation of the schema (context)
-            # link replaces that link; one with another relation replaces
-            # none. Another response the view returns (an error, a
-            # 204, a redirect, or a TRACE) is not described by its links: it
-            # gets none.
+            # A Link the view set with the relation of the schema link, or
+            # either context relation, replaces that link (merge_links); one
+            # with another relation replaces none. Another response the view
+            # returns (an error, a 204, a redirect, or a TRACE) is not
+            # described by its links: it gets none.
             link = merge_links(
                 response.get("Link"),
                 self.schema_link_header(*cb_args, **cb_kwargs),

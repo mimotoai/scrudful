@@ -568,8 +568,10 @@ with a handler of its own is wrapped: with ninja's defaults,
 fall back to the (wrapped) ``HttpError`` handler, as ninja looks handlers up.
 Each wrapped handler keeps the original's status and body and adds the entity's
 Links when the response has content. A Link the handler set itself with the
-relation of the entity's schema (context) link suppresses that link, so a
-response that already has scrudful's Links gets no Link twice. Calling it again
+relation of the entity's schema link suppresses that link, and one with either
+context relation (JSON-LD or ``rdf-context``, one slot) its context link, so a
+response that already has scrudful's Links gets no Link twice, nor two RDF
+Context Link Headers. Calling it again
 replaces the entity of the earlier call: the wrapped handlers are unwrapped
 first, so only the latest entity's Links, media type and link callables apply.
 Call it after registering your own exception handlers: it wraps the
