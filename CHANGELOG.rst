@@ -33,9 +33,11 @@ change, so clients and tests that compare them must be updated.
 * DRF: ``scrudful_viewset``, ``scrudful_api_view`` and now a ``@scrudful``
   method in a class body replace a class's stock ``APIView.options`` (an
   ``options`` the class defines is kept), as well as DRF's stock
-  ``SimpleMetadata``. So an ``APIView`` with ``@scrudful`` methods answers
-  OPTIONS with the HTTP Schema Resource; a plain ``@api_view`` +
-  ``@scrudful`` function view does not (use ``scrudful_api_view``).
+  ``SimpleMetadata``; a ``@scrudful`` method of a mixin does so on each
+  ``APIView`` subclassing the mixin. So an ``APIView`` with ``@scrudful``
+  methods answers OPTIONS with the HTTP Schema Resource; a plain
+  ``@api_view`` + ``@scrudful`` function view does not (use
+  ``scrudful_api_view``).
 * DRF: scrudful's own 400, 412 and 428 with an ``error`` entity, and the
   ``exception_handler`` responses of views with one, bypass DRF's content
   negotiation, so the browsable API gets JSON for them. The view's first JSON

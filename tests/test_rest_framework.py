@@ -2163,6 +2163,114 @@ def test_scrudful_method_of_a_class_that_is_not_a_view():
     assert "options" not in vars(NotAView)
 
 
+def _hsr(view_class, **kwargs):
+    """The OPTIONS response of ``view_class`` for ``/``."""
+    view = view_class.as_view(**kwargs)
+    return view(APIRequestFactory().options("/"), pk="1")
+
+
+def test_scrudful_methods_of_a_mixin_give_its_views_the_options():
+    links = dict(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+
+    class ItemMixin:
+        @scrudful(etag_func=etag_func, **links)
+        def get(self, request, pk):
+            return Response({"id": pk})
+
+        @scrudful(etag_func=etag_func, **links)
+        def put(self, request, pk):
+            return Response({"id": pk})
+
+    # The mixin itself is no view, and is left alone.
+    assert "metadata_class" not in vars(ItemMixin)
+    assert "options" not in vars(ItemMixin)
+
+    class ItemView(ItemMixin, drf_views.APIView):
+        pass
+
+    assert ItemView.metadata_class is ScrudfulMetadata
+    response = _hsr(ItemView)
+    assert response.status_code == 200
+    assert response["Link"] == options_links()
+    body = response.data
+    validate_http_schema_resource(body)
+    assert list(body) == ["get", "put", "options", "head"]
+    assert "412" in body["put"]["responses"]
+    assert response["Allow"] == allow_header(body)
+
+    # A subclass of the view, or of a view set: the same.
+    class SubView(ItemView):
+        pass
+
+    class ItemViewSet(ItemMixin, viewsets.ViewSet):
+        pass
+
+    assert SubView.metadata_class is ScrudfulMetadata
+    assert ItemViewSet.metadata_class is ScrudfulMetadata
+    response = _hsr(ItemViewSet, actions={"get": "get", "put": "put"})
+    assert list(response.data) == ["get", "put", "options", "head"]
+
+    # A class that is no view is unaffected.
+    class Helper(ItemMixin):
+        pass
+
+    assert "metadata_class" not in vars(Helper)
+    assert "options" not in vars(Helper)
+
+
+def test_a_mixin_view_keeps_what_it_chose():
+    class ItemMixin:
+        @scrudful(etag_func=etag_func)
+        def get(self, request, pk):
+            return Response({})
+
+    class OwnMetadata(ItemMixin, drf_views.APIView):
+        metadata_class = CustomMetadata
+
+    class Base(drf_views.APIView):
+        metadata_class = None
+
+    class Inherited(ItemMixin, Base):
+        pass
+
+    class OwnOptions(ItemMixin, drf_views.APIView):
+        def options(self, request, *args, **kwargs):
+            return Response({"own": True})
+
+    assert OwnMetadata.metadata_class is CustomMetadata
+    assert Inherited.metadata_class is None
+    assert OwnOptions.metadata_class is ScrudfulMetadata
+    assert _hsr(OwnOptions).data == {"own": True}
+
+
+def test_a_mixin_keeps_its_own_init_subclass():
+    seen = []
+
+    class Tagged:
+        def __init_subclass__(cls, tag=None, **kwargs):
+            super().__init_subclass__(**kwargs)
+            seen.append((cls.__name__, tag))
+
+    class ItemMixin(Tagged, tag="mixin"):
+        @scrudful(etag_func=etag_func)
+        def get(self, request, pk):
+            return Response({})
+
+        def __init_subclass__(cls, **kwargs):
+            super().__init_subclass__(**kwargs)
+            seen.append(("mixin hook", cls.__name__))
+
+    class ItemView(ItemMixin, drf_views.APIView, tag="view"):
+        pass
+
+    assert seen == [
+        ("ItemMixin", "mixin"),
+        ("ItemView", "view"),
+        ("mixin hook", "ItemView"),
+    ]
+    assert ItemView.metadata_class is ScrudfulMetadata
+
+
 # --- The view's JSON renderer ---------------------------------------------------
 
 

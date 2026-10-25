@@ -17,7 +17,12 @@ so subclass or mix in ``ScrudfulMetadata`` if you use your own metadata class
 and want scrudful's OPTIONS output.
 
 ``scrudful_viewset``, ``scrudful_api_view`` and a ``@scrudful`` method in the
-body of an ``APIView`` (or viewset) class install it. A function view with
+body of an ``APIView`` (or viewset) class install it. So does one in the body
+of a mixin: each ``APIView`` subclassing the mixin
+(``class ItemView(ItemMixin, APIView)``) gets it when it is created, by the
+same rules (scrudful chains the mixin's ``__init_subclass__`` to do so). A
+``metadata_class`` or ``options`` that the view, or a class between it and
+the mixin, sets is kept. A function view with
 ``@scrudful`` below a plain ``@api_view`` is SCRUDful, but there is no class
 to install it on when ``@scrudful`` runs: it keeps DRF's ``SimpleMetadata``
 and gets no HTTP Schema Resource. Use ``scrudful_api_view`` in place of

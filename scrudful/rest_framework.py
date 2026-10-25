@@ -288,10 +288,14 @@ class ScrudfulViewFunc:
         As :func:`scrudful_viewset` and :func:`scrudful_api_view` do (see
         :func:`_install_metadata`): DRF's stock ``SimpleMetadata`` and
         ``APIView.options`` are replaced, anything the class chose is kept.
-        A class that is not an ``APIView`` is left alone.
+        A class that is not an ``APIView``, e.g. a mixin, is left alone, but
+        each ``APIView`` subclassing it gets its OPTIONS the same way when it
+        is created (see :func:`_install_metadata_on_views`).
         """
         if issubclass(owner, APIView):
             _install_metadata(owner)
+        else:
+            _install_metadata_on_views(owner)
 
     @property
     def has_validators(self) -> bool:
@@ -700,6 +704,37 @@ def _install_metadata(cls: type) -> None:
         cls.metadata_class = ScrudfulMetadata  # type: ignore[attr-defined]
     if getattr(cls, "options", None) is APIView.options:
         cls.options = _options  # type: ignore[attr-defined]
+
+
+#: Set on a class whose ``APIView`` subclasses :func:`_install_metadata` sets up.
+_INSTALLS_METADATA = "_scrudful_installs_metadata"
+
+
+def _install_metadata_on_views(mixin: type) -> None:
+    """Have :func:`_install_metadata` set up each ``APIView`` subclass of ``mixin``.
+
+    For a mixin with ``@scrudful`` methods: its ``__init_subclass__`` is
+    replaced by one that calls the mixin's own (or, without one, the next
+    class's in the MRO, as ``super()`` does) and then, on an ``APIView``
+    subclass, :func:`_install_metadata`, which keeps a ``metadata_class`` or
+    ``options`` the subclass or a class between it and the mixin chose. Once
+    per mixin, whatever the number of ``@scrudful`` methods.
+    """
+    if vars(mixin).get(_INSTALLS_METADATA):
+        return
+    own = vars(mixin).get("__init_subclass__")
+
+    def __init_subclass__(cls: type, **kwargs: Any) -> None:
+        if own is not None:
+            # A classmethod (as the class body makes it), bound to ``cls``.
+            own.__get__(None, cls)(**kwargs)
+        else:
+            super(mixin, cls).__init_subclass__(**kwargs)  # type: ignore[misc]
+        if issubclass(cls, APIView):
+            _install_metadata(cls)
+
+    mixin.__init_subclass__ = classmethod(__init_subclass__)  # type: ignore[assignment]
+    setattr(mixin, _INSTALLS_METADATA, True)
 
 
 def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
