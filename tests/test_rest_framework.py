@@ -844,6 +844,24 @@ class DisagreeingAPIView(drf_views.APIView):
         return Response({})
 
 
+class DisagreeingNoGetAPIView(drf_views.APIView):
+    """No GET; the first error in method order (put, post ...) is PROBLEM."""
+
+    permission_classes = [DenyAll]
+
+    @scrudful(etag_func=etag_func, error=ERROR)
+    def post(self, request, pk):
+        return Response({})
+
+    @scrudful(etag_func=etag_func, error=PROBLEM)
+    def put(self, request, pk):
+        return Response({})
+
+    @scrudful(etag_func=etag_func, error=ERROR)
+    def patch(self, request, pk):
+        return Response({})
+
+
 class TaggingJSONRenderer(JSONRenderer):
     """A project's own JSON renderer (as a camel-case or orjson one would be)."""
 
@@ -933,6 +951,7 @@ urlpatterns = [
     path("trace/<int:pk>/", TraceAPIView.as_view()),
     path("denied-apiview/<int:pk>/", DeniedAPIView.as_view()),
     path("disagreeing-apiview/<int:pk>/", DisagreeingAPIView.as_view()),
+    path("disagreeing-no-get/<int:pk>/", DisagreeingNoGetAPIView.as_view()),
     path("conditional-trace/<int:pk>/", ConditionalTraceAPIView.as_view()),
     path("serializer-error/<int:pk>/", SerializerErrorAPIView.as_view()),
     path("custom-renderer-function/<int:pk>/", custom_renderer_function),
@@ -2152,15 +2171,15 @@ def test_a_custom_partial_update_is_not_the_update(client):
 
 def test_exception_handler_405_uses_the_view_wide_error_entity(client):
     """No handler runs for an unrouted method: the one error entity of the
-    view's handlers supplies the Links; none when they disagree (the list's
-    error entity differs from create's)."""
+    view's handlers supplies the Links; when they disagree (the list's error
+    entity differs from create's), the GET handler's."""
     response = client.post("/errors/1/")
     assert response.status_code == 405
     assert response["Link"] == ERROR_LINKS
     response = client.put("/errors/")
     assert response.status_code == 405
-    assert "Link" not in response
-    assert response["Content-Type"] == "application/json"
+    assert response["Link"] == PROBLEM_LINKS
+    assert response["Content-Type"] == "application/problem+json"
 
 
 @pytest.mark.parametrize("url", ["/denied/1/", "/denied-apiview/1/"])
@@ -2176,13 +2195,22 @@ def test_an_error_answering_options_gets_the_view_wide_error_links(client, url):
     assert response["Link"] == ERROR_LINKS
 
 
-def test_disagreeing_error_entities_give_an_options_error_no_links(client):
+def test_disagreeing_error_entities_fall_back_to_the_get_handler(client):
     response = client.options("/disagreeing-apiview/1/")
     assert response.status_code == 403
-    assert "Link" not in response
+    assert response["Link"] == ERROR_LINKS
+    assert response["Content-Type"] == "application/json"
     # Each method's own error still gets its handler's entity.
     assert client.get("/disagreeing-apiview/1/")["Link"] == ERROR_LINKS
     assert client.put("/disagreeing-apiview/1/")["Link"] == PROBLEM_LINKS
+
+
+def test_without_a_get_error_the_first_in_method_order(client):
+    """No scrudful GET with an error: the first of put, post ... with one."""
+    response = client.options("/disagreeing-no-get/1/")
+    assert response.status_code == 403
+    assert response["Link"] == PROBLEM_LINKS
+    assert response["Content-Type"] == "application/problem+json"
 
 
 def test_raised_errors_of_function_views(client):

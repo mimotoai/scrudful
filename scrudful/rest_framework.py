@@ -1020,10 +1020,11 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
     :class:`ScrudfulViewFunc` (an error answering OPTIONS, such as a 403 or
     an unsupported ``?format=``; a 405 for a method no handler serves; a
     handler that isn't scrudful), the view-wide entity supplies the Links:
-    the ``error`` of the scrudful handlers of the view's methods, when they
-    have exactly one between them. When they have different ones, or none,
-    the response is DRF's, unchanged. The entity's callables are called as
-    ``func(view, request, **url_kwargs)``.
+    the ``error`` the scrudful handlers of the view's methods share; when
+    they have different ones, the GET handler's, else the first one in the
+    order ``get``, ``put``, ``post``, ``delete``, ``options``, ``head``,
+    ``patch``, ``trace``. With none, the response is DRF's, unchanged. The
+    entity's callables are called as ``func(view, request, **url_kwargs)``.
 
     Settings must name it, as the example project does::
 
@@ -1094,26 +1095,34 @@ def _error_entity(view: APIView, request: Any) -> Entity | None:
 
     The ``error`` of the request's own handler (``view.action``'s, a
     viewset's, else the request method's) when it is a
-    :class:`ScrudfulViewFunc`. Otherwise (an OPTIONS, a 405 for a method no
-    handler serves, a handler that is not scrudful), the view-wide one: the
-    error entity of the scrudful handlers of the view's methods (a viewset's
-    route's action map), when there is exactly one; none when they have
-    several different ones, or none.
+    :class:`ScrudfulViewFunc`, even ``None``. Otherwise (an OPTIONS, a 405
+    for a method no handler serves, a handler that is not scrudful), the
+    view-wide one, from the scrudful handlers of the view's methods (a
+    viewset's route's action map): the one ``error`` they share; else, when
+    they have several, the GET handler's; else the first in the order of
+    :data:`~scrudful._adapter.METHOD_KEYS`. The OPTIONS body lists none of
+    these errors, so any error entity of the view describes them; a body
+    with content then always has Links.
     """
     metadata = ScrudfulMetadata()
     for name in (getattr(view, "action", None), getattr(request, "method", None)):
         handler = metadata.get_method(view, name.lower()) if name else None
         if handler is not None:
             return handler.error
-    errors: list[Entity] = []
+    errors: dict[str, Entity] = {}
     for method in METHOD_KEYS:
         if method.upper() not in view.allowed_methods:
             continue
         handler = metadata.get_method(view, method)
         if handler is not None and handler.error is not None:
-            if handler.error not in errors:
-                errors.append(handler.error)
-    return errors[0] if len(errors) == 1 else None
+            errors[method] = handler.error
+    distinct = []
+    for error in errors.values():
+        if error not in distinct:
+            distinct.append(error)
+    if len(distinct) <= 1:
+        return distinct[0] if distinct else None
+    return errors.get("get", distinct[0])
 
 
 def _has_validators(handler: Any) -> bool:

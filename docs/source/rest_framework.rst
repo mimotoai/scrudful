@@ -77,14 +77,18 @@ It calls DRF's handler and, for a view whose handler for the request has an
 entity's media type, whatever the request's ``Accept``. The entity is the
 view's: DRF has no app-wide error entity, so give each view's handlers
 ``error=``. An error with no scrudful handler of its own (one raised while
-answering OPTIONS, such as a 403 or an unsupported ``?format=``, or the 405
-for a method the view doesn't serve) gets the view-wide entity: the ``error``
-the view's scrudful handlers have, when they have exactly one between them.
-When they have different ones (a viewset list route whose ``Meta.list_error``
-differs from ``Meta.error``, say), such an error gets no Links: give them one
-entity for it to have them. The HTTP Schema Resource lists a PUT, PATCH or POST 400 under that
-media type (conditional or not) only when the view's exception handler is this
-one, which it knows by the handler's ``scrudful_error_links = True``
+answering OPTIONS, such as a 403 or an unsupported ``?format=``, the 405 for a
+method the view doesn't serve) gets the view-wide entity: the ``error`` the view's scrudful handlers
+share. When they have different ones (a viewset list route whose
+``Meta.list_error`` differs from ``Meta.error``, say), it gets the GET
+handler's, else the first one in the order ``get``, ``put``, ``post``,
+``delete``, ``options``, ``head``, ``patch``, ``trace``. The HTTP Schema
+Resource lists none of these errors, so any error entity of the view describes
+them.
+
+The HTTP Schema Resource lists a PUT, PATCH or POST 400 under the error
+entity's media type (conditional or not) only when the view's exception handler
+is this one, which it knows by the handler's ``scrudful_error_links = True``
 attribute. A project handler that delegates to scrudful's must carry it too:
 set ``handler.scrudful_error_links = True``, or use
 ``functools.wraps(exception_handler)``, which copies it:

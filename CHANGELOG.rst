@@ -48,8 +48,9 @@ change, so clients and tests that compare them must be updated.
   copy it onto the view class.
 * DRF: ``exception_handler`` gives an error that no scrudful handler answers
   (one raised while answering OPTIONS, a 405) the view-wide error entity:
-  the ``error`` of the view's scrudful handlers when they have exactly one,
-  else no Links (a 405 got the first allowed handler's before).
+  the ``error`` the view's scrudful handlers share; when they have different
+  ones, the GET handler's, else the first in method order (a 405 got the
+  first allowed handler's before).
 * DRF: scrudful's own 400, 412 and 428 with an ``error`` entity, and the
   ``exception_handler`` responses of views with one, bypass DRF's content
   negotiation, so the browsable API gets JSON for them. The view's first JSON
