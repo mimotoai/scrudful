@@ -230,15 +230,15 @@ def scrudful(
     keeps any Link the endpoint set. Raise an error (``HTTPException``)
     rather than return it to give it Links, through :func:`add_error_links`.
     The Link header is appended to any Link value the endpoint (or a
-    dependency) set; a Link it set with a ``describedby`` relation replaces
-    the schema link, and one with a context relation the context link (see
-    :func:`scrudful._adapter.merge_links`). Link URLs are resolved against the
-    request's URL (``str(request.url)``), so a relative value such as
-    ``"/schemas/item"`` is sent absolute. ``Access-Control-Expose-Headers``
-    is extended with whichever of ``ETag``, ``Link`` and ``Location`` the
-    response carries. Starlette's ``CORSMiddleware`` replaces that header on
-    cross-origin requests, so if you use it, list these names in its
-    ``expose_headers`` instead.
+    dependency) set; a Link it set with the relation of the schema
+    (context) link, ``describedby`` (the JSON-LD context) by default,
+    replaces that link (see :func:`scrudful._adapter.merge_links`). Link
+    URLs are resolved against the request's URL (``str(request.url)``), so
+    a relative value such as ``"/schemas/item"`` is sent absolute.
+    ``Access-Control-Expose-Headers`` is extended with whichever of
+    ``ETag``, ``Link`` and ``Location`` the response carries. Starlette's
+    ``CORSMiddleware`` replaces that header on cross-origin requests, so if
+    you use it, list these names in its ``expose_headers`` instead.
 
     If the endpoint returns a Starlette ``Response`` the headers are added to
     it, otherwise to the response FastAPI builds. ``HTTPException`` raised by
@@ -438,8 +438,8 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
     Each wrapped handler returns the response the original makes, with the
     same status, headers and body, and when it has JSON content (an
     ``application/json`` or ``+json`` Content-Type) adds ``error``'s Links to
-    it, as :func:`scrudful` adds them (a Link the handler set with a
-    ``describedby`` or a context relation suppresses that kind; see
+    it, as :func:`scrudful` adds them (a Link the handler set with the
+    relation of one of them suppresses it; see
     :func:`scrudful._adapter.merge_links`), and serves it as
     ``error.media_type``. Responses without content (e.g. a 304) or with
     other content are left unchanged. Link URLs are resolved against the

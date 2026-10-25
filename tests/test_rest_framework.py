@@ -422,6 +422,25 @@ class OwnDescribedByViewSet(viewsets.ViewSet):
         return Response({}, headers={"Link": '<https://o/s>; rel="describedby"'})
 
 
+class OverriddenRelViewSet(viewsets.ViewSet):
+    """Overridden relations: the view's own Links are compared with them."""
+
+    @scrudful(
+        schema_link_or_func="/schemas/thing",
+        schema_rel_or_func="profile",
+        context_link_or_func="/contexts/thing",
+        context_rel_or_func="Context",
+    )
+    def retrieve(self, request, pk):
+        return Response(
+            {},
+            headers={
+                "Link": '<https://o/s>; rel="describedby", '
+                '<https://o/c>; rel="context other"'
+            },
+        )
+
+
 class OwnErrorLinkViewSet(viewsets.ViewSet):
     """A view that returns an error with a Link of its own."""
 
@@ -810,6 +829,7 @@ for prefix, viewset in [
     ("mixed-actions", MixedActionViewSet),
     ("own-describedby", OwnDescribedByViewSet),
     ("own-error-link", OwnErrorLinkViewSet),
+    ("overridden-rel", OverriddenRelViewSet),
     ("custom-renderer", CustomRendererViewSet),
 ]:
     router.register(prefix, viewset, basename=prefix)
@@ -1267,6 +1287,17 @@ def test_view_link_not_duplicated(client):
     assert [target for target, _ in links] == [
         "https://o/s",
         f"{BASE}/contexts/thing",
+    ]
+
+
+def test_view_link_is_compared_with_the_relations_scrudful_sends(client):
+    links = parse_links(client.get("/overridden-rel/1/")["Link"])
+    # The view's describedby doesn't replace scrudful's ``profile`` link; its
+    # ``context`` one (one of two relations) replaces scrudful's ``Context``.
+    assert [(target, params["rel"]) for target, params in links] == [
+        ("https://o/s", "describedby"),
+        ("https://o/c", "context other"),
+        (f"{BASE}/schemas/thing", "profile"),
     ]
 
 

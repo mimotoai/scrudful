@@ -51,9 +51,11 @@ change, so clients and tests that compare them must be updated.
 * Removed ``options_schema_link`` and ``options_context_link`` from
   ``ScrudfulRouter``: the OPTIONS Links are the fixed w3id.org 0.1 URLs.
 * Every URI scrudful sends or describes is absolute: relative link values are
-  resolved against the request. Links are de-duplicated: a ``describedby`` or
-  context Link that the view set itself suppresses scrudful's of that kind,
-  and a Link of another relation suppresses nothing.
+  resolved against the request. Links are de-duplicated: a Link that the view
+  set itself with the relation scrudful's schema (context) link has, compared
+  case-insensitively (``describedby`` and the JSON-LD context with the
+  defaults, or an overridden ``*_rel_or_func``'s), suppresses scrudful's, and
+  a Link of another relation suppresses nothing.
 * ``Entity`` moved to ``scrudful.entity`` (still importable from the three
   adapters) and gained ``media_type``, which decides the context Link's
   defaults (none for in-band RDF media types, ``rdf-context`` for other

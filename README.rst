@@ -122,8 +122,10 @@ Rules worth knowing:
   ``rel="describedby"`` and ``type="application/schema+json"``, the context
   link to ``rel="http://www.w3.org/ns/json-ld#context"`` and
   ``type="application/ld+json"``. Relative values are resolved to absolute URIs
-  against the request, and a ``describedby`` or context Link that your view set
-  itself suppresses scrudful's of that kind.
+  against the request, and a Link that your view set itself with the relation
+  of scrudful's schema (context) link suppresses that link: ``describedby``
+  with the defaults, ``profile`` with ``schema_rel_or_func="profile"``.
+  Relations are compared case-insensitively, each of a multi-relation ``rel``.
 
 Concurrency
 -----------

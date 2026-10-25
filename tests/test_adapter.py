@@ -387,10 +387,40 @@ def test_merge_links_other_relation_keeps_both():
     )
 
 
-@pytest.mark.parametrize("rel", [JSON_LD_CONTEXT_REL, RDF_CONTEXT_REL])
-def test_merge_links_view_context_drops_context_link(rel):
-    view = link_content("https://h/v", rel, "text/turtle")
+def test_merge_links_view_context_drops_context_link():
+    view = link_content("https://h/v", JSON_LD_CONTEXT_REL.upper(), "text/turtle")
     assert merge_links(view, SCHEMA_LINK, CONTEXT_LINK) == f"{view}, {SCHEMA_LINK}"
+
+
+def test_merge_links_compares_the_relations_scrudful_sends():
+    """Only a link of the same relation as scrudful's replaces it."""
+    # Another context relation than the one scrudful sends replaces nothing.
+    view = link_content("https://h/v", RDF_CONTEXT_REL, "text/turtle")
+    assert merge_links(view, SCHEMA_LINK, CONTEXT_LINK) == (
+        f"{view}, {SCHEMA_LINK}, {CONTEXT_LINK}"
+    )
+    # An overridden relation: the view's ``profile`` link replaces scrudful's.
+    profile = link_content("https://h/s", "profile", SCHEMA_TYPE)
+    other = link_content("https://h/c", "Other", CONTEXT_TYPE)
+    view = '<https://h/p>; rel="Profile"'
+    assert merge_links(view, profile, other) == f"{view}, {other}"
+    view = '<https://h/o>; rel="other"'
+    assert merge_links(view, profile, other) == f"{view}, {profile}"
+    # A describedby link no longer replaces scrudful's ``profile`` one.
+    view = '<https://h/v>; rel="describedby"'
+    assert merge_links(view, profile, CONTEXT_LINK) == (
+        f"{view}, {profile}, {CONTEXT_LINK}"
+    )
+
+
+def test_merge_links_reads_every_relation_of_a_link():
+    view = '<https://h/v>; rel="describedby foo"'
+    assert merge_links(view, SCHEMA_LINK, CONTEXT_LINK) == f"{view}, {CONTEXT_LINK}"
+    # And of scrudful's: one of its relations is enough.
+    both = link_content("https://h/s", "describedby profile", SCHEMA_TYPE)
+    assert merge_links('<https://h/p>; rel="profile"', both, None) == (
+        '<https://h/p>; rel="profile"'
+    )
 
 
 def test_merge_links_nothing():

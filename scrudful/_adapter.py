@@ -382,13 +382,19 @@ def merge_links(
 ) -> str | None:
     """Join the view's Link ``existing`` with the ``schema`` and ``context`` links.
 
-    A link of ``existing`` with a ``describedby`` relation replaces the
-    ``schema`` link, and one with a context relation the ``context`` link.
+    A link of ``existing`` with a relation that scrudful's ``schema``
+    (``context``) link-value has replaces that link: with the defaults, a
+    ``describedby`` link replaces the schema link, and a JSON-LD context (or,
+    for other content, ``rdf-context``) link the context link; with
+    ``schema_rel_or_func="profile"``, a ``profile`` link replaces it, and a
+    ``describedby`` one doesn't. Relation types are compared
+    case-insensitively, every one of a ``rel`` holding several (RFC 8288
+    §2.1.1, §3.3). A link of another relation replaces nothing.
     """
     relations = link_relations(existing)
-    if SCHEMA_REL in relations:
+    if relations & link_relations(schema):
         schema = None
-    if relations & {JSON_LD_CONTEXT_REL, RDF_CONTEXT_REL}:
+    if relations & link_relations(context):
         context = None
     return join_links(existing, schema, context)
 

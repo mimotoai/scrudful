@@ -356,9 +356,10 @@ Headers
     none). Headers the handler set itself are never overwritten, neither by
     computed values nor by those set on ``ScrudfulResponse``. The Links are
     appended to any Link value the handler set, except that a handler's link
-    with a ``describedby`` relation replaces the schema link, and one with
-    a context relation (the JSON-LD or the rdf-context one) the context
-    link; a link with another relation (e.g. ``next``) replaces nothing.
+    with the relation of the schema (context) link replaces that link
+    (``describedby`` and the JSON-LD or the rdf-context one by default,
+    compared case-insensitively); a link with another relation (e.g.
+    ``next``) replaces nothing.
     The Link URLs are resolved against the request's absolute URI
     (``request.build_absolute_uri()``), so a relative one such as
     ``"/schemas/item"`` is sent absolute.
@@ -1257,8 +1258,8 @@ def add_error_links(api: NinjaAPI, error: Entity) -> None:
     keeps falling back to its base's handler, which is. Each wrapped handler
     returns the response the original makes, with the same status and body,
     and adds ``error``'s Links to it when it has content, as :func:`scrudful`
-    adds them (a Link the handler set with a ``describedby`` or a context
-    relation suppresses that kind; see :func:`scrudful._adapter.merge_links`).
+    adds them (a Link the handler set with the relation of one of them
+    suppresses it; see :func:`scrudful._adapter.merge_links`).
     So a custom handler registered before the call is kept, and calling this
     again replaces the entity of the earlier call: no Link is added twice,
     and only the latest ``error``'s link callables run. A handler registered
@@ -2219,10 +2220,9 @@ def _add_links(
 ) -> _Flow[None]:
     """Append the Links of ``entity`` to the Link header of ``headers``.
 
-    A Link the handler set with a ``describedby`` relation replaces the schema
-    link, one with a context relation the context link; one with another
-    relation (e.g. ``next``) replaces nothing (see
-    :func:`scrudful._adapter.merge_links`).
+    A Link the handler set with the relation of the schema (context) link
+    replaces that link; one with another relation (e.g. ``next``) replaces
+    nothing (see :func:`scrudful._adapter.merge_links`).
     """
     schema, context = yield from _entity_links(entity, request, obj)
     link = merge_links(headers.get("Link"), schema, context)

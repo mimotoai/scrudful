@@ -567,8 +567,8 @@ with a handler of its own is wrapped: with ninja's defaults,
 ``AuthenticationError``, ``AuthorizationError`` and ``Throttled`` have none and
 fall back to the (wrapped) ``HttpError`` handler, as ninja looks handlers up.
 Each wrapped handler keeps the original's status and body and adds the entity's
-Links when the response has content. A Link the handler set itself with a
-``describedby`` or a context relation suppresses scrudful's of that kind, so a
+Links when the response has content. A Link the handler set itself with the
+relation of the entity's schema (context) link suppresses that link, so a
 response that already has scrudful's Links gets no Link twice. Calling it again
 replaces the entity of the earlier call: the wrapped handlers are unwrapped
 first, so only the latest entity's Links, media type and link callables apply.
