@@ -17,9 +17,9 @@ supports it in production).
 
 import hashlib
 
+from django.urls import reverse
 from rest_framework import viewsets
 from rest_framework.decorators import api_view
-from django.urls import reverse
 from rest_framework.response import Response
 
 from items.models import Item

@@ -47,10 +47,12 @@ change, so clients and tests that compare them must be updated.
   (a custom class, or ``None``) on DRF 3.15.0 too, whose ``api_view`` doesn't
   copy it onto the view class.
 * DRF: ``exception_handler`` gives an error that no scrudful handler answers
-  (one raised while answering OPTIONS, a 405) the view-wide error entity:
-  the ``error`` the view's scrudful handlers share; when they have different
-  ones, the GET handler's, else the first in method order (a 405 got the
-  first allowed handler's before).
+  (one raised while answering OPTIONS, a 405, one raised by a handler that
+  isn't scrudful) the view-wide error entity: the ``error`` the view's
+  scrudful handlers share; when they have different ones, the GET
+  handler's, else the first in method order (a 405 got the first allowed
+  handler's before). An error raised by a non-scrudful handler is served
+  with that entity's Links and media type.
 * DRF: scrudful's own 400, 412 and 428 with an ``error`` entity, and the
   ``exception_handler`` responses of views with one, bypass DRF's content
   negotiation, so the browsable API gets JSON for them. The view's first JSON

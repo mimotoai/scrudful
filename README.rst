@@ -484,7 +484,8 @@ The application must still:
   text/html``) carry the Links of the JSON content, so they are not
   conformant. For full conformance, drop ``BrowsableAPIRenderer`` from
   ``DEFAULT_RENDERER_CLASSES`` (or the view's ``renderer_classes``), as the
-  example does.
+  example does. An OPTIONS with ``Accept: text/html`` then gets DRF's 406, an
+  error carrying the error Links, not an HTTP Schema Resource.
 * **Give every entity a schema and a context** (only a schema for in-band
   types such as JSON-LD or Turtle). The spec requires the context of JSON
   content to be a JSON-LD 1.1 context. Keep the default ``describedby``

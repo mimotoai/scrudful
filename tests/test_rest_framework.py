@@ -616,9 +616,10 @@ def api_authenticated(request):
     return Response({})
 
 
+# Not the settings' JSON-only renderers: the decorator must be honoured.
 @scrudful_api_view()
-@renderer_classes([JSONRenderer])
-def api_json_only(request):
+@renderer_classes([BrowsableAPIRenderer])
+def api_html_only(request):
     return Response({})
 
 
@@ -862,6 +863,17 @@ class DisagreeingNoGetAPIView(drf_views.APIView):
         return Response({})
 
 
+class PlainPostAPIView(drf_views.APIView):
+    """A scrudful GET, and a plain POST whose serializer error it describes."""
+
+    @scrudful(etag_func=etag_func, error=PROBLEM)
+    def get(self, request, pk):
+        return Response({})
+
+    def post(self, request, pk):
+        raise serializers.ValidationError({"name": ["This field is required."]})
+
+
 class TaggingJSONRenderer(JSONRenderer):
     """A project's own JSON renderer (as a camel-case or orjson one would be)."""
 
@@ -937,7 +949,7 @@ urlpatterns = [
     path("api-default/", api_default),
     path("api-throttled/", api_throttled),
     path("api-authenticated/", api_authenticated),
-    path("api-json-only/", api_json_only),
+    path("api-html-only/", api_html_only),
     path("api-own-metadata/", api_own_metadata),
     path("function/<int:pk>/", function_view),
     path("django/", django_view),
@@ -952,6 +964,7 @@ urlpatterns = [
     path("denied-apiview/<int:pk>/", DeniedAPIView.as_view()),
     path("disagreeing-apiview/<int:pk>/", DisagreeingAPIView.as_view()),
     path("disagreeing-no-get/<int:pk>/", DisagreeingNoGetAPIView.as_view()),
+    path("plain-post/<int:pk>/", PlainPostAPIView.as_view()),
     path("conditional-trace/<int:pk>/", ConditionalTraceAPIView.as_view()),
     path("serializer-error/<int:pk>/", SerializerErrorAPIView.as_view()),
     path("custom-renderer-function/<int:pk>/", custom_renderer_function),
@@ -1777,8 +1790,12 @@ def test_api_view_honours_policy_decorators(client):
     response = client.get("/api-authenticated/")
     assert response.status_code == 401
     assert response["WWW-Authenticate"].startswith("Basic")
-    response = client.get("/api-json-only/", headers={"Accept": "text/html"})
+    assert api_html_only.cls.renderer_classes == [BrowsableAPIRenderer]
+    response = client.get("/api-html-only/", headers={"Accept": "application/json"})
     assert response.status_code == 406
+    response = client.get("/api-html-only/", headers={"Accept": "text/html"})
+    assert response.status_code == 200
+    assert response["Content-Type"].startswith("text/html")
 
 
 def test_api_view_options_metadata(client):
@@ -2209,6 +2226,14 @@ def test_without_a_get_error_the_first_in_method_order(client):
     """No scrudful GET with an error: the first of put, post ... with one."""
     response = client.options("/disagreeing-no-get/1/")
     assert response.status_code == 403
+    assert response["Link"] == PROBLEM_LINKS
+    assert response["Content-Type"] == "application/problem+json"
+
+
+def test_a_plain_handler_error_gets_the_view_wide_error_entity(client):
+    """A handler that isn't scrudful has no error of its own."""
+    response = client.post("/plain-post/1/", {}, format="json")
+    assert response.status_code == 400
     assert response["Link"] == PROBLEM_LINKS
     assert response["Content-Type"] == "application/problem+json"
 

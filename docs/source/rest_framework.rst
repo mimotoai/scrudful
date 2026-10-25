@@ -78,13 +78,16 @@ entity's media type, whatever the request's ``Accept``. The entity is the
 view's: DRF has no app-wide error entity, so give each view's handlers
 ``error=``. An error with no scrudful handler of its own (one raised while
 answering OPTIONS, such as a 403 or an unsupported ``?format=``, the 405 for a
-method the view doesn't serve) gets the view-wide entity: the ``error`` the view's scrudful handlers
+method the view doesn't serve, or an error a handler that isn't scrudful
+raises) gets the view-wide entity: the ``error`` the view's scrudful handlers
 share. When they have different ones (a viewset list route whose
 ``Meta.list_error`` differs from ``Meta.error``, say), it gets the GET
 handler's, else the first one in the order ``get``, ``put``, ``post``,
 ``delete``, ``options``, ``head``, ``patch``, ``trace``. The HTTP Schema
 Resource lists none of these errors, so any error entity of the view describes
-them.
+them. Entities are compared by equality, their callables by identity: give the
+handlers one ``Entity`` object (or equal ones with the same callables) for them
+to share it.
 
 The HTTP Schema Resource lists a PUT, PATCH or POST 400 under the error
 entity's media type (conditional or not) only when the view's exception handler
@@ -108,9 +111,9 @@ set ``handler.scrudful_error_links = True``, or use
 Without the marker, such a handler's 400 still carries the error Links, but the
 HTTP Schema Resource doesn't list it. Without the setting, or without an
 ``error`` entity, such errors are DRF's own, with no Link. The HTTP Schema
-Resource doesn't list 404 and 405, so they have no entry to agree with. The example project
-(``examples/scrudful_rest_framework``) is conformant on the wire: its tests
-check every response against the Semantic HTTP 0.1 rules.
+Resource doesn't list 404 and 405, so they have no entry to agree with. The
+example project (``examples/scrudful_rest_framework``) is conformant on the
+wire: its tests check every response against the Semantic HTTP 0.1 rules.
 
 The responses served as the error entity's media type (scrudful's own 400,
 412 and 428, and this handler's) bypass DRF's content negotiation: the first
