@@ -510,6 +510,40 @@ def test_options_trace_when_routed(store):
     validate_http_schema_resource(body)
 
 
+def test_trace_gets_no_default_entity():
+    """A TRACE's content is the echoed request, not the item."""
+    router = ScrudfulRouter()
+
+    @router.api_operation(["GET", "TRACE"], "/items/{pk}", response={200: Message})
+    @scrudful(**LINKS)
+    def get_item(request, pk: int):
+        return {"detail": "item"}
+
+    # An entity declared for the status still applies to TRACE.
+    @router.api_operation(["GET", "TRACE"], "/echo/{pk}", response={200: Message})
+    @scrudful(**LINKS, responses={200: Entity("/schemas/echo")})
+    def echo(request, pk: int):
+        return {"detail": "echo"}
+
+    client = TestClient(router)
+    body = options(client, "/items/1").json()
+    validate_http_schema_resource(body)
+    assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
+    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    response = client.request("TRACE", "/items/1")
+    assert response.status_code == 200
+    assert "Link" not in response.headers
+
+    body = options(client, "/echo/1").json()
+    echo_content = content("/schemas/echo")
+    assert body["trace"]["responses"]["200"]["content"] == echo_content
+    response = client.request("TRACE", "/echo/1")
+    assert response.headers["Link"] == (
+        '<http://testlocation/schemas/echo>; rel="describedby"; '
+        'type="application/schema+json"'
+    )
+
+
 def test_router_rejects_options_links():
     with pytest.raises(TypeError):
         ScrudfulRouter(options_schema_link="x")

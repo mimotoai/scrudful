@@ -59,6 +59,10 @@ change, so clients and tests that compare them must be updated.
   errors, rather than return them, to give them the error entity's Links. A
   FastAPI route whose ``status_code`` is not such a 2xx is described without
   content in OPTIONS.
+* No adapter gives a TRACE response the default (item) entity's Links, and
+  django-ninja's OPTIONS no longer describes a TRACE with that content: a
+  TRACE's content is the echoed request. An entity declared for the status
+  (ninja's ``responses={200: Entity(...)}``) still applies.
 * Error entities: ``error=`` for DRF (``Meta.error`` / ``Meta.list_error``)
   and FastAPI, as ninja already had. An ``error`` entity's ``media_type`` must
   be JSON content (``application/json`` or ``+json``, other than JSON-LD);

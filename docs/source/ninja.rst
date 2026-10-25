@@ -124,8 +124,10 @@ required when ``etag_func`` or ``last_modified_func`` is set.
 
 The ``schema_*`` / ``context_*`` arguments are the default entity: its Links go
 on 2xx responses, except a 204, which has no body (so a DELETE answering 204
-gets none). ``responses={204: Entity(...)}`` or ``ScrudfulResponse.entity``
-still put Links on a 204 if you want them.
+gets none), and except those to TRACE, whose content is the echoed request
+(``message/http``), not the item: OPTIONS describes them without content.
+``responses={204: Entity(...)}`` (``responses={200: Entity(...)}`` for a TRACE)
+or ``ScrudfulResponse.entity`` still put Links on them if you want them.
 
 ninja routes HEAD only to operations that list it, as above.
 

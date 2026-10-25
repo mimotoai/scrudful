@@ -105,7 +105,8 @@ Rules worth knowing:
   to be in ``settings.TIME_ZONE`` by the DRF and django-ninja adapters (the
   same thing when ``TIME_ZONE`` is ``"UTC"``). Prefer aware datetimes.
 * **Link headers.** The schema and context links are added to every success
-  response with content (a 2xx other than 204) your view returns, and are
+  response with content (a 2xx other than 204, to a method other than TRACE,
+  whose content is the echoed request) your view returns, and are
   appended to any ``Link`` value it set. A response with another status that
   your view returns (an error, a 204, a redirect) gets no Links from scrudful
   (a ``Link`` it set itself is kept as is): the view's links don't describe

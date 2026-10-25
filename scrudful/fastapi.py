@@ -215,15 +215,16 @@ def scrudful(
         §9.3.4). Other methods and non-2xx responses get none. Headers the
         endpoint set itself are never overwritten.
 
-    The Link header is added to the 2xx responses but 204 the endpoint
-    produces, whose content its links describe (see
-    :func:`scrudful._adapter.has_default_entity`); another status it returns
-    (an error, a 204, a redirect) gets no Links from scrudful, and keeps any
-    Link the endpoint set. Raise an error (``HTTPException``) rather than
-    return it to give it Links, through :func:`add_error_links`. The Link
-    header is appended to any Link value the endpoint (or a dependency) set;
-    a Link it set with a ``describedby`` relation replaces the schema link,
-    and one with a context relation the context link (see
+    The Link header is added to the responses whose content the endpoint's
+    links describe: the 2xx but 204 it produces, to any method but TRACE
+    (whose content is the echoed request; see
+    :func:`scrudful._adapter.has_default_entity`). Another response it
+    returns (an error, a 204, a redirect) gets no Links from scrudful, and
+    keeps any Link the endpoint set. Raise an error (``HTTPException``)
+    rather than return it to give it Links, through :func:`add_error_links`.
+    The Link header is appended to any Link value the endpoint (or a
+    dependency) set; a Link it set with a ``describedby`` relation replaces
+    the schema link, and one with a context relation the context link (see
     :func:`scrudful._adapter.merge_links`). Link URLs are resolved against the
     request's URL (``str(request.url)``), so a relative value such as
     ``"/schemas/item"`` is sent absolute. ``Access-Control-Expose-Headers``
@@ -392,7 +393,7 @@ def scrudful(
                     etag, last_modified = await validators(kwargs)
                 if send:
                     set_validator_headers(headers, etag, last_modified)
-            if has_default_entity(status):
+            if has_default_entity(method, status):
                 # Another status the endpoint returns (an error, a 204, a
                 # redirect) is not described by its links: it gets none.
                 link = merge_links(
@@ -671,6 +672,9 @@ def add_options(app: FastAPI | APIRouter) -> None:
       validator callbacks, scrudful's 304, 400 and 412, the 400 and 412 with
       the content of its ``error``;
     - a scrudful HEAD: the same responses, without content;
+    - a scrudful TRACE: its success status, without content: a TRACE's
+      content is the echoed request, which the endpoint's links don't
+      describe, and it gets none of them;
     - a scrudful PUT, PATCH, DELETE or POST: the request body (the content
       of the endpoint's links, when the endpoint takes a body; DELETE has
       none), the success status with that content (but a 204), and, when
@@ -993,7 +997,7 @@ async def _describe_route(
         )
     if method == "get":
         description = describe_read(content, conditional, [status], error_content)
-        if content and has_default_entity(status):
+        if content and has_default_entity(method, status):
             # describe_read puts the content on a 200 only.
             success = description["responses"][str(status)]
             success.setdefault("content", copy.deepcopy(content))
@@ -1006,7 +1010,7 @@ async def _describe_route(
         config.etag_func is not None,
         config.last_modified_func is not None,
         [status],
-        response_content=content if has_default_entity(status) else None,
+        response_content=content if has_default_entity(method, status) else None,
         error_content=error_content,
     )
 

@@ -43,7 +43,8 @@ without scrudful decorators, gets DRF's ``Allow`` order, which differs from the
 body's.
 
 The view's schema and context links describe its success content: they go on
-a 2xx response other than 204 that the view returns, and on no other. A 204
+a 2xx response other than 204 that the view returns, and on no other (nor on
+a TRACE's, whose content is the echoed request). A 204
 (a DELETE's), a redirect, or an error the view *returns* (``Response(serializer.errors,
 status=400)``, a 404 ``Response``) gets no Links from scrudful; a ``Link`` the
 view set on it is kept as is. To give an error the error entity's Links,

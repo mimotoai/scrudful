@@ -2175,6 +2175,25 @@ def test_add_options_success_status_and_conditional_post(make_client, store):
     assert "requestBody" not in body["post"]
 
 
+def test_trace_gets_no_links(make_client):
+    """A TRACE's content is the echoed request: OPTIONS gives it none."""
+    app = FastAPI()
+
+    @app.api_route("/items/{item_id}", methods=["GET", "TRACE"])
+    @scrudful(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+    async def item(item_id: int):
+        return {"id": item_id}
+
+    add_options(app)
+    client = make_client(app)
+    body = client.options("/items/3").json()
+    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    response = client.request("TRACE", "/items/3")
+    assert response.status_code == 200
+    assert "link" not in response.headers
+    assert client.get("/items/3").headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+
+
 def test_add_options_success_content_only_on_a_2xx(make_client):
     """A redirect gets no Links on the wire, and no content in OPTIONS."""
     app = FastAPI()

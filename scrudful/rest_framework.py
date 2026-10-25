@@ -59,8 +59,9 @@ Concurrency
     itself conditional (``UPDATE ... WHERE version = <expected>``).
 
 Headers
-    The Link header is added to the 2xx responses but 204 the view returns,
-    whose content its links describe; another status it returns (an error,
+    The Link header is added to the responses whose content the view's links
+    describe: the 2xx but 204 it returns, to any method but TRACE (whose
+    content is the echoed request). Another response it returns (an error,
     a 204, a redirect) gets no Links from scrudful, and keeps any Link the
     view set. Raise an error rather than return it to give it the ``error``
     entity's Links, through :func:`exception_handler`. The Link header is
@@ -337,7 +338,7 @@ class ScrudfulViewFunc:
                 etag, last_modified = self._validators(cb_args, cb_kwargs)
             if send:
                 set_validator_headers(response, etag, last_modified)
-        if has_default_entity(response.status_code):
+        if has_default_entity(method, response.status_code):
             # A Link the view set with a describedby (context) relation
             # replaces the schema (context) link; one with another relation
             # replaces none. Another status the view returns (an error, a

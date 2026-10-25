@@ -296,7 +296,8 @@ OPTIONS
       for POST. Each status with a body gets the ``content`` of its entity:
       scrudful's own 400, 412 and 428 get ``error``'s, if declared, the
       others ``responses[status]``, else the default entity (2xx, 201 for a
-      create, the collection for a list);
+      create, the collection for a list; never for TRACE, whose content is
+      the echoed request, not the item);
     - ``parameters``: the precondition headers of a conditional write.
 
     ``head`` (when an operation routes it) is described like ``get``, but
@@ -636,25 +637,29 @@ class _Config:
         """Whether the If-* headers are evaluated before the handler runs."""
         return self.kind == "item" and self.has_validators
 
-    def has_default_entity(self, status: int) -> bool:
-        """Whether a response with ``status`` gets the default entity.
+    def has_default_entity(self, method: str, status: int) -> bool:
+        """Whether a ``method`` response with ``status`` gets the default entity.
 
-        Not a 204: it has no body for the entity to describe.
+        Not a 204, which has no body for the entity to describe, nor a
+        TRACE, whose content is the echoed request (see
+        :func:`scrudful._adapter.has_default_entity`).
         """
         if self.kind == "create":
             return status == 201
-        return has_default_entity(status)
+        return has_default_entity(method, status)
 
     @property
     def default_entity(self) -> Entity | None:
         """The entity of the responses :meth:`has_default_entity` selects."""
         return self.collection if self.kind == "list" else self.entity
 
-    def response_entity(self, status: int) -> Entity | None:
-        """The declared entity of a response with ``status``."""
+    def response_entity(self, method: str, status: int) -> Entity | None:
+        """The declared entity of a ``method`` response with ``status``."""
         if status in self.responses:
             return self.responses[status]
-        return self.default_entity if self.has_default_entity(status) else None
+        if self.has_default_entity(method, status):
+            return self.default_entity
+        return None
 
     @property
     def has_etag(self) -> bool:
@@ -1464,7 +1469,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 ):
                     entity = config.entity
             else:
-                entity = config.response_entity(status)
+                entity = config.response_entity(method, status)
             if config.kind == "list":
                 # None unless the collection's validators were computed.
                 if validator_policy(method, status)[1]:
@@ -1734,7 +1739,7 @@ def _raised_entity(config: _Config, method: str, status: int) -> Entity | None:
     """
     if status < 400:
         return None
-    entity = _described_entity(config, status, _is_conditional(config, method))
+    entity = _described_entity(config, method, status, _is_conditional(config, method))
     return config.error if entity is None else entity
 
 
@@ -2526,7 +2531,7 @@ def _describe_operation(
         for key, response in responses.items():
             if key in ("204", "304"):
                 continue  # no content
-            entity = _described_entity(config, int(key), conditional)
+            entity = _described_entity(config, method, int(key), conditional)
             content = yield from _media(entity, request)
             if content:
                 response["content"] = content
@@ -2560,8 +2565,10 @@ def _answered_statuses(operation: Any, config: _Config | None) -> list[int]:
     return declared or [200]
 
 
-def _described_entity(config: _Config, status: int, conditional: bool) -> Any:
-    """The entity of the responses with ``status``, for OPTIONS.
+def _described_entity(
+    config: _Config, method: str, status: int, conditional: bool
+) -> Any:
+    """The entity of the ``method`` responses with ``status``, for OPTIONS.
 
     scrudful's own early responses (listed when ``conditional``) get the
     ``error`` entity, if declared; the others the declared entity.
@@ -2570,7 +2577,7 @@ def _described_entity(config: _Config, status: int, conditional: bool) -> Any:
         return (
             config.error if config.error is not None else config.responses.get(status)
         )
-    return config.response_entity(status)
+    return config.response_entity(method, status)
 
 
 def _media(entity: Entity | None, request: HttpRequest) -> _Flow[Any]:

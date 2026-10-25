@@ -689,6 +689,18 @@ class UsedErrorAPIView(drf_views.APIView):
         return Response({"id": pk})
 
 
+class TraceAPIView(drf_views.APIView):
+    """GET and TRACE: the TRACE content is no item."""
+
+    @scrudful(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+    def get(self, request, pk):
+        return Response({"id": pk})
+
+    @scrudful(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+    def trace(self, request, pk):
+        return Response({"id": pk})
+
+
 class TaggingJSONRenderer(JSONRenderer):
     """A project's own JSON renderer (as a camel-case or orjson one would be)."""
 
@@ -769,6 +781,7 @@ urlpatterns = [
     path("apiview/<int:pk>/", ThingAPIView.as_view()),
     path("unused-error/<int:pk>/", UnusedErrorAPIView.as_view()),
     path("used-error/<int:pk>/", UsedErrorAPIView.as_view()),
+    path("trace/<int:pk>/", TraceAPIView.as_view()),
     path("custom-renderer-function/<int:pk>/", custom_renderer_function),
 ]
 
@@ -1301,6 +1314,15 @@ def test_options_calls_the_error_callables_only_when_described(client):
     for status in ("400", "412"):
         assert body["get"]["responses"][status]["content"] == error
     error_calls.clear()
+
+
+def test_trace_gets_no_links(client):
+    body = client.options("/trace/1/").json()
+    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    response = client.generic("TRACE", "/trace/1/")
+    assert response.status_code == 200
+    assert "Link" not in response
+    assert client.get("/trace/1/")["Link"].startswith(SCHEMA_LINK)
 
 
 def test_options_action_without_links(client):
