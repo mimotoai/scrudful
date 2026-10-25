@@ -43,6 +43,9 @@ change, so clients and tests that compare them must be updated.
   ``@scrudful`` ``update`` is described in OPTIONS as that ``update``
   (conditional, with its content and error responses), and
   ``exception_handler`` gives its errors that ``update``'s ``error`` Links.
+* DRF: ``scrudful_api_view`` keeps a ``metadata_class`` set on the function
+  (a custom class, or ``None``) on DRF 3.15.0 too, whose ``api_view`` doesn't
+  copy it onto the view class.
 * DRF: ``exception_handler`` gives an error that no scrudful handler answers
   (one raised while answering OPTIONS, a 405) the view-wide error entity:
   the ``error`` of the view's scrudful handlers when they have exactly one,

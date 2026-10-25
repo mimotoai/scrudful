@@ -580,7 +580,11 @@ def scrudful_api_view(
         scrudful_handler = decorate(handler)
         for method in http_method_names:
             setattr(view.cls, method.lower(), scrudful_handler)
-        # api_view already copies func.metadata_class onto the view class.
+        # A metadata_class set on the function is the view's choice. DRF's
+        # api_view copies it onto the view class only after 3.15.0, the
+        # minimum: copy it here, before _install_metadata keeps or replaces it.
+        if hasattr(func, "metadata_class"):
+            view.cls.metadata_class = func.metadata_class
         _install_metadata(view.cls)
         return view
 
