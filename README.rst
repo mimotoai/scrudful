@@ -70,6 +70,11 @@ Rules worth knowing:
   when ``etag_func`` or ``last_modified_func`` is configured. Without them a
   decorated view behaves like an undecorated one, apart from the ``Link`` and
   expose headers.
+* **TRACE, OPTIONS and CONNECT ignore preconditions.** Their response is not
+  a representation of the target resource (a TRACE echoes the request), so
+  the ``If-*`` headers are not evaluated, the validator callbacks are not
+  called for them and the response gets no ``ETag`` or ``Last-Modified``
+  (RFC 9110 §13.2.1). Their OPTIONS entry lists no 304, 400, 412 or 428.
 * **Invalid dates are ignored.** An invalid ``If-Modified-Since`` or
   ``If-Unmodified-Since`` is treated as absent, so a lone invalid
   ``If-Unmodified-Since`` on a write is answered with 428.

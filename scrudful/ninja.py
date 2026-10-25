@@ -435,6 +435,7 @@ from scrudful._adapter import (
     describe_options,
     describe_read,
     describe_write,
+    evaluates_preconditions,
     expose_headers,
     has_default_entity,
     is_json,
@@ -1378,7 +1379,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 obj = yield load, (request,), params
                 values[load_as] = obj
 
-            if config.evaluates_preconditions:
+            if config.evaluates_preconditions and evaluates_preconditions(method):
                 etag, last_modified = yield from _item_validators(config, obj)
                 result = evaluate_preconditions(
                     method,
@@ -2546,7 +2547,7 @@ def _is_conditional(config: _Config, method: str) -> bool:
     """
     if config.kind == "list":
         return method in ("get", "head") and config.has_list_validators
-    return config.evaluates_preconditions
+    return config.evaluates_preconditions and evaluates_preconditions(method.upper())
 
 
 def _answered_statuses(operation: Any, config: _Config | None) -> list[int]:

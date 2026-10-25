@@ -59,6 +59,10 @@ PRECONDITION_FIELDS = (
 )
 #: Methods whose 2xx responses get freshly computed validators (RFC 9110 §9.3.4).
 FRESH_VALIDATOR_METHODS = frozenset({"PUT", "PATCH"})
+#: Methods that neither select nor modify a representation of the target
+#: (RFC 9110 §13.2.1): their If-* headers are ignored, and their responses
+#: get no validators. A TRACE's content is the echoed request.
+NO_PRECONDITION_METHODS = frozenset({"CONNECT", "OPTIONS", "TRACE"})
 
 _MALFORMED = "Malformed If-Match or If-None-Match header."
 _PRECONDITION_FAILED = "Precondition Failed."
@@ -155,8 +159,24 @@ def precondition_headers(getlist: Callable[[str], Sequence[str]]) -> dict[str, s
     return headers
 
 
+def evaluates_preconditions(method: str) -> bool:
+    """Whether a request with ``method`` (upper-case) has its If-* evaluated.
+
+    Not for CONNECT, OPTIONS and TRACE (:data:`NO_PRECONDITION_METHODS`),
+    whose response is no representation of the target resource: the
+    resource's validators don't describe it, so a server ignores the
+    conditional headers (RFC 9110 §13.2.1). Their OPTIONS description lists
+    neither scrudful's early responses nor the precondition headers.
+    """
+    return method not in NO_PRECONDITION_METHODS
+
+
 def validator_policy(method: str, status: int) -> tuple[bool, bool]:
-    """``(refresh, send)``: recompute the validators / send them after the view."""
+    """``(refresh, send)``: recompute the validators / send them after the view.
+
+    Only for a 2xx to GET and HEAD (send) or PUT and PATCH (refresh and
+    send): never for the :data:`NO_PRECONDITION_METHODS`, among others.
+    """
     if not 200 <= status < 300:
         return False, False
     refresh = method in FRESH_VALIDATOR_METHODS

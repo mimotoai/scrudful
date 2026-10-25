@@ -2195,6 +2195,30 @@ def test_trace_gets_no_links(make_client):
     assert client.get("/items/3").headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
 
 
+def test_trace_ignores_preconditions(make_client, store):
+    """A TRACE's content is no representation: no If-*, no validators."""
+    app = FastAPI()
+
+    @app.api_route("/items/{item_id}", methods=["GET", "TRACE"])
+    @scrudful(etag_func=store.etag, last_modified_func=store.last_modified)
+    async def item(item_id: int):
+        return {"id": item_id}
+
+    add_options(app)
+    client = make_client(app)
+    for headers in ({"If-Match": '"nope"'}, {"If-None-Match": '"v1"'}, {}):
+        response = client.request("TRACE", "/items/3", headers=headers)
+        assert response.status_code == 200, headers
+        assert response.json() == {"id": 3}
+        assert "etag" not in response.headers
+        assert "last-modified" not in response.headers
+    assert store.calls == []
+    assert client.get("/items/3", headers={"If-Match": '"nope"'}).status_code == 412
+    body = client.options("/items/3").json()
+    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    assert "412" in body["get"]["responses"]
+
+
 def test_add_options_success_content_only_on_a_2xx(make_client):
     """A redirect gets no Links on the wire, and no content in OPTIONS."""
     app = FastAPI()

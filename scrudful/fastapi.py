@@ -46,6 +46,7 @@ from scrudful._adapter import (
     describe_read,
     describe_write,
     evaluated_signature,
+    evaluates_preconditions,
     expose_headers,
     has_default_entity,
     is_json,
@@ -375,7 +376,7 @@ def scrudful(
             method = request.method.upper()
             base = str(request.url)
 
-            if has_validators:
+            if has_validators and evaluates_preconditions(method):
                 etag, last_modified = await validators(kwargs)
                 result = evaluate_preconditions(
                     method,

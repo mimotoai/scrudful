@@ -125,6 +125,7 @@ from scrudful._adapter import (
     describe_options,
     describe_read,
     describe_write,
+    evaluates_preconditions,
     expose_headers,
     has_default_entity,
     is_json,
@@ -318,7 +319,7 @@ class ScrudfulViewFunc:
         cb_args, cb_kwargs = _callback_arguments(args, kwargs, index)
         method = request.method.upper()
         etag = last_modified = None
-        if self.has_validators:
+        if self.has_validators and evaluates_preconditions(method):
             etag, last_modified = self._validators(cb_args, cb_kwargs)
             result = evaluate_preconditions(
                 method,

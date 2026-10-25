@@ -59,6 +59,11 @@ change, so clients and tests that compare them must be updated.
   errors, rather than return them, to give them the error entity's Links. A
   FastAPI route whose ``status_code`` is not such a 2xx is described without
   content in OPTIONS.
+* TRACE, OPTIONS and CONNECT ignore the ``If-*`` headers in every adapter
+  (RFC 9110 §13.2.1): a decorated TRACE with validators no longer answers
+  412 (or 304, 400, 428), its validator callbacks are not called, and its
+  response gets no ``ETag`` or ``Last-Modified``, as its OPTIONS entry,
+  without those statuses, says.
 * No adapter gives a TRACE response the default (item) entity's Links, and
   django-ninja's OPTIONS no longer describes a TRACE with that content: a
   TRACE's content is the echoed request. An entity declared for the status

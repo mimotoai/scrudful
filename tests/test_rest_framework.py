@@ -713,6 +713,18 @@ class TraceAPIView(drf_views.APIView):
         return Response({"id": pk})
 
 
+class ConditionalTraceAPIView(drf_views.APIView):
+    """GET and TRACE with validators: TRACE ignores the If-* headers."""
+
+    @scrudful(etag_func=etag_func, last_modified_func=last_modified_func)
+    def get(self, request, pk):
+        return Response({"id": pk})
+
+    @scrudful(etag_func=etag_func, last_modified_func=last_modified_func)
+    def trace(self, request, pk):
+        return Response({"id": pk})
+
+
 class TaggingJSONRenderer(JSONRenderer):
     """A project's own JSON renderer (as a camel-case or orjson one would be)."""
 
@@ -794,6 +806,7 @@ urlpatterns = [
     path("unused-error/<int:pk>/", UnusedErrorAPIView.as_view()),
     path("used-error/<int:pk>/", UsedErrorAPIView.as_view()),
     path("trace/<int:pk>/", TraceAPIView.as_view()),
+    path("conditional-trace/<int:pk>/", ConditionalTraceAPIView.as_view()),
     path("serializer-error/<int:pk>/", SerializerErrorAPIView.as_view()),
     path("custom-renderer-function/<int:pk>/", custom_renderer_function),
 ]
@@ -1345,6 +1358,22 @@ def test_trace_gets_no_links(client):
     assert response.status_code == 200
     assert "Link" not in response
     assert client.get("/trace/1/")["Link"].startswith(SCHEMA_LINK)
+
+
+def test_trace_ignores_preconditions(client):
+    """A TRACE's content is no representation: no If-*, no validators."""
+    for headers in ({"If-Match": '"nope"'}, {"If-None-Match": '"v1"'}, {}):
+        response = client.generic("TRACE", "/conditional-trace/1/", headers=headers)
+        assert response.status_code == 200, headers
+        assert response.json() == {"id": 1}
+        assert "ETag" not in response
+        assert "Last-Modified" not in response
+    assert store.calls == []
+    response = client.get("/conditional-trace/1/", headers={"If-Match": '"nope"'})
+    assert response.status_code == 412
+    body = client.options("/conditional-trace/1/").json()
+    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    assert "412" in body["get"]["responses"]
 
 
 def test_options_action_without_links(client):

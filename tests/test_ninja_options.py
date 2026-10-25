@@ -544,6 +544,29 @@ def test_trace_gets_no_default_entity():
     )
 
 
+def test_trace_ignores_preconditions(store):
+    """A TRACE's content is no representation: no If-*, no validators."""
+    router = ScrudfulRouter()
+
+    @router.api_operation(["GET", "TRACE"], "/items/{pk}", response={200: Message})
+    @scrudful(load=store.load, etag_func=etag, last_modified_func=modified)
+    def get_item(request, pk: int, obj):
+        return {"detail": obj["name"]}
+
+    client = TestClient(router)
+    for headers in ({"If-Match": '"nope"'}, {"If-None-Match": '"v1"'}, {}):
+        response = client.request("TRACE", "/items/1", headers=headers)
+        assert response.status_code == 200, headers
+        assert response.json() == {"detail": "a"}
+        assert "ETag" not in response.headers
+        assert "Last-Modified" not in response.headers
+    assert client.get("/items/1", headers={"If-Match": '"nope"'}).status_code == 412
+    body = options(client, "/items/1").json()
+    validate_http_schema_resource(body)
+    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    assert "412" in body["get"]["responses"]
+
+
 def test_router_rejects_options_links():
     with pytest.raises(TypeError):
         ScrudfulRouter(options_schema_link="x")
