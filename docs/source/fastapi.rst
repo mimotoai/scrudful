@@ -117,9 +117,11 @@ Outside the endpoint, the helpers call some of them with much less:
 * :func:`~scrudful.fastapi.add_error_links` calls the endpoint's ``error``
   callables for the errors raised for it.
 
-There they get only the URL's path parameters as Starlette matched them
-(strings, unless the path uses a convertor such as ``{id:int}``), plus the
-request under the name of the endpoint's ``Request`` parameter when it
+There they get only the URL's path parameters that the endpoint takes, as
+Starlette matched them (strings, unless the path uses a convertor such as
+``{id:int}``): a parameter of an ``include_router`` prefix that the endpoint
+doesn't declare reaches neither the endpoint nor its callables. They also get
+the request under the name of the endpoint's ``Request`` parameter when it
 declares one. The entity passed to ``add_error_links`` gets ``request=``
 only. Both helpers check every such callable when they are called and raise
 ``TypeError`` for one that can't be called that way, naming the endpoint and

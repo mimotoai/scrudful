@@ -116,6 +116,9 @@ class _EndpointConfig:
     error: Entity | None
     #: The name of the endpoint's own ``Request`` parameter, if it declares one.
     request_name: str | None
+    #: The names of the endpoint's own parameters: the keyword arguments its
+    #: callables get inside it, of which a path parameter is passed outside.
+    param_names: frozenset[str]
 
 
 def scrudful(
@@ -161,8 +164,10 @@ def scrudful(
         type) are also called by :func:`add_options` for the OPTIONS body,
         and those of ``error`` by :func:`add_options` and by
         :func:`add_error_links`'s exception handlers. There they get only the
-        URL's path parameters as Starlette matched them (strings, unless the
-        path uses a convertor such as ``{id:int}``), plus the request under
+        URL's path parameters that the endpoint takes (not those of an
+        ``include_router`` prefix it doesn't declare, which FastAPI doesn't
+        pass it either) as Starlette matched them (strings, unless the path
+        uses a convertor such as ``{id:int}``), plus the request under
         the name of the endpoint's ``Request`` parameter when it declares
         one: no body, query or dependency values. Both helpers check, when
         they are called, that each such callable can be called that way, and
@@ -356,6 +361,7 @@ def scrudful(
             context_type_or_func=context_type_or_func,
             error=error,
             request_name=request_name if pass_request else None,
+            param_names=_param_names(endpoint),
         )
 
         @functools.wraps(endpoint)
@@ -469,9 +475,9 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
         called with ``request=<Request>`` only; they may be ``def`` (run in
         the threadpool) or ``async def``. An endpoint's own ``error`` is
         called outside the endpoint, as in :func:`add_options`: with the
-        URL's path parameters, plus the request under the name of the
-        endpoint's ``Request`` parameter if it declares one (see "Callbacks"
-        in :func:`scrudful`). Both are checked when this is called, against
+        URL's path parameters it takes, plus the request under the name of
+        the endpoint's ``Request`` parameter if it declares one (see
+        "Callbacks" in :func:`scrudful`). Both are checked when this is called, against
         the endpoints the app has then: those of included routers and under
         any ``Mount`` or ``Host``, with or without middleware, since this
         app's handlers serve them, but not those of a mounted Starlette or
@@ -615,8 +621,8 @@ _LINK_FIELDS = (
 )
 #: What an endpoint's callables get outside the endpoint.
 _OUTSIDE = (
-    "the URL's path parameters, and the request under the name of the "
-    "endpoint's Request parameter if it declares one"
+    "the URL's path parameters the endpoint takes, and the request under the "
+    "name of the endpoint's Request parameter if it declares one"
 )
 #: The fields of an entity whose callables :func:`add_error_links`'s handlers
 #: call (via :func:`_entity_links`).
@@ -691,16 +697,17 @@ def add_options(app: FastAPI | APIRouter) -> None:
 
     Callables are called outside the endpoint here: the endpoints' link
     callables (schema and context URL and type), and their ``error``'s when
-    they are conditional, get only the path parameters of the URL, as
-    Starlette matched them (strings, unless the path uses a convertor such
-    as ``{id:int}``), plus the request under the name of the endpoint's
-    ``Request`` parameter when it declares one: not the values FastAPI
-    resolves for the endpoint (body, query, dependencies). Each is checked
-    when this is called, and one that can't be called that way raises
-    ``TypeError``; accept ``**kwargs`` or give the other parameters defaults
-    to use one both inside the endpoint and here. Validator callbacks are not
-    called. Every URL is resolved against the request's URL, as the Links
-    are.
+    they are conditional, get only the path parameters of the URL that the
+    endpoint takes (as inside it: not an ``include_router`` prefix's that it
+    doesn't declare), as Starlette matched them (strings, unless the path
+    uses a convertor such as ``{id:int}``), plus the request under the name
+    of the endpoint's ``Request`` parameter when it declares one: not the
+    values FastAPI resolves for the endpoint (body, query, dependencies).
+    Each is checked when this is called, and one that can't be called that
+    way raises ``TypeError``; accept ``**kwargs`` or give the other
+    parameters defaults to use one both inside the endpoint and here.
+    Validator callbacks are not called. Every URL is resolved against the
+    request's URL, as the Links are.
 
     Call it once the routes are added (the endpoints added later are
     described, but their callables are not checked); calling it again adds
@@ -1029,10 +1036,16 @@ def _endpoint_config(endpoint: Any) -> _EndpointConfig | None:
 def _description_kwargs(config: _EndpointConfig, request: Request) -> dict[str, Any]:
     """The kwargs of an endpoint's callables outside the endpoint.
 
-    The request's path parameters, plus the request under the name of the
-    endpoint's ``Request`` parameter, when it declares one.
+    The request's path parameters that the endpoint takes (as FastAPI passes
+    them inside it: not those of an ``include_router`` prefix it doesn't
+    declare), plus the request under the name of the endpoint's ``Request``
+    parameter, when it declares one.
     """
-    kwargs = dict(request.path_params)
+    kwargs = {
+        name: value
+        for name, value in request.path_params.items()
+        if name in config.param_names
+    }
     if config.request_name is not None:
         kwargs[config.request_name] = request
     return kwargs
@@ -1104,8 +1117,27 @@ def _check_error_callables(routes: Sequence[Any], error: Entity) -> None:
 
 
 def _outside_names(config: _EndpointConfig, names: frozenset[str]) -> set[str]:
-    """The kwargs names an endpoint's callables get outside the endpoint."""
-    return set(names) | ({config.request_name} if config.request_name else set())
+    """The kwargs names an endpoint's callables get outside the endpoint.
+
+    Those of the path parameters ``names`` the endpoint takes (see
+    :func:`_description_kwargs`), and its ``Request`` parameter's.
+    """
+    request = {config.request_name} if config.request_name else set()
+    return (set(names) & config.param_names) | request
+
+
+def _param_names(endpoint: Callable[..., Any]) -> frozenset[str]:
+    """The names of ``endpoint``'s parameters, but ``*args`` and ``**kwargs``.
+
+    FastAPI passes nothing to those: an undeclared path parameter (e.g. of an
+    ``include_router`` prefix) never reaches the endpoint or its callables.
+    """
+    variadic = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    return frozenset(
+        name
+        for name, param in evaluated_signature(endpoint).parameters.items()
+        if param.kind not in variadic
+    )
 
 
 def _check_call(

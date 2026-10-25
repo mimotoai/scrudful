@@ -82,8 +82,10 @@ change, so clients and tests that compare them must be updated.
   ``add_error_links`` again replaces the entity of the earlier call.
 * FastAPI: ``add_options(app)`` answers OPTIONS on every URL a scrudful
   endpoint serves. A callable used outside the endpoint (by ``add_options``
-  and ``add_error_links``) gets only the URL's path parameters plus the request
-  under the name of the endpoint's ``Request`` parameter; the helpers check
+  and ``add_error_links``) gets only the URL's path parameters that the
+  endpoint takes (not those of an ``include_router`` prefix it doesn't
+  declare) plus the request under the name of the endpoint's ``Request``
+  parameter; the helpers check
   every such callable when called and raise ``TypeError`` for one that can't
   be called that way. ``add_options`` leaves mounted apps and middleware
   Mounts and Routers to themselves, and ``add_error_links`` covers the

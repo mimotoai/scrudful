@@ -1779,6 +1779,7 @@ def test_endpoint_config_is_attached():
         context_type_or_func=None,
         error=ERROR,
         request_name="req",
+        param_names=frozenset({"item_id", "req"}),
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
         get_item._scrudful.error = None
@@ -2426,6 +2427,58 @@ def test_add_options_covers_included_routers(make_client):
     assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
     get = client.get("/v1/inner/items/3")
     assert link_problems("GET", 200, get.headers, True, body) == []
+
+
+def _prefixed_router():
+    """``GET /items/{item_id}``, whose schema callable takes ``item_id`` only."""
+    router = APIRouter()
+
+    def schema(item_id):
+        return f"/schemas/item?id={item_id}"
+
+    @router.get("/items/{item_id}")
+    @scrudful(schema_link_or_func=schema, context_link_or_func=CONTEXT)
+    async def get_item(item_id: int):
+        return {}
+
+    return router
+
+
+@pytest.mark.parametrize("on", ["router", "app"])
+def test_add_options_under_a_prefix_with_path_parameters(make_client, on):
+    """The callables get what the endpoint gets, not the prefix's parameters."""
+    router = _prefixed_router()
+    app = FastAPI()
+    if on == "router":
+        add_options(router)
+    app.include_router(router, prefix="/users/{user_id}")
+    if on == "app":
+        add_options(app)
+    client = make_client(app)
+    get = client.get("/users/1/items/2")
+    assert get.status_code == 200
+    response = client.options("/users/1/items/2")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "http://testserver/schemas/item?id=2"
+    }
+    assert link_problems("GET", 200, get.headers, True, body) == []
+
+
+def test_add_options_still_rejects_a_parameter_the_endpoint_lacks():
+    """A callable needing a path parameter the endpoint doesn't take fails."""
+    router = APIRouter()
+
+    @router.get("/items/{item_id}")
+    @scrudful(schema_link_or_func=lambda item_id, user_id: "/s.json")
+    async def get_item(item_id: int):
+        return {}
+
+    app = FastAPI()
+    app.include_router(router, prefix="/users/{user_id}")
+    with pytest.raises(TypeError, match="user_id"):
+        add_options(app)
 
 
 def test_add_options_after_the_app_started(make_client):
