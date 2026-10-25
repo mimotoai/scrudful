@@ -322,6 +322,17 @@ def check_error_media_type(media_type: str) -> None:
         )
 
 
+def has_default_entity(status: int) -> bool:
+    """Whether a response with ``status`` gets the endpoint's own entity.
+
+    A 2xx but 204, which has no body for the entity to describe. A response
+    with another status the endpoint returns gets no Links from scrudful
+    (it keeps those it set itself); scrudful's own 304, 400, 412 and 428 and
+    the errors raised get the error entity's instead.
+    """
+    return 200 <= status < 300 and status != 204
+
+
 def merge_links(
     existing: str | None, schema: str | None, context: str | None
 ) -> str | None:

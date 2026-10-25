@@ -59,6 +59,16 @@ the endpoints under any ``Mount`` (with or without middleware), whose callables
 it checks too; a mounted FastAPI (or Starlette) app has its own exception
 handlers: call it on that app too.
 
+The endpoint's schema and context links describe its success content: they
+go on a 2xx response other than 204 that the endpoint returns, and on no
+other. A 204, a redirect, or an error the endpoint *returns* (``return
+JSONResponse({...}, status_code=404)``, or ``response.status_code = 400``)
+gets no Links from scrudful; a ``Link`` the endpoint set on it is kept as is.
+To give an error the error entity's Links, *raise* it (``HTTPException``):
+:func:`~scrudful.fastapi.add_error_links` then adds them. The OPTIONS body
+agrees: a route whose ``status_code`` is not such a 2xx is described without
+content.
+
 scrudful's own 400, 412 and 428 are returned by the endpoint, not raised, so
 no exception handler sees them: they carry Links only from the decorator's
 ``error``. Give every conditional ``@scrudful(...)`` an ``error=``, also with

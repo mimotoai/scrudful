@@ -396,6 +396,18 @@ class OwnDescribedByViewSet(viewsets.ViewSet):
         return Response({}, headers={"Link": '<https://o/s>; rel="describedby"'})
 
 
+class OwnErrorLinkViewSet(viewsets.ViewSet):
+    """A view that returns an error with a Link of its own."""
+
+    @scrudful(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+    def retrieve(self, request, pk):
+        return Response(
+            {"detail": "gone"},
+            status=404,
+            headers={"Link": '</schemas/gone>; rel="describedby"'},
+        )
+
+
 class HeaderViewSet(viewsets.ViewSet):
     """Handlers that set the headers scrudful also sets."""
 
@@ -681,6 +693,7 @@ for prefix, viewset in [
     ("error-only", ErrorOnlyViewSet),
     ("mixed-actions", MixedActionViewSet),
     ("own-describedby", OwnDescribedByViewSet),
+    ("own-error-link", OwnErrorLinkViewSet),
     ("custom-renderer", CustomRendererViewSet),
 ]:
     router.register(prefix, viewset, basename=prefix)
@@ -749,8 +762,8 @@ def test_missing_resource_is_left_to_the_view(client):
         response = client.get("/things/1/", headers=headers)
         assert response.status_code == 404
         assert "ETag" not in response
-        # The Link header is added to every response of the view.
-        assert response["Link"].startswith(SCHEMA_LINK)
+        # A returned 404 is not described by the view's links.
+        assert "Link" not in response
     assert client.delete("/things/1/", headers={"If-Match": '"v1"'}).status_code == 404
     assert client.patch("/things/1/").status_code == 404
     assert client.put("/things/1/").status_code == 404
@@ -843,7 +856,26 @@ def test_failed_write_gets_no_validators(client):
     assert response.status_code == 400
     assert "ETag" not in response
     assert "Last-Modified" not in response
+
+
+def test_only_a_success_with_content_gets_the_links(client):
+    """The view's Links go on a 2xx but 204, as in OPTIONS."""
+    response = client.get("/things/1/")
+    assert response.status_code == 200
     assert response["Link"].startswith(SCHEMA_LINK)
+    response = client.put("/things/1/", {"invalid": True}, headers={"If-Match": '"v1"'})
+    assert response.status_code == 400
+    assert "Link" not in response
+    response = client.delete("/things/1/", headers={"If-Match": '"v1"'})
+    assert response.status_code == 204
+    assert "Link" not in response
+    response = client.get("/things/1/")
+    assert response.status_code == 404
+    assert "Link" not in response
+    # A Link of the view's own on an error is kept as is.
+    response = client.get("/own-error-link/1/")
+    assert response.status_code == 404
+    assert response["Link"] == '</schemas/gone>; rel="describedby"'
 
 
 def test_delete_response_has_no_validators(client):
@@ -860,7 +892,9 @@ def test_views_without_validators_ignore_preconditions(client):
             "/links-only/1/", headers={"If-Match": '"nope"'}
         )
         assert response.status_code in (200, 204)
-        assert response["Link"] == SCHEMA_LINK
+        assert response.get("Link") == (
+            SCHEMA_LINK if response.status_code == 200 else None
+        )
         assert "ETag" not in response
 
 

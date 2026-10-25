@@ -59,10 +59,14 @@ Concurrency
     itself conditional (``UPDATE ... WHERE version = <expected>``).
 
 Headers
-    The Link header is added to every response the view returns and is appended
-    to any Link value the view set; a Link of the view's with a ``describedby``
-    relation replaces the schema link, and one with a JSON-LD (or RDF) context
-    relation the context link. Every link URL is resolved against the
+    The Link header is added to the 2xx responses but 204 the view returns,
+    whose content its links describe; another status it returns (an error,
+    a 204, a redirect) gets no Links from scrudful, and keeps any Link the
+    view set. Raise an error rather than return it to give it the ``error``
+    entity's Links, through :func:`exception_handler`. The Link header is
+    appended to any Link value the view set; a Link of the view's with a
+    ``describedby`` relation replaces the schema link, and one with a JSON-LD
+    (or RDF) context relation the context link. Every link URL is resolved against the
     request's absolute URI (``request.build_absolute_uri()``), so relative
     values such as ``"/schemas/item"`` are sent absolute.
     ``Access-Control-Expose-Headers`` is extended with whichever of ``ETag``,
@@ -121,6 +125,7 @@ from scrudful._adapter import (
     describe_read,
     describe_write,
     expose_headers,
+    has_default_entity,
     is_json,
     merge_links,
     options_links,
@@ -332,15 +337,18 @@ class ScrudfulViewFunc:
                 etag, last_modified = self._validators(cb_args, cb_kwargs)
             if send:
                 set_validator_headers(response, etag, last_modified)
-        # A Link the view set with a describedby (context) relation replaces
-        # the schema (context) link; one with another relation replaces none.
-        link = merge_links(
-            response.get("Link"),
-            self.schema_link_header(*cb_args, **cb_kwargs),
-            self.context_link_header(*cb_args, **cb_kwargs),
-        )
-        if link is not None:
-            response["Link"] = link
+        if has_default_entity(response.status_code):
+            # A Link the view set with a describedby (context) relation
+            # replaces the schema (context) link; one with another relation
+            # replaces none. Another status the view returns (an error, a
+            # 204, a redirect) is not described by its links: it gets none.
+            link = merge_links(
+                response.get("Link"),
+                self.schema_link_header(*cb_args, **cb_kwargs),
+                self.context_link_header(*cb_args, **cb_kwargs),
+            )
+            if link is not None:
+                response["Link"] = link
         self.add_expose_headers(response)
         return response
 

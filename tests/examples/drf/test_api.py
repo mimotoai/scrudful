@@ -262,7 +262,8 @@ def test_delete_with_if_match(client, item):
     assert response.status_code == 204
     assert "ETag" not in response
     assert "Last-Modified" not in response
-    assert response["Link"] == LINKS
+    # A 204 has no content for the item's Links to describe.
+    assert "Link" not in response
     assert not Item.objects.filter(pk=item.pk).exists()
 
 

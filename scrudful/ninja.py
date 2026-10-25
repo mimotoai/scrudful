@@ -435,6 +435,7 @@ from scrudful._adapter import (
     describe_read,
     describe_write,
     expose_headers,
+    has_default_entity,
     is_json,
     merge_links,
     options_links,
@@ -642,7 +643,7 @@ class _Config:
         """
         if self.kind == "create":
             return status == 201
-        return 200 <= status < 300 and status != 204
+        return has_default_entity(status)
 
     @property
     def default_entity(self) -> Entity | None:

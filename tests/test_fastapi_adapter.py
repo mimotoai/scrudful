@@ -567,6 +567,45 @@ def test_http_exception_propagates_unchanged(make_client, store):
     assert "link" not in response.headers
 
 
+def test_only_a_success_with_content_gets_the_links(make_client, store):
+    """The endpoint's Links go on a 2xx but 204, as in OPTIONS."""
+    app = FastAPI()
+    own = '<http://example.com/own>; rel="describedby"'
+    links = dict(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+
+    @app.get("/items/{status}")
+    @scrudful(**links)
+    async def get_item(status: int, response: Response):
+        if status == 404:
+            return JSONResponse({"detail": "gone"}, status_code=404)
+        if status == 405:
+            # A Link of the endpoint's own on an error is kept as is.
+            return JSONResponse(
+                {"detail": "gone"}, status_code=404, headers={"Link": own}
+            )
+        response.status_code = status
+        return {"status": status}
+
+    @app.delete("/items/{pk}", status_code=204)
+    @scrudful(**links)
+    async def delete_item(pk: int):
+        return None
+
+    client = make_client(app)
+    response = client.get("/items/200")
+    assert response.headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+    for status in (400, 404):
+        response = client.get(f"/items/{status}")
+        assert response.status_code == status
+        assert "link" not in response.headers
+    response = client.get("/items/405")
+    assert response.status_code == 404
+    assert response.headers.get_list("link") == [own]
+    response = client.delete("/items/1")
+    assert response.status_code == 204
+    assert "link" not in response.headers
+
+
 def test_headers_set_by_the_endpoint_are_kept_and_merged(make_client, store):
     app = FastAPI()
 
@@ -2134,6 +2173,33 @@ def test_add_options_success_status_and_conditional_post(make_client, store):
     assert body["post"]["responses"]["400"]["content"] == ERROR_CONTENT
     # The endpoint takes no body: no requestBody.
     assert "requestBody" not in body["post"]
+
+
+def test_add_options_success_content_only_on_a_2xx(make_client):
+    """A redirect gets no Links on the wire, and no content in OPTIONS."""
+    app = FastAPI()
+    links = dict(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+
+    @app.get("/items/{item_id}", status_code=307)
+    @scrudful(**links)
+    async def get_item(item_id: int, response: Response):
+        response.headers["Location"] = "/elsewhere"
+
+    @app.put("/items/{item_id}", status_code=303)
+    @scrudful(**links)
+    async def put_item(item_id: int, response: Response):
+        response.headers["Location"] = "/elsewhere"
+
+    add_options(app)
+    client = make_client(app)
+    body = client.options("/items/3").json()
+    validate_http_schema_resource(body)
+    assert body["get"]["responses"] == {"307": {"description": "Temporary Redirect"}}
+    assert body["put"]["responses"] == {"303": {"description": "See Other"}}
+    for method in ("GET", "PUT"):
+        response = client.request(method, "/items/3", follow_redirects=False)
+        assert response.status_code in (303, 307)
+        assert "link" not in response.headers
 
 
 @pytest.mark.parametrize(

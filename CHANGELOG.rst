@@ -52,6 +52,13 @@ change, so clients and tests that compare them must be updated.
   adapters) and gained ``media_type``, which decides the context Link's
   defaults (none for in-band RDF media types, ``rdf-context`` for other
   non-JSON ones).
+* DRF and FastAPI: the view's (endpoint's) schema and context Links go only
+  on a 2xx response other than 204 that it returns, as in django-ninja. A
+  204, a redirect, or an error the view returns gets no Links from scrudful
+  (a Link it set itself is kept), instead of the success entity's: raise
+  errors, rather than return them, to give them the error entity's Links. A
+  FastAPI route whose ``status_code`` is not such a 2xx is described without
+  content in OPTIONS.
 * Error entities: ``error=`` for DRF (``Meta.error`` / ``Meta.list_error``)
   and FastAPI, as ninja already had. An ``error`` entity's ``media_type`` must
   be JSON content (``application/json`` or ``+json``, other than JSON-LD);

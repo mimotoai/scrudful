@@ -47,6 +47,7 @@ from scrudful._adapter import (
     describe_write,
     evaluated_signature,
     expose_headers,
+    has_default_entity,
     is_json,
     merge_links,
     options_links,
@@ -214,10 +215,15 @@ def scrudful(
         §9.3.4). Other methods and non-2xx responses get none. Headers the
         endpoint set itself are never overwritten.
 
-    The Link header is added to every response the endpoint produces and is
-    appended to any Link value the endpoint (or a dependency) set; a Link it
-    set with a ``describedby`` relation replaces the schema link, and one with
-    a context relation the context link (see
+    The Link header is added to the 2xx responses but 204 the endpoint
+    produces, whose content its links describe (see
+    :func:`scrudful._adapter.has_default_entity`); another status it returns
+    (an error, a 204, a redirect) gets no Links from scrudful, and keeps any
+    Link the endpoint set. Raise an error (``HTTPException``) rather than
+    return it to give it Links, through :func:`add_error_links`. The Link
+    header is appended to any Link value the endpoint (or a dependency) set;
+    a Link it set with a ``describedby`` relation replaces the schema link,
+    and one with a context relation the context link (see
     :func:`scrudful._adapter.merge_links`). Link URLs are resolved against the
     request's URL (``str(request.url)``), so a relative value such as
     ``"/schemas/item"`` is sent absolute. ``Access-Control-Expose-Headers``
@@ -386,11 +392,14 @@ def scrudful(
                     etag, last_modified = await validators(kwargs)
                 if send:
                     set_validator_headers(headers, etag, last_modified)
-            link = merge_links(
-                ", ".join(headers.getlist("link")), *await links(kwargs, base)
-            )
-            if link is not None:
-                headers["Link"] = link
+            if has_default_entity(status):
+                # Another status the endpoint returns (an error, a 204, a
+                # redirect) is not described by its links: it gets none.
+                link = merge_links(
+                    ", ".join(headers.getlist("link")), *await links(kwargs, base)
+                )
+                if link is not None:
+                    headers["Link"] = link
             _join_expose_lines(headers)
             expose_headers(headers)
             return content
@@ -594,8 +603,6 @@ def _has_json_content(response: Response) -> bool:
 
 #: The media type the OPTIONS body gives an endpoint's own content (DRF's).
 _ENDPOINT_MEDIA_TYPE = "application/json"
-#: The success statuses whose responses have no content.
-_NO_CONTENT = frozenset({204, 304})
 #: The fields of an endpoint or entity whose callables an OPTIONS body calls
 #: (the rels are not needed there).
 _LINK_FIELDS = (
@@ -986,7 +993,7 @@ async def _describe_route(
         )
     if method == "get":
         description = describe_read(content, conditional, [status], error_content)
-        if content and status not in _NO_CONTENT:
+        if content and has_default_entity(status):
             # describe_read puts the content on a 200 only.
             success = description["responses"][str(status)]
             success.setdefault("content", copy.deepcopy(content))
@@ -999,7 +1006,7 @@ async def _describe_route(
         config.etag_func is not None,
         config.last_modified_func is not None,
         [status],
-        response_content=content,
+        response_content=content if has_default_entity(status) else None,
         error_content=error_content,
     )
 
