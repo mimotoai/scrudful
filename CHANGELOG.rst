@@ -2,6 +2,54 @@
 Changelog
 =========
 
+0.6.0 (since 0.5.0)
+===================
+
+Everything in this release is opt-in: a DRF, ninja or FastAPI view that sets
+none of the new options behaves exactly as in 0.5.0.
+
+DRF parity (#2)
+---------------
+
+* DRF: ``object_validators`` (``Meta.object_validators``, or a keyword of
+  ``@scrudful`` / ``scrudful_viewset`` / ``ScrudfulViewFunc``) computes the
+  validators from ``view.get_object()``, after DRF's queryset filtering and
+  object permissions, so a missing or forbidden object is a 404 or 403 and
+  never a validator, 412 or 428. ``etag_func(obj)`` and
+  ``last_modified_func(obj)`` take the object, the handler's ``get_object()``
+  returns the same instance, and a PUT or PATCH response gets validators from a
+  refreshed object. A handler calling ``get_object()`` after saving gets the
+  pre-save instance. ``@scrudful(object_validators=True)`` on a function view
+  raises ``TypeError`` at request time.
+* DRF: creates describe the new resource. ``creates=True`` (set by
+  ``scrudful_viewset`` for ``create``) sends ``ETag`` and ``Last-Modified`` on
+  the 201, and ``location_func(view, request, obj)``
+  (``Meta.location_func``; needs ``creates=True``) sends ``Location``. A custom
+  ``create()`` that bypasses ``perform_create`` gets none of them, and OPTIONS
+  describes the 201 without the validator headers, as ninja does.
+* DRF: ``ScrudfulPagination`` lists in the scrud envelope django-ninja's
+  ``scrudful_list`` returns (``count``, ``page_count``, ``first``,
+  ``previous``, ``next``, ``last``, ``content`` of entries with ``href``,
+  ``etag``, ``last_modified``, ``link``, ``content``). It needs
+  ``Meta.href_func(view, request, obj)``; ``page`` and ``page_size`` default to
+  1 and 100 (maximum 1000); bad parameters are a 400, a page past the last one
+  a 404 ("Invalid page.").
+* ``scrudful.collection`` gains ``page_envelope``, ``envelope_entry`` and
+  ``InvalidPage`` (standard library only), the code both front ends share.
+
+Error bodies
+------------
+
+* ``error_body_func(request, result)`` replaces the ``{"detail": ...}`` body of
+  scrudful's own 400, 412 and 428, on DRF (``@scrudful``, ``scrudful_viewset``
+  with ``Meta.error_body_func`` and ``Meta.list_error_body_func``), ninja
+  (``scrudful``, ``scrudful_list``) and FastAPI (``scrudful``). It must be a
+  plain function, also in async endpoints; status, headers, Links and
+  Content-Type are unchanged and a 304 never calls it.
+* New ``scrudful.problem`` module: ``problem_details`` returns RFC 9457 problem
+  details for those responses and ``PROBLEM_JSON`` is the media type for the
+  ``error`` entity.
+
 0.5.0 (since 0.4.0)
 ===================
 

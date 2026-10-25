@@ -151,6 +151,15 @@ are those with JSON content only, and each is served with the entity's
 so its body must be content the entity describes. Responses without content
 (e.g. a 304) or with other content are left as they are.
 
+Error bodies
+~~~~~~~~~~~~
+
+``error_body_func(request, result)`` on ``@scrudful`` returns the dict that
+replaces the ``{"detail": ...}`` body of scrudful's own 400, 412 and 428. It
+must be a plain function, also for an ``async def`` endpoint.
+:func:`scrudful.problem.problem_details` gives RFC 9457 problem details; pair
+it with an ``error`` entity whose ``media_type`` is ``PROBLEM_JSON``.
+
 HEAD
 ~~~~
 

@@ -602,6 +602,22 @@ entity's ``media_type`` whatever the handler chose, so every wrapped handler's
 JSON bodies must be content the entity describes. A handler's response with
 other content (e.g. ``text/plain``) keeps its ``Content-Type``.
 
+**Error bodies.** ``error_body_func(request, result)`` on ``@scrudful`` and
+``@scrudful_list`` returns the dict that replaces the default
+``{"detail": ...}`` body of scrudful's own 400, 412 and 428 (``result`` is the
+:class:`~scrudful.conditional.ConditionalResult`; its default body is
+``result.body``). It must be a plain function, also in an ``async`` operation.
+The status, headers, Links and media type are unchanged, and a 304 never calls
+it. :func:`scrudful.problem.problem_details` gives RFC 9457 problem details;
+pair it with an ``error`` entity of media type ``PROBLEM_JSON``:
+
+.. code-block:: python
+
+    from scrudful.problem import PROBLEM_JSON, problem_details
+
+    @scrudful(error_body_func=problem_details,
+              error=Entity(media_type=PROBLEM_JSON), **ROLE)
+
 Not covered, since no ninja exception handler makes them:
 
 * ninja's own 405 for a method that no operation of the path routes (e.g. a
@@ -630,4 +646,7 @@ Reference
    :exclude-members: Entity
 
 .. automodule:: scrudful.collection
-   :members: collection_schema, collection_context
+   :members: collection_schema, collection_context, page_envelope, envelope_entry, InvalidPage
+
+.. automodule:: scrudful.problem
+   :members:
