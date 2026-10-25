@@ -5,20 +5,14 @@ The envelope is a page of a collection::
     {"count", "page_count", "first", "previous", "next", "last",
      "content": [{"href", "etag", "last_modified", "link", "content": <item>}]}
 
-This module is framework-neutral. Importing it needs only the standard library;
-:func:`slice_page` loads Django by name, to recognise a ``QuerySet``.
+This module is framework-neutral and depends only on the standard library.
 """
 
 from __future__ import annotations
 
-import importlib
 import math
-import warnings
+from collections.abc import Callable
 from typing import Any
-from urllib.parse import urlencode, urlsplit, urlunsplit
-
-# A Django ``QueryDict`` (not imported: this module stays stdlib-only).
-QueryDict = Any
 
 # Keys of one entry of a page's ``content`` array.
 ENVELOPE_FIELDS = ("href", "etag", "last_modified", "link", "content")
@@ -143,52 +137,6 @@ class InvalidPage(Exception):
     """A page number past the last page (page 1 always exists)."""
 
 
-def slice_page(items: Any, number: int, size: int) -> tuple[int, list[Any]]:
-    """The item count of ``items`` and the items of page ``number``.
-
-    ``count()`` for a ``QuerySet``, else ``len()``. An unordered ``QuerySet``
-    gets Django's ``UnorderedObjectListWarning``, as with its ``Paginator``.
-
-    Raises
-    ------
-    InvalidPage
-        For a page past the last one (page 1 always exists).
-    """
-    # Resolved by name, not imported: this module stays stdlib-only.
-    paginator = importlib.import_module("django.core.paginator")
-    queryset_type = importlib.import_module("django.db.models").QuerySet
-
-    if isinstance(items, queryset_type):
-        if not items.ordered:
-            warnings.warn(
-                "Pagination may yield inconsistent results with an unordered "
-                f"object_list: {items.model} {items.__class__.__name__}.",
-                paginator.UnorderedObjectListWarning,
-                stacklevel=2,
-            )
-        count = items.count()
-    else:
-        count = len(items)
-    if number > max(math.ceil(count / size), 1):
-        raise InvalidPage("Invalid page.")
-    start = (number - 1) * size
-    return count, list(items[start : start + size])
-
-
-def page_url(url: str, query: QueryDict, number: int) -> str:
-    """``url`` with the query ``query`` (a ``QueryDict``) and ``page=number``.
-
-    The parameters are sorted by name, as DRF's ``replace_query_param`` does.
-    The query comes from ``request.GET``, not from ``url``: they are the same
-    in Django, but ninja's ``TestClient`` builds URLs without a query.
-    """
-    query = query.copy()
-    query.setlist("page", [str(number)])
-    scheme, netloc, path, _, _ = urlsplit(url)
-    encoded = urlencode(sorted(query.lists()), doseq=True)
-    return urlunsplit((scheme, netloc, path, encoded, ""))
-
-
 def envelope_entry(
     *,
     href: str,
@@ -207,15 +155,15 @@ def page_envelope(
     count: int,
     number: int,
     size: int,
-    url: str,
-    query: QueryDict,
+    page_url: Callable[[int], str],
     entries: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """The page ``number`` of ``count`` items, keyed by ``PAGE_FIELDS``."""
-    page_count = math.ceil(count / size)
+    """The page ``number`` of ``count`` items, keyed by ``PAGE_FIELDS``.
 
-    def link(n: int) -> str:
-        return page_url(url, query, n)
+    ``page_url(n)`` is the URL of page ``n``.
+    """
+    page_count = math.ceil(count / size)
+    link = page_url
 
     values = (
         count,

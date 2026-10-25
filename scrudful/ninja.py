@@ -445,14 +445,19 @@ from scrudful._adapter import (
     set_validator_headers,
     validator_policy,
 )
-from scrudful._django import aware, conditional_response, precondition_headers
+from scrudful._django import (
+    aware,
+    conditional_response,
+    page_url,
+    precondition_headers,
+    slice_page,
+)
 from scrudful.collection import (
     ENVELOPE_FIELDS,
     PAGE_FIELDS,
     InvalidPage,
     envelope_entry,
     page_envelope,
-    slice_page,
 )
 from scrudful.conditional import (
     ConditionalResult,
@@ -1951,8 +1956,7 @@ def _page(
         count=count,
         number=number,
         size=size,
-        url=request.build_absolute_uri(),
-        query=request.GET,
+        page_url=functools.partial(page_url, request.build_absolute_uri(), request.GET),
         entries=entries,
     )
 

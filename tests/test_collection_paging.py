@@ -9,9 +9,8 @@ from scrudful.collection import (
     InvalidPage,
     envelope_entry,
     page_envelope,
-    page_url,
-    slice_page,
 )
+from scrudful._django import page_url, slice_page
 
 
 def test_slice_page_counts_and_slices():
@@ -64,8 +63,7 @@ def _envelope(count, number, size=2):
         count=count,
         number=number,
         size=size,
-        url="http://testserver/things",
-        query=QueryDict(),
+        page_url=lambda n: f"http://testserver/things?page={n}",
         entries=[],
     )
 
