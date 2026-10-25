@@ -483,9 +483,13 @@ def allow_header(body: Mapping[str, Any]) -> str:
 
 
 def check_error_body_func(func: Any) -> None:
-    """Raise ``TypeError`` unless ``func`` is ``None`` or callable."""
-    if func is not None and not callable(func):
+    """Raise ``TypeError`` unless ``func`` is ``None`` or a plain callable."""
+    if func is None:
+        return
+    if not callable(func):
         raise TypeError(f"error_body_func must be callable, not {type(func).__name__}")
+    if inspect.iscoroutinefunction(func):
+        raise TypeError("error_body_func must be a plain function, not async")
 
 
 def with_error_body(
@@ -500,7 +504,12 @@ def with_error_body(
     """
     if error_body_func is None or result.body is None:
         return result
-    return dataclasses.replace(result, body=error_body_func(request, result))
+    body = error_body_func(request, result)
+    if not isinstance(body, Mapping):
+        raise TypeError(
+            f"error_body_func must return a dict, not {type(body).__name__}"
+        )
+    return dataclasses.replace(result, body=body)
 
 
 def reason_phrase(status: int) -> str:

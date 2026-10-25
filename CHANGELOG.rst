@@ -11,8 +11,8 @@ none of the new options behaves exactly as in 0.5.0.
 DRF parity (#2)
 ---------------
 
-* DRF: ``object_validators`` (``Meta.object_validators``, or a keyword of
-  ``@scrudful`` / ``scrudful_viewset`` / ``ScrudfulViewFunc``) computes the
+* DRF: ``object_validators`` (``Meta.object_validators`` on a viewset, or a
+  keyword of ``@scrudful`` / ``ScrudfulViewFunc``) computes the
   validators from ``view.get_object()``, after DRF's queryset filtering and
   object permissions, so a missing or forbidden object is a 404 or 403 and
   never a validator, 412 or 428. ``etag_func(obj)`` and
@@ -27,7 +27,8 @@ DRF parity (#2)
   only links and the error entity) sends ``ETag`` and ``Last-Modified`` on
   the 201, and ``location_func(view, request, obj)``
   (``Meta.location_func``; needs ``creates=True`` and ``object_validators``) sends ``Location``. A custom
-  ``create()`` that bypasses ``perform_create`` gets none of them, and OPTIONS
+  ``create()`` that bypasses ``perform_create``, or a ``many=True`` create,
+  gets none of them, and OPTIONS
   describes the 201 without the validator headers, as ninja does.
 * DRF: ``ScrudfulPagination`` lists in the scrud envelope django-ninja's
   ``scrudful_list`` returns (``count``, ``page_count``, ``first``,

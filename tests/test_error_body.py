@@ -211,6 +211,22 @@ def test_problem_json_error_entity_content_type(send):
 
 
 @adapters
+def test_error_body_func_returning_none_is_a_type_error(send):
+    with pytest.raises(TypeError, match="error_body_func"):
+        send("PUT", {}, error_body_func=lambda request, result: None)
+
+
+def test_error_body_func_must_not_be_a_coroutine_function():
+    async def hook(request, result):
+        return {}
+
+    with pytest.raises(TypeError, match="error_body_func"):
+        sf_drf.scrudful_api_view(["GET"], error_body_func=hook)
+    with pytest.raises(TypeError, match="error_body_func"):
+        sf_ninja.scrudful(load=lambda r: 1, error_body_func=hook)
+
+
+@adapters
 def test_error_body_func_must_be_callable(send):
     with pytest.raises(TypeError, match="error_body_func"):
         send("GET", {}, error_body_func="nope")

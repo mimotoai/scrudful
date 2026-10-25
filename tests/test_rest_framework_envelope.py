@@ -94,7 +94,40 @@ class SmallViewSet(BareViewSet):
     pagination_class = SmallPagination
 
 
+def none_modified(obj):
+    return None
+
+
+@scrudful_viewset
+class NoneModifiedViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Item.objects.order_by("pk")
+    serializer_class = ItemSerializer
+    pagination_class = ScrudfulPagination
+
+    class Meta:
+        href_func = drf_href
+        object_validators = True
+        etag_func = item_etag
+        last_modified_func = none_modified
+
+
+def nested_schema(view, request, parent, pk=None):
+    return f"/schemas/{parent}/{pk}"
+
+
+@scrudful_viewset
+class NestedViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Item.objects.order_by("pk")
+    serializer_class = ItemSerializer
+    pagination_class = ScrudfulPagination
+
+    class Meta:
+        href_func = drf_href
+        schema_link_or_func = nested_schema
+
+
 router = SimpleRouter()
+router.register("nonemod", NoneModifiedViewSet, basename="nonemod")
 router.register("items", ItemViewSet, basename="item")
 router.register("bare", BareViewSet, basename="bare")
 router.register("nohref", NoHrefViewSet, basename="nohref")
@@ -102,6 +135,14 @@ router.register("unordered", UnorderedViewSet, basename="unordered")
 router.register("small", SmallViewSet, basename="small")
 
 ninja_router = Router()
+
+
+@ninja_router.get("/nonemod", response=list[ItemOut])
+@scrudful_list(
+    href_func=ninja_href, etag_func=item_etag, last_modified_func=none_modified
+)
+def ninja_nonemod(request):
+    return Item.objects.order_by("pk")
 
 
 @ninja_router.get("/items", response=list[ItemOut])
@@ -120,6 +161,14 @@ api = NinjaAPI(urls_namespace="test-drf-envelope")
 api.add_router("", ninja_router)
 
 urlpatterns = [
+    path(
+        "drf/p/<int:parent>/items/",
+        NestedViewSet.as_view({"get": "list"}),
+    ),
+    path(
+        "drf/p/<int:parent>/items/<int:pk>/",
+        NestedViewSet.as_view({"get": "retrieve"}),
+    ),
     path("drf/", include(router.urls)),
     path("ninja/", api.urls),
 ]
@@ -242,3 +291,21 @@ def test_schema_describes_the_envelope():
     entry = schema["properties"]["content"]["items"]
     assert list(entry["properties"]) == list(ENVELOPE_FIELDS)
     assert entry["properties"]["content"] == {"type": "object"}
+
+
+def test_none_last_modified_is_null_like_ninja(items, client):
+    drf = client.get("/drf/nonemod/").json()
+    ninja = client.get("/ninja/nonemod").json()
+    assert [e["last_modified"] for e in drf["content"]] == [None] * 3
+    assert [e["last_modified"] for e in ninja["content"]] == [None] * 3
+    assert [e["etag"] for e in drf["content"]] == [e["etag"] for e in ninja["content"]]
+
+
+def test_entry_link_callbacks_get_the_list_route_kwargs(items, client):
+    response = client.get("/drf/p/7/items/")
+    assert response.status_code == 200
+    for item, entry in zip(items, response.json()["content"]):
+        detail = client.get(f"/drf/p/7/items/{item.pk}/")
+        assert detail.status_code == 200
+        assert entry["link"] == detail["Link"]
+        assert f"/schemas/7/{item.pk}" in entry["link"]

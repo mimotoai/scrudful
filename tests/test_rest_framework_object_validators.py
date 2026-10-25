@@ -8,6 +8,7 @@ from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient
 
 from items.models import Item
+from scrudful.problem import PROBLEM_JSON, problem_details
 from scrudful.rest_framework import (
     Entity,
     exception_handler,
@@ -164,7 +165,28 @@ class NoLocationViewSet(viewsets.ModelViewSet):
         etag_func = object_etag
 
 
+class ManyViewSet(CreateViewSet):
+    def get_serializer(self, *args, **kwargs):
+        if isinstance(kwargs.get("data"), list):
+            kwargs["many"] = True
+        return super().get_serializer(*args, **kwargs)
+
+
+@scrudful_viewset
+class ProblemViewSet(viewsets.ModelViewSet):
+    queryset = Item.objects.all()
+    serializer_class = ItemSerializer
+
+    class Meta:
+        object_validators = True
+        etag_func = object_etag
+        error = Entity(schema_link_or_func="/schemas/error", media_type=PROBLEM_JSON)
+        error_body_func = problem_details
+
+
 router = SimpleRouter()
+router.register("problems", ProblemViewSet, basename="problem")
+router.register("many", ManyViewSet, basename="many")
 router.register("nolocs", NoLocationViewSet, basename="noloc")
 router.register("creates", CreateViewSet, basename="create")
 router.register("keeps", KeepLocationViewSet, basename="keep")
@@ -390,7 +412,7 @@ def test_create_without_object_validators_is_unchanged(client):
     assert calls == []
 
 
-def test_options_describes_201_validators(client):
+def test_options_does_not_describe_201_validators(client):
     """As ninja's create: described with its 201 only (describe_write has no
     response-header description), never as a conditional write."""
     post = client.options("/creates/").json()["post"]
@@ -407,3 +429,56 @@ def test_create_without_location_func_sends_validators_only(client):
     post = client.options("/nolocs/").json()["post"]
     assert list(post["responses"]) == ["201"]
     assert "parameters" not in post
+
+
+def test_many_create_gets_no_location_or_validators(client):
+    response = client.post("/many/", [{"name": "a"}, {"name": "b"}], format="json")
+    assert response.status_code == 201
+    assert Item.objects.count() == 2
+    assert "Location" not in response and "ETag" not in response
+    assert calls == []
+
+
+def test_patch_requires_precondition(client, item):
+    response = client.patch(f"/objects/{item.pk}/", {"name": "x"}, format="json")
+    assert response.status_code == 428
+    assert len(object_checks) == 1
+
+
+def test_patch_stale_if_match_is_412(client, item):
+    response = client.patch(
+        f"/objects/{item.pk}/", {"name": "x"}, format="json", HTTP_IF_MATCH='"v0"'
+    )
+    assert response.status_code == 412
+    item.refresh_from_db()
+    assert item.name == "one"
+    assert len(object_checks) == 1
+
+
+def test_patch_refreshes_validators_with_one_get_object_per_phase(client, item):
+    response = client.patch(
+        f"/objects/{item.pk}/",
+        {"name": "two"},
+        format="json",
+        HTTP_IF_MATCH='"v1"',
+    )
+    assert response.status_code == 200
+    assert response["ETag"] == '"v2"'
+    assert response.json()["name"] == "two"
+    # partial_update -> update re-enters the wrapper: still one load for the
+    # request and one fresh load for the response.
+    assert len(object_checks) == 2
+    assert object_checks[0] is not object_checks[1]
+
+
+def test_428_with_problem_entity_and_problem_details(client, item):
+    response = client.put(f"/problems/{item.pk}/", {"name": "x"}, format="json")
+    assert response.status_code == 428
+    assert response["Content-Type"].split(";")[0] == PROBLEM_JSON
+    assert "/schemas/error" in response["Link"]
+    body = response.json()
+    assert body["status"] == 428
+    assert body["title"] == "Precondition Required"
+    assert body["accepted-precondition-headers"] == ["If-Match"]
+    item.refresh_from_db()
+    assert item.name == "one"

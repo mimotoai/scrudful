@@ -243,6 +243,15 @@ queryset: an unordered one warns, as with Django's ``Paginator``.
         return request.build_absolute_uri(f"/items/{obj.pk}")
 
 
+    # With object_validators the callbacks take the object, not the URL kwargs.
+    def item_object_etag(obj):
+        return f"v{obj.version}"
+
+
+    def item_object_modified(obj):
+        return obj.updated_at
+
+
     @scrudful_viewset
     class ItemViewSet(viewsets.ReadOnlyModelViewSet):
         queryset = Item.objects.order_by("pk")
@@ -251,8 +260,8 @@ queryset: an unordered one warns, as with Django's ``Paginator``.
         class Meta:
             href_func = item_href
             object_validators = True
-            etag_func = item_etag
-            last_modified_func = item_last_modified
+            etag_func = item_object_etag
+            last_modified_func = item_object_modified
 
 Everything below is opt-in; a viewset that sets none of it behaves as before.
 
@@ -280,7 +289,8 @@ instance, plus ``Location`` from ``Meta.location_func(view, request, obj)``
 (``location_func=`` on the decorator; it requires ``creates=True`` and
 ``object_validators``). A header
 the view set is never replaced. The 201 is built in ``perform_create``, so a
-custom ``create()`` that bypasses it gets no validators. OPTIONS describes the
+custom ``create()`` that bypasses it gets no validators, and neither does a
+bulk create (``many=True``) that saves several objects. OPTIONS describes the
 201 without the validator headers, as django-ninja does.
 
 **Error bodies (``error_body_func``).** ``error_body_func(request, result)``,
@@ -296,6 +306,10 @@ called for a 304.
     from scrudful.rest_framework import Entity
 
 
+    def item_object_etag(obj):
+        return f"v{obj.version}"
+
+
     def item_location(view, request, obj):
         return f"/items/{obj.pk}"
 
@@ -304,7 +318,7 @@ called for a 304.
     class ItemViewSet(viewsets.ModelViewSet):
         class Meta:
             object_validators = True
-            etag_func = item_etag
+            etag_func = item_object_etag
             location_func = item_location
             error_body_func = problem_details
             error = Entity(media_type=PROBLEM_JSON)

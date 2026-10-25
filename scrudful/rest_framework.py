@@ -18,6 +18,8 @@ Callbacks
     scoping, e.g. ``view.get_queryset().filter(pk=pk)`` rather than
     ``Model.objects.filter(pk=pk)``. Otherwise an object the view would hide
     reveals its validators (304) and its existence (412/428 instead of 404).
+    ``object_validators`` avoids this: the callbacks then take the object
+    ``get_object()`` returns, already scoped and permission-checked.
 
 Validators
     Without validator callbacks no preconditions are evaluated: the If-*
@@ -261,8 +263,9 @@ class ScrudfulViewFunc:
         type, else DRF's ``JSONRenderer``) renders them. Without ``error``
         these responses carry no Link and are rendered as before.
     error_body_func : callable, optional
-        ``error_body_func(request, result)`` returns the body (a ``dict``) of
-        scrudful's own 400, 412 or 428 response in place of
+        ``error_body_func(request, result)`` returns the body (a ``dict``;
+        ``request`` is the DRF ``Request``; a plain function, not ``async``)
+        of scrudful's own 400, 412 or 428 response in place of
         ``{"detail": ...}``; ``result`` is the
         :class:`~scrudful.conditional.ConditionalResult`, whose default body is
         ``result.body``. The status, headers, Links and Content-Type are
@@ -288,7 +291,8 @@ class ScrudfulViewFunc:
         ``create``) the validators describe the new resource instead:
         no precondition is evaluated, and a 201 gets ``ETag`` and
         ``Last-Modified`` from the saved instance (``serializer.instance``
-        after ``perform_create``), never replacing a header the view set.
+        after ``perform_create``), never replacing a header the view set. A
+        ``many=True`` create saves several objects and gets neither.
     creates : bool, optional
         The method creates a resource (see ``object_validators``). Needs
         ``object_validators``.
@@ -904,7 +908,11 @@ def _record_created(view: Any) -> None:
 
     def record(serializer: Any) -> Any:
         result = perform_create(serializer)
-        setattr(request, _CREATED_ATTR, getattr(serializer, "instance", None))
+        # A many=True create saves a list: no single object to describe.
+        created = None
+        if not getattr(serializer, "many", False):
+            created = getattr(serializer, "instance", None)
+        setattr(request, _CREATED_ATTR, created)
         return result
 
     view.perform_create = record
@@ -1574,7 +1582,7 @@ class ScrudfulPagination(BasePagination):
         )
         entity = Entity(**{name: getattr(meta, name, None) for name in _LINK_OPTIONS})
         entries = []
-        for obj, item in zip(self.objects, data):
+        for obj, item in zip(self.objects, data, strict=True):
             href = self.href_func(view, request, obj)
             if href is None:
                 raise TypeError(
@@ -1587,9 +1595,8 @@ class ScrudfulPagination(BasePagination):
                 etag = None if value is None else quote_etag(value)
             last_modified = None
             if modified_func is not None:
-                last_modified = format_http_date(
-                    http_timestamp(aware(modified_func(obj)))
-                )
+                stamp = http_timestamp(aware(modified_func(obj)))
+                last_modified = None if stamp is None else format_http_date(stamp)
             links = _entity_links(
                 entity,
                 (view, request, *getattr(view, "args", ())),
@@ -1647,12 +1654,18 @@ class ScrudfulPagination(BasePagination):
         return value
 
     def _item_kwargs(self, obj: Any) -> dict[str, Any]:
-        """The URL keyword of ``obj``, as the item routes' callbacks get it."""
+        """The URL keywords of ``obj``'s detail route, as its callbacks get them.
+
+        The list route's own keywords (a nested route's parent, say) plus the
+        lookup keyword set to ``obj``'s value.
+        """
+        kwargs = dict(getattr(self.view, "kwargs", None) or {})
         field = getattr(self.view, "lookup_field", None)
         if field is None:
-            return {}
+            return kwargs
         name = getattr(self.view, "lookup_url_kwarg", None) or field
         try:
-            return {name: getattr(obj, field)}
+            kwargs[name] = getattr(obj, field)
         except AttributeError:
-            return {}
+            pass
+        return kwargs

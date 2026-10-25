@@ -1139,8 +1139,8 @@ def scrudful_list(
         served with it.
     error_body_func : callable, optional
         ``error_body_func(request, result)`` returns the body (a ``dict``) of
-        scrudful's own 400, 412 or 428 response (with a list validator set) in place of
-        ``{"detail": ...}``; ``result`` is the
+        scrudful's own 400 or 412 response (with a list validator set; a list
+        never answers 428) in place of ``{"detail": ...}``; ``result`` is the
         :class:`~scrudful.conditional.ConditionalResult`, whose default body
         is ``result.body``. It must be a plain (sync) function. The status,
         headers, Links and Content-Type are unchanged, and it is never called
