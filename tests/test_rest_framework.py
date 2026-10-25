@@ -4,6 +4,7 @@ The module is its own URLconf (``pytestmark`` below). The views keep their
 state in ``store``, which is reset for every test.
 """
 
+import functools
 import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -2040,6 +2041,50 @@ def test_a_non_conditional_delete_has_no_400_entry(client):
 def test_a_serializer_400_is_described_with_the_exception_handler(client):
     listing = client.options("/errors/").json()
     assert set(listing["post"]["responses"]) == {"201", "400"}
+
+
+def marked_handler(exc, context):
+    """A project's handler that delegates to scrudful's, and says so."""
+    return exception_handler(exc, context)
+
+
+marked_handler.scrudful_error_links = True
+
+
+@functools.wraps(exception_handler)
+def wrapping_handler(exc, context):
+    """A project's handler wrapping scrudful's: ``wraps`` copies the marker."""
+    return exception_handler(exc, context)
+
+
+def unmarked_handler(exc, context):
+    """Delegates to scrudful's, but doesn't say so."""
+    return exception_handler(exc, context)
+
+
+@pytest.mark.parametrize(
+    "handler, described",
+    [
+        ("marked_handler", True),
+        ("wrapping_handler", True),
+        ("unmarked_handler", False),
+    ],
+)
+def test_a_delegating_exception_handler_is_known_by_its_marker(
+    client, handler, described
+):
+    settings = {"EXCEPTION_HANDLER": f"{__name__}.{handler}"}
+    with override_settings(REST_FRAMEWORK=settings):
+        response = client.put(
+            "/errors/1/", {"raise": True}, format="json", headers=IF_MATCH
+        )
+        listing = client.options("/errors/").json()
+    # Each delegates: the serializer's 400 carries the error Links.
+    assert response.status_code == 400
+    assert response["Link"] == ERROR_LINKS
+    validate_http_schema_resource(listing)
+    expected = {"201", "400"} if described else {"201"}
+    assert set(listing["post"]["responses"]) == expected
 
 
 # --- APIView with class-body @scrudful ----------------------------------------

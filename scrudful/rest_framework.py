@@ -843,11 +843,12 @@ class ScrudfulMetadata(BaseMetadata):
         conditional = _has_validators(handler)
         view = args[0] if args else None
         # The serializer's 400 carries the error Links only through
-        # :func:`exception_handler`, so only then is it described.
+        # :func:`exception_handler` (or a handler delegating to it, which
+        # carries its marker), so only then is it described.
         serializer_400 = (
             method != "delete"
             and getattr(view, "get_exception_handler", None) is not None
-            and view.get_exception_handler() is exception_handler
+            and getattr(view.get_exception_handler(), "scrudful_error_links", False)
         )
         # The error entity's callables run only when its content is described.
         error_content = (
@@ -984,6 +985,13 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
             "EXCEPTION_HANDLER": "scrudful.rest_framework.exception_handler",
         }
 
+    It carries the attribute ``scrudful_error_links = True``, by which
+    :class:`ScrudfulMetadata` knows that the serializer's 400 gets the error
+    Links, and so describes it. A project handler that delegates to it (logs,
+    then returns ``exception_handler(exc, context)``) must carry it too: set
+    ``handler.scrudful_error_links = True``, or decorate the handler with
+    ``functools.wraps(exception_handler)``, which copies it.
+
     Parameters
     ----------
     exc : Exception
@@ -1013,6 +1021,10 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
     response.content_type = handler.error.media_type
     expose_headers(response)
     return response
+
+
+#: The marker of an exception handler that gives the errors the error Links.
+exception_handler.scrudful_error_links = True  # type: ignore[attr-defined]
 
 
 def _render_as_json(request: Request, view: Any) -> None:

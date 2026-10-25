@@ -68,7 +68,25 @@ entity's media type, whatever the request's ``Accept``. The entity is the
 view's: DRF has no app-wide error entity, so give each view's handlers
 ``error=``. The HTTP Schema Resource lists a PUT, PATCH or POST 400 under that
 media type (conditional or not) only when the view's exception handler is this
-one. Without the setting, or without an ``error`` entity, such errors are
+one, which it knows by the handler's ``scrudful_error_links = True``
+attribute. A project handler that delegates to scrudful's must carry it too:
+set ``handler.scrudful_error_links = True``, or use
+``functools.wraps(exception_handler)``, which copies it:
+
+.. code-block:: python
+
+    import functools
+
+    from scrudful.rest_framework import exception_handler
+
+
+    @functools.wraps(exception_handler)
+    def logging_exception_handler(exc, context):
+        logger.info("error: %r", exc)
+        return exception_handler(exc, context)
+
+Without the marker, such a handler's 400 still carries the error Links, but the
+HTTP Schema Resource doesn't list it. Without the setting, or without an ``error`` entity, such errors are
 DRF's own, with no Link. The HTTP Schema Resource doesn't list 404 and 405, so
 they have no entry to agree with. The example project
 (``examples/scrudful_rest_framework``) is conformant on the wire: its tests

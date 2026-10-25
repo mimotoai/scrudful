@@ -82,7 +82,10 @@ change, so clients and tests that compare them must be updated.
   entity's Links: ``add_error_links(api, error)`` for django-ninja and
   ``add_error_links(app, error)`` for FastAPI, and
   ``scrudful.rest_framework.exception_handler`` (named as DRF's
-  ``EXCEPTION_HANDLER``). Errors raised inside a ninja scrudful operation get
+  ``EXCEPTION_HANDLER``; a project handler delegating to it carries its
+  ``scrudful_error_links = True`` marker, e.g. through
+  ``functools.wraps(exception_handler)``, for OPTIONS to describe the
+  serializer's 400). Errors raised inside a ninja scrudful operation get
   the Links of the entity OPTIONS describes for their status. Calling an
   ``add_error_links`` again replaces the entity of the earlier call.
 * FastAPI: ``add_options(app)`` answers OPTIONS on every URL a scrudful
