@@ -1012,10 +1012,14 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
     not handle.
 
     The handler is looked up as :meth:`ScrudfulMetadata.get_method` does:
-    ``view.action`` (a viewset's), then the request method. A 405 has no
-    handler (the method is not routed): the first method the view allows whose
-    handler has an ``error`` entity supplies the Links. Its callables are called
-    as ``func(view, request, **url_kwargs)``.
+    ``view.action`` (a viewset's), then the request method. When that is no
+    :class:`ScrudfulViewFunc` (an error answering OPTIONS, such as a 403 or
+    an unsupported ``?format=``; a 405 for a method no handler serves; a
+    handler that isn't scrudful), the view-wide entity supplies the Links:
+    the ``error`` of the scrudful handlers of the view's methods, when they
+    have exactly one between them. When they have different ones, or none,
+    the response is DRF's, unchanged. The entity's callables are called as
+    ``func(view, request, **url_kwargs)``.
 
     Settings must name it, as the example project does::
 
@@ -1046,17 +1050,15 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
     view, request = context.get("view"), context.get("request")
     if response is None or not isinstance(view, APIView):
         return response
-    handler = _error_handler(view, request, response.status_code)
-    if handler is None or not isinstance(request, Request):
+    error = _error_entity(view, request)
+    if error is None or not isinstance(request, Request):
         return response
     args, kwargs = _callback_arguments((view, request), {}, 1)
-    link = merge_links(
-        response.get("Link"), *_entity_links(handler.error, args, kwargs)
-    )
+    link = merge_links(response.get("Link"), *_entity_links(error, args, kwargs))
     if link is not None:
         response["Link"] = link
     _render_as_json(request, view)
-    response.content_type = handler.error.media_type
+    response.content_type = error.media_type
     expose_headers(response)
     return response
 
@@ -1083,20 +1085,31 @@ def _render_as_json(request: Request, view: Any) -> None:
     request.accepted_media_type = renderer.media_type
 
 
-def _error_handler(view: APIView, request: Any, status: int) -> ScrudfulViewFunc | None:
-    """The handler with an ``error`` entity that an error of ``view`` belongs to."""
+def _error_entity(view: APIView, request: Any) -> Entity | None:
+    """The error entity of an error of ``view`` answering ``request``.
+
+    The ``error`` of the request's own handler (``view.action``'s, a
+    viewset's, else the request method's) when it is a
+    :class:`ScrudfulViewFunc`. Otherwise (an OPTIONS, a 405 for a method no
+    handler serves, a handler that is not scrudful), the view-wide one: the
+    error entity of the scrudful handlers of the view's methods (a viewset's
+    route's action map), when there is exactly one; none when they have
+    several different ones, or none.
+    """
     metadata = ScrudfulMetadata()
-    names = [getattr(view, "action", None), getattr(request, "method", None)]
-    if status == 405:
-        # Nothing handles the method: describe the error like the first one the
-        # view does allow.
-        allowed = {method.lower() for method in view.allowed_methods}
-        names += [method for method in METHOD_KEYS if method in allowed]
-    for name in names:
+    for name in (getattr(view, "action", None), getattr(request, "method", None)):
         handler = metadata.get_method(view, name.lower()) if name else None
+        if handler is not None:
+            return handler.error
+    errors: list[Entity] = []
+    for method in METHOD_KEYS:
+        if method.upper() not in view.allowed_methods:
+            continue
+        handler = metadata.get_method(view, method)
         if handler is not None and handler.error is not None:
-            return handler
-    return None
+            if handler.error not in errors:
+                errors.append(handler.error)
+    return errors[0] if len(errors) == 1 else None
 
 
 def _has_validators(handler: Any) -> bool:

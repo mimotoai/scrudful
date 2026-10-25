@@ -27,7 +27,7 @@ from rest_framework.decorators import (
 from rest_framework.metadata import SimpleMetadata
 from rest_framework.exceptions import NotFound
 from rest_framework.mixins import UpdateModelMixin
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.renderers import BrowsableAPIRenderer, JSONRenderer
 from rest_framework.response import Response
 from rest_framework.routers import SimpleRouter
@@ -787,6 +787,52 @@ class ConditionalTraceAPIView(drf_views.APIView):
         return Response({"id": pk})
 
 
+class DenyAll(BasePermission):
+    """Refuses every request, OPTIONS included."""
+
+    def has_permission(self, request, view):
+        return False
+
+
+@scrudful_viewset
+class DeniedViewSet(ThingViewSetBase):
+    permission_classes = [DenyAll]
+
+    class Meta:
+        etag_func = etag_func
+        schema_link_or_func = "/schemas/thing"
+        context_link_or_func = "/contexts/thing"
+        error = ERROR
+
+
+class DeniedAPIView(drf_views.APIView):
+    """Its handlers share one error entity."""
+
+    permission_classes = [DenyAll]
+
+    @scrudful(etag_func=etag_func, error=ERROR)
+    def get(self, request, pk):
+        return Response({})
+
+    @scrudful(etag_func=etag_func, error=ERROR)
+    def put(self, request, pk):
+        return Response({})
+
+
+class DisagreeingAPIView(drf_views.APIView):
+    """Its handlers have different error entities."""
+
+    permission_classes = [DenyAll]
+
+    @scrudful(etag_func=etag_func, error=ERROR)
+    def get(self, request, pk):
+        return Response({})
+
+    @scrudful(etag_func=etag_func, error=PROBLEM)
+    def put(self, request, pk):
+        return Response({})
+
+
 class TaggingJSONRenderer(JSONRenderer):
     """A project's own JSON renderer (as a camel-case or orjson one would be)."""
 
@@ -830,6 +876,7 @@ for prefix, viewset in [
     ("stock-subclass", SubclassedStockViewSet),
     ("stock-patch-error", StockPatchErrorViewSet),
     ("custom-patch", CustomPatchViewSet),
+    ("denied", DeniedViewSet),
     ("user-partial", UserPartialUpdateViewSet),
     ("actions", ActionViewSet),
     ("headers", HeaderViewSet),
@@ -873,6 +920,8 @@ urlpatterns = [
     path("unused-error/<int:pk>/", UnusedErrorAPIView.as_view()),
     path("used-error/<int:pk>/", UsedErrorAPIView.as_view()),
     path("trace/<int:pk>/", TraceAPIView.as_view()),
+    path("denied-apiview/<int:pk>/", DeniedAPIView.as_view()),
+    path("disagreeing-apiview/<int:pk>/", DisagreeingAPIView.as_view()),
     path("conditional-trace/<int:pk>/", ConditionalTraceAPIView.as_view()),
     path("serializer-error/<int:pk>/", SerializerErrorAPIView.as_view()),
     path("custom-renderer-function/<int:pk>/", custom_renderer_function),
@@ -2086,13 +2135,39 @@ def test_a_custom_partial_update_is_not_the_update(client):
     assert response.json() == {"patched": "1"}
 
 
-def test_exception_handler_405_uses_the_first_allowed_handler_with_an_error(client):
-    """No handler runs for an unrouted method: the first allowed one supplies
-    the Links (here the list's, whose error entity differs from create's)."""
+def test_exception_handler_405_uses_the_view_wide_error_entity(client):
+    """No handler runs for an unrouted method: the one error entity of the
+    view's handlers supplies the Links; none when they disagree (the list's
+    error entity differs from create's)."""
+    response = client.post("/errors/1/")
+    assert response.status_code == 405
+    assert response["Link"] == ERROR_LINKS
     response = client.put("/errors/")
     assert response.status_code == 405
-    assert response["Link"] == PROBLEM_LINKS
-    assert response["Content-Type"] == "application/problem+json"
+    assert "Link" not in response
+    assert response["Content-Type"] == "application/json"
+
+
+@pytest.mark.parametrize("url", ["/denied/1/", "/denied-apiview/1/"])
+def test_an_error_answering_options_gets_the_view_wide_error_links(client, url):
+    response = client.options(url)
+    assert response.status_code == 403
+    assert response["Link"] == ERROR_LINKS
+    assert response["Content-Type"] == "application/json"
+    assert response["Access-Control-Expose-Headers"] == "Link"
+    # The request's own handler's entity, as before.
+    response = client.get(url)
+    assert response.status_code == 403
+    assert response["Link"] == ERROR_LINKS
+
+
+def test_disagreeing_error_entities_give_an_options_error_no_links(client):
+    response = client.options("/disagreeing-apiview/1/")
+    assert response.status_code == 403
+    assert "Link" not in response
+    # Each method's own error still gets its handler's entity.
+    assert client.get("/disagreeing-apiview/1/")["Link"] == ERROR_LINKS
+    assert client.put("/disagreeing-apiview/1/")["Link"] == PROBLEM_LINKS
 
 
 def test_raised_errors_of_function_views(client):

@@ -43,6 +43,10 @@ change, so clients and tests that compare them must be updated.
   ``@scrudful`` ``update`` is described in OPTIONS as that ``update``
   (conditional, with its content and error responses), and
   ``exception_handler`` gives its errors that ``update``'s ``error`` Links.
+* DRF: ``exception_handler`` gives an error that no scrudful handler answers
+  (one raised while answering OPTIONS, a 405) the view-wide error entity:
+  the ``error`` of the view's scrudful handlers when they have exactly one,
+  else no Links (a 405 got the first allowed handler's before).
 * DRF: scrudful's own 400, 412 and 428 with an ``error`` entity, and the
   ``exception_handler`` responses of views with one, bypass DRF's content
   negotiation, so the browsable API gets JSON for them. The view's first JSON
