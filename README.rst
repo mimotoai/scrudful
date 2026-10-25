@@ -105,13 +105,14 @@ Rules worth knowing:
   to be in ``settings.TIME_ZONE`` by the DRF and django-ninja adapters (the
   same thing when ``TIME_ZONE`` is ``"UTC"``). Prefer aware datetimes.
 * **Link headers.** The schema and context links are added to every success
-  response with content (a 2xx other than 204, to a method other than TRACE,
-  whose content is the echoed request) your view returns, and are
-  appended to any ``Link`` value it set. A response with another status that
-  your view returns (an error, a 204, a redirect) gets no Links from scrudful
-  (a ``Link`` it set itself is kept as is): the view's links don't describe
-  it. *Raise* errors, rather than return them, to have them carry the error
-  entity's Links (see "Semantic HTTP conformance"). Each
+  response with content (a 2xx other than 204; never a TRACE, whose content
+  is the echoed request) your view returns, and are appended to any ``Link``
+  value it set. Another response your view returns (an error, a 204, a
+  redirect) gets no Links from scrudful, unless an entity is declared for
+  that status (django-ninja's ``responses=`` or ``ScrudfulResponse.entity``);
+  a ``Link`` it set itself is kept as is. *Raise* errors, rather than return
+  them, to have them carry the error entity's Links (see "Semantic HTTP
+  conformance"). Each
   ``*_or_func`` argument is a value or a callable. The schema link defaults to
   ``rel="describedby"`` and ``type="application/schema+json"``, the context
   link to ``rel="http://www.w3.org/ns/json-ld#context"`` and
@@ -438,8 +439,10 @@ The application must still:
   raises, per view, for the views whose scrudful handler has an ``error``
   (DRF has no app-wide error entity).
 * **Raise errors, don't return them:** a 4xx or 5xx your view returns gets
-  no Links from scrudful (the view's links describe its 2xx content only);
-  one it raises goes through the error-links helper.
+  no Links from scrudful (the view's links describe its 2xx content only),
+  unless an entity is declared for that status (django-ninja's
+  ``responses=`` or ``ScrudfulResponse.entity``); one it raises goes through
+  the error-links helper.
 * **Give every conditional decorator** ``error=`` (``Meta.error`` and
   ``Meta.list_error`` for a DRF viewset): the helpers cover the errors the
   framework raises, not scrudful's own 400, 412 and 428, which carry Links

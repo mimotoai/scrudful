@@ -341,8 +341,9 @@ class ScrudfulViewFunc:
         if has_default_entity(method, response.status_code):
             # A Link the view set with a describedby (context) relation
             # replaces the schema (context) link; one with another relation
-            # replaces none. Another status the view returns (an error, a
-            # 204, a redirect) is not described by its links: it gets none.
+            # replaces none. Another response the view returns (an error, a
+            # 204, a redirect, or a TRACE) is not described by its links: it
+            # gets none.
             link = merge_links(
                 response.get("Link"),
                 self.schema_link_header(*cb_args, **cb_kwargs),

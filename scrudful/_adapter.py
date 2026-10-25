@@ -328,8 +328,8 @@ def has_default_entity(method: str, status: int) -> bool:
     A 2xx but 204, which has no body for the entity to describe, to any
     method but TRACE, whose content is the echoed request (``message/http``),
     not the endpoint's. Another response the endpoint returns gets no Links
-    from scrudful (it keeps those it set itself); scrudful's own 304, 400,
-    412 and 428 and the errors raised get the error entity's instead.
+    from scrudful (it keeps those it set itself); scrudful's own 400, 412
+    and 428 and the errors raised get the error entity's instead.
     """
     return 200 <= status < 300 and status != 204 and method.upper() != "TRACE"
 

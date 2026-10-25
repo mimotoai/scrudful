@@ -394,8 +394,9 @@ def scrudful(
                 if send:
                     set_validator_headers(headers, etag, last_modified)
             if has_default_entity(method, status):
-                # Another status the endpoint returns (an error, a 204, a
-                # redirect) is not described by its links: it gets none.
+                # Another response the endpoint returns (an error, a 204, a
+                # redirect, or a TRACE) is not described by its links: it
+                # gets none.
                 link = merge_links(
                     ", ".join(headers.getlist("link")), *await links(kwargs, base)
                 )

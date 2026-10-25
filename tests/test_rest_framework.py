@@ -689,6 +689,18 @@ class UsedErrorAPIView(drf_views.APIView):
         return Response({"id": pk})
 
 
+class SerializerErrorAPIView(drf_views.APIView):
+    """Not conditional, but scrudful's exception handler: the serializer 400."""
+
+    @scrudful(
+        schema_link_or_func=SCHEMA,
+        context_link_or_func=CONTEXT,
+        error=Entity(used_error_schema),
+    )
+    def put(self, request, pk):
+        return Response({"id": pk})
+
+
 class TraceAPIView(drf_views.APIView):
     """GET and TRACE: the TRACE content is no item."""
 
@@ -782,6 +794,7 @@ urlpatterns = [
     path("unused-error/<int:pk>/", UnusedErrorAPIView.as_view()),
     path("used-error/<int:pk>/", UsedErrorAPIView.as_view()),
     path("trace/<int:pk>/", TraceAPIView.as_view()),
+    path("serializer-error/<int:pk>/", SerializerErrorAPIView.as_view()),
     path("custom-renderer-function/<int:pk>/", custom_renderer_function),
 ]
 
@@ -1313,6 +1326,15 @@ def test_options_calls_the_error_callables_only_when_described(client):
     error = content(f"{BASE}/schemas/error?pk=1")
     for status in ("400", "412"):
         assert body["get"]["responses"][status]["content"] == error
+
+    # No validators, but the serializer's 400 carries the error Links.
+    error_calls.clear()
+    response = client.options("/serializer-error/1/")
+    assert response.status_code == 200
+    body = response.json()
+    assert error_calls == ["used"]
+    assert set(body["put"]["responses"]) == {"200", "400"}
+    assert body["put"]["responses"]["400"]["content"] == error
     error_calls.clear()
 
 
