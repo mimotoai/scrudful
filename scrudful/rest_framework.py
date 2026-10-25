@@ -104,6 +104,7 @@ from typing import Any
 
 from django.core.exceptions import PermissionDenied
 from django.http import Http404, HttpRequest, HttpResponseBase
+from django.utils.encoding import iri_to_uri
 from rest_framework.exceptions import APIException
 from rest_framework.decorators import api_view
 from rest_framework.metadata import BaseMetadata, SimpleMetadata
@@ -177,6 +178,8 @@ _LINK_OPTIONS = (
 )
 _VALIDATOR_OPTIONS = ("etag_func", "last_modified_func")
 _OBJECT_OPTIONS = ("object_validators",)
+# The object a create saved (see ``object_validators``).
+_CREATED_ATTR = "_scrudful_created"
 # The object ``get_object()`` returned for the request (see ``object_validators``).
 _OBJECT_ATTR = "_scrudful_object"
 _ERROR_OPTIONS = ("error",)
@@ -257,6 +260,17 @@ class ScrudfulViewFunc:
         ``last_modified_func``. Default ``False``: the callbacks are called as
         ``func(view, request, **url_kwargs)``, before ``get_object()``.
 
+        On a *create* (``create`` of a viewset, or a method given
+        ``location_func``) the validators describe the new resource instead:
+        no precondition is evaluated, and a 201 gets ``ETag`` and
+        ``Last-Modified`` from the saved instance (``serializer.instance``
+        after ``perform_create``), never replacing a header the view set.
+    location_func : callable, optional
+        For a create with ``object_validators``: ``location_func(view,
+        request, obj)`` returns the ``Location`` of the new object ``obj``
+        (passed through ``iri_to_uri(str(...))``); a 201 without a
+        ``Location`` gets it. ``None`` sends none.
+
     Raises
     ------
     TypeError
@@ -281,6 +295,7 @@ class ScrudfulViewFunc:
         context_type_or_func: Any = None,
         error: Entity | None = None,
         object_validators: bool = False,
+        location_func: Callable[..., Any] | None = None,
     ) -> None:
         check_validators(etag_func, last_modified_func)
         _check_error(error)
@@ -303,6 +318,11 @@ class ScrudfulViewFunc:
         self.context_type_or_func = context_type_or_func
         self.error = error
         self.object_validators = bool(object_validators)
+        if location_func is not None and not callable(location_func):
+            raise TypeError("location_func must be callable")
+        self.location_func = location_func
+        # A create describes the object it saved: see ``object_validators``.
+        self.creates = self.object_validators and location_func is not None
         self._from_viewset = False
 
     def __get__(self, obj: Any, objtype: type | None = None) -> Any:
@@ -320,6 +340,8 @@ class ScrudfulViewFunc:
         each ``APIView`` subclassing it gets its OPTIONS the same way when it
         is created (see :func:`_install_metadata_on_views`).
         """
+        if name == "create" and self.object_validators:
+            self.creates = True
         if issubclass(owner, APIView):
             _install_metadata(owner)
         else:
@@ -354,7 +376,9 @@ class ScrudfulViewFunc:
         method = request.method.upper()
         etag = last_modified = None
         view = args[0] if index > 0 else None
-        if self.has_validators and evaluates_preconditions(method):
+        if self.creates and view is not None:
+            _record_created(view)
+        if self.has_validators and not self.creates and evaluates_preconditions(method):
             exists = None
             if self.object_validators:
                 # Authorization comes first: an exception propagates as the
@@ -380,7 +404,10 @@ class ScrudfulViewFunc:
 
         response = self.view_method(*args, **kwargs)
 
-        if self.has_validators:
+        if self.creates:
+            if response.status_code == 201:
+                self._created_headers(request, view, response)
+        elif self.has_validators:
             refresh, send = validator_policy(method, response.status_code)
             if refresh and self.object_validators:
                 etag = last_modified = None
@@ -410,6 +437,20 @@ class ScrudfulViewFunc:
                 response["Link"] = link
         self.add_expose_headers(response)
         return response
+
+    def _created_headers(
+        self, request: HttpRequest | Request, view: Any, response: HttpResponseBase
+    ) -> None:
+        """Set the Location and validators of the object the create saved."""
+        obj = getattr(request, _CREATED_ATTR, None)
+        if obj is None:
+            return
+        if self.location_func is not None and "Location" not in response:
+            location = self.location_func(view, request, obj)
+            if location is not None:
+                response["Location"] = iri_to_uri(str(location))
+        etag, last_modified = self._validators((obj,), {})
+        set_validator_headers(response, etag, last_modified)
 
     def _early_response(
         self,
@@ -512,6 +553,7 @@ def scrudful(
     context_type_or_func: Any = None,
     error: Entity | None = None,
     object_validators: bool = False,
+    location_func: Callable[..., Any] | None = None,
 ) -> Callable[[Callable[..., Any]], ScrudfulViewFunc]:
     """Decorate a view method or function view to make it SCRUDful.
 
@@ -551,6 +593,7 @@ def scrudful(
         "context_type_or_func": context_type_or_func,
         "error": error,
         "object_validators": object_validators,
+        "location_func": location_func,
     }
     check_validators(etag_func, last_modified_func)
     _check_error(error)
@@ -732,14 +775,20 @@ def scrudful_viewset(cls: type) -> type:
     item = options(
         "", _VALIDATOR_OPTIONS + _LINK_OPTIONS + _ERROR_OPTIONS + _OBJECT_OPTIONS
     )
+    create = options("", _LINK_OPTIONS + _ERROR_OPTIONS)
     if item["object_validators"]:
         if not callable(getattr(cls, "get_object", None)):
             raise TypeError("object_validators needs a view with get_object()")
         _memoize_get_object(cls)
+        # The create's validators and Location describe the saved object.
+        create.update(
+            options("", _VALIDATOR_OPTIONS + _OBJECT_OPTIONS),
+            location_func=getattr(meta, "location_func", None),
+        )
     else:
         item["object_validators"] = False
     configs = {
-        "create": options("", _LINK_OPTIONS + _ERROR_OPTIONS),
+        "create": create,
         "retrieve": item,
         "update": item,
         "partial_update": item,
@@ -786,9 +835,26 @@ def _memoize_get_object(cls: type) -> None:
     cls.get_object = get_object  # type: ignore[attr-defined]
 
 
+def _record_created(view: Any) -> None:
+    """Make ``view.perform_create`` record the saved instance on the request."""
+    perform_create = getattr(view, "perform_create", None)
+    if not callable(perform_create):
+        return
+    request = view.request
+    setattr(request, _CREATED_ATTR, None)
+
+    def record(serializer: Any) -> Any:
+        result = perform_create(serializer)
+        setattr(request, _CREATED_ATTR, getattr(serializer, "instance", None))
+        return result
+
+    view.perform_create = record
+
+
 def _forget_object(view: Any) -> None:
     """Drop the per-call ``get_object`` override of :meth:`ScrudfulViewFunc._handle`."""
     view.__dict__.pop("get_object", None)
+    view.__dict__.pop("perform_create", None)
 
 
 def _load_object(view: Any, fresh: bool = False) -> Any:
@@ -1240,6 +1306,8 @@ def _is_conditional(handler: Any, method: str) -> bool:
     With validators, for a method :func:`scrudful._adapter.evaluates_preconditions`
     accepts (not TRACE).
     """
+    if isinstance(handler, ScrudfulViewFunc) and handler.creates:
+        return False  # it describes the object it saved, and checks nothing
     return _has_validators(handler) and evaluates_preconditions(method.upper())
 
 

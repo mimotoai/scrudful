@@ -105,13 +105,63 @@ class ErrorViewSet(viewsets.ModelViewSet):
         error = ERROR
 
 
+def item_location(view, request, obj):
+    calls.append(("location", obj))
+    return f"/created/{obj.pk}/ é"
+
+
+@scrudful_viewset
+class CreateViewSet(viewsets.ModelViewSet):
+    queryset = Item.objects.all()
+    serializer_class = ItemSerializer
+
+    class Meta:
+        object_validators = True
+        etag_func = object_etag
+        last_modified_func = object_modified
+        location_func = item_location
+
+
+@scrudful_viewset
+class KeepLocationViewSet(CreateViewSet):
+    def create(self, request, *args, **kwargs):
+        response = super().create(request, *args, **kwargs)
+        response["Location"] = "/mine/"
+        response["ETag"] = '"mine"'
+        return response
+
+
+@scrudful_viewset
+class PlainCreateViewSet(viewsets.ModelViewSet):
+    queryset = Item.objects.all()
+    serializer_class = ItemSerializer
+
+    class Meta:
+        etag_func = legacy_etag
+
+
+class ExplicitCreateView(generics.CreateAPIView):
+    queryset = Item.objects.all()
+    serializer_class = ItemSerializer
+
+    @scrudful(
+        etag_func=object_etag, object_validators=True, location_func=item_location
+    )
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
+
+
 router = SimpleRouter()
+router.register("creates", CreateViewSet, basename="create")
+router.register("keeps", KeepLocationViewSet, basename="keep")
+router.register("plains", PlainCreateViewSet, basename="plain")
 router.register("errors", ErrorViewSet, basename="error")
 router.register("objects", ObjectViewSet, basename="object")
 router.register("legacy", LegacyViewSet, basename="legacy")
 urlpatterns = [
     path("", include(router.urls)),
     path("explicit/<int:pk>/", ExplicitView.as_view()),
+    path("explicit-create/", ExplicitCreateView.as_view()),
 ]
 
 
@@ -273,3 +323,62 @@ def test_object_validators_missing_object_404_carries_error_links(client):
     ):
         assert response.status_code == 404
         assert "/schemas/error" in response["Link"]
+
+
+def test_create_sends_validators_of_created_object(client):
+    response = client.post("/creates/", {"name": "new"}, format="json")
+    assert response.status_code == 201
+    created = Item.objects.get(name="new")
+    assert response["ETag"] == f'"v{created.version}"'
+    assert "Last-Modified" in response
+    assert sorted(name for name, _ in calls) == ["etag", "location", "modified"]
+    assert all(obj.pk == created.pk for _, obj in calls)
+
+
+def test_create_location_func_sets_location(client):
+    response = client.post("/creates/", {"name": "new"}, format="json")
+    created = Item.objects.get(name="new")
+    assert response["Location"] == f"/created/{created.pk}/%20%C3%A9"
+    assert "Location" in response["Access-Control-Expose-Headers"]
+
+
+def test_create_keeps_view_location(client):
+    response = client.post("/keeps/", {"name": "new"}, format="json")
+    assert response.status_code == 201
+    assert response["Location"] == "/mine/"
+    assert response["ETag"] == '"mine"'
+    assert response["Last-Modified"]
+    assert "location" not in [name for name, _ in calls]
+
+
+def test_create_ignores_preconditions_and_invalid_is_400(client):
+    response = client.post(
+        "/creates/", {"name": "new"}, format="json", HTTP_IF_MATCH='"nope"'
+    )
+    assert response.status_code == 201
+    bad = client.post("/creates/", {}, format="json")
+    assert bad.status_code == 400
+    assert "ETag" not in bad and "Location" not in bad
+
+
+def test_create_explicit_decorator(client):
+    response = client.post("/explicit-create/", {"name": "new"}, format="json")
+    assert response.status_code == 201
+    created = Item.objects.get(name="new")
+    assert response["ETag"] == f'"v{created.version}"'
+    assert response["Location"] == f"/created/{created.pk}/%20%C3%A9"
+
+
+def test_create_without_object_validators_is_unchanged(client):
+    response = client.post("/plains/", {"name": "new"}, format="json")
+    assert response.status_code == 201
+    assert "ETag" not in response and "Location" not in response
+    assert calls == []
+
+
+def test_options_describes_201_validators(client):
+    """As ninja's create: described with its 201 only (describe_write has no
+    response-header description), never as a conditional write."""
+    post = client.options("/creates/").json()["post"]
+    assert list(post["responses"]) == ["201"]
+    assert "parameters" not in post
