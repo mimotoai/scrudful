@@ -349,6 +349,34 @@ def test_add_error_links_idempotent_with_operation_links(store):
     assert response.headers["Link"] == API_ERR_LINK
 
 
+def test_add_error_links_again_replaces_the_earlier_entity(store):
+    calls: list[str] = []
+
+    def link(name: str) -> Any:
+        def func(request, obj):
+            calls.append(name)
+            return f"/schemas/{name}"
+
+        return func
+
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+
+    @api.get("/conflict")
+    def conflict(request):
+        raise HttpError(409, "taken")
+
+    add_error_links(api, Entity(link("a")))
+    add_error_links(api, Entity(link("b"), media_type="application/problem+json"))
+    response = TestClient(api).get("/conflict")
+    assert response.status_code == 409
+    assert response.headers["Link"] == (
+        '<http://testlocation/schemas/b>; rel="describedby"; '
+        'type="application/schema+json"'
+    )
+    assert response.headers["Content-Type"] == "application/problem+json"
+    assert calls == ["b"]
+
+
 def test_add_error_links_operation_entity_wins(store):
     """A raised error gets the operation's entity, else the API's."""
     api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")

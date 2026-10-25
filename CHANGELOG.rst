@@ -65,7 +65,8 @@ change, so clients and tests that compare them must be updated.
   ``add_error_links(app, error)`` for FastAPI, and
   ``scrudful.rest_framework.exception_handler`` (named as DRF's
   ``EXCEPTION_HANDLER``). Errors raised inside a ninja scrudful operation get
-  the Links of the entity OPTIONS describes for their status.
+  the Links of the entity OPTIONS describes for their status. Calling an
+  ``add_error_links`` again replaces the entity of the earlier call.
 * FastAPI: ``add_options(app)`` answers OPTIONS on every URL a scrudful
   endpoint serves. A callable used outside the endpoint (by ``add_options``
   and ``add_error_links``) gets only the URL's path parameters plus the request

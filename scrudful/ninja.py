@@ -1252,10 +1252,12 @@ def add_error_links(api: NinjaAPI, error: Entity) -> None:
     adds them (a Link the handler set with a ``describedby`` or a context
     relation suppresses that kind; see :func:`scrudful._adapter.merge_links`).
     So a custom handler registered before the call is kept, and calling this
-    twice adds no Link twice. A handler registered after the call replaces
-    the wrapped one, for its class and the subclasses without a handler of
-    their own (e.g. a later ``HttpError`` handler answers the 401, 403 and
-    429 too, without Links): call this after registering your handlers.
+    again replaces the entity of the earlier call: no Link is added twice,
+    and only the latest ``error``'s link callables run. A handler registered
+    after the call replaces the wrapped one, for its class and the
+    subclasses without a handler of their own (e.g. a later ``HttpError``
+    handler answers the 401, 403 and 429 too, without Links): call this
+    after registering your handlers.
 
     A response with JSON content (an ``application/json`` or ``+json``
     Content-Type, as ninja's renderer gives) is served as
@@ -1311,9 +1313,10 @@ def add_error_links(api: NinjaAPI, error: Entity) -> None:
     handlers = api._exception_handlers
     for exc_class in _ERROR_CLASSES:
         if exc_class in handlers:
-            api.add_exception_handler(
-                exc_class, _error_handler(handlers[exc_class], error)
-            )
+            handler = handlers[exc_class]
+            # Calling this again replaces the earlier entity.
+            handler = getattr(handler, "_scrudful_error_handler", handler)
+            api.add_exception_handler(exc_class, _error_handler(handler, error))
 
 
 def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
@@ -1758,6 +1761,7 @@ def _error_handler(
             _run_sync(_error_links(response, error, request))
         return response
 
+    scrudful_handler._scrudful_error_handler = handler  # type: ignore[attr-defined]
     return scrudful_handler
 
 
