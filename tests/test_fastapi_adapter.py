@@ -8,7 +8,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 import pytest
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+)
 from fastapi.exception_handlers import (
     http_exception_handler,
     request_validation_exception_handler,
@@ -2525,6 +2534,48 @@ def test_add_options_still_rejects_a_parameter_the_endpoint_lacks():
     app = FastAPI()
     app.include_router(router, prefix="/users/{user_id}")
     with pytest.raises(TypeError, match="user_id"):
+        add_options(app)
+
+
+def test_outside_callables_get_an_aliased_parameter_by_its_name(make_client):
+    """As inside the endpoint: ``item``, not the URL's ``item_id``."""
+    received = []
+
+    def schema(item, **kwargs):
+        received.append((item, kwargs))
+        return f"/schemas/item?id={item}"
+
+    def owner(user_id: int):
+        return user_id
+
+    app = FastAPI()
+
+    @app.get("/users/{user_id}/items/{item_id}")
+    @scrudful(schema_link_or_func=schema, context_link_or_func=CONTEXT)
+    async def get_item(item: int = Path(alias="item_id"), who=Depends(owner)):
+        return {}
+
+    add_options(app)
+    client = make_client(app)
+    get = client.get("/users/1/items/2")
+    body = client.options("/users/1/items/2").json()
+    # GET gets the endpoint's kwargs (``who``, not the dependency's
+    # ``user_id``); OPTIONS the path parameters among them.
+    assert received == [(2, {"who": 1}), ("2", {})]
+    assert body["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "http://testserver/schemas/item?id=2"
+    }
+    assert link_problems("GET", 200, get.headers, True, body) == []
+
+    # Checked by the same names: ``item_id`` is no keyword the callable gets.
+    app = FastAPI()
+
+    @app.get("/items/{item_id}")
+    @scrudful(schema_link_or_func=lambda item_id: "/s.json")
+    async def aliased(item: int = Path(alias="item_id")):
+        return {}
+
+    with pytest.raises(TypeError, match=r"\['item'\]"):
         add_options(app)
 
 

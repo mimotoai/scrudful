@@ -828,7 +828,7 @@ class ScrudfulMetadata(BaseMetadata):
     def determine_metadata_for_get(
         self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
     ) -> dict[str, Any]:
-        conditional = _has_validators(handler)
+        conditional = _is_conditional(handler, "get")
         return describe_read(
             _content(handler, args, kwargs),
             conditional,
@@ -841,7 +841,7 @@ class ScrudfulMetadata(BaseMetadata):
     def determine_metadata_for_head(
         self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return describe_read(None, _has_validators(handler))
+        return describe_read(None, _is_conditional(handler, "head"))
 
     def determine_metadata_for_options(
         self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
@@ -876,7 +876,7 @@ class ScrudfulMetadata(BaseMetadata):
         kwargs: Mapping[str, Any],
     ) -> dict[str, Any]:
         content = None if method == "delete" else _content(handler, args, kwargs)
-        conditional = _has_validators(handler)
+        conditional = _is_conditional(handler, method)
         view = args[0] if args else None
         # The serializer's 400 carries the error Links only through
         # :func:`exception_handler` (or a handler delegating to it, which
@@ -1099,6 +1099,15 @@ def _error_handler(view: APIView, request: Any, status: int) -> ScrudfulViewFunc
 
 def _has_validators(handler: Any) -> bool:
     return isinstance(handler, ScrudfulViewFunc) and handler.has_validators
+
+
+def _is_conditional(handler: Any, method: str) -> bool:
+    """Whether ``handler`` evaluates the If-* headers for ``method`` (lower-case).
+
+    With validators, for a method :func:`scrudful._adapter.evaluates_preconditions`
+    accepts (not TRACE).
+    """
+    return _has_validators(handler) and evaluates_preconditions(method.upper())
 
 
 def _handler(view: APIView, method: str) -> Any:

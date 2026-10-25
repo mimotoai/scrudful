@@ -120,7 +120,10 @@ Outside the endpoint, the helpers call some of them with much less:
 There they get only the URL's path parameters that the endpoint takes, as
 Starlette matched them (strings, unless the path uses a convertor such as
 ``{id:int}``): a parameter of an ``include_router`` prefix that the endpoint
-doesn't declare reaches neither the endpoint nor its callables. They also get
+doesn't declare reaches neither the endpoint nor its callables. An aliased one
+(``item: int = Path(alias="item_id")``) is passed under the endpoint's name for
+it (``item``), and one that only a ``Depends(...)`` takes is not passed, as in
+the endpoint. They also get
 the request under the name of the endpoint's ``Request`` parameter when it
 declares one. The entity passed to ``add_error_links`` gets ``request=``
 only. Both helpers check every such callable when they are called and raise

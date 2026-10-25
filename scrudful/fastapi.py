@@ -479,11 +479,12 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
         called outside the endpoint, as in :func:`add_options`: with the
         URL's path parameters it takes, plus the request under the name of
         the endpoint's ``Request`` parameter if it declares one (see
-        "Callbacks" in :func:`scrudful`). Both are checked when this is called, against
-        the endpoints the app has then: those of included routers and under
-        any ``Mount`` or ``Host``, with or without middleware, since this
-        app's handlers serve them, but not those of a mounted Starlette or
-        FastAPI app, which has its own handlers: call this on that app too.
+        "Callbacks" in :func:`scrudful`). Both are checked when this is
+        called, against the endpoints the app has then: those of included
+        routers and under any ``Mount`` or ``Host``, with or without
+        middleware, since this app's handlers serve them, but not those of a
+        mounted Starlette or FastAPI app, which has its own handlers: call
+        this on that app too.
 
     Raises
     ------
@@ -993,12 +994,13 @@ async def _describe_route(
     kwargs = _description_kwargs(config, routed_request)
     base = str(request.url)
     status = int(getattr(route, "status_code", None) or 200)
-    conditional = _is_conditional(config)
+    conditional = _is_conditional(config, method)
     if method == "head":
         return describe_read(None, conditional, [status])
     if method == "trace":
-        # Neither a read nor a write: its status only, as django-ninja's.
-        return describe_read(None, False, [status])
+        # Neither a read nor a write: its status, without content (and, never
+        # conditional, without early responses), as django-ninja's.
+        return describe_read(None, conditional, [status])
     content = await _media(config, _ENDPOINT_MEDIA_TYPE, kwargs, base)
     error_content = None
     if conditional and config.error is not None:  # scrudful's 400, 412, 428
@@ -1025,8 +1027,17 @@ async def _describe_route(
     )
 
 
-def _is_conditional(config: _EndpointConfig) -> bool:
+def _has_validators(config: _EndpointConfig) -> bool:
     return config.etag_func is not None or config.last_modified_func is not None
+
+
+def _is_conditional(config: _EndpointConfig, method: str) -> bool:
+    """Whether the endpoint evaluates the If-* headers for ``method`` (lower-case).
+
+    With validators, for a method :func:`scrudful._adapter.evaluates_preconditions`
+    accepts (not TRACE).
+    """
+    return _has_validators(config) and evaluates_preconditions(method.upper())
 
 
 def _endpoint_config(endpoint: Any) -> _EndpointConfig | None:
@@ -1038,15 +1049,16 @@ def _endpoint_config(endpoint: Any) -> _EndpointConfig | None:
 def _description_kwargs(config: _EndpointConfig, request: Request) -> dict[str, Any]:
     """The kwargs of an endpoint's callables outside the endpoint.
 
-    The request's path parameters that the endpoint takes (as FastAPI passes
-    them inside it: not those of an ``include_router`` prefix it doesn't
-    declare), plus the request under the name of the endpoint's ``Request``
-    parameter, when it declares one.
+    The request's path parameters that the endpoint takes, under the names
+    it takes them by, as FastAPI passes them inside it (see
+    :func:`_path_names`), plus the request under the name of the endpoint's
+    ``Request`` parameter, when it declares one.
     """
+    names = _path_names(config, request.scope.get("route"))
     kwargs = {
-        name: value
+        names[name]: value
         for name, value in request.path_params.items()
-        if name in config.param_names
+        if name in names
     }
     if config.request_name is not None:
         kwargs[config.request_name] = request
@@ -1056,12 +1068,33 @@ def _description_kwargs(config: _EndpointConfig, request: Request) -> dict[str, 
 # --- checking the callables called outside the endpoint ------------------------
 
 
+def _path_names(config: _EndpointConfig, route: Any) -> dict[str, str]:
+    """The endpoint's own path parameters: URL name to its keyword argument.
+
+    From FastAPI's ``route.dependant``: an aliased parameter
+    (``item: int = Path(alias="item_id")``) maps ``item_id`` to ``item``,
+    and neither a parameter of an ``include_router`` prefix the endpoint
+    doesn't declare nor one only a ``Depends(...)`` takes is listed: FastAPI
+    passes those to the endpoint neither. Without a ``dependant``, the
+    endpoint's parameter names, unaliased.
+    """
+    route = getattr(route, "original_route", route)
+    dependant = getattr(route, "dependant", None)
+    if dependant is None:
+        return {name: name for name in config.param_names}
+    return {
+        getattr(field, "alias", None) or field.name: field.name
+        for field in dependant.path_params
+    }
+
+
 def _endpoints(
     routes: Sequence[Any],
     for_options: bool,
     params: frozenset[str] = frozenset(),
-) -> Iterator[tuple[Any, _EndpointConfig, frozenset[str]]]:
-    """The scrudful endpoints under ``routes``, with their path parameter names.
+) -> Iterator[tuple[Any, _EndpointConfig, set[str]]]:
+    """The scrudful endpoints under ``routes``, with the names their callables
+    get outside them (see :func:`_outside_names`).
 
     Including those under the ``Mount``\\ s and ``Host``\\ s that
     :func:`_contents` looks into for ``for_options``.
@@ -1077,22 +1110,17 @@ def _endpoints(
         endpoint = getattr(route, "endpoint", None)
         config = _endpoint_config(endpoint)
         if config is not None:
-            yield endpoint, config, names
+            yield endpoint, config, _outside_names(config, names, route)
 
 
 def _check_options_callables(routes: Sequence[Any]) -> None:
     """Check the callables an OPTIONS body calls (see :func:`add_options`)."""
     for endpoint, config, names in _endpoints(routes, for_options=True):
         where = f"endpoint {_endpoint_name(endpoint)}"
-        _check_call(config, "", where, _outside_names(config, names), "in OPTIONS")
-        if config.error is not None and _is_conditional(config):
-            _check_call(
-                config.error,
-                "error.",
-                where,
-                _outside_names(config, names),
-                "in OPTIONS",
-            )
+        _check_call(config, "", where, names, "in OPTIONS")
+        # Called for the conditional methods: checked whichever it serves.
+        if config.error is not None and _has_validators(config):
+            _check_call(config.error, "error.", where, names, "in OPTIONS")
 
 
 def _check_error_callables(routes: Sequence[Any], error: Entity) -> None:
@@ -1112,20 +1140,23 @@ def _check_error_callables(routes: Sequence[Any], error: Entity) -> None:
                 config.error,
                 "error.",
                 f"endpoint {_endpoint_name(endpoint)}",
-                _outside_names(config, names),
+                names,
                 "in add_error_links's handlers",
                 fields=_ERROR_LINK_FIELDS,
             )
 
 
-def _outside_names(config: _EndpointConfig, names: frozenset[str]) -> set[str]:
+def _outside_names(
+    config: _EndpointConfig, names: frozenset[str], route: Any
+) -> set[str]:
     """The kwargs names an endpoint's callables get outside the endpoint.
 
-    Those of the path parameters ``names`` the endpoint takes (see
-    :func:`_description_kwargs`), and its ``Request`` parameter's.
+    Those the endpoint takes the path parameters ``names`` of ``route`` by
+    (see :func:`_description_kwargs`), and its ``Request`` parameter's.
     """
+    path_names = _path_names(config, route)
     request = {config.request_name} if config.request_name else set()
-    return (set(names) & config.param_names) | request
+    return {path_names[name] for name in names if name in path_names} | request
 
 
 def _param_names(endpoint: Callable[..., Any]) -> frozenset[str]:

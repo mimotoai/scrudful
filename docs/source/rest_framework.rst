@@ -91,9 +91,9 @@ set ``handler.scrudful_error_links = True``, or use
         return exception_handler(exc, context)
 
 Without the marker, such a handler's 400 still carries the error Links, but the
-HTTP Schema Resource doesn't list it. Without the setting, or without an ``error`` entity, such errors are
-DRF's own, with no Link. The HTTP Schema Resource doesn't list 404 and 405, so
-they have no entry to agree with. The example project
+HTTP Schema Resource doesn't list it. Without the setting, or without an
+``error`` entity, such errors are DRF's own, with no Link. The HTTP Schema
+Resource doesn't list 404 and 405, so they have no entry to agree with. The example project
 (``examples/scrudful_rest_framework``) is conformant on the wire: its tests
 check every response against the Semantic HTTP 0.1 rules.
 
