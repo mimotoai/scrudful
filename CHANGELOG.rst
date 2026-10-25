@@ -66,7 +66,9 @@ change, so clients and tests that compare them must be updated.
   ``Content-Type`` equal to its ``media_type``: scrudful's own 400, 412 and
   428 (all adapters), the responses of DRF's ``exception_handler`` and of both
   ``add_error_links`` helpers, and the errors raised inside a ninja scrudful
-  operation (with the entity OPTIONS describes for their status).
+  operation (with the entity OPTIONS describes for their status). DRF's
+  OPTIONS calls the ``error`` entity's callables only for the methods whose
+  description has its content.
 * New helpers that give the errors a framework answers itself the error
   entity's Links: ``add_error_links(api, error)`` for django-ninja and
   ``add_error_links(app, error)`` for FastAPI, and

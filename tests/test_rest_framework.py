@@ -637,6 +637,58 @@ class ThingAPIView(drf_views.APIView):
         return Response({"id": pk, "version": store.version})
 
 
+error_calls = []
+
+
+def unused_error_schema(view, request, **kwargs):
+    """Fails, as ``kwargs["pk"]`` would on a list URL."""
+    error_calls.append("unused")
+    raise KeyError("pk")
+
+
+def used_error_schema(view, request, pk):
+    error_calls.append("used")
+    return f"/schemas/error?pk={pk}"
+
+
+UNUSED_ERROR = dict(
+    schema_link_or_func=SCHEMA,
+    context_link_or_func=CONTEXT,
+    error=Entity(unused_error_schema),
+)
+
+
+class UnusedErrorAPIView(drf_views.APIView):
+    """Not conditional, and DRF's exception handler: no error content."""
+
+    def get_exception_handler(self):
+        return drf_views.exception_handler
+
+    @scrudful(**UNUSED_ERROR)
+    def get(self, request, pk):
+        return Response({"id": pk})
+
+    @scrudful(**UNUSED_ERROR)
+    def put(self, request, pk):
+        return Response({"id": pk})
+
+    @scrudful(**UNUSED_ERROR)
+    def delete(self, request, pk):
+        return Response(status=204)
+
+
+class UsedErrorAPIView(drf_views.APIView):
+    """Conditional: the error content describes scrudful's 400 and 412."""
+
+    @scrudful(
+        etag_func=etag_func,
+        schema_link_or_func=SCHEMA,
+        error=Entity(used_error_schema),
+    )
+    def get(self, request, pk):
+        return Response({"id": pk})
+
+
 class TaggingJSONRenderer(JSONRenderer):
     """A project's own JSON renderer (as a camel-case or orjson one would be)."""
 
@@ -715,6 +767,8 @@ urlpatterns = [
     path("api-error/<int:pk>/", api_error),
     path("django-error/", django_error_view),
     path("apiview/<int:pk>/", ThingAPIView.as_view()),
+    path("unused-error/<int:pk>/", UnusedErrorAPIView.as_view()),
+    path("used-error/<int:pk>/", UsedErrorAPIView.as_view()),
     path("custom-renderer-function/<int:pk>/", custom_renderer_function),
 ]
 
@@ -1226,6 +1280,27 @@ def test_options_error_content(client):
             )["application/json"]
         },
     }
+
+
+def test_options_calls_the_error_callables_only_when_described(client):
+    error_calls.clear()
+    response = client.options("/unused-error/1/")
+    assert response.status_code == 200
+    body = response.json()
+    validate_http_schema_resource(body)
+    assert error_calls == []
+    for description in body.values():
+        for status in ("400", "412", "428"):
+            assert status not in description["responses"]
+
+    response = client.options("/used-error/1/")
+    assert response.status_code == 200
+    body = response.json()
+    assert error_calls == ["used"]
+    error = content(f"{BASE}/schemas/error?pk=1")
+    for status in ("400", "412"):
+        assert body["get"]["responses"][status]["content"] == error
+    error_calls.clear()
 
 
 def test_options_action_without_links(client):

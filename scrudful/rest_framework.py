@@ -754,8 +754,11 @@ class ScrudfulMetadata(BaseMetadata):
     list, detail, nested and ``@action`` routes each to their own). Link
     callbacks are called with the same arguments as for the request
     (``func(view, request, **url_kwargs)``), and every URL is resolved against
-    the request's absolute URI. Methods that are not SCRUDful are described
-    without content or preconditions.
+    the request's absolute URI. Those of the ``error`` entity are called only
+    for a method whose description has its content: a conditional one, or a
+    PUT, PATCH or POST whose serializer 400 :func:`exception_handler` gives
+    its Links. Methods that are not SCRUDful are described without content
+    or preconditions.
 
     The Links, ``Allow`` and JSON rendering of the OPTIONS response are added
     by the ``options`` that :func:`scrudful_viewset` and
@@ -786,10 +789,14 @@ class ScrudfulMetadata(BaseMetadata):
     def determine_metadata_for_get(
         self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
     ) -> dict[str, Any]:
+        conditional = _has_validators(handler)
         return describe_read(
             _content(handler, args, kwargs),
-            _has_validators(handler),
-            error_content=_error_content(handler, args, kwargs),
+            conditional,
+            # Only scrudful's 400 and 412 have it: its callables run only then.
+            error_content=(
+                _error_content(handler, args, kwargs) if conditional else None
+            ),
         )
 
     def determine_metadata_for_head(
@@ -831,7 +838,20 @@ class ScrudfulMetadata(BaseMetadata):
     ) -> dict[str, Any]:
         content = None if method == "delete" else _content(handler, args, kwargs)
         conditional = _has_validators(handler)
-        error_content = _error_content(handler, args, kwargs)
+        view = args[0] if args else None
+        # The serializer's 400 carries the error Links only through
+        # :func:`exception_handler`, so only then is it described.
+        serializer_400 = (
+            method != "delete"
+            and getattr(view, "get_exception_handler", None) is not None
+            and view.get_exception_handler() is exception_handler
+        )
+        # The error entity's callables run only when its content is described.
+        error_content = (
+            _error_content(handler, args, kwargs)
+            if conditional or serializer_400
+            else None
+        )
         metadata = describe_write(
             method,
             content,
@@ -841,15 +861,7 @@ class ScrudfulMetadata(BaseMetadata):
             response_content=content,
             error_content=error_content,
         )
-        view = args[0] if args else None
-        if (
-            error_content
-            and method != "delete"
-            and getattr(view, "get_exception_handler", None) is not None
-            and view.get_exception_handler() is exception_handler
-        ):
-            # The serializer's 400 carries the error Links only through
-            # :func:`exception_handler`, so only then is it described.
+        if error_content and serializer_400:
             metadata["responses"].setdefault(
                 "400",
                 {"description": reason_phrase(400), "content": error_content},
