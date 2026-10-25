@@ -10,6 +10,8 @@ This module is framework-neutral and depends only on the standard library.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
 from typing import Any
 
 # Keys of one entry of a page's ``content`` array.
@@ -129,3 +131,47 @@ def collection_context(item_context_uri: str, *, vocabulary: str) -> dict[str, A
         },
     }
     return {"@context": context}
+
+
+class InvalidPage(Exception):
+    """A page number past the last page (page 1 always exists)."""
+
+
+def envelope_entry(
+    *,
+    href: str,
+    etag: str | None,
+    last_modified: str | None,
+    link: str | None,
+    content: Any,
+) -> dict[str, Any]:
+    """One entry of a page's ``content`` array, keyed by ``ENVELOPE_FIELDS``."""
+    values = (href, etag, last_modified, link, content)
+    return dict(zip(ENVELOPE_FIELDS, values))
+
+
+def page_envelope(
+    *,
+    count: int,
+    number: int,
+    size: int,
+    page_url: Callable[[int], str],
+    entries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """The page ``number`` of ``count`` items, keyed by ``PAGE_FIELDS``.
+
+    ``page_url(n)`` is the URL of page ``n``.
+    """
+    page_count = math.ceil(count / size)
+    link = page_url
+
+    values = (
+        count,
+        page_count,
+        link(1),
+        link(number - 1) if number > 1 else None,
+        link(number + 1) if number < page_count else None,
+        link(max(page_count, 1)),
+        entries,
+    )
+    return dict(zip(PAGE_FIELDS, values))

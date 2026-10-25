@@ -394,20 +394,15 @@ from __future__ import annotations
 
 import functools
 import inspect
-import math
 import re
 import types
-import warnings
 from collections.abc import Callable, Generator, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from typing import Any, NamedTuple, TypeVar, Union, get_args, get_origin
-from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from asgiref.sync import async_to_sync, sync_to_async
-from django.core.paginator import UnorderedObjectListWarning
-from django.db.models import QuerySet
 from django.http import (
     Http404,
     HttpRequest,
@@ -431,6 +426,7 @@ from scrudful._adapter import (
     SCHEMA_REL,
     SCHEMA_TYPE,
     allow_header,
+    check_error_body_func,
     check_error_media_type,
     check_validators,
     context_defaults,
@@ -449,9 +445,22 @@ from scrudful._adapter import (
     resolved_signature,
     set_validator_headers,
     validator_policy,
+    with_error_body,
 )
-from scrudful._django import aware, conditional_response, precondition_headers
-from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS
+from scrudful._django import (
+    aware,
+    conditional_response,
+    page_url,
+    precondition_headers,
+    slice_page,
+)
+from scrudful.collection import (
+    ENVELOPE_FIELDS,
+    PAGE_FIELDS,
+    InvalidPage,
+    envelope_entry,
+    page_envelope,
+)
 from scrudful.conditional import (
     ConditionalResult,
     evaluate_preconditions,
@@ -611,6 +620,8 @@ class _Config:
     )
     #: The entity of scrudful's own 400, 412 and 428 bodies.
     error: Entity | None = None
+    #: ``error_body_func(request, result)``: the body of those responses.
+    error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None
     #: The validators of a list operation's collection (called with the
     #: queryset the handler returned).
     list_etag_func: Callable[[Any], Any] | None = None
@@ -706,6 +717,7 @@ def scrudful(
     request: Entity | None = None,
     responses: Mapping[int, Entity] | None = None,
     error: Entity | None = None,
+    error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation on a single resource to make it SCRUDful.
 
@@ -808,6 +820,17 @@ def scrudful(
         ``+json``, e.g. ``application/problem+json``), since scrudful's error
         bodies are JSON objects; they, and the JSON responses to the errors
         the operation raises, are served with that Content-Type.
+    error_body_func : callable, optional
+        ``error_body_func(request, result)`` returns the body (a ``dict``) of
+        scrudful's own 400, 412 or 428 response in place of
+        ``{"detail": ...}``; ``result`` is the
+        :class:`~scrudful.conditional.ConditionalResult`, whose default body
+        is ``result.body``. It must be a plain (sync) function. The status,
+        headers, Links and Content-Type are unchanged, and it is never called
+        for a 304. :func:`scrudful.problem.problem_details` returns RFC 9457
+        problem details (pair it with
+        ``error=Entity(media_type=PROBLEM_JSON)``). Without it the bodies are
+        as before.
 
     Raises
     ------
@@ -834,6 +857,7 @@ def scrudful(
         raise TypeError(f"load must be callable, not {type(load).__name__}")
     _check_entity("request", request)
     _check_error(error)
+    check_error_body_func(error_body_func)
     config = _Config(
         kind="item",
         load=load,
@@ -849,6 +873,7 @@ def scrudful(
         request=request,
         responses=_entities_by_status(responses),
         error=error,
+        error_body_func=error_body_func,
     )
     if config.has_validators and load is None:
         raise TypeError(
@@ -1009,6 +1034,7 @@ def scrudful_list(
     page_size: int = 100,
     max_page_size: int = 1000,
     error: Entity | None = None,
+    error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation listing a collection (GET on a list).
 
@@ -1111,6 +1137,17 @@ def scrudful_list(
         be JSON content, as for :func:`scrudful`; scrudful's 400 and 412,
         and the JSON responses to the errors the operation raises, are
         served with it.
+    error_body_func : callable, optional
+        ``error_body_func(request, result)`` returns the body (a ``dict``) of
+        scrudful's own 400 or 412 response (with a list validator set; a list
+        never answers 428) in place of ``{"detail": ...}``; ``result`` is the
+        :class:`~scrudful.conditional.ConditionalResult`, whose default body
+        is ``result.body``. It must be a plain (sync) function. The status,
+        headers, Links and Content-Type are unchanged, and it is never called
+        for a 304. :func:`scrudful.problem.problem_details` returns RFC 9457
+        problem details (pair it with
+        ``error=Entity(media_type=PROBLEM_JSON)``). Without it the bodies are
+        as before.
 
     Raises
     ------
@@ -1148,10 +1185,10 @@ def scrudful_list(
         raise ValueError(f"page_size must be at least 1, not {page_size}")
     if max_page_size < page_size:
         raise ValueError(
-            f"max_page_size ({max_page_size}) must be at least page_size "
-            f"({page_size})"
+            f"max_page_size ({max_page_size}) must be at least page_size ({page_size})"
         )
     _check_error(error)
+    check_error_body_func(error_body_func)
     config = _Config(
         kind="list",
         href_func=href_func,
@@ -1164,6 +1201,7 @@ def scrudful_list(
         context_rel_or_func=context_rel_or_func,
         context_type_or_func=context_type_or_func,
         error=error,
+        error_body_func=error_body_func,
         list_etag_func=list_etag_func,
         list_last_modified_func=list_last_modified_func,
         collection=Entity(
@@ -1601,6 +1639,7 @@ def _early_response(
     callables get ``obj``, and its media type as their Content-Type.
     """
     error = config.error
+    result = with_error_body(config.error_body_func, request, result)
     early = conditional_response(
         result, content_type=None if error is None else error.media_type
     )
@@ -1924,36 +1963,33 @@ def _page(
     size = config.page_size if pagination is None else pagination.page_size
     # Counted and sliced in one call: in an async operation, in a thread.
     count, items = yield _slice, (queryset, number, size), {}
-    page_count = math.ceil(count / size)
     entries = []
     for item in items:
         href = yield config.href_func, (request, item), {}
         if href is None:
             raise TypeError(
-                f"href_func returned None for {item!r}: it must return the "
-                "item's URL"
+                f"href_func returned None for {item!r}: it must return the item's URL"
             )
         etag, last_modified = yield from _item_validators(config, item)
         link = yield from _links(config.entity, request, item)
-        values = (
-            iri_to_uri(str(href)),
-            etag,
-            None if last_modified is None else format_http_date(last_modified),
-            link,
-            item,
+        entries.append(
+            envelope_entry(
+                href=iri_to_uri(str(href)),
+                etag=etag,
+                last_modified=(
+                    None if last_modified is None else format_http_date(last_modified)
+                ),
+                link=link,
+                content=item,
+            )
         )
-        entries.append(dict(zip(ENVELOPE_FIELDS, values)))
-    url = functools.partial(_page_url, request.build_absolute_uri(), request.GET)
-    values = (
-        count,
-        page_count,
-        url(1),
-        url(number - 1) if number > 1 else None,
-        url(number + 1) if number < page_count else None,
-        url(max(page_count, 1)),
-        entries,
+    return page_envelope(
+        count=count,
+        number=number,
+        size=size,
+        page_url=functools.partial(page_url, request.build_absolute_uri(), request.GET),
+        entries=entries,
     )
-    return dict(zip(PAGE_FIELDS, values))
 
 
 def _has_async_item_callables(config: _Config) -> bool:
@@ -1966,40 +2002,11 @@ def _has_async_item_callables(config: _Config) -> bool:
 
 
 def _slice(queryset: Any, number: int, size: int) -> tuple[int, list[Any]]:
-    """The item count of ``queryset`` and the items of page ``number``.
-
-    ``count()`` for a ``QuerySet``, else ``len()``. An unordered ``QuerySet``
-    gets Django's ``UnorderedObjectListWarning``, as with its ``Paginator``.
-    """
-    if isinstance(queryset, QuerySet):
-        if not queryset.ordered:
-            warnings.warn(
-                "Pagination may yield inconsistent results with an unordered "
-                f"object_list: {queryset.model} {queryset.__class__.__name__}.",
-                UnorderedObjectListWarning,
-                stacklevel=2,
-            )
-        count = queryset.count()
-    else:
-        count = len(queryset)
-    if number > max(math.ceil(count / size), 1):
-        raise HttpError(404, "Invalid page.")
-    start = (number - 1) * size
-    return count, list(queryset[start : start + size])
-
-
-def _page_url(url: str, query: Any, number: int) -> str:
-    """``url`` with the query ``query`` (a ``QueryDict``) and ``page=number``.
-
-    The parameters are sorted by name, as DRF's ``replace_query_param`` does.
-    The query comes from ``request.GET``, not from ``url``: they are the same
-    in Django, but ninja's ``TestClient`` builds URLs without a query.
-    """
-    query = query.copy()
-    query.setlist("page", [str(number)])
-    scheme, netloc, path, _, _ = urlsplit(url)
-    encoded = urlencode(sorted(query.lists()), doseq=True)
-    return urlunsplit((scheme, netloc, path, encoded, ""))
+    """:func:`~scrudful.collection.slice_page`, with ninja's 404 for a bad page."""
+    try:
+        return slice_page(queryset, number, size)
+    except InvalidPage:
+        raise HttpError(404, "Invalid page.") from None
 
 
 def _with_body(content: Any, body: Any) -> Any:

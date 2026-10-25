@@ -16,7 +16,12 @@ A decorated view or endpoint:
   the JSON-LD context of the response body (RFC 8288), as Semantic HTTP 0.1
   asks, and answers ``OPTIONS`` with the 0.1 HTTP Schema Resource;
 * exposes ``ETag``, ``Link`` and ``Location`` to browsers through
-  ``Access-Control-Expose-Headers``.
+  ``Access-Control-Expose-Headers``;
+* with DRF, can compute validators from ``get_object()`` (``object_validators``),
+  send them on a 201, and list in the same scrud envelope as django-ninja
+  (``ScrudfulPagination``);
+* can replace the body of its own 400, 412 and 428 (``error_body_func``, with
+  RFC 9457 ``scrudful.problem.problem_details``).
 
 The HTTP logic is framework-agnostic and lives in ``scrudful.conditional`` and
 ``scrudful.utils``; ``scrudful.rest_framework``, ``scrudful.ninja`` and
@@ -62,7 +67,9 @@ Status  When
 ======  ==========================================================================
 
 The error responses are JSON (``{"detail": ...}``), and none of them calls your
-view.
+view. ``error_body_func(request, result)`` replaces the body of the 400, 412 and
+428 (see below); ``scrudful.problem.problem_details`` makes it RFC 9457
+``application/problem+json``.
 
 Rules worth knowing:
 
@@ -212,6 +219,109 @@ instead. Set ``error=`` (or ``Meta.error``) and name
 ``scrudful.rest_framework.exception_handler`` as DRF's ``EXCEPTION_HANDLER`` so
 that the errors DRF raises itself for those views carry the error entity's
 Links too. See ``examples/scrudful_rest_framework`` for a complete project.
+
+A list in the scrud envelope (``count``, ``page_count``, ``first``,
+``previous``, ``next``, ``last`` and ``content``; each entry has ``href``,
+``etag``, ``last_modified``, ``link`` and ``content``), the one django-ninja's
+``scrudful_list`` returns, comes from ``ScrudfulPagination``. It is opt-in as the
+viewset's ``pagination_class``; other views are unchanged. It needs
+``Meta.href_func(view, request, obj)``. With ``Meta.object_validators`` the
+entries' ``etag`` and ``last_modified`` come from ``Meta.etag_func(obj)`` and
+``Meta.last_modified_func(obj)`` (otherwise they are ``null``), and ``link``
+holds the item schema and context links of ``Meta`` (their callbacks get the
+object's lookup value as the URL keyword). ``page`` (at least 1, default 1) and
+``page_size`` (1 to ``max_page_size``; default 100, maximum 1000) outside their
+range are a 400, and a page past the last one a 404. Give the view an ordered
+queryset: an unordered one warns, as with Django's ``Paginator``.
+
+.. code-block:: python
+
+    from scrudful.rest_framework import ScrudfulPagination
+
+
+    def item_href(view, request, obj):
+        return request.build_absolute_uri(f"/items/{obj.pk}")
+
+
+    # With object_validators the callbacks take the object, not the URL kwargs.
+    def item_object_etag(obj):
+        return f"v{obj.version}"
+
+
+    def item_object_modified(obj):
+        return obj.updated_at
+
+
+    @scrudful_viewset
+    class ItemViewSet(viewsets.ReadOnlyModelViewSet):
+        queryset = Item.objects.order_by("pk")
+        pagination_class = ScrudfulPagination
+
+        class Meta:
+            href_func = item_href
+            object_validators = True
+            etag_func = item_object_etag
+            last_modified_func = item_object_modified
+
+Everything below is opt-in; a viewset that sets none of it behaves as before.
+
+**Validators from the object (``object_validators``).** By default the
+callbacks run before the view looks the object up. With
+``Meta.object_validators = True`` (or ``object_validators=True`` on a
+``@scrudful`` method of a generic view) ``etag_func(obj)`` and
+``last_modified_func(obj)`` take the object ``view.get_object()`` returns, after
+DRF's queryset filtering and object permissions, so a missing or forbidden
+object is a 404 or 403 that never reveals a validator, a 412 or a 428. The
+handler's own ``get_object()`` returns the same instance, and after a
+successful PUT or PATCH the object is loaded again for the response's validators
+(none are sent if that fails). A handler that calls ``get_object()`` *after*
+saving gets the pre-save instance. On a function view
+``@scrudful(object_validators=True)`` raises ``TypeError`` when the request
+arrives, as there is no ``get_object()``.
+
+**Creates.** With ``object_validators`` (which needs ``etag_func`` or
+``last_modified_func``), ``scrudful_viewset`` sets ``creates=True`` for
+``create``; without it, ``create`` gets only the links and error entity. Set
+``creates=True`` on an explicit ``@scrudful`` create (it needs
+``object_validators``). No precondition is
+evaluated and the 201 gets ``ETag`` and ``Last-Modified`` from the saved
+instance, plus ``Location`` from ``Meta.location_func(view, request, obj)``
+(``location_func=`` on the decorator; it requires ``creates=True`` and
+``object_validators``). A header
+the view set is never replaced. The 201 is built in ``perform_create``, so a
+custom ``create()`` that bypasses it gets no validators, and neither does a
+bulk create (``many=True``) that saves several objects. OPTIONS describes the
+201 without the validator headers, as django-ninja does.
+
+**Error bodies (``error_body_func``).** ``error_body_func(request, result)``,
+also ``Meta.error_body_func`` and ``Meta.list_error_body_func`` (the list
+response's), returns the dict used as the body of scrudful's own 400, 412 and
+428. It must be a plain function. ``scrudful_viewset`` does not apply it to
+``create``. Status, headers, Links and Content-Type are unchanged and it is not
+called for a 304.
+
+.. code-block:: python
+
+    from scrudful.problem import PROBLEM_JSON, problem_details
+    from scrudful.rest_framework import Entity
+
+
+    def item_object_etag(obj):
+        return f"v{obj.version}"
+
+
+    def item_location(view, request, obj):
+        return f"/items/{obj.pk}"
+
+
+    @scrudful_viewset
+    class ItemViewSet(viewsets.ModelViewSet):
+        class Meta:
+            object_validators = True
+            etag_func = item_object_etag
+            location_func = item_location
+            error_body_func = problem_details
+            error = Entity(media_type=PROBLEM_JSON)
 
 Caveats of ``scrudful_viewset``:
 
