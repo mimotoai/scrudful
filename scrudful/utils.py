@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 # Response headers a browser client may need to read (CORS).
 EXPOSABLE_HEADERS = ("ETag", "Link", "Location")
@@ -60,3 +60,71 @@ def merge_expose_headers(existing: str | None, names: Iterable[str]) -> str | No
             seen.add(name.lower())
             merged.append(name)
     return ", ".join(merged) or None
+
+
+def resolve_uri(url: object, base: str) -> str:
+    """Resolve ``url`` against the absolute URI ``base``, as a browser would.
+
+    Absolute values are unchanged. Non-``str`` arguments (e.g. a Starlette
+    ``URL`` or a lazy string) are converted with ``str()``.
+    """
+    return urljoin(base, str(url))
+
+
+def _split_top_level(value: str, separator: str) -> list[str]:
+    """Split ``value`` on ``separator`` outside ``<...>`` and quoted strings."""
+    parts = []
+    start = 0
+    in_angle = in_quotes = escaped = False
+    for index, char in enumerate(value):
+        if in_quotes:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_quotes = False
+        elif in_angle:
+            in_angle = char != ">"
+        elif char == '"':
+            in_quotes = True
+        elif char == "<":
+            in_angle = True
+        elif char == separator:
+            parts.append(value[start:index])
+            start = index + 1
+    parts.append(value[start:])
+    return parts
+
+
+def _unquote(value: str) -> str | None:
+    """The text of a token or quoted-string parameter value, else ``None``."""
+    value = value.strip(" \t")
+    if not value.startswith('"'):
+        return value
+    if len(value) < 2 or not value.endswith('"'):
+        return None
+    return re.sub(r"\\(.)", r"\1", value[1:-1])
+
+
+def link_relations(field_value: str | None) -> set[str]:
+    """The lower-cased relation types of the links in a Link field value.
+
+    Every link-value of the RFC 8288 field value is read: its ``rel`` may hold
+    several space-separated types, as a quoted-string or a token. Commas inside
+    ``<...>`` or quoted strings do not separate link-values. Malformed
+    link-values are skipped; this never raises.
+    """
+    relations: set[str] = set()
+    for link in _split_top_level(field_value or "", ","):
+        link = link.strip(" \t")
+        if not link.startswith("<") or ">" not in link:
+            continue
+        params = _split_top_level(link[link.index(">") + 1 :], ";")[1:]
+        for param in params:
+            name, _, value = param.partition("=")
+            if name.strip(" \t").lower() == "rel":
+                # RFC 8288 §3.4.1: only the first rel parameter counts.
+                relations.update((_unquote(value) or "").lower().split())
+                break
+    return relations

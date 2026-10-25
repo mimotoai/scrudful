@@ -63,6 +63,18 @@ DATABASES = {
     }
 }
 
+REST_FRAMEWORK = {
+    # Gives the errors DRF itself raises (a serializer's 400, a 404, a 405 ...)
+    # the Links of the views' error entity.
+    "EXCEPTION_HANDLER": "scrudful.rest_framework.exception_handler",
+    # Semantic HTTP 0.1: every response's content is described by its Links,
+    # and OPTIONS lists every request body media type. Only JSON is: the
+    # browsable API's HTML carries the Links of the JSON content, and form
+    # data has no lifting to RDF, so neither is served nor accepted.
+    "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
+}
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 LANGUAGE_CODE = "en-us"

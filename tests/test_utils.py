@@ -6,7 +6,9 @@ from scrudful.utils import (
     EXPOSABLE_HEADERS,
     join_links,
     link_content,
+    link_relations,
     merge_expose_headers,
+    resolve_uri,
 )
 
 # --- link_content -----------------------------------------------------------
@@ -200,3 +202,57 @@ def test_exposable_headers():
 )
 def test_merge_expose_headers(existing, names, expected):
     assert merge_expose_headers(existing, names) == expected
+
+
+# --- resolve_uri ------------------------------------------------------------
+
+
+def test_resolve_uri_relative():
+    assert resolve_uri("/s", "http://h/a/b") == "http://h/s"
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("//cdn/s", "http://cdn/s"),
+        ("s?v=1", "http://h/a/s?v=1"),
+        ("#f", "http://h/a/b#f"),
+        ("https://x/y", "https://x/y"),
+    ],
+)
+def test_resolve_uri_variants(url, expected):
+    assert resolve_uri(url, "http://h/a/b") == expected
+
+
+def test_resolve_uri_non_str():
+    class Lazy:
+        def __str__(self):
+            return "/s"
+
+    assert resolve_uri(Lazy(), "http://h/a/b") == "http://h/s"
+    assert resolve_uri(URL("/s"), "http://h/a/b") == "http://h/s"
+
+
+# --- link_relations ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ('<a>; rel="describedby"', {"describedby"}),
+        ('<a>; rel="next prev", <b>; rel=self', {"next", "prev", "self"}),
+        ('<https://x/a,b>; rel="next"; title="a, b"', {"next"}),
+        ('<a>; title="x, <b>; rel=bad"; rel=next', {"next"}),
+        ('<a>; title="q\\"uote, y"; REL=Next', {"next"}),
+        ("<a>; rel=next;rel=prev", {"next"}),
+        ("<a>", set()),
+        (None, set()),
+        ("", set()),
+        ("garbage", set()),
+        ('<a>; rel="unterminated', set()),
+        ('<unterminated; rel="next"', set()),
+        ('<a>; rel="next", garbage, <b>; rel=prev', {"next", "prev"}),
+    ],
+)
+def test_link_relations(value, expected):
+    assert link_relations(value) == expected

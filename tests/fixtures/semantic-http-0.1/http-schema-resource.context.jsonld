@@ -1,0 +1,63 @@
+{
+  "@context": {
+    "@version": 1.1,
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "http-methods": "http://www.w3.org/2011/http-methods#",
+    "shttp": "https://w3id.org/semantic-http/ns#",
+
+    "get": { "@id": "http-methods:GET" },
+    "put": { "@id": "http-methods:PUT" },
+    "post": { "@id": "http-methods:POST" },
+    "delete": { "@id": "http-methods:DELETE" },
+    "options": { "@id": "http-methods:OPTIONS" },
+    "head": { "@id": "http-methods:HEAD" },
+    "patch": { "@id": "http-methods:PATCH" },
+    "trace": { "@id": "http-methods:TRACE" },
+
+    "summary": { "@id": "rdfs:label" },
+    "description": { "@id": "rdfs:comment" },
+
+    "parameters": { "@id": "shttp:parameters", "@type": "@json" },
+    "requestBody": { "@id": "shttp:request-body" },
+    "required": { "@id": "shttp:required" },
+
+    "responses": {
+      "@id": "shttp:response",
+      "@container": "@index",
+      "@index": "shttp:status-code"
+    },
+    "content": {
+      "@id": "shttp:content",
+      "@container": "@index",
+      "@index": "shttp:media-type",
+      "@context": {
+        "@propagate": false,
+        "schema": {
+          "@id": "shttp:schema",
+          "@context": {
+            "@propagate": false,
+            "$ref": "@id"
+          }
+        },
+        "x-schema": {
+          "@id": "shttp:schema",
+          "@context": {
+            "@propagate": false,
+            "href": "@id",
+            "type": { "@id": "shttp:media-type" }
+          }
+        },
+        "x-rdf-context": {
+          "@id": "shttp:rdf-context",
+          "@context": {
+            "@propagate": false,
+            "href": "@id",
+            "type": { "@id": "shttp:media-type" }
+          }
+        }
+      }
+    }
+  }
+}

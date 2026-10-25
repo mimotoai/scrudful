@@ -30,26 +30,32 @@ on the API itself, make the API's default router one too:
 
     from ninja import NinjaAPI
 
-    from scrudful.ninja import ScrudfulRouter
+    from scrudful.ninja import ScrudfulRouter, add_error_links
 
-    SCHEMA_RESOURCE = dict(
-        options_schema_link="https://example.com/schemas/http-schema-resource.json",
-        options_context_link="https://example.com/contexts/http-schema-resource.jsonld",
-    )
-
-    api = NinjaAPI(auth=..., default_router=ScrudfulRouter(**SCHEMA_RESOURCE))
-    roles = ScrudfulRouter(**SCHEMA_RESOURCE)
+    api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
+    roles = ScrudfulRouter()
     api.add_router("/roles", roles)
+    add_error_links(api, ERROR)  # see "Error responses"
 
 Scrudful operations on a plain ``ninja.Router`` work, but get no OPTIONS
 operation (ninja answers 405).
 
-``options_schema_link`` and ``options_context_link`` are the Links of the
-OPTIONS response: the JSON Schema and JSON-LD context of the HTTP Schema
-Resource. The OPTIONS body follows the semantic-http spec's 2019 draft (the
-shape DRF's ``ScrudfulMetadata`` produces), which publishes no resolvable URLs
-for these documents, so the URLs above are placeholders: point them at copies
-your application serves. Alignment with the spec's 0.1 revision is planned.
+The Links of the OPTIONS response are fixed: the published JSON Schema and
+JSON-LD context of the Semantic HTTP 0.1 HTTP Schema Resource, at
+``https://w3id.org/semantic-http/0.1/``. The OPTIONS body follows that
+revision (see the "Semantic HTTP conformance" section of :doc:`usage`).
+
+HEAD is routed like any method: ninja answers 405 to HEAD on an operation
+declared with ``get``. Declare ``api_operation(["GET", "HEAD"], ...)`` for the
+paths that should serve it, as the example does for the item and the list.
+
+.. note::
+
+   The schema Link's default relation is ``describedby``, which is what
+   Semantic HTTP 0.1 requires of a Schema Link Header. If you override it
+   (``schema_rel_or_func="profile"``), the response's Link is no longer a Schema
+   Link Header, while the OPTIONS body still describes that schema as the
+   response's schema: the API is then not conformant. Use the default.
 
 Single resources
 ----------------
@@ -112,13 +118,16 @@ GET and HEAD answer 304 to a matching ``If-None-Match`` / ``If-Modified-Since``
 and send the validators on 2xx. PUT, PATCH and DELETE get 428 without a
 precondition, 412 when it is stale, 400 for a malformed ``If-Match`` /
 ``If-None-Match``, and fresh validators on 2xx. With ``error=Entity(...)``
-scrudful's own 400, 412 and 428 bodies carry that entity's Links. ``load`` is
+scrudful's own 400, 412 and 428 bodies carry that entity's Links, and so do
+the errors the operation raises (see :ref:`ninja-errors`). ``load`` is
 required when ``etag_func`` or ``last_modified_func`` is set.
 
 The ``schema_*`` / ``context_*`` arguments are the default entity: its Links go
 on 2xx responses, except a 204, which has no body (so a DELETE answering 204
-gets none). ``responses={204: Entity(...)}`` or ``ScrudfulResponse.entity``
-still put Links on a 204 if you want them.
+gets none), and except those to TRACE, whose content is the echoed request
+(``message/http``), not the item: OPTIONS describes them without content.
+``responses={204: Entity(...)}`` (``responses={200: Entity(...)}`` for a TRACE)
+or ``ScrudfulResponse.entity`` still put Links on them if you want them.
 
 ninja routes HEAD only to operations that list it, as above.
 
@@ -411,7 +420,7 @@ so ninja's validation and OpenAPI describe the real body:
      "next": "…?page=3", "last": "…?page=3",
      "content": [{"href": "https://…/roles/17", "etag": "\"…\"",
                   "last_modified": "Thu, 22 Oct 2026 21:09:56 GMT",
-                  "link": "</schemas/role>; rel=\"describedBy\"; …",
+                  "link": "</schemas/role>; rel=\"describedby\"; …",
                   "content": {"id": 17, "name": "admin"}}]}
 
 Each entry's ``etag``, ``last_modified`` and ``link`` come from the same item
@@ -452,8 +461,9 @@ OPTIONS
 -------
 
 The automatic OPTIONS operation answers, for each method the path serves, an
-OpenAPI-like description in the shape DRF's ``ScrudfulMetadata`` produces: the
-request and response ``content`` (``{"schema": <url>, "context": <url>}``),
+HTTP Schema Resource (Semantic HTTP 0.1), the shape DRF's ``ScrudfulMetadata``
+produces too: the request and response ``content`` (per media type, a
+``schema`` ``$ref`` and, for a non-in-band type, an ``x-rdf-context`` ``href``),
 the statuses and the precondition headers of conditional writes. The statuses
 are those the operation answers: the ones it declares in ``response=`` (200
 without one), plus 201 for a ``@scrudful_create`` operation, and scrudful's
@@ -474,8 +484,9 @@ every POST. It is the same for everyone:
   which can differ between Python versions (e.g. for 422);
 * link callables are called with the request and ``obj=None`` (there is no
   loaded object, queryset or created item), so they must accept ``None``;
-* without ``options_schema_link`` / ``options_context_link`` the response has
-  no Link, which the semantic-http spec does not allow (see Setup).
+* the response always has the two fixed HTTP Schema Resource Links, an
+  ``Allow`` header listing the body's methods and, for the paths that serve
+  it, a ``head`` entry without content.
 
 CORS
 ~~~~
@@ -500,6 +511,107 @@ also has ``etag_func`` / ``last_modified_func`` must stay consistent with
 them: the preconditions of the next request are evaluated with the computed
 values.
 
+.. _ninja-errors:
+
+Error responses
+---------------
+
+The semantic-http spec asks for the schema and context Links on every response
+with content, error responses included. scrudful adds them in two places.
+
+**Errors a scrudful operation raises.** An ``HttpError`` (or a subclass) or
+``Http404`` raised by ``load``, a callback, the handler or a list's paging (the
+404 of a page past the last one) propagates as before, through
+``add_decorator(mode="operation")`` decorators (so a transaction still rolls
+back), and ninja answers it with the API's exception handler: the status and
+body are the API's, custom handlers included. That response then gets the Links
+of the entity the operation's OPTIONS describes for its status:
+``responses[status]`` if declared (``error`` first for scrudful's own 400, 412
+and 428 when the operation evaluates the ``If-*`` headers), else ``error``. So a
+404 a client gets agrees with the HTTP Schema Resource:
+
+.. code-block:: python
+
+    NOT_FOUND = Entity(schema_link_or_func="/schemas/not-found",
+                       context_link_or_func="/contexts/not-found")
+
+
+    @roles.get("/{int:pk}", response={200: RoleOut, 404: Message})
+    @scrudful(load=authorized_role, responses={404: NOT_FOUND}, error=ERROR,
+              **ROLE)
+    def get_role(request, pk: int, obj: Role):
+        return obj
+
+Their link callables are called with the request and ``obj=None``: nothing was
+loaded. A status the operation has no entity for gets no Link from it.
+
+**Errors ninja answers before the operation runs**, the 422 of a parameter that
+does not validate, the 401 of missing credentials, the 403 of an
+``AuthorizationError`` and the 429 of a throttle, come from the API's exception
+handlers. :func:`~scrudful.ninja.add_error_links` gives them an API-wide error
+entity:
+
+.. code-block:: python
+
+    from scrudful.ninja import add_error_links
+
+    api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
+    add_error_links(api, ERROR)
+
+It wraps the handlers registered for ``ninja.errors.ValidationError``,
+``AuthenticationError``, ``AuthorizationError`` (when the installed ninja
+defines it), ``Throttled``, ``HttpError`` and ``Http404``, so it also covers
+the errors of plain ninja operations, and of scrudful operations without an
+entity for the status (a scrudful operation's own entity wins). Only a class
+with a handler of its own is wrapped: with ninja's defaults,
+``AuthenticationError``, ``AuthorizationError`` and ``Throttled`` have none and
+fall back to the (wrapped) ``HttpError`` handler, as ninja looks handlers up.
+Each wrapped handler keeps the original's status and body and adds the entity's
+Links when the response has content. A Link the handler set itself with the
+relation of the entity's schema link suppresses that link, and one with either
+context relation (JSON-LD or ``rdf-context``, one slot) its context link, so a
+response that already has scrudful's Links gets no Link twice, nor two RDF
+Context Link Headers. Calling it again
+replaces the entity of the earlier call: the wrapped handlers are unwrapped
+first, so only the latest entity's Links, media type and link callables apply.
+Call it after registering your own exception handlers: it wraps the
+ones registered when it is called, and a handler registered later replaces the
+wrapped one, for its class and for the subclasses without a handler of their
+own (a later ``HttpError`` handler answers the 401, 403 and 429 too, without
+Links).
+ninja's exception handlers are sync, also for async operations, where they run
+on the event loop: the entity's link callables must be sync (``TypeError``
+otherwise) and must not use the ORM there.
+
+scrudful's own 400, 412 and 428 are returned by the operation, not raised, so
+no exception handler sees them: they carry Links only from the decorator's
+``error``. Give every conditional ``@scrudful`` and ``@scrudful_list`` an
+``error=``, also with :func:`~scrudful.ninja.add_error_links` installed.
+
+**The error media type.** An error entity describes JSON bodies: its
+``media_type`` must be ``application/json`` or another ``+json`` type (e.g.
+``application/problem+json``), other than JSON-LD; anything else raises
+``ValueError``, from the decorators and from
+:func:`~scrudful.ninja.add_error_links`. An error response is served with the
+media type of the entity whose Links it carries, as the OPTIONS body lists it:
+scrudful's own 400, 412 and 428, and the responses the API's exception
+handlers make for the errors raised inside a scrudful operation and for those
+:func:`~scrudful.ninja.add_error_links` covers. ninja renders those
+``application/json``, and scrudful replaces that ``Content-Type`` with the
+entity's ``media_type`` whatever the handler chose, so every wrapped handler's
+JSON bodies must be content the entity describes. A handler's response with
+other content (e.g. ``text/plain``) keeps its ``Content-Type``.
+
+Not covered, since no ninja exception handler makes them:
+
+* ninja's own 405 for a method that no operation of the path routes (e.g. a
+  POST on a path with only a GET);
+* Django's 404 for a URL no pattern matches, and Django's 500 page (or ninja's
+  traceback page for other exceptions with ``DEBUG = True``).
+
+Give those Links in Django: custom ``handler404`` / ``handler500`` views, or a
+middleware adding them to error responses.
+
 Async operations
 ----------------
 
@@ -515,6 +627,7 @@ Reference
 .. automodule:: scrudful.ninja
    :members:
    :member-order: bysource
+   :exclude-members: Entity
 
 .. automodule:: scrudful.collection
    :members: collection_schema, collection_context

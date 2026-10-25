@@ -10,16 +10,46 @@ import copy
 import http
 import inspect
 import sys
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol
 
 from scrudful.conditional import SAFE_METHODS, validator_headers
-from scrudful.utils import EXPOSABLE_HEADERS, merge_expose_headers
+from scrudful.utils import (
+    EXPOSABLE_HEADERS,
+    join_links,
+    link_content,
+    link_relations,
+    merge_expose_headers,
+)
 
-DEFAULT_SCHEMA_REL = "describedBy"
-DEFAULT_SCHEMA_TYPE = "application/json"
-DEFAULT_CONTEXT_REL = "http://www.w3.org/ns/json-ld#context"
-DEFAULT_CONTEXT_TYPE = "application/ld+json"
+# Semantic HTTP 0.1 vocabulary.
+SCHEMA_REL = "describedby"
+SCHEMA_TYPE = "application/schema+json"
+JSON_LD_CONTEXT_REL = "http://www.w3.org/ns/json-ld#context"
+CONTEXT_TYPE = "application/ld+json"
+RDF_CONTEXT_REL = "https://w3id.org/semantic-http/ns#rdf-context"
+HSR_SCHEMA_URL = "https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json"
+HSR_CONTEXT_URL = (
+    "https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld"
+)
+#: Media types that carry their RDF in-band, so need no context link.
+IN_BAND_MEDIA_TYPES = frozenset(
+    {
+        "application/ld+json",
+        "text/turtle",
+        "application/n-triples",
+        "application/n-quads",
+        "application/trig",
+        "application/rdf+xml",
+    }
+)
+#: The keys of an HTTP Schema Resource that are methods (the others are ``x-``).
+METHOD_KEYS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
+
+DEFAULT_SCHEMA_REL = SCHEMA_REL
+DEFAULT_SCHEMA_TYPE = SCHEMA_TYPE
+DEFAULT_CONTEXT_REL = JSON_LD_CONTEXT_REL
+DEFAULT_CONTEXT_TYPE = CONTEXT_TYPE
 
 PRECONDITION_FIELDS = (
     "if-match",
@@ -29,6 +59,10 @@ PRECONDITION_FIELDS = (
 )
 #: Methods whose 2xx responses get freshly computed validators (RFC 9110 §9.3.4).
 FRESH_VALIDATOR_METHODS = frozenset({"PUT", "PATCH"})
+#: Methods that neither select nor modify a representation of the target
+#: (RFC 9110 §13.2.1): their If-* headers are ignored, and their responses
+#: get no validators. A TRACE's content is the echoed request.
+NO_PRECONDITION_METHODS = frozenset({"CONNECT", "OPTIONS", "TRACE"})
 
 _MALFORMED = "Malformed If-Match or If-None-Match header."
 _PRECONDITION_FAILED = "Precondition Failed."
@@ -125,8 +159,24 @@ def precondition_headers(getlist: Callable[[str], Sequence[str]]) -> dict[str, s
     return headers
 
 
+def evaluates_preconditions(method: str) -> bool:
+    """Whether a request with ``method`` (upper-case) has its If-* evaluated.
+
+    Not for CONNECT, OPTIONS and TRACE (:data:`NO_PRECONDITION_METHODS`),
+    whose response is no representation of the target resource: the
+    resource's validators don't describe it, so a server ignores the
+    conditional headers (RFC 9110 §13.2.1). Their OPTIONS description lists
+    neither scrudful's early responses nor the precondition headers.
+    """
+    return method not in NO_PRECONDITION_METHODS
+
+
 def validator_policy(method: str, status: int) -> tuple[bool, bool]:
-    """``(refresh, send)``: recompute the validators / send them after the view."""
+    """``(refresh, send)``: recompute the validators / send them after the view.
+
+    Only for a 2xx to GET and HEAD (send) or PUT and PATCH (refresh and
+    send): never for the :data:`NO_PRECONDITION_METHODS`, among others.
+    """
     if not 200 <= status < 300:
         return False, False
     refresh = method in FRESH_VALIDATOR_METHODS
@@ -227,12 +277,208 @@ def resolve_annotation(annotation: Any, globalns: dict[str, Any]) -> Any:
     return annotation
 
 
+# --- Media types and links --------------------------------------------------
+
+
+def essence(media_type: str) -> str:
+    """The lowercase ``type/subtype`` of ``media_type``, without parameters."""
+    return media_type.partition(";")[0].strip().lower()
+
+
+def media_type_key(media_type: str) -> str:
+    """``media_type`` as a ``content`` key: lowercase ``type/subtype``, then the
+    parameters (after the first ``;``) as written.
+
+    Raises
+    ------
+    ValueError
+        If the ``type/subtype`` lacks a type or a subtype.
+    """
+    head, semicolon, parameters = media_type.strip().partition(";")
+    main, slash, sub = head.strip().lower().partition("/")
+    if not (main and slash and sub):
+        raise ValueError(f"not a media type: {media_type!r}")
+    return f"{main}/{sub}{semicolon}{parameters}"
+
+
+def is_json(media_type: str) -> bool:
+    """Whether ``media_type`` is JSON content: ``application/json`` or ``+json``,
+    other than JSON-LD, which carries its context in-band."""
+    name = essence(media_type)
+    return name != "application/ld+json" and (
+        name == "application/json" or name.endswith("+json")
+    )
+
+
+def is_in_band(media_type: str) -> bool:
+    """Whether ``media_type`` carries RDF in-band (no context link needed)."""
+    return essence(media_type) in IN_BAND_MEDIA_TYPES
+
+
+def context_defaults(media_type: str) -> tuple[str | None, str | None]:
+    """The default ``(rel, type)`` of the context link for ``media_type``.
+
+    ``(None, None)`` when the content has no context link (in-band RDF); a
+    ``None`` type when the caller has to give one (non-JSON content).
+    """
+    if is_in_band(media_type):
+        return None, None
+    if is_json(media_type):
+        return JSON_LD_CONTEXT_REL, CONTEXT_TYPE
+    return RDF_CONTEXT_REL, None
+
+
+def context_link_type(media_type: str, value: Any) -> str:
+    """The ``type`` of the context link of ``media_type`` content.
+
+    ``value``, the evaluated ``context_type_or_func``, unless it is empty;
+    else the default of :func:`context_defaults` (JSON-LD, for JSON content).
+    The Link header and the OPTIONS body both take the type from here, so
+    they agree, and fail alike.
+
+    Raises
+    ------
+    ValueError
+        If neither gives one: a ``context_type_or_func`` callable returned
+        nothing for content that is not JSON. A context Link without a type
+        would not say how to lift the content.
+    """
+    if value:
+        return str(value)
+    default = context_defaults(media_type)[1]
+    if default is None:
+        raise ValueError(f"the context of {media_type!r} needs a type")
+    return default
+
+
+def check_error_media_type(media_type: str) -> None:
+    """Raise ``ValueError`` unless an ``error`` entity's ``media_type`` is JSON.
+
+    The ``error`` entity describes scrudful's own 400, 412 and 428 bodies,
+    which are JSON objects served as ``media_type``.
+    """
+    if not is_json(media_type):
+        raise ValueError(
+            f"error has the media type {media_type!r}, but the error entity "
+            "describes scrudful's JSON error bodies (400, 412 and 428): use "
+            "application/json or a +json media type"
+        )
+
+
+def has_default_entity(method: str, status: int) -> bool:
+    """Whether a ``method`` response with ``status`` gets the endpoint's entity.
+
+    A 2xx but 204, which has no body for the entity to describe, to any
+    method but TRACE, whose content is the echoed request (``message/http``),
+    not the endpoint's. Another response the endpoint returns gets no Links
+    from scrudful (it keeps those it set itself); scrudful's own 400, 412
+    and 428 and the errors raised get the error entity's instead.
+    """
+    return 200 <= status < 300 and status != 204 and method.upper() != "TRACE"
+
+
+#: The relations of an RDF Context Link Header: one slot (see :func:`merge_links`).
+_CONTEXT_RELS = frozenset({JSON_LD_CONTEXT_REL, RDF_CONTEXT_REL})
+
+
+def merge_links(
+    existing: str | None, schema: str | None, context: str | None
+) -> str | None:
+    """Join the view's Link ``existing`` with the ``schema`` and ``context`` links.
+
+    A link of ``existing`` with a relation that scrudful's ``schema``
+    (``context``) link-value has replaces that link: with the defaults, a
+    ``describedby`` link replaces the schema link; with
+    ``schema_rel_or_func="profile"``, a ``profile`` link replaces it, and a
+    ``describedby`` one doesn't. The JSON-LD context and the ``rdf-context``
+    relations are one slot, since a response has at most one RDF Context
+    Link Header: when scrudful's context link has either, a link of either
+    replaces it. An overridden context relation is matched exactly.
+    Relation types are compared case-insensitively, every one of a ``rel``
+    holding several (RFC 8288 §2.1.1, §3.3). A link of another relation
+    replaces nothing.
+    """
+    relations = link_relations(existing)
+    if relations & link_relations(schema):
+        schema = None
+    context_rels = link_relations(context)
+    if context_rels & _CONTEXT_RELS:
+        context_rels |= _CONTEXT_RELS
+    if relations & context_rels:
+        context = None
+    return join_links(existing, schema, context)
+
+
+def options_links() -> str:
+    """The Link field value of an OPTIONS response: the HTTP Schema Resource's
+    own schema and context."""
+    schema = link_content(HSR_SCHEMA_URL, SCHEMA_REL, SCHEMA_TYPE)
+    context = link_content(HSR_CONTEXT_URL, JSON_LD_CONTEXT_REL, CONTEXT_TYPE)
+    return f"{schema}, {context}"
+
+
 # --- OPTIONS descriptions ----------------------------------------------------
 #
-# The operations of an OPTIONS body (an OpenAPI-like Path Item), shared by the
-# DRF and django-ninja adapters. ``content`` is a Media Type map such as
-# ``{"application/json": {"schema": <url>, "context": <url>}}``; falsy means
-# none. ``conditional``: whether the method's preconditions are evaluated.
+# The operations of an OPTIONS body (an HTTP Schema Resource: an OpenAPI Path
+# Item), shared by the DRF and django-ninja adapters. ``content`` is a Media
+# Type map as built by :func:`describe_content`; falsy means none.
+# ``conditional``: whether the method's preconditions are evaluated.
+
+
+def describe_content(
+    media_type: str,
+    schema: str | None,
+    schema_type: str,
+    context: str | None,
+    context_type: str | None,
+) -> dict[str, Any] | None:
+    """A ``content`` map with the Media Type Object of ``media_type``.
+
+    ``schema`` and ``context`` are absolute URIs. The schema is a JSON Schema
+    (``schema``) when ``schema_type`` is ``application/schema+json``, else an
+    ``x-schema``. The ``x-rdf-context`` is left out of in-band media types; its
+    type defaults to JSON-LD for JSON content. ``None`` without a ``schema``.
+
+    Raises
+    ------
+    ValueError
+        If ``media_type`` is malformed, or a context is given for non-JSON
+        content without ``context_type``.
+    """
+    key = media_type_key(media_type)
+    if not schema:
+        return None
+    if essence(schema_type) == SCHEMA_TYPE:
+        entry: dict[str, Any] = {"schema": {"$ref": schema}}
+    else:
+        entry = {"x-schema": {"href": schema, "type": schema_type}}
+    if context and not is_in_band(media_type):
+        context_type = context_link_type(media_type, context_type)
+        entry["x-rdf-context"] = {"href": context, "type": context_type}
+    return {key: entry}
+
+
+def describe_options() -> dict[str, Any]:
+    """The ``options`` operation: a 200 whose content is the HTTP Schema Resource."""
+    return {
+        "responses": {
+            "200": {
+                "description": "OK",
+                "content": describe_content(
+                    "application/json",
+                    HSR_SCHEMA_URL,
+                    SCHEMA_TYPE,
+                    HSR_CONTEXT_URL,
+                    CONTEXT_TYPE,
+                ),
+            }
+        }
+    }
+
+
+def allow_header(body: Mapping[str, Any]) -> str:
+    """The ``Allow`` value for an HTTP Schema Resource ``body``: its methods."""
+    return ", ".join(key.upper() for key in body if key in METHOD_KEYS)
 
 
 def reason_phrase(status: int) -> str:
@@ -256,18 +502,32 @@ def describe_read(
     content: dict[str, Any] | None,
     conditional: bool,
     statuses: Iterable[int] | None = None,
+    error_content: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Describe a GET: its 200 and, when conditional, the 304, 400 and 412.
 
     ``statuses`` replaces the 200 by the statuses the operation answers
-    (``content`` then goes on the 200, if listed).
+    (``content`` then goes on the 200, if listed). ``error_content`` goes on the
+    400 and 412.
     """
     responses = _success_responses(statuses, "200")
     if content and "200" in responses:
         responses["200"]["content"] = content
     if conditional:
         responses.update(copy.deepcopy(READ_RESPONSES))
+        _add_content(responses, ("400", "412"), error_content)
     return {"responses": responses}
+
+
+def _add_content(
+    responses: dict[str, dict[str, Any]],
+    statuses: Iterable[str],
+    content: dict[str, Any] | None,
+) -> None:
+    """Put a copy of ``content`` on each of ``statuses`` among ``responses``."""
+    if content:
+        for status in statuses:
+            responses[status]["content"] = copy.deepcopy(content)
 
 
 def describe_write(
@@ -277,10 +537,14 @@ def describe_write(
     has_etag: bool,
     has_last_modified: bool,
     statuses: Iterable[int] | None = None,
+    response_content: dict[str, Any] | None = None,
+    error_content: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Describe a ``post``, ``put``, ``patch`` or ``delete``.
 
-    ``content`` describes the request body (DELETE has none). The success
+    ``content`` describes the request body (DELETE has none, and the body is
+    left out when ``content`` is falsy). ``response_content`` goes on every
+    success status but 204, ``error_content`` on the 400, 412 and 428. The success
     status is DRF's (201 for POST, 204 for DELETE, else 200), unless
     ``statuses`` lists the statuses the operation answers. A conditional
     POST gets the 400 and 412, since it is evaluated but never required to be
@@ -296,25 +560,32 @@ def describe_write(
         raise ValueError(f"not a write method: {method!r}")
     body_description, status = _WRITES[method]
     metadata: dict[str, Any] = {}
-    if body_description is not None:
-        request_body: dict[str, Any] = {
+    if body_description is not None and content:
+        metadata["requestBody"] = {
             "description": body_description,
             "required": True,
+            "content": content,
         }
-        if content:
-            request_body["content"] = content
-        metadata["requestBody"] = request_body
-    metadata["responses"] = _success_responses(statuses, status)
+    responses = metadata["responses"] = _success_responses(statuses, status)
+    if response_content:
+        for code, response in responses.items():
+            if code != "204":
+                response["content"] = copy.deepcopy(response_content)
     if conditional:
         if method == "post":
-            metadata["responses"].update(
+            responses.update(
                 {code: copy.deepcopy(WRITE_RESPONSES[code]) for code in ("400", "412")}
             )
         else:
-            metadata["responses"].update(copy.deepcopy(WRITE_RESPONSES))
+            responses.update(copy.deepcopy(WRITE_RESPONSES))
             metadata["parameters"] = conditional_header_parameters(
                 has_etag, has_last_modified
             )
+        _add_content(
+            responses,
+            [code for code in ("400", "412", "428") if code in responses],
+            error_content,
+        )
     return metadata
 
 

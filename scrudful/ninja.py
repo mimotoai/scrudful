@@ -20,7 +20,8 @@ Order of execution
 
     Exceptions raised by ``load``, the callbacks or the handler (e.g.
     ``Http404``, ``ninja.errors.HttpError``) go through ninja's exception
-    handlers, as for any operation.
+    handlers, as for any operation; the response of an ``HttpError`` or
+    ``Http404`` then gets the operation's Links (see "Error responses").
 
 Placement
     The decorator sits directly below the operation decorator. When ninja
@@ -86,8 +87,10 @@ Validators
     handler, as a ``JsonResponse`` (304 without a body), so the operation's
     ``response`` schema does not apply to them. With ``error=Entity(...)``
     the 400, 412 and 428 bodies carry that entity's Links (its link callables
-    get the loaded object); the 304 has no body and gets none, and without
-    ``error`` they carry no Link. Describe them in OpenAPI with
+    get the loaded object) and are served with its media type, which must be
+    JSON content (e.g. ``application/problem+json``); the 304 has no body and
+    gets none, and without ``error`` they carry no Link and are
+    ``application/json``. Describe them in OpenAPI with
     ``openapi_extra={"responses": CONDITIONAL_READ_RESPONSES}`` (or
     :data:`CONDITIONAL_WRITE_RESPONSES`). They are built fresh, without the
     headers and cookies of ninja's temporal response: with ninja's stock
@@ -134,6 +137,23 @@ Entities and Links
     validators, with the same consequence if it raises) when a validator
     callback is set or a value of the response's entity is callable, and not
     otherwise.
+
+Error responses
+    An ``HttpError`` (or a subclass) or ``Http404`` raised by ``load``, a
+    callback, the handler or a list's paging (the 404 of a page past the
+    last one) propagates out of the operation's function as for any
+    operation, and ninja answers it with the API's exception handler: its
+    status and body are the API's. When that response has content, it gets
+    the Links of the entity the operation's OPTIONS describes for its
+    status: ``responses[status]`` (``error`` first for scrudful's own 400,
+    412 and 428 when the operation evaluates the If-* headers), else
+    ``error``, else none. Link callables get ``None``. A response with JSON
+    content (ninja's renderer's ``application/json``) is then served as that
+    entity's media type when it is JSON content too, e.g.
+    ``application/problem+json``, as OPTIONS lists it. The errors ninja
+    answers before the operation runs (401, 422, 429, ...) and those of
+    operations without an entity for them get Links from
+    :func:`add_error_links`, the API-wide error entity.
 
 Create
     :func:`scrudful_create` decorates a POST on a collection that creates an
@@ -256,14 +276,15 @@ OPTIONS
     way gates OPTIONS too. Every automatic OPTIONS operation has the URL name
     ``scrudful_options``, so don't ``reverse()`` it.
 
-    The body is the semantic-http spec's "HTTP Schema Resource": for each of
-    ``get``, ``head`` (when an operation routes it, described like ``get``),
-    ``post``, ``put``, ``patch`` and ``delete`` that the path serves, an
-    OpenAPI-like operation, in the shape DRF's ``ScrudfulMetadata`` produces
+    The body is the semantic-http 0.1 "HTTP Schema Resource" (an OpenAPI 3.1
+    Path Item): for each method the path serves, in the order ``get``,
+    ``put``, ``post``, ``delete``, ``options``, ``head``, ``patch``,
+    ``trace``, an operation in the shape DRF's ``ScrudfulMetadata`` produces
     (``scrudful.rest_framework``), which it extends:
 
     - ``requestBody`` (POST, PUT, PATCH) with the ``content`` of the
-      ``request`` entity, else of the item entity, as in DRF;
+      ``request`` entity, else of the item entity, as in DRF; left out when
+      that entity has no schema link;
     - ``responses``: the statuses the operation answers, with their reason
       phrase: those it declares in ``response=`` (ninja's default, 200,
       without one), and 201 for a :func:`scrudful_create` operation, whose
@@ -275,26 +296,37 @@ OPTIONS
       for POST. Each status with a body gets the ``content`` of its entity:
       scrudful's own 400, 412 and 428 get ``error``'s, if declared, the
       others ``responses[status]``, else the default entity (2xx, 201 for a
-      create, the collection for a list);
+      create, the collection for a list; never for TRACE, whose content is
+      the echoed request, not the item);
     - ``parameters``: the precondition headers of a conditional write.
 
-    A ``content`` is ``{"application/json": {"schema": <url>, "context":
-    <url>}}``, with the entity's links; an entity without links (such as
-    ``Entity()``) has none. Link callables are called with the request and
-    ``obj=None`` (there is no loaded object), so they must accept ``None``;
-    the OPTIONS view is sync, so the callables of an async
-    operation are run with ``asgiref.sync.async_to_sync``, as the operation
-    runs them (ninja runs the view in a thread on a path with async
-    operations). Methods whose operation is not scrudful get no content and
-    no preconditions, as in DRF.
+    ``head`` (when an operation routes it) is described like ``get``, but
+    without ``content``: a HEAD response has none. ``options`` is this
+    operation: a 200 whose content is the HTTP Schema Resource.
 
-    The response is JSON, with the Links of the ``options_schema_link`` and
-    ``options_context_link`` of :class:`ScrudfulRouter` (the HTTP Schema
-    Resource's own schema and context). Without them it has no Link, which
-    the spec does not allow. The body follows the spec's 2019 draft, which
-    publishes no resolvable URLs for these two documents: point them at
-    copies the application serves. Alignment with the spec's 0.1 revision is
-    planned.
+    A ``content`` maps the entity's ``media_type`` to its Media Type Object:
+    ``{"schema": {"$ref": <schema URL>}}`` for a JSON Schema (the schema
+    type ``application/schema+json``, the default), else ``{"x-schema":
+    {"href": <schema URL>, "type": <schema type>}}``, and, unless the media
+    type is in-band RDF, ``"x-rdf-context": {"href": <context URL>, "type":
+    <context type>}`` when the entity has a context link. An entity without
+    a schema link (such as ``Entity()``) has no ``content``. The URLs are
+    resolved against the request's absolute URI, as those of the Links are,
+    so the body agrees with the Links of the responses it describes. Link
+    callables are called with the request and ``obj=None`` (there is no
+    loaded object), so they must accept ``None``; the OPTIONS view is sync,
+    so the callables of an async operation are run with
+    ``asgiref.sync.async_to_sync``, as the operation runs them (ninja runs
+    the view in a thread on a path with async operations). Methods whose
+    operation is not scrudful get no content, no ``requestBody`` and no
+    preconditions, as in DRF.
+
+    The response is ``application/json``, with the Links of the HTTP Schema
+    Resource's JSON Schema
+    (``https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json``,
+    ``rel="describedby"``) and JSON-LD context
+    (``https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld``),
+    and an ``Allow`` listing the body's methods in its order.
 
 The runtime response
     A handler parameter annotated :class:`ScrudfulResponse` receives a fresh
@@ -322,8 +354,17 @@ Headers
     ninja's temporal response (passed to a handler parameter annotated
     ``HttpResponse``, which the wrapper adds, hidden, when the handler has
     none). Headers the handler set itself are never overwritten, neither by
-    computed values nor by those set on ``ScrudfulResponse``. The Link header
-    is appended to any Link value the handler set.
+    computed values nor by those set on ``ScrudfulResponse``. The Links are
+    appended to any Link value the handler set, except that a handler's link
+    with the relation of the schema link (``describedby`` by default)
+    replaces that link, and one with either context relation (the JSON-LD
+    or the rdf-context one, a single slot) replaces the context link, when
+    it has one of those; an overridden relation is matched exactly.
+    Relations are compared case-insensitively; a link with another relation
+    (e.g. ``next``) replaces nothing.
+    The Link URLs are resolved against the request's absolute URI
+    (``request.build_absolute_uri()``), so a relative one such as
+    ``"/schemas/item"`` is sent absolute.
     ``Access-Control-Expose-Headers`` is extended with whichever of ``ETag``,
     ``Link`` and ``Location`` the response carries (django-cors-headers
     replaces that header when ``CORS_EXPOSE_HEADERS`` is set; list the names
@@ -358,6 +399,7 @@ import re
 import types
 import warnings
 from collections.abc import Callable, Generator, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from typing import Any, NamedTuple, TypeVar, Union, get_args, get_origin
@@ -366,9 +408,16 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from asgiref.sync import async_to_sync, sync_to_async
 from django.core.paginator import UnorderedObjectListWarning
 from django.db.models import QuerySet
-from django.http import HttpRequest, HttpResponse, HttpResponseBase, JsonResponse
+from django.http import (
+    Http404,
+    HttpRequest,
+    HttpResponse,
+    HttpResponseBase,
+    JsonResponse,
+)
 from django.utils.encoding import iri_to_uri
-from ninja import Query, Router, Schema, Status
+from ninja import NinjaAPI, Query, Router, Schema, Status
+from ninja import errors as ninja_errors
 from ninja.constants import NOT_SET
 from ninja.errors import ConfigError, HttpError
 from ninja.signature.details import is_collection_type
@@ -378,14 +427,24 @@ from pydantic import Field, create_model
 from scrudful import _adapter
 from scrudful._adapter import (
     BODY_HEADERS,
-    DEFAULT_CONTEXT_REL,
-    DEFAULT_CONTEXT_TYPE,
-    DEFAULT_SCHEMA_REL,
-    DEFAULT_SCHEMA_TYPE,
+    METHOD_KEYS,
+    SCHEMA_REL,
+    SCHEMA_TYPE,
+    allow_header,
+    check_error_media_type,
     check_validators,
+    context_defaults,
+    context_link_type,
+    describe_content,
+    describe_options,
     describe_read,
     describe_write,
+    evaluates_preconditions,
     expose_headers,
+    has_default_entity,
+    is_json,
+    merge_links,
+    options_links,
     resolve_annotation,
     resolved_signature,
     set_validator_headers,
@@ -400,7 +459,13 @@ from scrudful.conditional import (
     http_timestamp,
     quote_etag,
 )
-from scrudful.utils import join_links, link_content, merge_expose_headers
+from scrudful.entity import Entity
+from scrudful.utils import (
+    join_links,
+    link_content,
+    merge_expose_headers,
+    resolve_uri,
+)
 
 __all__ = [
     "CONDITIONAL_READ_RESPONSES",
@@ -408,6 +473,7 @@ __all__ = [
     "Entity",
     "ScrudfulResponse",
     "ScrudfulRouter",
+    "add_error_links",
     "scrudful",
     "scrudful_create",
     "scrudful_list",
@@ -441,27 +507,6 @@ _Flow = Generator[tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any]], An
 #: The argument a list operation's query parameters ``page`` and ``page_size``
 #: are passed in (pydantic rejects names with a leading underscore).
 _PAGINATION = "scrudful_pagination"
-
-
-@dataclass(frozen=True)
-class Entity:
-    """The schema and JSON-LD context of a request or response body.
-
-    Each field is a value or a callable ``func(request, obj)``, with the same
-    meaning as the ``schema_*`` and ``context_*`` arguments of
-    :func:`scrudful`: without a link, no Link is sent; rel and type default to
-    ``"describedBy"`` / ``"application/json"`` for the schema and to
-    ``"http://www.w3.org/ns/json-ld#context"`` / ``"application/ld+json"`` for
-    the context. ``obj`` is the object the operation has at that point (the
-    loaded object, or ``None``).
-    """
-
-    schema_link_or_func: Any = None
-    schema_rel_or_func: Any = None
-    schema_type_or_func: Any = None
-    context_link_or_func: Any = None
-    context_rel_or_func: Any = None
-    context_type_or_func: Any = None
 
 
 class _Unset:
@@ -533,11 +578,11 @@ class ScrudfulResponse:
 class _Config:
     """What a scrudful decorator declared, set as ``view_func._scrudful``.
 
-    The six ``schema_*`` / ``context_*`` fields are the item entity, also
-    available as :attr:`entity`: the default entity of 2xx responses but 204
-    for an item operation, of 201 responses (the created item) for a create
-    operation, and the ``link`` of each entry of a list operation's envelope,
-    whose responses get :attr:`collection`.
+    The six ``schema_*`` / ``context_*`` fields and ``media_type`` are the
+    item entity, also available as :attr:`entity`: the default entity of 2xx
+    responses but 204 for an item operation, of 201 responses (the created
+    item) for a create operation, and the ``link`` of each entry of a list
+    operation's envelope, whose responses get :attr:`collection`.
     """
 
     #: ``"item"`` (:func:`scrudful`), ``"create"`` (:func:`scrudful_create`)
@@ -557,6 +602,7 @@ class _Config:
     context_link_or_func: Any = None
     context_rel_or_func: Any = None
     context_type_or_func: Any = None
+    media_type: str = "application/json"
     #: The request body's entity (described by OPTIONS; no header).
     request: Entity | None = None
     #: The response entity of each status, overriding :attr:`entity`.
@@ -596,25 +642,29 @@ class _Config:
         """Whether the If-* headers are evaluated before the handler runs."""
         return self.kind == "item" and self.has_validators
 
-    def has_default_entity(self, status: int) -> bool:
-        """Whether a response with ``status`` gets the default entity.
+    def has_default_entity(self, method: str, status: int) -> bool:
+        """Whether a ``method`` response with ``status`` gets the default entity.
 
-        Not a 204: it has no body for the entity to describe.
+        Not a 204, which has no body for the entity to describe, nor a
+        TRACE, whose content is the echoed request (see
+        :func:`scrudful._adapter.has_default_entity`).
         """
         if self.kind == "create":
             return status == 201
-        return 200 <= status < 300 and status != 204
+        return has_default_entity(method, status)
 
     @property
     def default_entity(self) -> Entity | None:
         """The entity of the responses :meth:`has_default_entity` selects."""
         return self.collection if self.kind == "list" else self.entity
 
-    def response_entity(self, status: int) -> Entity | None:
-        """The declared entity of a response with ``status``."""
+    def response_entity(self, method: str, status: int) -> Entity | None:
+        """The declared entity of a ``method`` response with ``status``."""
         if status in self.responses:
             return self.responses[status]
-        return self.default_entity if self.has_default_entity(status) else None
+        if self.has_default_entity(method, status):
+            return self.default_entity
+        return None
 
     @property
     def has_etag(self) -> bool:
@@ -729,9 +779,9 @@ def scrudful(
         again, which it is when a validator callback is set or a value of the
         response's entity is callable.
     schema_rel_or_func : str or callable, optional
-        ``rel`` of the schema link. Defaults to ``"describedBy"``.
+        ``rel`` of the schema link. Defaults to ``"describedby"``.
     schema_type_or_func : str or callable, optional
-        ``type`` of the schema link. Defaults to ``"application/json"``.
+        ``type`` of the schema link. Defaults to ``"application/schema+json"``.
     context_link_or_func : str or callable, optional
         URL of the JSON-LD context of the response body. If no value is given,
         no context link is sent.
@@ -746,10 +796,18 @@ def scrudful(
     responses : mapping of int to Entity, optional
         The response entity of each status, in place of the default one (the
         six arguments above) for that status, e.g. ``{404: Entity(...)}`` for
-        a ``Status(404, ...)`` the handler returns.
+        a ``Status(404, ...)`` the handler returns or an ``HttpError(404)``
+        it raises.
     error : Entity, optional
         The schema and context of scrudful's own 400, 412 and 428 bodies, sent
-        as Links on them. Without it, they carry no Link.
+        as Links on them, and of the response to an ``HttpError`` or
+        ``Http404`` the operation raises, unless ``responses`` declares its
+        status (see "Error responses" in the module docstring; link
+        callables then get ``None``). Without it, they carry no Link. Its
+        ``media_type`` must be JSON content (``application/json`` or
+        ``+json``, e.g. ``application/problem+json``), since scrudful's error
+        bodies are JSON objects; they, and the JSON responses to the errors
+        the operation raises, are served with that Content-Type.
 
     Raises
     ------
@@ -762,6 +820,8 @@ def scrudful(
         ninja operation (the decorator sits above the operation decorator),
         or if the handler is sync and ``load``, a validator callback or a
         link callable (also inside an entity) is ``async def``.
+    ValueError
+        If ``error``'s media type is not JSON content.
     ninja.errors.ConfigError
         When the operation is built, if something replaced its ``view_func``
         before the decorator bound it: a ``_ninja_contribute_to_operation``
@@ -773,7 +833,7 @@ def scrudful(
     if load is not None and not callable(load):
         raise TypeError(f"load must be callable, not {type(load).__name__}")
     _check_entity("request", request)
-    _check_entity("error", error)
+    _check_error(error)
     config = _Config(
         kind="item",
         load=load,
@@ -859,9 +919,9 @@ def scrudful_create(
         :func:`scrudful`. Link callables get the created object; without
         one they are not called (see ``location_func``).
     schema_rel_or_func : str or callable, optional
-        ``rel`` of the schema link. Defaults to ``"describedBy"``.
+        ``rel`` of the schema link. Defaults to ``"describedby"``.
     schema_type_or_func : str or callable, optional
-        ``type`` of the schema link. Defaults to ``"application/json"``.
+        ``type`` of the schema link. Defaults to ``"application/schema+json"``.
     context_link_or_func : str or callable, optional
         URL of the item's JSON-LD context, sent on 201 responses.
     context_rel_or_func : str or callable, optional
@@ -875,9 +935,11 @@ def scrudful_create(
         create).
     responses : mapping of int to Entity, optional
         The response entity of each status, e.g. ``{400: Entity(...)}`` for a
-        ``Status(400, ...)`` the handler returns. ``responses[201]`` replaces
-        the item entity's Links on 201 responses. There is no ``error``
-        argument: a create produces no 400, 412 or 428 of its own.
+        ``Status(400, ...)`` the handler returns, or an ``HttpError(400)`` it
+        raises (see "Error responses" in the module docstring).
+        ``responses[201]`` replaces the item entity's Links on 201 responses.
+        There is no ``error`` argument: a create produces no 400, 412 or 428
+        of its own.
 
     Raises
     ------
@@ -999,9 +1061,9 @@ def scrudful_list(
         Link value is an entry's ``link`` (``null`` without links); link
         callables get the item.
     schema_rel_or_func : str or callable, optional
-        ``rel`` of the item schema link. Defaults to ``"describedBy"``.
+        ``rel`` of the item schema link. Defaults to ``"describedby"``.
     schema_type_or_func : str or callable, optional
-        ``type`` of the item schema link. Defaults to ``"application/json"``.
+        ``type`` of the item schema link. Defaults to ``"application/schema+json"``.
     context_link_or_func : str or callable, optional
         URL of the item's JSON-LD context.
     context_rel_or_func : str or callable, optional
@@ -1043,7 +1105,12 @@ def scrudful_list(
     error : Entity, optional
         The schema and context of scrudful's own 400 and 412 bodies (with a
         list validator set), sent as Links on them; link callables get the
-        queryset.
+        queryset. Also those of the response to an ``HttpError`` or
+        ``Http404`` the operation raises, e.g. the 404 of a page past the
+        last one; link callables then get ``None``. Its ``media_type`` must
+        be JSON content, as for :func:`scrudful`; scrudful's 400 and 412,
+        and the JSON responses to the errors the operation raises, are
+        served with it.
 
     Raises
     ------
@@ -1056,7 +1123,7 @@ def scrudful_list(
         a link callable (also inside ``error``) is ``async def``.
     ValueError
         If ``page_size`` is less than 1 or ``max_page_size`` less than
-        ``page_size``.
+        ``page_size``, or if ``error``'s media type is not JSON content.
     ninja.errors.ConfigError
         When the operation is built, if it declares no collection response
         (e.g. ``response=List[ItemOut]``), or one that is a union (e.g.
@@ -1084,7 +1151,7 @@ def scrudful_list(
             f"max_page_size ({max_page_size}) must be at least page_size "
             f"({page_size})"
         )
-    _check_entity("error", error)
+    _check_error(error)
     config = _Config(
         kind="list",
         href_func=href_func,
@@ -1134,22 +1201,12 @@ class ScrudfulRouter(Router):
     on a plain ``ninja.Router`` get no OPTIONS (ninja answers 405)::
 
         api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
-        items = ScrudfulRouter(
-            options_schema_link=(
-                "https://example.com/schemas/http-schema-resource.json"
-            ),
-            options_context_link=(
-                "https://example.com/contexts/http-schema-resource.jsonld"
-            ),
-        )
+        items = ScrudfulRouter()
         api.add_router("/items", items)
 
-    The semantic-http spec's 2019 draft, whose shape the OPTIONS body
-    follows (as DRF's ``ScrudfulMetadata``), publishes no resolvable URLs
-    for the HTTP Schema Resource's schema and context: point
-    ``options_schema_link`` and ``options_context_link`` at copies the
-    application serves (the URLs above are placeholders). Alignment with the
-    spec's 0.1 revision is planned.
+    The OPTIONS response is the semantic-http 0.1 HTTP Schema Resource, with
+    the Links of its published JSON Schema and JSON-LD context and an
+    ``Allow`` listing the methods of the body.
 
     CORS preflight requests (an OPTIONS with ``Access-Control-Request-Method``)
     are sent by browsers without credentials and are meant to be answered by
@@ -1157,32 +1214,8 @@ class ScrudfulRouter(Router):
     scrudful's OPTIONS is the other, non-preflight, case: a request that does
     reach it is answered with the description like any other OPTIONS.
 
-    Parameters
-    ----------
-    options_schema_link : str, optional
-        URL of the JSON Schema of the HTTP Schema Resource, sent as the
-        OPTIONS response's schema Link (``rel="describedBy"``,
-        ``type="application/json"``). Omitted when unset, which the
-        semantic-http spec does not allow.
-    options_context_link : str, optional
-        URL of the JSON-LD context of the HTTP Schema Resource, sent as the
-        OPTIONS response's context Link
-        (``rel="http://www.w3.org/ns/json-ld#context"``,
-        ``type="application/ld+json"``). Omitted when unset.
-
-    The other arguments are ``ninja.Router``'s.
+    It takes ``ninja.Router``'s arguments.
     """
-
-    def __init__(
-        self,
-        *args: Any,
-        options_schema_link: str | None = None,
-        options_context_link: str | None = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self.options_schema_link = options_schema_link
-        self.options_context_link = options_context_link
 
     def add_api_operation(
         self,
@@ -1207,11 +1240,94 @@ class ScrudfulRouter(Router):
             super().add_api_operation(
                 path,
                 ["OPTIONS"],
-                _options_view(self, path, path_view),
+                _options_view(path, path_view),
                 auth=None,
                 response=NOT_SET,
                 include_in_schema=False,
             )
+
+
+def add_error_links(api: NinjaAPI, error: Entity) -> None:
+    """Give the error responses of ``api``'s exception handlers ``error``'s Links.
+
+    Wraps the handlers registered, when this is called, for
+    ``ninja.errors.ValidationError`` (422), ``AuthenticationError`` (401),
+    ``AuthorizationError`` (403, when the installed ninja defines it),
+    ``Throttled`` (429), ``HttpError`` and ``django.http.Http404``: the
+    responses ninja answers before an operation runs, and the errors any
+    operation raises. Only a class with a handler of its own is wrapped;
+    one without (with ninja's defaults, the three ``HttpError`` subclasses)
+    keeps falling back to its base's handler, which is. Each wrapped handler
+    returns the response the original makes, with the same status and body,
+    and adds ``error``'s Links to it when it has content, as :func:`scrudful`
+    adds them (a Link the handler set with the relation of one of them
+    suppresses it; see :func:`scrudful._adapter.merge_links`).
+    So a custom handler registered before the call is kept, and calling this
+    again replaces the entity of the earlier call: no Link is added twice,
+    and only the latest ``error``'s link callables run. A handler registered
+    after the call replaces the wrapped one, for its class and the
+    subclasses without a handler of their own (e.g. a later ``HttpError``
+    handler answers the 401, 403 and 429 too, without Links): call this
+    after registering your handlers.
+
+    A response with JSON content (an ``application/json`` or ``+json``
+    Content-Type, as ninja's renderer gives) is served as
+    ``error.media_type``, whatever the handler chose, so the JSON bodies of
+    every wrapped handler must be content that ``error`` describes. Other
+    content keeps its Content-Type.
+
+    An error raised inside a scrudful operation gets that operation's
+    entity for the status, if it has one (``responses[status]``, else its
+    ``error``), and its media type: it describes the response, as the
+    OPTIONS of the operation does, and ``error`` here applies only otherwise.
+
+    Not covered: ninja's 405 for a method no operation of the path routes,
+    which no exception handler makes, Django's own 404 for an unknown URL
+    and Django's 500 page.
+
+    Parameters
+    ----------
+    api : NinjaAPI
+        The API whose exception handlers are wrapped.
+    error : Entity
+        The schema, context and media type of the error bodies. Its link
+        callables are called with the request and ``obj=None``. ninja's
+        exception handlers are sync, also in an async operation, where they
+        run on the event loop: the callables must be sync, and must not use
+        the Django ORM there.
+
+    Raises
+    ------
+    TypeError
+        If ``api`` isn't a ``NinjaAPI``, ``error`` isn't an :class:`Entity`
+        or one of its values is an ``async def`` callable.
+    ValueError
+        If ``error``'s media type is not JSON content (``application/json``
+        or ``+json``, other than JSON-LD).
+    """
+    if not isinstance(api, NinjaAPI):
+        raise TypeError(f"api must be a NinjaAPI, not {type(api).__name__}")
+    if not isinstance(error, Entity):
+        raise TypeError(f"error must be an Entity, not {type(error).__name__}")
+    check_error_media_type(error.media_type)
+    for entity_field in fields(Entity):
+        if _is_async_callable(getattr(error, entity_field.name)):
+            raise TypeError(
+                f"error.{entity_field.name} is async, but ninja's exception "
+                "handlers are sync"
+            )
+    # Only the classes with a handler of their own: the others (with ninja's
+    # defaults, AuthenticationError, AuthorizationError and Throttled) fall
+    # back to their base's through the MRO, as ninja's
+    # ``_lookup_exception_handler`` does, and so to the wrapped one, or to
+    # one the app registers for the base later.
+    handlers = api._exception_handlers
+    for exc_class in _ERROR_CLASSES:
+        if exc_class in handlers:
+            handler = handlers[exc_class]
+            # Calling this again replaces the earlier entity.
+            handler = getattr(handler, "_scrudful_error_handler", handler)
+            api.add_exception_handler(exc_class, _error_handler(handler, error))
 
 
 def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
@@ -1267,7 +1383,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 obj = yield load, (request,), params
                 values[load_as] = obj
 
-            if config.evaluates_preconditions:
+            if config.evaluates_preconditions and evaluates_preconditions(method):
                 etag, last_modified = yield from _item_validators(config, obj)
                 result = evaluate_preconditions(
                     method,
@@ -1297,7 +1413,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 # The queryset is the authorized object: the collection's
                 # preconditions are evaluated now, then the page is built.
                 obj = _body(content)
-                if config.has_list_validators:
+                if config.has_list_validators and evaluates_preconditions(method):
                     list_etag, list_last_modified = yield from _validators(
                         config.list_etag_func, config.list_last_modified_func, obj
                     )
@@ -1358,7 +1474,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 ):
                     entity = config.entity
             else:
-                entity = config.response_entity(status)
+                entity = config.response_entity(method, status)
             if config.kind == "list":
                 # None unless the collection's validators were computed.
                 if validator_policy(method, status)[1]:
@@ -1385,13 +1501,21 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
 
                 @functools.wraps(handler)
                 async def wrapper(request: HttpRequest, **values: Any) -> Any:
-                    return await _run_async(flow(request, values, answers))
+                    try:
+                        return await _run_async(flow(request, values, answers))
+                    except (HttpError, Http404):
+                        _note_raised(config)
+                        raise
 
             else:
 
                 @functools.wraps(handler)
                 def wrapper(request: HttpRequest, **values: Any) -> Any:
-                    return _run_sync(flow(request, values, answers))
+                    try:
+                        return _run_sync(flow(request, values, answers))
+                    except (HttpError, Http404):
+                        _note_raised(config)
+                        raise
 
             wrapper.__signature__ = hidden.signature  # type: ignore[attr-defined]
             wrapper._scrudful = config  # type: ignore[attr-defined]
@@ -1435,6 +1559,15 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             operation.view_func = bind(
                 _Answers(_declared_status(operation), collection)
             )
+            # The Links of an error the wrapper raises go on the response of
+            # the API's exception handler, which ``Operation.run`` returns. It
+            # is wrapped as ``decorate_view`` wraps it, so that ninja's clones
+            # of the operation (one per mount) wrap theirs too.
+            run_decorator = _raised_links_run(asynchronous)
+            if not hasattr(operation, "_run_decorators"):
+                operation._run_decorators = []  # type: ignore[attr-defined]
+            operation.run = run_decorator(operation.run)  # type: ignore[method-assign]
+            operation._run_decorators.append(run_decorator)
 
         # Registered with ninja, which replaces it in each operation by the
         # wrapper :func:`bind_operation` binds (called directly, it declares
@@ -1465,11 +1598,14 @@ def _early_response(
     """scrudful's own response to a failed or short-circuited precondition.
 
     The 400, 412 and 428 bodies get the Links of ``config.error``, whose link
-    callables get ``obj``.
+    callables get ``obj``, and its media type as their Content-Type.
     """
-    early = conditional_response(result)
-    if result.body is not None and config.error is not None:
-        yield from _add_links(early, config.error, request, obj)
+    error = config.error
+    early = conditional_response(
+        result, content_type=None if error is None else error.media_type
+    )
+    if result.body is not None and error is not None:
+        yield from _add_links(early, error, request, obj)
         expose_headers(early)
     return early
 
@@ -1494,6 +1630,167 @@ def _keep_handler_headers(early: HttpResponseBase, temporal: HttpResponse) -> No
                 early[name] = value
     early.cookies.update(temporal.cookies)
     expose_headers(early)
+
+
+# --- Raised errors -------------------------------------------------------------
+
+#: The exceptions whose handlers :func:`add_error_links` wraps.
+_ERROR_CLASSES: tuple[type[Exception], ...] = tuple(
+    exc_class
+    for exc_class in (
+        ninja_errors.ValidationError,
+        ninja_errors.AuthenticationError,
+        getattr(ninja_errors, "AuthorizationError", None),
+        ninja_errors.Throttled,
+        HttpError,
+        Http404,
+    )
+    if exc_class is not None
+)
+
+
+@dataclass(eq=False, slots=True)
+class _Raised:
+    """What the scrudful operation running ``Operation.run`` raised."""
+
+    #: The operation's, once its wrapper raised an ``HttpError`` or
+    #: ``Http404``.
+    config: _Config | None = None
+
+
+#: Set by :func:`_raised_links_run` while ``Operation.run`` runs. A mutable
+#: holder, so the wrapper's note reaches it from a copied context too.
+_RAISED: ContextVar[_Raised | None] = ContextVar("scrudful_raised", default=None)
+
+
+def _note_raised(config: _Config) -> None:
+    """Note that the operation of ``config`` raised the error being handled."""
+    raised = _RAISED.get()
+    if raised is not None:
+        raised.config = config
+
+
+def _raised_links_run(
+    asynchronous: bool,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """The ``Operation.run`` decorator adding the Links of a raised error.
+
+    The exception propagates out of the wrapper as before (through the
+    decorators added with ``add_decorator(mode="operation")``, e.g. one
+    rolling a transaction back), and ninja answers it with the API's
+    exception handler. The response ``run`` returns then gets the Links of
+    the operation's entity for its status, see :func:`_raised_entity`.
+    """
+
+    def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
+        if asynchronous:
+
+            @functools.wraps(run)
+            async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
+                raised = _Raised()
+                token = _RAISED.set(raised)
+                try:
+                    response = await run(request, *args, **kw)
+                finally:
+                    _RAISED.reset(token)
+                if raised.config is not None:
+                    await _run_async(_raised_links(raised.config, request, response))
+                return response
+
+        else:
+
+            @functools.wraps(run)
+            def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
+                raised = _Raised()
+                token = _RAISED.set(raised)
+                try:
+                    response = run(request, *args, **kw)
+                finally:
+                    _RAISED.reset(token)
+                if raised.config is not None:
+                    _run_sync(_raised_links(raised.config, request, response))
+                return response
+
+        return scrudful_run
+
+    return decorator
+
+
+def _raised_links(
+    config: _Config, request: HttpRequest, response: HttpResponseBase
+) -> _Flow[None]:
+    """Add the Links of an error the operation raised to ``response``.
+
+    ``response`` is the API's answer to it; when it has content, it gets
+    the entity :func:`_raised_entity` picks for its status, whose link
+    callables get ``None``, and its media type (see :func:`_error_links`).
+    """
+    if not _carries_body(response):
+        return
+    entity = _raised_entity(config, request.method.lower(), response.status_code)
+    if entity is not None:
+        yield from _error_links(response, entity, request)
+
+
+def _raised_entity(config: _Config, method: str, status: int) -> Entity | None:
+    """The entity of the response to an error the operation raised.
+
+    The one the operation's OPTIONS describes for ``status`` (see
+    :func:`_described_entity`: ``responses[status]``, but ``error`` first
+    for scrudful's own early statuses), else ``error``. None below 400: an
+    operation decorator turned the error into another response, which is
+    its own to describe (a link callable of the default entity would get
+    ``None``, not the object).
+    """
+    if status < 400:
+        return None
+    entity = _described_entity(config, method, status, _is_conditional(config, method))
+    return config.error if entity is None else entity
+
+
+def _error_handler(
+    handler: Callable[[HttpRequest, Exception], HttpResponseBase], error: Entity
+) -> Callable[[HttpRequest, Exception], HttpResponseBase]:
+    """``handler``, an exception handler of the API, adding ``error``'s Links."""
+
+    @functools.wraps(handler)
+    def scrudful_handler(request: HttpRequest, exc: Exception) -> HttpResponseBase:
+        response = handler(request, exc)
+        raised = _RAISED.get()
+        if (
+            raised is not None
+            and raised.config is not None
+            and _raised_entity(
+                raised.config, request.method.lower(), response.status_code
+            )
+            is not None
+        ):
+            # A scrudful operation raised it: its entity describes the
+            # response, and :func:`_raised_links_run` adds it.
+            return response
+        if _carries_body(response):
+            _run_sync(_error_links(response, error, request))
+        return response
+
+    scrudful_handler._scrudful_error_handler = handler  # type: ignore[attr-defined]
+    return scrudful_handler
+
+
+def _error_links(
+    response: HttpResponseBase, entity: Entity, request: HttpRequest
+) -> _Flow[None]:
+    """Give the error ``response`` the Links and media type of ``entity``.
+
+    Its link callables get ``None``. A response with JSON content, as
+    ninja's renderer makes, is served as ``entity.media_type`` when that is
+    JSON content too (an ``error`` entity's always is), so that it agrees
+    with the OPTIONS body; other content keeps its Content-Type.
+    """
+    yield from _add_links(response, entity, request, None)
+    content_type = response.get("Content-Type")
+    if content_type and is_json(content_type) and is_json(entity.media_type):
+        response["Content-Type"] = entity.media_type
+    expose_headers(response)
 
 
 class _CollectionResponse(NamedTuple):
@@ -1864,6 +2161,13 @@ def _check_entity(name: str, entity: Any) -> None:
         raise TypeError(f"{name} must be an Entity, not {type(entity).__name__}")
 
 
+def _check_error(error: Any) -> None:
+    """:func:`_check_entity` for ``error``, whose media type must be JSON."""
+    _check_entity("error", error)
+    if error is not None:
+        check_error_media_type(error.media_type)
+
+
 def _entities_by_status(
     responses: Mapping[int, Entity] | None,
 ) -> Mapping[int, Entity]:
@@ -1916,15 +2220,29 @@ def _has_callables(entity: Entity | None) -> bool:
 def _add_links(
     headers: HttpResponseBase, entity: Entity, request: HttpRequest, obj: Any
 ) -> _Flow[None]:
-    """Append the Links of ``entity`` to the Link header of ``headers``."""
-    links = yield from _links(entity, request, obj)
-    link = join_links(headers.get("Link"), links)
+    """Append the Links of ``entity`` to the Link header of ``headers``.
+
+    A Link the handler set with the relation of the schema link replaces
+    that link, and one with either context relation (JSON-LD or
+    ``rdf-context``, one slot) the context link; one with another relation
+    (e.g. ``next``) replaces nothing (see
+    :func:`scrudful._adapter.merge_links`).
+    """
+    schema, context = yield from _entity_links(entity, request, obj)
+    link = merge_links(headers.get("Link"), schema, context)
     if link is not None:
         headers["Link"] = link
 
 
 def _links(entity: Entity, request: HttpRequest, obj: Any) -> _Flow[str | None]:
     """The Link field value of the schema and context links of ``entity``."""
+    return join_links(*(yield from _entity_links(entity, request, obj)))
+
+
+def _entity_links(
+    entity: Entity, request: HttpRequest, obj: Any
+) -> _Flow[tuple[str | None, str | None]]:
+    """The schema and the context link-values of ``entity`` (``None`` if unset)."""
     schema = yield from _link(
         request,
         obj,
@@ -1933,41 +2251,58 @@ def _links(entity: Entity, request: HttpRequest, obj: Any) -> _Flow[str | None]:
             entity.schema_rel_or_func,
             entity.schema_type_or_func,
         ),
-        (DEFAULT_SCHEMA_REL, DEFAULT_SCHEMA_TYPE),
+        (SCHEMA_REL, SCHEMA_TYPE),
     )
-    context = yield from _link(
-        request,
-        obj,
-        (
-            entity.context_link_or_func,
-            entity.context_rel_or_func,
-            entity.context_type_or_func,
-        ),
-        (DEFAULT_CONTEXT_REL, DEFAULT_CONTEXT_TYPE),
-    )
-    return join_links(schema, context)
+    context = None
+    defaults = context_defaults(entity.media_type)
+    if defaults != (None, None):
+        context = yield from _link(
+            request,
+            obj,
+            (
+                entity.context_link_or_func,
+                entity.context_rel_or_func,
+                entity.context_type_or_func,
+            ),
+            defaults,
+            context_of=entity.media_type,
+        )
+    return schema, context
+
+
+def _value(value_or_func: Any, request: HttpRequest, obj: Any) -> _Flow[Any]:
+    """``value_or_func``, or what it returns when called with ``(request, obj)``."""
+    if callable(value_or_func):
+        return (yield value_or_func, (request, obj), {})
+    return value_or_func
 
 
 def _link(
     request: HttpRequest,
     obj: Any,
     values_or_funcs: tuple[Any, Any, Any],
-    defaults: tuple[str, str],
+    defaults: tuple[str | None, str | None],
+    context_of: str | None = None,
 ) -> _Flow[str | None]:
-    """Build one link-value from (url, rel, type) values or callables."""
+    """Build one link-value from (url, rel, type) values or callables.
 
-    def value(value_or_func: Any) -> _Flow[Any]:
-        if callable(value_or_func):
-            return (yield value_or_func, (request, obj), {})
-        return value_or_func
-
+    The URL is resolved against the request's absolute URI, as in the OPTIONS
+    body (see :func:`_media`). The context link of ``context_of`` content
+    takes its type from :func:`scrudful._adapter.context_link_type`, as the
+    OPTIONS body does.
+    """
     url_or_func, rel_or_func, type_or_func = values_or_funcs
-    url = yield from value(url_or_func)
+    url = yield from _value(url_or_func, request, obj)
     if not url:
         return None
-    rel = (yield from value(rel_or_func)) or defaults[0]
-    content_type = (yield from value(type_or_func)) or defaults[1]
-    return link_content(url, rel, content_type)
+    rel = (yield from _value(rel_or_func, request, obj)) or defaults[0]
+    content_type = yield from _value(type_or_func, request, obj)
+    if context_of is not None:
+        content_type = context_link_type(context_of, content_type)
+    content_type = content_type or defaults[1]
+    return link_content(
+        resolve_uri(url, request.build_absolute_uri()), rel, content_type
+    )
 
 
 def _has_status(content: Any) -> bool:
@@ -2079,9 +2414,6 @@ def _wrapper_signature(
 
 # --- OPTIONS -------------------------------------------------------------------
 
-#: The methods an OPTIONS body describes, in this order, when the path serves
-#: them.
-_DESCRIBED_METHODS = ("get", "head", "post", "put", "patch", "delete")
 #: The statuses of scrudful's own responses with a body (``error``'s entity).
 _EARLY_STATUSES = frozenset({400, 412, 428})
 
@@ -2103,9 +2435,7 @@ def _path_view(router: Router, view_func: Callable[..., Any]) -> Any:
     raise LookupError(f"{view_func!r} is not an operation of {router!r}")
 
 
-def _options_view(
-    router: ScrudfulRouter, path: str, path_view: Any
-) -> Callable[..., HttpResponseBase]:
+def _options_view(path: str, path_view: Any) -> Callable[..., HttpResponseBase]:
     """The view of the automatic OPTIONS operation of ``path``.
 
     It reads ``path_view``, the router's own (template) ``PathView``, when a
@@ -2113,22 +2443,15 @@ def _options_view(
     whichever API, prefix or mount the request came through (ninja serves
     clones of them). It declares the path parameters, as ``Any`` (a
     converter such as ``{int:pk}`` passes an ``int``), so that ninja passes
-    them and validates nothing.
+    them and validates nothing. The response carries the HTTP Schema
+    Resource's own Links and an ``Allow`` listing the body's methods.
     """
 
     def scrudful_options(request: HttpRequest, **params: Any) -> HttpResponseBase:
         body = _describe_path(request, path_view)
         response = JsonResponse(body)
-        link = join_links(
-            _options_link(
-                router.options_schema_link, DEFAULT_SCHEMA_REL, DEFAULT_SCHEMA_TYPE
-            ),
-            _options_link(
-                router.options_context_link, DEFAULT_CONTEXT_REL, DEFAULT_CONTEXT_TYPE
-            ),
-        )
-        if link is not None:
-            response["Link"] = link
+        response["Link"] = options_links()
+        response["Allow"] = allow_header(body)
         expose_headers(response)
         return response
 
@@ -2146,19 +2469,22 @@ def _options_view(
     return scrudful_options
 
 
-def _options_link(url: str | None, rel: str, content_type: str) -> str | None:
-    return link_content(url, rel, content_type) if url else None
-
-
 def _describe_path(request: HttpRequest, path_view: Any) -> dict[str, Any]:
-    """The HTTP Schema Resource of the path: each method it serves."""
+    """The HTTP Schema Resource of the path: each method it serves.
+
+    In the order of :data:`~scrudful._adapter.METHOD_KEYS`, ``options`` (this
+    operation) among them, so ``Allow`` follows it too.
+    """
     operations = [
         operation
         for operation in path_view.operations
         if not _is_automatic_options(operation)
     ]
     body = {}
-    for method in _DESCRIBED_METHODS:
+    for method in METHOD_KEYS:
+        if method == "options":
+            body[method] = describe_options()
+            continue
         # The operation ninja routes the method to: the first that lists it.
         operation = next(
             (op for op in operations if method.upper() in op.methods), None
@@ -2183,23 +2509,21 @@ def _describe_operation(
     The description of :func:`scrudful._adapter.describe_read` /
     :func:`~scrudful._adapter.describe_write` (DRF's), with the statuses the
     operation answers (see :func:`_answered_statuses`) and the response
-    content of each status's entity. Link callables are called with
-    ``(request, None)``.
+    content of each status's entity, but for HEAD, whose responses have no
+    content. Link callables are called with ``(request, None)``.
     """
     config = getattr(operation.view_func, "_scrudful", None)
     if not isinstance(config, _Config):
         config = None
     read = method in ("get", "head")
-    # Whether the If-* headers are evaluated: a list's (after the handler,
-    # never required) only matter for GET/HEAD; a create never evaluates them.
-    conditional = config is not None and (
-        read and config.has_list_validators
-        if config.kind == "list"
-        else config.evaluates_preconditions
-    )
+    conditional = config is not None and _is_conditional(config, method)
     statuses = _answered_statuses(operation, config)
     if read:
         description = describe_read(None, conditional, statuses)
+    elif method == "trace":
+        # Neither a read nor one of the writes: its statuses only, without
+        # scrudful's early responses or a request body.
+        description = describe_read(None, False, statuses)
     else:
         content = None
         if config is not None and method != "delete":
@@ -2216,15 +2540,26 @@ def _describe_operation(
         )
 
     responses = description["responses"]
-    if config is not None:
+    if config is not None and method != "head":
         for key, response in responses.items():
             if key in ("204", "304"):
                 continue  # no content
-            entity = _described_entity(config, int(key), conditional)
+            entity = _described_entity(config, method, int(key), conditional)
             content = yield from _media(entity, request)
             if content:
                 response["content"] = content
     return description
+
+
+def _is_conditional(config: _Config, method: str) -> bool:
+    """Whether the operation evaluates the If-* headers for ``method``.
+
+    A list's (after the handler, never required) only matter for GET/HEAD; a
+    create never evaluates them. ``method`` is lowercase.
+    """
+    if config.kind == "list":
+        return method in ("get", "head") and config.has_list_validators
+    return config.evaluates_preconditions and evaluates_preconditions(method.upper())
 
 
 def _answered_statuses(operation: Any, config: _Config | None) -> list[int]:
@@ -2243,8 +2578,10 @@ def _answered_statuses(operation: Any, config: _Config | None) -> list[int]:
     return declared or [200]
 
 
-def _described_entity(config: _Config, status: int, conditional: bool) -> Any:
-    """The entity of the responses with ``status``, for OPTIONS.
+def _described_entity(
+    config: _Config, method: str, status: int, conditional: bool
+) -> Any:
+    """The entity of the ``method`` responses with ``status``, for OPTIONS.
 
     scrudful's own early responses (listed when ``conditional``) get the
     ``error`` entity, if declared; the others the declared entity.
@@ -2253,25 +2590,37 @@ def _described_entity(config: _Config, status: int, conditional: bool) -> Any:
         return (
             config.error if config.error is not None else config.responses.get(status)
         )
-    return config.response_entity(status)
+    return config.response_entity(method, status)
 
 
 def _media(entity: Entity | None, request: HttpRequest) -> _Flow[Any]:
-    """The ``content`` of ``entity``: ``{"application/json": {...}}``, or ``None``.
+    """The ``content`` of ``entity``: its Media Type Object, or ``None``.
 
-    The values are the schema and context URLs (as DRF's metadata has them);
-    an entity without links (e.g. ``Entity()``) has none.
+    Built by :func:`scrudful._adapter.describe_content` from the entity's
+    schema and context URLs and types, which are evaluated as for its Links
+    (the context only when its media type takes one), and with the URLs
+    resolved the same way, so that the entry agrees with the Links of the
+    responses it describes. ``None`` without a schema URL (e.g. ``Entity()``).
     """
     if entity is None:
         return None
-    links = {}
-    for key, value_or_func in (
-        ("schema", entity.schema_link_or_func),
-        ("context", entity.context_link_or_func),
-    ):
-        value = value_or_func
-        if callable(value_or_func):
-            value = yield value_or_func, (request, None), {}
-        if value:
-            links[key] = str(value)
-    return {"application/json": links} if links else None
+    schema = yield from _value(entity.schema_link_or_func, request, None)
+    if not schema:
+        return None
+    schema_type = yield from _value(entity.schema_type_or_func, request, None)
+    context = context_type = None
+    rel, default_type = context_defaults(entity.media_type)
+    if rel is not None:  # not in-band RDF
+        context = yield from _value(entity.context_link_or_func, request, None)
+    if context:
+        context_type = (
+            yield from _value(entity.context_type_or_func, request, None)
+        ) or default_type
+    base = request.build_absolute_uri()
+    return describe_content(
+        entity.media_type,
+        resolve_uri(schema, base),
+        str(schema_type or SCHEMA_TYPE),
+        resolve_uri(context, base) if context else None,
+        None if context_type is None else str(context_type),
+    )

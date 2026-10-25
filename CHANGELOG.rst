@@ -2,6 +2,143 @@
 Changelog
 =========
 
+0.5.0 (since 0.4.0)
+===================
+
+Semantic HTTP 0.1 (breaking)
+----------------------------
+
+All three adapters now follow `Semantic HTTP 0.1
+<https://w3id.org/semantic-http/0.1/>`_ (#4). Responses and OPTIONS bodies
+change, so clients and tests that compare them must be updated.
+
+* The schema Link defaults changed: ``rel="describedby"`` (was ``describedBy``)
+  and ``type="application/schema+json"`` (was ``application/json``). The
+  context Link keeps ``rel="http://www.w3.org/ns/json-ld#context"`` and
+  ``type="application/ld+json"``. ``DEFAULT_SCHEMA_REL`` and the other
+  ``DEFAULT_*`` names remain. Overriding the schema ``rel`` makes the
+  response's Link no longer a Schema Link Header, while the OPTIONS body still
+  describes it as the schema: use the default to stay conformant.
+* OPTIONS (DRF's ``ScrudfulMetadata``, ``ScrudfulRouter``, FastAPI's
+  ``add_options``) answers the 0.1 HTTP Schema Resource, in place of the 2019
+  draft shape. The ``content`` of a request or response is a Media Type Object
+  (``schema`` ``$ref``, ``x-schema`` for a schema that is not JSON Schema, and
+  ``x-rdf-context`` for a non-in-band media type). The body has an ``options``
+  entry and a content-less ``head`` entry where HEAD is served. ``Allow`` lists
+  exactly the body's methods, and the response is ``application/json`` with the
+  two published HTTP Schema Resource Links (also for DRF's browsable API).
+  The body's keys follow the order ``get``, ``put``, ``post``, ``delete``,
+  ``options``, ``head``, ``patch``, ``trace``, and a write's ``requestBody`` is
+  omitted when it has no content (it was an entry without ``content``).
+* DRF: ``scrudful_viewset``, ``scrudful_api_view`` and now a ``@scrudful``
+  method in a class body replace a class's stock ``APIView.options`` (an
+  ``options`` the class defines is kept), as well as DRF's stock
+  ``SimpleMetadata``; a ``@scrudful`` method of a mixin does so on each
+  ``APIView`` subclassing the mixin. So an ``APIView`` with ``@scrudful``
+  methods answers OPTIONS with the HTTP Schema Resource; a plain
+  ``@api_view`` + ``@scrudful`` function view does not, and the errors it
+  raises get no error Links through ``exception_handler`` (use
+  ``scrudful_api_view``, which gives them both).
+* DRF: a PATCH that DRF's stock ``partial_update`` serves through an explicit
+  ``@scrudful`` ``update`` is described in OPTIONS as that ``update``
+  (conditional, with its content and error responses), and
+  ``exception_handler`` gives its errors that ``update``'s ``error`` Links.
+* DRF: ``scrudful_api_view`` keeps a ``metadata_class`` set on the function
+  (a custom class, or ``None``) on DRF 3.15.0 too, whose ``api_view`` doesn't
+  copy it onto the view class.
+* DRF: ``exception_handler`` gives an error that no scrudful handler answers
+  (one raised while answering OPTIONS, a 405, one raised by a handler that
+  isn't scrudful) the view-wide error entity: the ``error`` the view's
+  scrudful handlers share; when they have different ones, the GET
+  handler's, else the first in method order (a 405 got the first allowed
+  handler's before). An error raised by a non-scrudful handler is served
+  with that entity's Links and media type.
+* DRF: scrudful's own 400, 412 and 428 with an ``error`` entity, and the
+  ``exception_handler`` responses of views with one, bypass DRF's content
+  negotiation, so the browsable API gets JSON for them. The view's first JSON
+  renderer renders them (DRF's ``JSONRenderer`` if it has none). The
+  browsable API's HTML responses are not conformant: drop
+  ``BrowsableAPIRenderer`` for full conformance.
+* Removed ``options_schema_link`` and ``options_context_link`` from
+  ``ScrudfulRouter``: the OPTIONS Links are the fixed w3id.org 0.1 URLs.
+* Every Link header target scrudful sends and every URI in the OPTIONS document
+  is absolute: relative link values are resolved against the request. A
+  ``Location`` (from ``location_func`` or ``ScrudfulResponse.location``, which
+  RFC 9110 allows to be relative) and a list entry's ``href`` (from
+  ``href_func``) are sent as given: return absolute ones from those callables
+  if you want them. Links are de-duplicated: a Link that the view set itself
+  with the relation of scrudful's schema link (``describedby`` by default, or
+  an overridden ``schema_rel_or_func``'s) suppresses that link; one with either
+  context relation (JSON-LD or ``rdf-context``, a single slot) suppresses
+  scrudful's context link of either, and an overridden context relation is
+  matched exactly. Relations are compared case-insensitively, and a Link of
+  another relation suppresses nothing.
+* ``Entity`` moved to ``scrudful.entity`` (still importable from the three
+  adapters) and gained ``media_type``, which decides the context Link's
+  defaults (none for in-band RDF media types, ``rdf-context`` for other
+  non-JSON ones). For other non-JSON content a ``context_type_or_func``
+  callable must return a type: one that returns nothing raises
+  ``ValueError`` on the Links as in OPTIONS, rather than send a context Link
+  without a type.
+* DRF and FastAPI: the view's (endpoint's) schema and context Links go only
+  on a 2xx response other than 204 that it returns, as in django-ninja. A
+  204, a redirect, or an error the view returns gets no Links from scrudful
+  (a Link it set itself is kept), instead of the success entity's: raise
+  errors, rather than return them, to give them the error entity's Links. A
+  FastAPI route whose ``status_code`` is not such a 2xx is described without
+  content in OPTIONS.
+* TRACE, OPTIONS and CONNECT ignore the ``If-*`` headers in every adapter
+  (RFC 9110 §13.2.1): a decorated TRACE with validators no longer answers
+  412 (or 304, 400, 428), its validator callbacks are not called, and its
+  response gets no ``ETag`` or ``Last-Modified``, as its OPTIONS entry,
+  without those statuses, says.
+* No adapter gives a TRACE response the default (item) entity's Links, and
+  django-ninja's OPTIONS no longer describes a TRACE with that content: a
+  TRACE's content is the echoed request. An entity declared for the status
+  (ninja's ``responses={200: Entity(...)}``) still applies.
+* Error entities: ``error=`` for DRF (``Meta.error`` / ``Meta.list_error``)
+  and FastAPI, as ninja already had. An ``error`` entity's ``media_type`` must
+  be JSON content (``application/json`` or ``+json``, other than JSON-LD);
+  every error response that carries an error entity's Links is served with
+  ``Content-Type`` equal to its ``media_type``: scrudful's own 400, 412 and
+  428 (all adapters), the responses of DRF's ``exception_handler`` and of both
+  ``add_error_links`` helpers, and the errors raised inside a ninja scrudful
+  operation (with the entity OPTIONS describes for their status). DRF's
+  OPTIONS calls the ``error`` entity's callables only for the methods whose
+  description has its content.
+* New helpers that give the errors a framework answers itself the error
+  entity's Links: ``add_error_links(api, error)`` for django-ninja and
+  ``add_error_links(app, error)`` for FastAPI, and
+  ``scrudful.rest_framework.exception_handler`` (named as DRF's
+  ``EXCEPTION_HANDLER``; a project handler delegating to it carries its
+  ``scrudful_error_links = True`` marker, e.g. through
+  ``functools.wraps(exception_handler)``, for OPTIONS to describe the
+  serializer's 400). Errors raised inside a ninja scrudful operation get
+  the Links of the entity OPTIONS describes for their status. Calling an
+  ``add_error_links`` again replaces the entity of the earlier call.
+* FastAPI: ``add_options(app)`` answers OPTIONS on every URL a scrudful
+  endpoint serves. A callable used outside the endpoint (by ``add_options``
+  and ``add_error_links``) gets only the URL's path parameters that the
+  endpoint takes (not those of an ``include_router`` prefix it doesn't
+  declare) plus the request under the name of the endpoint's ``Request``
+  parameter; the helpers check
+  every such callable when called and raise ``TypeError`` for one that can't
+  be called that way. ``add_options`` leaves mounted apps and middleware
+  Mounts and Routers to themselves, and ``add_error_links`` covers the
+  endpoints under middleware Mounts but not mounted apps: those need their own
+  calls. The FastAPI adapter has no request entity: a request body is
+  described with the endpoint's response links.
+* The ninja example (``examples/ninja``) calls ``add_error_links`` and serves
+  HEAD on the list; all three examples are tested against the 0.1 rules.
+* The DRF example (``examples/scrudful_rest_framework``) renders and parses
+  JSON only (no browsable API, no form bodies, which OPTIONS can't describe),
+  its callbacks accept ``**kwargs`` (the router's format-suffix routes pass
+  ``format``), and its link callables return ``django.urls.reverse`` paths,
+  so ``?format=`` stays out of the link targets. The README's DRF snippet
+  does the same.
+* The documentation has a "Semantic HTTP conformance" section, builds without
+  warnings, and documents ``Entity`` once.
+
 0.4.0 (since 0.3.0)
 ===================
 

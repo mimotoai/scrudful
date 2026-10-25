@@ -8,15 +8,192 @@ viewsets, ``APIView`` methods and function views. Install it with
 function view. See :doc:`usage` for the behaviour table, the caveats of
 ``scrudful_viewset`` and the concurrency note.
 
-OPTIONS requests are answered by ``ScrudfulMetadata`` only when the view's
-``metadata_class`` is DRF's default ``SimpleMetadata``. A custom class, ``None``,
-or a project-wide ``DEFAULT_METADATA_CLASS`` is kept, so subclass or mix in
-``ScrudfulMetadata`` if you use your own metadata class and want scrudful's
-OPTIONS output.
+OPTIONS requests are answered with a Semantic HTTP 0.1 HTTP Schema Resource
+(``Content-Type: application/json``, the two published HTTP Schema Resource
+Links and an ``Allow`` listing the body's methods) by ``ScrudfulMetadata``, but
+only when the view's ``metadata_class`` is DRF's default ``SimpleMetadata``. A
+custom class, ``None``, or a project-wide ``DEFAULT_METADATA_CLASS`` is kept,
+so subclass or mix in ``ScrudfulMetadata`` if you use your own metadata class
+and want scrudful's OPTIONS output.
+
+``scrudful_viewset``, ``scrudful_api_view`` and a ``@scrudful`` method in the
+body of an ``APIView`` (or viewset) class install it. So does one in the body
+of a mixin: each ``APIView`` subclassing the mixin
+(``class ItemView(ItemMixin, APIView)``) gets it when it is created, by the
+same rules (scrudful chains the mixin's ``__init_subclass__`` to do so). A
+``metadata_class`` or ``options`` that the view, or a class between it and
+the mixin, sets is kept.
+
+A function view with ``@scrudful`` below a plain ``@api_view`` is SCRUDful,
+but there is no class to install it on when ``@scrudful`` runs: it keeps DRF's
+``SimpleMetadata`` and gets no HTTP Schema Resource. Nor can
+``exception_handler`` find its ``error`` entity (the view's methods are
+``api_view``'s own), so the errors it raises (a serializer's 400, a
+``NotFound``) get no error Links: only scrudful's own 400, 412 and 428 carry
+them. Use ``scrudful_api_view`` in place of ``@api_view`` + ``@scrudful``:
+
+.. code-block:: python
+
+    # OPTIONS: DRF's SimpleMetadata, no HTTP Schema Resource; raised errors
+    # get no error Links.
+    @api_view(["GET", "PUT"])
+    @scrudful(etag_func=item_etag, error=ERROR)
+    def item(request, pk): ...
+
+
+    # OPTIONS: the HTTP Schema Resource; raised errors get ERROR's Links.
+    @scrudful_api_view(["GET", "PUT"], etag_func=item_etag, error=ERROR)
+    def item(request, pk): ...
+
+(The callbacks of the first get ``(request, **url_kwargs)``, those of the
+second ``(view, request, **url_kwargs)``.)
+
+A view that uses ``ScrudfulMetadata`` only through ``DEFAULT_METADATA_CLASS``,
+without scrudful decorators, gets DRF's ``Allow`` order, which differs from the
+body's.
+
+The view's schema and context links describe its success content: they go on
+a 2xx response other than 204 that the view returns, and on no other (nor on
+a TRACE's, whose content is the echoed request). A 204 (a DELETE's), a
+redirect, or an error the view *returns* (``Response(serializer.errors,
+status=400)``, a 404 ``Response``) gets no Links from scrudful; a ``Link``
+the view set on it is kept as is. To give an error the error entity's Links,
+*raise* it (``serializers.ValidationError``, ``NotFound``, ...) and install
+``exception_handler`` (below).
+
+Errors DRF raises
+-----------------
+
+An ``error`` entity gives scrudful's own 400, 412 and 428 its Links. The errors
+DRF itself raises (a serializer's 400, the 404 of ``get_object()``, a 405, a 401
+or 403) need ``exception_handler``, which settings must name::
+
+    REST_FRAMEWORK = {
+        "EXCEPTION_HANDLER": "scrudful.rest_framework.exception_handler",
+    }
+
+It calls DRF's handler and, for a view whose handler for the request has an
+``error`` entity, adds that entity's Links and serves the response with the
+entity's media type, whatever the request's ``Accept``. The entity is the
+view's: DRF has no app-wide error entity, so give each view's handlers
+``error=``. An error with no scrudful handler of its own (one raised while
+answering OPTIONS, such as a 403 or an unsupported ``?format=``, the 405 for a
+method the view doesn't serve, or an error a handler that isn't scrudful
+raises) gets the view-wide entity: the ``error`` the view's scrudful handlers
+share. When they have different ones (a viewset list route whose
+``Meta.list_error`` differs from ``Meta.error``, say), it gets the GET
+handler's, else the first one in the order ``get``, ``put``, ``post``,
+``delete``, ``options``, ``head``, ``patch``, ``trace``. The HTTP Schema
+Resource lists none of these errors, so any error entity of the view describes
+them. Entities are compared by equality, their callables by identity: give the
+handlers one ``Entity`` object (or equal ones with the same callables) for them
+to share it.
+
+The HTTP Schema Resource lists a PUT, PATCH or POST 400 under the error
+entity's media type (conditional or not) only when the view's exception handler
+is this one, which it knows by the handler's ``scrudful_error_links = True``
+attribute. A project handler that delegates to scrudful's must carry it too:
+set ``handler.scrudful_error_links = True``, or use
+``functools.wraps(exception_handler)``, which copies it:
+
+.. code-block:: python
+
+    import functools
+
+    from scrudful.rest_framework import exception_handler
+
+
+    @functools.wraps(exception_handler)
+    def logging_exception_handler(exc, context):
+        logger.info("error: %r", exc)
+        return exception_handler(exc, context)
+
+Without the marker, such a handler's 400 still carries the error Links, but the
+HTTP Schema Resource doesn't list it. Without the setting, or without an
+``error`` entity, such errors are DRF's own, with no Link. The HTTP Schema
+Resource doesn't list 404 and 405, so they have no entry to agree with. The
+example project (``examples/scrudful_rest_framework``) is conformant on the
+wire: its tests check every response against the Semantic HTTP 0.1 rules.
+
+The responses served as the error entity's media type (scrudful's own 400,
+412 and 428, and this handler's) bypass DRF's content negotiation: the first
+of the view's ``renderer_classes`` with a JSON media type (``application/json``
+or ``+json``) renders them, so a project's own JSON renderer (camel-case keys,
+orjson ...) formats them as it formats the rest, and DRF's ``JSONRenderer``
+does when the view has none.
+
+Callbacks
+---------
+
+Every callback gets ``(view, request, **url_kwargs)``: every URL kwarg, among
+them DRF's ``format`` on the format-suffix routes a router adds
+(``/items/1.json``). Accept ``**kwargs`` (``def item_etag(view, request, pk,
+**kwargs)``), or ``/items/1.json`` answers 500.
+
+For a schema or context URL, return a path from ``django.urls.reverse(name,
+kwargs=...)``: scrudful makes it absolute against the request. DRF's
+``reverse(..., request=request)`` keeps the request's ``?format=`` in the URL,
+so the linked document would answer 404.
+
+The browsable API and form bodies
+---------------------------------
+
+DRF's browsable API is not conformant: a ``GET`` with ``Accept: text/html``
+gets an HTML page carrying the Links of the JSON content (the JSON schema and
+the JSON-LD context relation), which do not describe HTML. OPTIONS and the
+error responses above are JSON whatever the ``Accept``, but the other
+responses follow DRF's content negotiation. For full conformance, drop
+``BrowsableAPIRenderer`` from ``DEFAULT_RENDERER_CLASSES`` (or from the view's
+``renderer_classes``):
+
+.. code-block:: python
+
+    REST_FRAMEWORK = {
+        "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+        "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
+        "EXCEPTION_HANDLER": "scrudful.rest_framework.exception_handler",
+    }
+
+An ``Accept`` none of the view's renderers serves then gets DRF's 406, for
+OPTIONS too.
+
+DRF's default parsers also accept ``application/x-www-form-urlencoded`` and
+``multipart/form-data`` request bodies, which the HTTP Schema Resource doesn't
+list: it describes JSON bodies only, and no lifting to RDF covers form data.
+For conformance, set ``DEFAULT_PARSER_CLASSES`` (as above) or the view's
+``parser_classes`` to ``JSONParser`` only; another body then gets DRF's 415. The
+example project does both.
 
 An explicit ``@scrudful`` on ``update`` also applies to PATCH when
-``partial_update`` is DRF's stock ``UpdateModelMixin.partial_update``.
+``partial_update`` is DRF's stock ``UpdateModelMixin.partial_update``, which
+calls ``update``: the OPTIONS body describes PATCH as that ``update``, and
+``exception_handler`` gives a PATCH's errors its ``error`` Links. A
+``partial_update`` of your own is described, and handled, only as itself.
+
+On DRF's generic views (``GenericAPIView``, ``RetrieveUpdateAPIView`` ...) the
+stock ``get``, ``put`` and ``patch`` delegate to ``retrieve``, ``update`` and
+``partial_update``. A ``@scrudful`` on ``update`` there is evaluated on the
+wire (a PUT without ``If-Match`` gets the 428), but OPTIONS looks at the HTTP
+method handlers and describes ``put`` and ``patch`` as bare 200s. Decorate the
+HTTP method handlers (``get``, ``put``, ``patch`` ...) of a generic view, or
+use a viewset with ``scrudful_viewset``.
+
+.. note::
+
+   The schema Link's default relation is ``describedby``, which Semantic HTTP
+   0.1 requires of a Schema Link Header. Overriding it
+   (``schema_rel_or_func="profile"``) makes the response's Link no longer a
+   Schema Link Header, while the OPTIONS body still describes that schema as
+   the response's schema: the API is then not conformant. Use the default.
+
+Set ``error=`` on every conditional decorator (or ``Meta.error`` /
+``Meta.list_error``) so that scrudful's 400, 412 and 428 carry the error
+entity's Links and are served as JSON with its ``media_type``, which must be
+JSON content (``application/json`` or ``+json``, other than JSON-LD).
+``exception_handler`` does not cover them: scrudful returns them, it does not
+raise them.
 
 .. automodule:: scrudful.rest_framework
    :members:
    :member-order: bysource
+   :exclude-members: Entity

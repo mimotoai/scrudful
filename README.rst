@@ -12,8 +12,9 @@ A decorated view or endpoint:
   ``If-Unmodified-Since`` as specified by RFC 9110 section 13, answering 304,
   400, 412 or 428 without calling your code when appropriate;
 * sets ``ETag`` and ``Last-Modified`` on the responses that should carry them;
-* adds ``Link`` headers pointing at the JSON schema and the JSON-LD context of
-  the response body (RFC 8288);
+* adds ``Link`` headers pointing at the JSON schema (``rel="describedby"``) and
+  the JSON-LD context of the response body (RFC 8288), as Semantic HTTP 0.1
+  asks, and answers ``OPTIONS`` with the 0.1 HTTP Schema Resource;
 * exposes ``ETag``, ``Link`` and ``Location`` to browsers through
   ``Access-Control-Expose-Headers``.
 
@@ -69,6 +70,11 @@ Rules worth knowing:
   when ``etag_func`` or ``last_modified_func`` is configured. Without them a
   decorated view behaves like an undecorated one, apart from the ``Link`` and
   expose headers.
+* **TRACE, OPTIONS and CONNECT ignore preconditions.** Their response is not
+  a representation of the target resource (a TRACE echoes the request), so
+  the ``If-*`` headers are not evaluated, the validator callbacks are not
+  called for them and the response gets no ``ETag`` or ``Last-Modified``
+  (RFC 9110 §13.2.1). Their OPTIONS entry lists no 304, 400, 412 or 428.
 * **Invalid dates are ignored.** An invalid ``If-Modified-Since`` or
   ``If-Unmodified-Since`` is treated as absent, so a lone invalid
   ``If-Unmodified-Since`` on a write is answered with 428.
@@ -103,9 +109,26 @@ Rules worth knowing:
   discarded. A *naive* datetime is taken to be UTC by the FastAPI adapter and
   to be in ``settings.TIME_ZONE`` by the DRF and django-ninja adapters (the
   same thing when ``TIME_ZONE`` is ``"UTC"``). Prefer aware datetimes.
-* **Link headers.** The schema and context links are added to every response
-  your view returns and are appended to any ``Link`` value it set. Each ``*_or_func``
-  argument is a value or a callable.
+* **Link headers.** The schema and context links are added to every success
+  response with content (a 2xx other than 204; never a TRACE, whose content
+  is the echoed request) your view returns, and are appended to any ``Link``
+  value it set. Another response your view returns (an error, a 204, a
+  redirect) gets no Links from scrudful, unless an entity is declared for
+  that status (django-ninja's ``responses=`` or ``ScrudfulResponse.entity``);
+  a ``Link`` it set itself is kept as is. *Raise* errors, rather than return
+  them, to have them carry the error entity's Links (see "Semantic HTTP
+  conformance"). Each
+  ``*_or_func`` argument is a value or a callable. The schema link defaults to
+  ``rel="describedby"`` and ``type="application/schema+json"``, the context
+  link to ``rel="http://www.w3.org/ns/json-ld#context"`` and
+  ``type="application/ld+json"``. Relative values are resolved to absolute URIs
+  against the request, and a Link that your view set itself with the relation
+  of scrudful's schema link suppresses that link: ``describedby`` with the
+  defaults, ``profile`` with ``schema_rel_or_func="profile"``. The JSON-LD
+  context and ``rdf-context`` relations are one slot (a response has at most
+  one RDF Context Link Header): your Link with either suppresses scrudful's
+  context Link of either. An overridden context relation is matched exactly.
+  Relations are compared case-insensitively, each of a multi-relation ``rel``.
 
 Concurrency
 -----------
@@ -130,14 +153,15 @@ Starlette's ``CORSMiddleware``, ``CORS_EXPOSE_HEADERS`` for django-cors-headers.
 Django REST Framework
 =====================
 
-Callbacks are called as ``func(view, request, **url_kwargs)``. ``@scrudful_viewset``
-reads its configuration from an inner ``Meta`` class (``list_*`` options
-configure the list response):
+Callbacks are called as ``func(view, request, **url_kwargs)``, with every URL
+kwarg, DRF's ``format`` among them on the format-suffix routes a router adds:
+accept ``**kwargs``. ``@scrudful_viewset`` reads its configuration from an inner
+``Meta`` class (``list_*`` options configure the list response):
 
 .. code-block:: python
 
+    from django.urls import reverse
     from rest_framework import viewsets
-    from rest_framework.reverse import reverse
 
     from scrudful.rest_framework import scrudful_viewset
 
@@ -146,19 +170,21 @@ configure the list response):
 
 
     # The callbacks run before the view's lookup: use its queryset.
-    def item_etag(view, request, pk):
+    def item_etag(view, request, pk, **kwargs):
         items = view.get_queryset().filter(pk=pk)
         version = items.values_list("version", flat=True).first()
         return None if version is None else f"v{version}"
 
 
-    def item_last_modified(view, request, pk):
+    def item_last_modified(view, request, pk, **kwargs):
         items = view.get_queryset().filter(pk=pk)
         return items.values_list("updated_at", flat=True).first()
 
 
+    # A path: scrudful makes it absolute. DRF's reverse(..., request=request)
+    # would keep the request's ?format= in it.
     def item_schema_url(view, request, **kwargs):
-        return reverse("item-schema", request=request)
+        return reverse("item-schema")
 
 
     @scrudful_viewset
@@ -172,12 +198,20 @@ configure the list response):
             schema_link_or_func = item_schema_url
             schema_type_or_func = "application/schema+json"
 
-For single methods use ``@scrudful(...)`` on a view method or function view
-(below ``@api_view``), and ``@scrudful_api_view(["GET", "PUT"], ...)`` as a
-replacement for ``@api_view``. OPTIONS requests are answered with an
-OpenAPI-like description of the methods the route serves
-(``ScrudfulMetadata``). See ``examples/scrudful_rest_framework`` for a complete
-project.
+For single methods use ``@scrudful(...)`` on a method of an ``APIView`` or
+viewset, and ``@scrudful_api_view(["GET", "PUT"], ...)`` for a function view,
+in place of ``@api_view``. OPTIONS requests are answered with the Semantic HTTP
+0.1 HTTP Schema Resource of the methods the route serves (``ScrudfulMetadata``)
+by ``scrudful_viewset`` viewsets, by classes with a ``@scrudful`` method and by
+``scrudful_api_view`` views. ``@scrudful`` below a plain ``@api_view`` also
+makes the function view SCRUDful, but there is no class to install
+``ScrudfulMetadata`` on when it runs: that view keeps DRF's ``SimpleMetadata``
+and gets no HTTP Schema Resource, and the errors it raises get no error Links
+(only scrudful's own 400, 412 and 428 do), so use ``scrudful_api_view``
+instead. Set ``error=`` (or ``Meta.error``) and name
+``scrudful.rest_framework.exception_handler`` as DRF's ``EXCEPTION_HANDLER`` so
+that the errors DRF raises itself for those views carry the error entity's
+Links too. See ``examples/scrudful_rest_framework`` for a complete project.
 
 Caveats of ``scrudful_viewset``:
 
@@ -185,13 +219,15 @@ Caveats of ``scrudful_viewset``:
   list route, where there is no ``pk``. Accept ``**kwargs``, as
   ``item_schema_url`` does above.
 * An explicit ``@scrudful`` on ``update`` applies to PATCH when
-  ``partial_update`` is DRF's stock one (decorate a subclass of a decorated
+  ``partial_update`` is DRF's stock one, in OPTIONS and for the errors
+  ``exception_handler`` answers too (decorate a subclass of a decorated
   viewset with ``scrudful_viewset`` too, or it inherits the parent's wrapper).
   With a user-defined ``partial_update`` that calls ``update``, the
   ``Meta``-configured wrapper of ``partial_update`` wins: decorate
   ``partial_update`` explicitly to override it.
 * OPTIONS uses ``ScrudfulMetadata`` only when the viewset's ``metadata_class``
-  is DRF's default ``SimpleMetadata``. A custom ``metadata_class`` (or ``None``,
+  is DRF's default ``SimpleMetadata`` (so does an ``APIView`` with a
+  ``@scrudful`` method). A custom ``metadata_class`` (or ``None``,
   or a project-wide ``DEFAULT_METADATA_CLASS``) is kept; subclass
   ``ScrudfulMetadata`` to get its output with your own additions.
 * Methods the class does not have are not added (a read-only viewset answers
@@ -268,8 +304,16 @@ Notes:
   (GET/HEAD) or ``CONDITIONAL_WRITE_RESPONSES`` (PUT/PATCH/DELETE) to the route's
   ``responses=`` to document them in OpenAPI; merge them with your own:
   ``responses={**CONDITIONAL_READ_RESPONSES, 404: {...}}``.
-* FastAPI answers 405 to HEAD on a route declared with ``@app.get``. Use
-  ``@app.api_route(path, methods=["GET", "HEAD"])`` to serve HEAD.
+* FastAPI answers 405 to HEAD on a route declared with ``@app.get``. Stack
+  ``@app.head(path)`` with ``@app.get(path)`` above ``@scrudful(...)`` (the
+  example does), or use ``@app.api_route(path, methods=["GET", "HEAD"])``;
+  newer FastAPI versions warn about the duplicate operation id of the latter.
+* ``add_error_links(app, ERROR)`` gives the errors FastAPI and Starlette answer
+  (422, 404, 405, ``HTTPException``) the error entity's Links, and
+  ``add_options(app)`` answers ``OPTIONS`` on every scrudful URL with its HTTP
+  Schema Resource. Call both once the routes are declared. FastAPI request
+  bodies are described there with the endpoint's response links: the adapter
+  has no request entity.
 * To have a link callback build absolute URLs, declare a ``request: Request``
   parameter on the endpoint (``request.url_for(...)``).
 
@@ -296,7 +340,9 @@ and so does the handler. It does not need Django REST Framework.
     from scrudful.ninja import (
         CONDITIONAL_READ_RESPONSES,
         CONDITIONAL_WRITE_RESPONSES,
+        Entity,
         ScrudfulRouter,
+        add_error_links,
         scrudful,
         scrudful_create,
         scrudful_list,
@@ -305,6 +351,9 @@ and so does the handler. It does not need Django REST Framework.
     api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
     roles = ScrudfulRouter()  # adds OPTIONS to every path with a scrudful operation
     api.add_router("/roles", roles)
+    ERROR = Entity(schema_link_or_func="/schemas/error",
+                   context_link_or_func="/contexts/error")
+    add_error_links(api, ERROR)  # the 422, 401, ... get the error entity's Links
 
 
     def authorized_role(request, pk: int, **params):
@@ -320,8 +369,8 @@ and so does the handler. It does not need Django REST Framework.
     )
 
 
-    @roles.get("/{int:pk}", response=RoleOut,
-               openapi_extra={"responses": CONDITIONAL_READ_RESPONSES})
+    @roles.api_operation(["GET", "HEAD"], "/{int:pk}", response=RoleOut,
+                         openapi_extra={"responses": CONDITIONAL_READ_RESPONSES})
     @scrudful(load=authorized_role, **ROLE)
     def get_role(request, pk: int, obj: Role):
         return obj
@@ -357,10 +406,12 @@ Notes:
   to choose; the docs show the four patterns.
 * Use ``ScrudfulRouter`` (and ``NinjaAPI(default_router=ScrudfulRouter(...))``
   for operations on the API itself): it answers OPTIONS with the
-  semantic-http "HTTP Schema Resource", the same for every client, without
+  Semantic HTTP 0.1 "HTTP Schema Resource", the same for every client, without
   ``auth``. Scrudful operations on a plain ``Router`` get no OPTIONS.
 * ``Entity(...)`` declares request and per-status response entities and the
-  ``error`` entity whose Links scrudful's 400, 412 and 428 bodies carry; a
+  ``error`` entity whose Links scrudful's 400, 412 and 428 bodies carry
+  (``add_error_links(api, ERROR)`` gives the errors ninja answers itself,
+  the 422 and 401 for example, the same Links); a
   handler parameter annotated ``ScrudfulResponse`` sets the status,
   ``Location``, validators or Links of one response.
 * ``async def`` handlers are supported; sync callables then run through
@@ -370,6 +421,92 @@ Notes:
 
 See ``examples/ninja`` for a complete project, and the documentation's
 django-ninja page for the details.
+
+Semantic HTTP conformance
+=========================
+
+scrudful follows `Semantic HTTP 0.1 <https://w3id.org/semantic-http/0.1/>`_
+(issue #4) in all three adapters. By default it guarantees that:
+
+* every response scrudful makes with content has a schema Link
+  (``rel="describedby"``, ``type="application/schema+json"``) and, for a
+  non-in-band media type, a context Link, and that every ``HEAD`` carries the
+  Links of the ``GET``;
+* Link header targets and every URI in the OPTIONS document are absolute,
+  link relations are de-duplicated, and a ``Link`` your view set with the
+  same relation is kept instead of scrudful's. A ``Location`` (which may be
+  relative) and a list entry's ``href`` are the application's, sent as given:
+  return absolute ones from ``location_func`` / ``href_func`` if you want
+  them;
+* ``OPTIONS`` answers 200 with the 0.1 HTTP Schema Resource as
+  ``application/json``, the published HTTP Schema Resource Links, an ``Allow``
+  listing exactly the body's methods and an ``options`` entry (plus a
+  content-less ``head`` entry where HEAD is served);
+* scrudful's own 400, 412 and 428 carry the Links of the ``error`` entity you
+  pass, and are served with its ``media_type``, which must be JSON content
+  (``application/json`` or ``+json``, other than JSON-LD). The same holds for
+  every JSON error response that gets an error entity's Links (from the
+  error-links helpers below, or raised inside a ninja scrudful operation): it
+  is served with that entity's ``media_type``.
+
+The application must still:
+
+* **Install the error-links helper:** ``add_error_links(api, ERROR)`` for
+  django-ninja and FastAPI, so the errors the framework answers (422, 401,
+  404, 405, ...) carry Links. For DRF, name ``exception_handler`` as
+  ``EXCEPTION_HANDLER``: it adds the view's ``error`` Links to the errors DRF
+  raises, per view, for the views whose scrudful handler has an ``error``
+  (DRF has no app-wide error entity).
+* **Raise errors, don't return them:** a 4xx or 5xx your view returns gets
+  no Links from scrudful (the view's links describe its 2xx content only),
+  unless an entity is declared for that status (django-ninja's
+  ``responses=`` or ``ScrudfulResponse.entity``); one it raises goes through
+  the error-links helper.
+* **Give every conditional decorator** ``error=`` (``Meta.error`` and
+  ``Meta.list_error`` for a DRF viewset): the helpers cover the errors the
+  framework raises, not scrudful's own 400, 412 and 428, which carry Links
+  only from the decorator's ``error``.
+* **Install the OPTIONS helper in FastAPI:** ``add_options(app)``.
+* **Use** ``scrudful_api_view`` **for DRF function views:** a plain
+  ``@api_view`` with ``@scrudful`` keeps DRF's OPTIONS, which is no HTTP
+  Schema Resource, and ``exception_handler`` can't find its ``error``: the
+  errors it raises get no Links, only scrudful's own 400, 412 and 428 do.
+* **Decorate the HTTP method handlers of a DRF generic view** (``get``,
+  ``put``, ``patch`` ...), or use a viewset with ``scrudful_viewset``: a
+  ``@scrudful`` ``update`` behind the stock ``put`` of a
+  ``RetrieveUpdateAPIView`` is evaluated, but OPTIONS describes ``put`` and
+  ``patch`` as bare 200s.
+* **Accept JSON request bodies only (DRF):** DRF's default parsers also take
+  form and multipart bodies, which the HTTP Schema Resource doesn't list (no
+  lifting to RDF covers form data). Set ``DEFAULT_PARSER_CLASSES`` (or the
+  view's ``parser_classes``) to ``JSONParser`` only, as the example does.
+* **Leave the browsable API out (DRF):** its HTML responses (``Accept:
+  text/html``) carry the Links of the JSON content, so they are not
+  conformant. For full conformance, drop ``BrowsableAPIRenderer`` from
+  ``DEFAULT_RENDERER_CLASSES`` (or the view's ``renderer_classes``), as the
+  example does. An OPTIONS with ``Accept: text/html`` then gets DRF's 406, an
+  error carrying the error Links, not an HTTP Schema Resource.
+* **Give every entity a schema and a context** (only a schema for in-band
+  types such as JSON-LD or Turtle). The spec requires the context of JSON
+  content to be a JSON-LD 1.1 context. Keep the default ``describedby``
+  relation: another one is no Schema Link Header while the OPTIONS body still
+  describes it as the schema.
+* **Serve the linked documents:** scrudful sends the URLs, not the documents.
+* **Make item contexts map every member** of the item schema, so the item is
+  RDF, and the collection context the envelope.
+* **Handle 5xx pages and URLs no route serves** (Django's 404 and 500 pages, a
+  ninja 405 for an unrouted method): no exception handler of the framework
+  reaches them, so give them Links in a handler or middleware of your own.
+* **Expose the headers to browsers:** list ``OPTIONS`` in the CORS middleware's
+  ``Access-Control-Allow-Methods`` and ``Link`` in its expose list
+  (``expose_headers``, ``CORS_EXPOSE_HEADERS``).
+* **Answer CORS preflights with the CORS middleware.** On a plain ninja
+  ``Router``, or behind ``add_decorator`` permission or throttle gates,
+  scrudful's ``OPTIONS`` never sees the preflight (nor does it, in FastAPI,
+  under a ``Mount`` or ``Router`` with ``middleware``).
+
+The three example projects (``examples/``) are conformant: their tests check
+every response against the rules above.
 
 Development
 ===========

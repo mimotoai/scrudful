@@ -17,7 +17,7 @@ from ninja.testing import TestAsyncClient, TestClient
 from referencing import Registry, Resource
 
 from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS, collection_schema
-from scrudful.ninja import Entity, scrudful, scrudful_list
+from scrudful.ninja import Entity, ScrudfulRouter, scrudful, scrudful_list
 from tests.test_ninja_adapter import (
     ALICE,
     CONTEXT_LINK,
@@ -37,8 +37,9 @@ LIST_LINKS = dict(
     list_context_link_or_func="/contexts/items",
 )
 LIST_LINK = (
-    '</schemas/items>; rel="describedBy"; type="application/json", '
-    '</contexts/items>; rel="http://www.w3.org/ns/json-ld#context"; '
+    '<http://testlocation/schemas/items>; rel="describedby"; '
+    'type="application/schema+json", '
+    '<http://testlocation/contexts/items>; rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
 )
 # ninja's TestClient builds absolute URIs without the path.
@@ -266,7 +267,8 @@ def test_list_link_callables_get_queryset_and_item(items):
 
     response = TestClient(router).get("/items")
     assert response.headers["Link"] == (
-        '</schemas/items>; rel="describedBy"; type="application/json"'
+        '<http://testlocation/schemas/items>; rel="describedby"; '
+        'type="application/schema+json"'
     )
     assert [kind for kind, _ in seen] == ["item", "item", "item", "list"]
     assert [obj for kind, obj in seen if kind == "item"] == items
@@ -302,6 +304,33 @@ def test_list_validators_304(items):
     response = client.get("/items", headers={"If-Match": '"n2"'})
     assert response.status_code == 412
     assert "Link" not in response.headers
+
+
+def test_list_trace_ignores_preconditions(items):
+    """A TRACE's content is no representation of the collection."""
+    router = ScrudfulRouter()
+    calls = []
+
+    def list_etag(qs):
+        calls.append("etag")
+        return "n3"
+
+    @router.api_operation(["GET", "TRACE"], "/items", response=list[ItemOut])
+    @scrudful_list(href_func=href, list_etag_func=list_etag, **LIST_LINKS)
+    def list_items(request):
+        return Item.objects.all()
+
+    client = TestClient(router)
+    for headers in ({"If-Match": '"nope"'}, {"If-None-Match": '"n3"'}, {}):
+        response = client.request("TRACE", "/items", headers=headers)
+        assert response.status_code == 200, headers
+        assert "ETag" not in response.headers
+        assert "Last-Modified" not in response.headers
+    assert calls == []
+    assert client.get("/items", headers={"If-Match": '"nope"'}).status_code == 412
+    body = client.request("OPTIONS", "/items").json()
+    assert set(body["trace"]["responses"]) == {"200"}
+    assert "412" in body["get"]["responses"]
 
 
 def test_list_early_responses_keep_handler_headers(items):
@@ -662,7 +691,8 @@ def test_async_list_async_per_item_callable(db, hops):
     assert response.status_code == 200
     assert [entry["etag"] for entry in response.json()["content"]] == ['"a1"'] * 3
     assert [entry["link"] for entry in response.json()["content"]] == [
-        f'</schemas/item/{item.pk}>; rel="describedBy"; type="application/json"'
+        f'<http://testlocation/schemas/item/{item.pk}>; rel="describedby"; '
+        'type="application/schema+json"'
         for item in items
     ]
     # The slice, then href_func and the link callable of each item.

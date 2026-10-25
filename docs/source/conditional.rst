@@ -11,3 +11,12 @@ adapter for another framework.
 
 .. automodule:: scrudful.utils
    :members:
+
+Entity
+------
+
+:class:`~scrudful.entity.Entity` is shared by the three adapters, which
+re-export it (``from scrudful.ninja import Entity``).
+
+.. automodule:: scrudful.entity
+   :members:

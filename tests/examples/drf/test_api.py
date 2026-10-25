@@ -15,6 +15,13 @@ from items.models import Item
 from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient
 
+from scrudful._adapter import allow_header, describe_options, options_links
+from tests.semantic_http import (
+    link_problems,
+    parse_links,
+    validate_http_schema_resource,
+)
+
 pytestmark = pytest.mark.django_db
 
 BASE = "http://testserver"
@@ -24,7 +31,7 @@ MODIFIED = datetime(2024, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)
 MODIFIED_HTTP = "Tue, 02 Jan 2024 03:04:05 GMT"
 EARLIER_HTTP = "Tue, 02 Jan 2024 03:04:04 GMT"
 SCHEMA_LINK = (
-    f'<{BASE}/schemas/item.json>; rel="describedBy"; type="application/schema+json"'
+    f'<{BASE}/schemas/item.json>; rel="describedby"; type="application/schema+json"'
 )
 CONTEXT_LINK = (
     f'<{BASE}/contexts/item.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; '
@@ -36,6 +43,15 @@ PRECONDITION_REQUIRED = {
     "accepted-precondition-headers": ["If-Match", "If-Unmodified-Since"],
 }
 PRECONDITION_FAILED = {"detail": "Precondition failed."}
+ITEM_CONTENT = {
+    "application/json": {
+        "schema": {"$ref": f"{BASE}/schemas/item.json"},
+        "x-rdf-context": {
+            "href": f"{BASE}/contexts/item.jsonld",
+            "type": "application/ld+json",
+        },
+    }
+}
 
 
 @pytest.fixture
@@ -246,7 +262,8 @@ def test_delete_with_if_match(client, item):
     assert response.status_code == 204
     assert "ETag" not in response
     assert "Last-Modified" not in response
-    assert response["Link"] == LINKS
+    # A 204 has no content for the item's Links to describe.
+    assert "Link" not in response
     assert not Item.objects.filter(pk=item.pk).exists()
 
 
@@ -391,8 +408,13 @@ def test_list_has_a_collection_etag(client, item):
     assert [entry["name"] for entry in response.json()] == ["One"]
     etag = response["ETag"]
     assert "Last-Modified" not in response
-    assert "Link" not in response
-    assert response["Access-Control-Expose-Headers"] == "ETag"
+    assert response["Link"] == (
+        f'<{BASE}/schemas/items.json>; rel="describedby"; '
+        'type="application/schema+json", '
+        f'<{BASE}/contexts/item.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; '
+        'type="application/ld+json"'
+    )
+    assert response["Access-Control-Expose-Headers"] == "ETag, Link"
     assert client.get("/items/", headers={"If-None-Match": etag}).status_code == 304
 
     client.post("/items/", {"name": "Two"}, format="json")
@@ -418,7 +440,7 @@ def test_readonly_viewset_reads(client, item):
     response = client.get(f"/readonly-items/{item.pk}/")
     assert response.status_code == 200
     assert response["ETag"] == '"v1"'
-    assert response["Link"] == SCHEMA_LINK
+    assert response["Link"] == LINKS
     etag = client.get("/readonly-items/")["ETag"]
     response = client.get("/readonly-items/", headers={"If-None-Match": etag})
     assert response.status_code == 304
@@ -441,8 +463,10 @@ def test_readonly_viewset_rejects_writes_with_405(client, item, method, path):
 
 
 def test_readonly_viewset_options_lists_only_get(client, item):
-    assert set(client.options(f"/readonly-items/{item.pk}/").json()) == {"get"}
-    assert set(client.options("/readonly-items/").json()) == {"get"}
+    for path_ in (f"/readonly-items/{item.pk}/", "/readonly-items/"):
+        body = client.options(path_).json()
+        validate_http_schema_resource(body)
+        assert list(body) == ["get", "options", "head"]
 
 
 # --- OPTIONS metadata ---------------------------------------------------------
@@ -452,20 +476,16 @@ def test_options_describes_the_detail_route(client, item):
     response = client.options(detail(item))
     assert response.status_code == 200
     metadata = response.json()
-    assert set(metadata) == {"get", "put", "patch", "delete"}
-    content = {
-        "application/json": {
-            "schema": f"{BASE}/schemas/item.json",
-            "context": f"{BASE}/contexts/item.jsonld",
-        }
-    }
+    validate_http_schema_resource(metadata)
+    assert list(metadata) == ["get", "put", "delete", "options", "head", "patch"]
     assert metadata["get"]["responses"]["200"] == {
         "description": "OK",
-        "content": content,
+        "content": ITEM_CONTENT,
     }
     assert set(metadata["get"]["responses"]) == {"200", "304", "400", "412"}
+    assert set(metadata["head"]["responses"]) == {"200", "304", "400", "412"}
     for method in ("put", "patch"):
-        assert metadata[method]["requestBody"]["content"] == content
+        assert metadata[method]["requestBody"]["content"] == ITEM_CONTENT
         assert set(metadata[method]["responses"]) == {"200", "400", "412", "428"}
     assert metadata["put"]["requestBody"]["description"] == (
         "The new content of the resource."
@@ -483,13 +503,46 @@ def test_options_describes_the_detail_route(client, item):
 
 def test_options_describes_the_list_route(client):
     metadata = client.options("/items/").json()
-    assert set(metadata) == {"get", "post"}
+    validate_http_schema_resource(metadata)
+    assert list(metadata) == ["get", "post", "options", "head"]
     assert metadata["post"]["requestBody"]["description"] == (
         "The content for the resource to be created."
     )
-    assert set(metadata["post"]["responses"]) == {"201"}
+    assert set(metadata["post"]["responses"]) == {"201", "400"}
     assert "parameters" not in metadata["post"]
     assert set(metadata["get"]["responses"]) == {"200", "304", "400", "412"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/items/{pk}/", "/items/", "/readonly-items/{pk}/", "/readonly-items/", "/stats/"],
+)
+def test_options_valid_0_1(client, item, path):
+    path = path.format(pk=item.pk)
+    response = client.options(path)
+    assert response.status_code == 200
+    assert response["Content-Type"] == "application/json"
+    body = response.json()
+    validate_http_schema_resource(body)
+    assert response["Link"] == options_links()
+    assert response["Allow"] == allow_header(body)
+    assert body["options"] == describe_options()
+    # The body lists exactly the methods the route serves, HEAD included.
+    assert ("head" in body) == (client.head(path).status_code != 405)
+    assert "head" in body
+    assert link_problems("OPTIONS", 200, dict(response.items()), True, body) == []
+
+
+def test_options_write_response_content(client, item):
+    metadata = client.options(detail(item)).json()
+    validate_http_schema_resource(metadata)
+    for method in ("put", "patch"):
+        assert metadata[method]["requestBody"]["content"] == ITEM_CONTENT
+        assert metadata[method]["responses"]["200"]["content"] == ITEM_CONTENT
+    listing = client.options("/items/").json()
+    validate_http_schema_resource(listing)
+    assert listing["post"]["requestBody"]["content"] == ITEM_CONTENT
+    assert listing["post"]["responses"]["201"]["content"] == ITEM_CONTENT
 
 
 # --- Function view ------------------------------------------------------------
@@ -503,4 +556,160 @@ def test_stats_function_view(client, item):
     assert etag == client.get("/items/")["ETag"]
     assert client.get("/stats/", headers={"If-None-Match": etag}).status_code == 304
     assert client.post("/stats/").status_code == 405
-    assert set(client.options("/stats/").json()) == {"get"}
+    body = client.options("/stats/").json()
+    validate_http_schema_resource(body)
+    assert list(body) == ["get", "options", "head"]
+
+
+# --- Conformance of every response (Semantic HTTP 0.1) ------------------------
+
+ITEM = "/items/{pk}/"
+LIST = "/items/"
+READONLY = "/readonly-items/{pk}/"
+READONLY_LIST = "/readonly-items/"
+STATS = "/stats/"
+IF_MATCH_STALE = {"If-Match": '"v0"'}
+IF_MATCH = {"If-Match": '"v1"'}
+NOT_MODIFIED = {"If-None-Match": "*"}
+MALFORMED = {"If-Match": "v1"}
+BODY = {"data": {"name": "Two"}, "format": "json"}
+INVALID = {"data": {}, "format": "json"}
+
+# (method, path, request arguments, status).
+CONFORMANCE = [
+    ("get", ITEM, {}, 200),
+    ("get", ITEM, {"headers": NOT_MODIFIED}, 304),
+    ("get", ITEM, {"headers": IF_MATCH_STALE}, 412),
+    ("get", ITEM, {"headers": MALFORMED | {"If-None-Match": "v1"}}, 400),
+    ("head", ITEM, {}, 200),
+    ("head", ITEM, {"headers": NOT_MODIFIED}, 304),
+    ("put", ITEM, {**BODY, "headers": IF_MATCH}, 200),
+    ("put", ITEM, {**BODY}, 428),
+    ("put", ITEM, {**BODY, "headers": IF_MATCH_STALE}, 412),
+    ("put", ITEM, {**BODY, "headers": MALFORMED}, 400),
+    ("put", ITEM, {**INVALID, "headers": IF_MATCH}, 400),
+    ("patch", ITEM, {**BODY, "headers": IF_MATCH}, 200),
+    ("patch", ITEM, {"data": {"name": ""}, "format": "json", "headers": IF_MATCH}, 400),
+    ("patch", ITEM, {**BODY}, 428),
+    ("delete", ITEM, {"headers": IF_MATCH}, 204),
+    ("delete", ITEM, {}, 428),
+    ("delete", ITEM, {"headers": IF_MATCH_STALE}, 412),
+    ("options", ITEM, {}, 200),
+    ("get", "/items/999/", {}, 404),
+    ("put", "/items/999/", {**BODY, "headers": IF_MATCH}, 412),
+    ("post", ITEM, {}, 405),
+    ("get", LIST, {}, 200),
+    ("get", LIST, {"headers": NOT_MODIFIED}, 304),
+    ("get", LIST, {"headers": IF_MATCH_STALE}, 412),
+    ("head", LIST, {}, 200),
+    ("head", LIST, {"headers": NOT_MODIFIED}, 304),
+    ("post", LIST, {**BODY}, 201),
+    ("post", LIST, {**INVALID}, 400),
+    ("options", LIST, {}, 200),
+    ("put", LIST, {}, 405),
+    ("get", READONLY, {}, 200),
+    ("get", READONLY, {"headers": NOT_MODIFIED}, 304),
+    ("get", READONLY, {"headers": IF_MATCH_STALE}, 412),
+    ("head", READONLY, {}, 200),
+    ("head", READONLY, {"headers": NOT_MODIFIED}, 304),
+    ("options", READONLY, {}, 200),
+    ("get", "/readonly-items/999/", {}, 404),
+    ("post", READONLY, {}, 405),
+    ("get", READONLY_LIST, {}, 200),
+    ("get", READONLY_LIST, {"headers": NOT_MODIFIED}, 304),
+    ("head", READONLY_LIST, {}, 200),
+    ("options", READONLY_LIST, {}, 200),
+    ("post", READONLY_LIST, {**BODY}, 405),
+    ("get", STATS, {}, 200),
+    ("get", STATS, {"headers": NOT_MODIFIED}, 304),
+    ("get", STATS, {"headers": IF_MATCH_STALE}, 412),
+    ("head", STATS, {}, 200),
+    ("head", STATS, {"headers": NOT_MODIFIED}, 304),
+    ("options", STATS, {}, 200),
+    ("post", STATS, {}, 405),
+]
+# Statuses with nothing in the OPTIONS bodies to agree with: DRF's 404 and 405
+# are not listed, and a 304 (a HEAD's too) has no content, hence no entry. Their
+# Links are still checked by the rules that don't need the body.
+NO_ENTRY = {304, 404, 405}
+
+
+@pytest.mark.parametrize(
+    "method, path, arguments, status",
+    CONFORMANCE,
+    ids=[f"{m}-{p}-{s}-{i}" for i, (m, p, _, s) in enumerate(CONFORMANCE)],
+)
+def test_example_links_everywhere(client, item, method, path, arguments, status):
+    """Every response, a HEAD included, follows the Semantic HTTP 0.1 Link rules
+    and agrees with the OPTIONS body of its path."""
+    path = path.format(pk=item.pk)
+    hsr = client.options(path).json()
+    response = getattr(client, method)(path, **arguments)
+    assert response.status_code == status
+    content = method != "head" and bool(response.content)
+    assert content == (status not in (204, 304) and method != "head")
+    problems = link_problems(
+        method.upper(),
+        status,
+        dict(response.items()),
+        content,
+        None if status in NO_ENTRY else hsr,
+    )
+    assert problems == []
+    if status == 405:
+        # The Links are still those of the error entity.
+        assert f'<{BASE}/schemas/error.json>; rel="describedby"' in response["Link"]
+
+
+@pytest.mark.parametrize("path", [ITEM, LIST, READONLY, READONLY_LIST, STATS])
+def test_example_links_are_served_with_the_documents(client, item, path):
+    """Every document a Link points at is served."""
+    path = path.format(pk=item.pk)
+    links = parse_links(client.get(path)["Link"])
+    links += parse_links(client.put(path, **BODY, headers=IF_MATCH).get("Link"))
+    for target, _ in links:
+        assert client.get(target.removeprefix(BASE)).status_code == 200
+
+
+# --- Conformance settings and routes ----------------------------------------
+
+
+def test_format_suffix_routes(client, item):
+    """The router's ``.json`` routes: the callables take DRF's ``format`` too."""
+    for url in (f"/items/{item.pk}.json", "/items.json"):
+        hsr = client.options(url).json()
+        validate_http_schema_resource(hsr)
+        response = client.get(url)
+        assert response.status_code == 200, url
+        assert "ETag" in response
+        assert link_problems("GET", 200, dict(response.items()), True, hsr) == []
+    response = client.get(f"/items/{item.pk}.json")
+    assert response["Link"] == LINKS
+    response = client.put(f"/items/{item.pk}.json", {"name": "Two"}, format="json")
+    assert response.status_code == 428
+
+
+def test_format_query_parameter_stays_out_of_the_links(client, item):
+    """``?format=json`` is negotiation, not part of the linked documents' URLs."""
+    response = client.get(detail(item) + "?format=json")
+    assert response.status_code == 200
+    assert response["Link"] == LINKS
+    response = client.put(detail(item) + "?format=json", {"name": "Two"}, format="json")
+    assert response.status_code == 428
+    for target, _ in parse_links(response["Link"]):
+        assert "?" not in target
+        assert client.get(target.removeprefix(BASE)).status_code == 200
+
+
+def test_only_json_is_served_and_accepted(client, item):
+    """No browsable API, and no form bodies, which OPTIONS can't describe."""
+    response = client.get(detail(item), headers={"Accept": "text/html"})
+    assert response.status_code == 406
+    response = client.post("/items/", {"name": "Two"}, format="multipart")
+    assert response.status_code == 415
+    response = client.post(
+        "/items/", "name=Two", content_type="application/x-www-form-urlencoded"
+    )
+    assert response.status_code == 415
+    hsr = client.options("/items/").json()
+    assert list(hsr["post"]["requestBody"]["content"]) == ["application/json"]

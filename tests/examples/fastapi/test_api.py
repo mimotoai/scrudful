@@ -9,16 +9,27 @@ import pytest
 from fastapi.testclient import TestClient
 
 from examples.fastapi import api
+from scrudful._adapter import allow_header, options_links
+from tests.semantic_http import (
+    link_problems,
+    parse_links,
+    validate_http_schema_resource,
+)
 
 BASE = "http://testserver"
 SCHEMA_LINK = (
-    f'<{BASE}/schemas/user.json>; rel="describedBy"; type="application/schema+json"'
+    f'<{BASE}/schemas/user.json>; rel="describedby"; type="application/schema+json"'
 )
 CONTEXT_LINK = (
     f'<{BASE}/contexts/user.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; '
     'type="application/ld+json"'
 )
 LINKS = f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+ERROR_LINKS = (
+    f'<{BASE}/schemas/error.json>; rel="describedby"; type="application/schema+json", '
+    f'<{BASE}/contexts/error.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; '
+    'type="application/ld+json"'
+)
 # The seed data has sub-second timestamps; the header is floored to seconds.
 SEED_MODIFIED = "Tue, 25 May 2021 14:45:30 GMT"
 BEFORE_SEED_MODIFIED = "Tue, 25 May 2021 14:45:29 GMT"
@@ -107,10 +118,14 @@ def test_if_modified_since_echo_gives_304(client):
     assert client.get("/users/1", headers=earlier).status_code == 200
 
 
-def test_head_is_not_routed_to_get(client):
-    """Current FastAPI behaviour: HEAD on a GET-only route is 405."""
+def test_head_user(client):
     response = client.head("/users/1")
-    assert response.status_code == 405
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers["etag"] == '"user-1-v1"'
+    assert response.headers["link"] == LINKS
+    response = client.head("/users/1", headers={"If-None-Match": '"user-1-v1"'})
+    assert response.status_code == 304
 
 
 # --- POST --------------------------------------------------------------------------
@@ -390,3 +405,124 @@ def test_openapi_documents_conditional_responses(client):
     post = paths["/users"]["post"]
     assert "parameters" not in post
     assert set(post["responses"]) == {"201", "422"}
+
+
+# --- OPTIONS and Semantic HTTP 0.1 conformance ---------------------------------
+
+
+def test_options_user(client):
+    response = client.options("/users/1")
+    assert response.status_code == 200
+    body = response.json()
+    validate_http_schema_resource(body)
+    assert response.headers["allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
+    assert response.headers["allow"] == allow_header(body)
+    assert response.headers["link"] == options_links()
+    assert body["get"]["responses"]["200"]["content"] == {
+        "application/json": {
+            "schema": {"$ref": f"{BASE}/schemas/user.json"},
+            "x-rdf-context": {
+                "href": f"{BASE}/contexts/user.jsonld",
+                "type": "application/ld+json",
+            },
+        }
+    }
+    assert body["put"]["responses"]["428"]["content"] == {
+        "application/json": {
+            "schema": {"$ref": f"{BASE}/schemas/error.json"},
+            "x-rdf-context": {
+                "href": f"{BASE}/contexts/error.jsonld",
+                "type": "application/ld+json",
+            },
+        }
+    }
+    users = client.options("/users")
+    assert users.headers["allow"] == "POST, OPTIONS"
+    validate_http_schema_resource(users.json())
+
+
+USER = "/users/2"
+USERS = "/users"
+IF_MATCH = {"If-Match": '"user-2-v1"'}
+IF_MATCH_STALE = {"If-Match": '"user-2-v0"'}
+NOT_MODIFIED = {"If-None-Match": "*"}
+MALFORMED = {"If-Match": "user-2-v1"}
+BODY = {"name": "Eve", "age": 99}
+INVALID = {"name": "", "age": 99}
+
+# (method, path, request arguments, status).
+CONFORMANCE = [
+    ("get", USER, {}, 200),
+    ("get", USER, {"headers": NOT_MODIFIED}, 304),
+    ("get", USER, {"headers": IF_MATCH_STALE}, 412),
+    ("get", USER, {"headers": {"If-None-Match": "user-2-v1"}}, 400),
+    ("head", USER, {}, 200),
+    ("head", USER, {"headers": NOT_MODIFIED}, 304),
+    ("head", USER, {"headers": IF_MATCH_STALE}, 412),
+    ("put", USER, {"json": BODY, "headers": IF_MATCH}, 200),
+    ("put", USER, {"json": BODY}, 428),
+    ("put", USER, {"json": BODY, "headers": IF_MATCH_STALE}, 412),
+    ("put", USER, {"json": BODY, "headers": MALFORMED}, 400),
+    ("put", USER, {"json": INVALID, "headers": IF_MATCH}, 422),
+    ("patch", USER, {"json": {"age": 30}, "headers": IF_MATCH}, 200),
+    ("patch", USER, {"json": {"age": 30}}, 428),
+    ("patch", USER, {"json": {"age": -1}, "headers": IF_MATCH}, 422),
+    ("delete", USER, {"headers": IF_MATCH}, 204),
+    ("delete", USER, {}, 428),
+    ("delete", USER, {"headers": IF_MATCH_STALE}, 412),
+    ("delete", USER, {"headers": MALFORMED}, 400),
+    ("options", USER, {}, 200),
+    ("get", "/users/99", {}, 404),
+    ("head", "/users/99", {}, 404),
+    ("get", "/users/x", {}, 422),
+    ("put", "/users/99", {"json": BODY, "headers": IF_MATCH}, 412),
+    ("delete", "/users/99", {"headers": {"If-Match": '"user-99-v1"'}}, 404),
+    ("post", USER, {}, 405),
+    ("post", USERS, {"json": BODY}, 201),
+    ("post", USERS, {"json": INVALID}, 422),
+    ("options", USERS, {}, 200),
+    ("get", USERS, {}, 405),
+    ("get", "/nowhere", {}, 404),
+]
+# Statuses with nothing in the OPTIONS bodies to agree with: the 404 the
+# endpoints and Starlette raise, the 405 and FastAPI's 422 are not listed, and a
+# 304 (a HEAD's too) has no content, hence no entry. Their Links are still
+# checked by the rules that don't need the body.
+NO_ENTRY = {304, 404, 405, 422}
+
+
+@pytest.mark.parametrize(
+    "method, path, arguments, status",
+    CONFORMANCE,
+    ids=[f"{m}-{p}-{s}-{i}" for i, (m, p, _, s) in enumerate(CONFORMANCE)],
+)
+def test_example_links_everywhere(client, method, path, arguments, status):
+    """Every response, a HEAD included, follows the Semantic HTTP 0.1 Link rules
+    and agrees with the OPTIONS body of its path."""
+    options = client.options(path)
+    hsr = options.json() if options.status_code == 200 else None
+    response = client.request(method.upper(), path, **arguments)
+    assert response.status_code == status
+    content = method != "head" and bool(response.content)
+    assert content == (status not in (204, 304) and method != "head")
+    problems = link_problems(
+        method.upper(),
+        status,
+        dict(response.headers),
+        content,
+        None if status in NO_ENTRY else hsr,
+    )
+    assert problems == []
+    if status in (404, 405, 422):
+        # The Links are still those of the error entity.
+        assert response.headers["link"] == ERROR_LINKS
+        assert response.headers["content-type"] == "application/json"
+
+
+def test_example_links_are_served_with_the_documents(client):
+    """Every document a Link points at is served."""
+    links = parse_links(client.get(USER).headers["link"])
+    links += parse_links(client.put(USER, json=BODY).headers["link"])
+    links += parse_links(client.post(USERS, json=BODY).headers["link"])
+    for target, _ in links:
+        assert client.get(target.removeprefix(BASE)).status_code == 200
