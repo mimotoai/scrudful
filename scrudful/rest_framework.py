@@ -260,11 +260,14 @@ class ScrudfulViewFunc:
         ``last_modified_func``. Default ``False``: the callbacks are called as
         ``func(view, request, **url_kwargs)``, before ``get_object()``.
 
-        On a *create* (``create`` of a viewset, or a method given
-        ``location_func``) the validators describe the new resource instead:
+        On a *create* (``creates=True``; :func:`scrudful_viewset` sets it for
+        ``create``) the validators describe the new resource instead:
         no precondition is evaluated, and a 201 gets ``ETag`` and
         ``Last-Modified`` from the saved instance (``serializer.instance``
         after ``perform_create``), never replacing a header the view set.
+    creates : bool, optional
+        The method creates a resource (see ``object_validators``). Needs
+        ``object_validators``.
     location_func : callable, optional
         For a create with ``object_validators``: ``location_func(view,
         request, obj)`` returns the ``Location`` of the new object ``obj``
@@ -296,6 +299,7 @@ class ScrudfulViewFunc:
         error: Entity | None = None,
         object_validators: bool = False,
         location_func: Callable[..., Any] | None = None,
+        creates: bool = False,
     ) -> None:
         check_validators(etag_func, last_modified_func)
         _check_error(error)
@@ -322,7 +326,11 @@ class ScrudfulViewFunc:
             raise TypeError("location_func must be callable")
         self.location_func = location_func
         # A create describes the object it saved: see ``object_validators``.
-        self.creates = self.object_validators and location_func is not None
+        if (creates or location_func is not None) and not self.object_validators:
+            raise TypeError("creates and location_func need object_validators")
+        if location_func is not None and not creates:
+            raise TypeError("location_func needs creates=True")
+        self.creates = bool(creates)
         self._from_viewset = False
 
     def __get__(self, obj: Any, objtype: type | None = None) -> Any:
@@ -340,8 +348,6 @@ class ScrudfulViewFunc:
         each ``APIView`` subclassing it gets its OPTIONS the same way when it
         is created (see :func:`_install_metadata_on_views`).
         """
-        if name == "create" and self.object_validators:
-            self.creates = True
         if issubclass(owner, APIView):
             _install_metadata(owner)
         else:
@@ -554,6 +560,7 @@ def scrudful(
     error: Entity | None = None,
     object_validators: bool = False,
     location_func: Callable[..., Any] | None = None,
+    creates: bool = False,
 ) -> Callable[[Callable[..., Any]], ScrudfulViewFunc]:
     """Decorate a view method or function view to make it SCRUDful.
 
@@ -594,6 +601,7 @@ def scrudful(
         "error": error,
         "object_validators": object_validators,
         "location_func": location_func,
+        "creates": creates,
     }
     check_validators(etag_func, last_modified_func)
     _check_error(error)
@@ -784,6 +792,7 @@ def scrudful_viewset(cls: type) -> type:
         create.update(
             options("", _VALIDATOR_OPTIONS + _OBJECT_OPTIONS),
             location_func=getattr(meta, "location_func", None),
+            creates=True,
         )
     else:
         item["object_validators"] = False
@@ -854,7 +863,6 @@ def _record_created(view: Any) -> None:
 def _forget_object(view: Any) -> None:
     """Drop the per-call ``get_object`` override of :meth:`ScrudfulViewFunc._handle`."""
     view.__dict__.pop("get_object", None)
-    view.__dict__.pop("perform_create", None)
 
 
 def _load_object(view: Any, fresh: bool = False) -> Any:

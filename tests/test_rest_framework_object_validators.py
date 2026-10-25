@@ -145,13 +145,27 @@ class ExplicitCreateView(generics.CreateAPIView):
     serializer_class = ItemSerializer
 
     @scrudful(
-        etag_func=object_etag, object_validators=True, location_func=item_location
+        etag_func=object_etag,
+        object_validators=True,
+        creates=True,
+        location_func=item_location,
     )
     def post(self, request, *args, **kwargs):
         return super().post(request, *args, **kwargs)
 
 
+@scrudful_viewset
+class NoLocationViewSet(viewsets.ModelViewSet):
+    queryset = Item.objects.all()
+    serializer_class = ItemSerializer
+
+    class Meta:
+        object_validators = True
+        etag_func = object_etag
+
+
 router = SimpleRouter()
+router.register("nolocs", NoLocationViewSet, basename="noloc")
 router.register("creates", CreateViewSet, basename="create")
 router.register("keeps", KeepLocationViewSet, basename="keep")
 router.register("plains", PlainCreateViewSet, basename="plain")
@@ -380,5 +394,16 @@ def test_options_describes_201_validators(client):
     """As ninja's create: described with its 201 only (describe_write has no
     response-header description), never as a conditional write."""
     post = client.options("/creates/").json()["post"]
+    assert list(post["responses"]) == ["201"]
+    assert "parameters" not in post
+
+
+def test_create_without_location_func_sends_validators_only(client):
+    response = client.post("/nolocs/", {"name": "new"}, format="json")
+    assert response.status_code == 201
+    created = Item.objects.get(name="new")
+    assert response["ETag"] == f'"v{created.version}"'
+    assert "Location" not in response
+    post = client.options("/nolocs/").json()["post"]
     assert list(post["responses"]) == ["201"]
     assert "parameters" not in post
