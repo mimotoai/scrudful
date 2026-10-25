@@ -387,18 +387,25 @@ def test_merge_links_other_relation_keeps_both():
     )
 
 
-def test_merge_links_view_context_drops_context_link():
-    view = link_content("https://h/v", JSON_LD_CONTEXT_REL.upper(), "text/turtle")
+@pytest.mark.parametrize("rel", [JSON_LD_CONTEXT_REL, RDF_CONTEXT_REL])
+def test_merge_links_view_context_drops_context_link(rel):
+    """Either context relation fills the one RDF Context Link Header slot."""
+    view = link_content("https://h/v", rel.upper(), "text/turtle")
     assert merge_links(view, SCHEMA_LINK, CONTEXT_LINK) == f"{view}, {SCHEMA_LINK}"
+    # The reverse: non-JSON content, whose context link is rdf-context.
+    csv_context = link_content("https://h/c", RDF_CONTEXT_REL, "application/csvm+json")
+    assert merge_links(view, SCHEMA_LINK, csv_context) == f"{view}, {SCHEMA_LINK}"
 
 
 def test_merge_links_compares_the_relations_scrudful_sends():
     """Only a link of the same relation as scrudful's replaces it."""
-    # Another context relation than the one scrudful sends replaces nothing.
-    view = link_content("https://h/v", RDF_CONTEXT_REL, "text/turtle")
-    assert merge_links(view, SCHEMA_LINK, CONTEXT_LINK) == (
-        f"{view}, {SCHEMA_LINK}, {CONTEXT_LINK}"
-    )
+    # An overridden context relation collides with neither context relation.
+    profile_context = link_content("https://h/c", "profile", CONTEXT_TYPE)
+    for rel in (JSON_LD_CONTEXT_REL, RDF_CONTEXT_REL):
+        view = link_content("https://h/v", rel, "text/turtle")
+        assert merge_links(view, SCHEMA_LINK, profile_context) == (
+            f"{view}, {SCHEMA_LINK}, {profile_context}"
+        )
     # An overridden relation: the view's ``profile`` link replaces scrudful's.
     profile = link_content("https://h/s", "profile", SCHEMA_TYPE)
     other = link_content("https://h/c", "Other", CONTEXT_TYPE)

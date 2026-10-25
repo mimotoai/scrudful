@@ -1320,6 +1320,21 @@ def test_view_link_is_compared_with_the_relations_scrudful_sends(client):
     ]
 
 
+def test_a_view_rdf_context_link_is_the_one_context_link():
+    """Defaults: no second RDF Context Link Header beside the view's."""
+    own = '<https://o/c>; rel="https://w3id.org/semantic-http/ns#rdf-context"'
+
+    class OwnContext(drf_views.APIView):
+        @scrudful(schema_link_or_func="/s", context_link_or_func="/c")
+        def get(self, request):
+            return Response({}, headers={"Link": own})
+
+    response = OwnContext.as_view()(APIRequestFactory().get("/"))
+    assert response["Link"] == (
+        f'{own}, <{BASE}/s>; rel="describedby"; type="application/schema+json"'
+    )
+
+
 # --- Semantic HTTP 0.1 OPTIONS ------------------------------------------------
 
 

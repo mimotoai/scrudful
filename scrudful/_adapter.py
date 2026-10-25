@@ -377,6 +377,10 @@ def has_default_entity(method: str, status: int) -> bool:
     return 200 <= status < 300 and status != 204 and method.upper() != "TRACE"
 
 
+#: The relations of an RDF Context Link Header: one slot (see :func:`merge_links`).
+_CONTEXT_RELS = frozenset({JSON_LD_CONTEXT_REL, RDF_CONTEXT_REL})
+
+
 def merge_links(
     existing: str | None, schema: str | None, context: str | None
 ) -> str | None:
@@ -384,17 +388,23 @@ def merge_links(
 
     A link of ``existing`` with a relation that scrudful's ``schema``
     (``context``) link-value has replaces that link: with the defaults, a
-    ``describedby`` link replaces the schema link, and a JSON-LD context (or,
-    for other content, ``rdf-context``) link the context link; with
+    ``describedby`` link replaces the schema link; with
     ``schema_rel_or_func="profile"``, a ``profile`` link replaces it, and a
-    ``describedby`` one doesn't. Relation types are compared
-    case-insensitively, every one of a ``rel`` holding several (RFC 8288
-    §2.1.1, §3.3). A link of another relation replaces nothing.
+    ``describedby`` one doesn't. The JSON-LD context and the ``rdf-context``
+    relations are one slot, since a response has at most one RDF Context
+    Link Header: when scrudful's context link has either, a link of either
+    replaces it. An overridden context relation is matched exactly.
+    Relation types are compared case-insensitively, every one of a ``rel``
+    holding several (RFC 8288 §2.1.1, §3.3). A link of another relation
+    replaces nothing.
     """
     relations = link_relations(existing)
     if relations & link_relations(schema):
         schema = None
-    if relations & link_relations(context):
+    context_rels = link_relations(context)
+    if context_rels & _CONTEXT_RELS:
+        context_rels |= _CONTEXT_RELS
+    if relations & context_rels:
         context = None
     return join_links(existing, schema, context)
 
