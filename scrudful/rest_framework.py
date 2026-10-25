@@ -1114,10 +1114,20 @@ def _handler(view: APIView, method: str) -> Any:
     """``view.<method>`` as a function (a :class:`ScrudfulViewFunc`, if it is one).
 
     A viewset routes each method of the action map to its action as
-    ``view.<method>``.
+    ``view.<method>``. DRF's stock ``UpdateModelMixin.partial_update`` calls
+    ``self.update(partial=True)``: when ``update`` is a
+    :class:`ScrudfulViewFunc`, it is what serves the request, so it is the
+    handler (as :func:`scrudful_viewset` leaves the stock ``partial_update``
+    to it). Both :class:`ScrudfulMetadata` and :func:`exception_handler` look
+    handlers up here. A ``partial_update`` of the view's own stays its own.
     """
     handler = getattr(view, method, None)
-    return getattr(handler, "__func__", handler)
+    handler = getattr(handler, "__func__", handler)
+    if handler is _STOCK_PARTIAL_UPDATE:
+        update = _handler(view, "update")
+        if isinstance(update, ScrudfulViewFunc):
+            return update
+    return handler
 
 
 def _check_error(error: Any) -> None:

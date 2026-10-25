@@ -126,7 +126,10 @@ An ``Accept`` none of the view's renderers serves then gets DRF's 406, for
 OPTIONS too.
 
 An explicit ``@scrudful`` on ``update`` also applies to PATCH when
-``partial_update`` is DRF's stock ``UpdateModelMixin.partial_update``.
+``partial_update`` is DRF's stock ``UpdateModelMixin.partial_update``, which
+calls ``update``: the OPTIONS body describes PATCH as that ``update``, and
+``exception_handler`` gives a PATCH's errors its ``error`` Links. A
+``partial_update`` of your own is described, and handled, only as itself.
 
 .. note::
 

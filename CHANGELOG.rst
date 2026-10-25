@@ -38,6 +38,10 @@ change, so clients and tests that compare them must be updated.
   methods answers OPTIONS with the HTTP Schema Resource; a plain
   ``@api_view`` + ``@scrudful`` function view does not (use
   ``scrudful_api_view``).
+* DRF: a PATCH that DRF's stock ``partial_update`` serves through an explicit
+  ``@scrudful`` ``update`` is described in OPTIONS as that ``update``
+  (conditional, with its content and error responses), and
+  ``exception_handler`` gives its errors that ``update``'s ``error`` Links.
 * DRF: scrudful's own 400, 412 and 428 with an ``error`` entity, and the
   ``exception_handler`` responses of views with one, bypass DRF's content
   negotiation, so the browsable API gets JSON for them. The view's first JSON

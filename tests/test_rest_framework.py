@@ -267,6 +267,31 @@ class StockExplicitUpdateViewSet(StockPartialUpdate):
 
 
 @scrudful_viewset
+class StockPatchErrorViewSet(StockPartialUpdate):
+    """The stock partial_update serves PATCH through the decorated update."""
+
+    @scrudful(
+        etag_func=etag_func,
+        schema_link_or_func=SCHEMA,
+        context_link_or_func=CONTEXT,
+        error=ERROR,
+    )
+    def update(self, request, pk, partial=False):
+        return super().update(request, pk, partial=partial)
+
+
+class CustomPatchViewSet(ThingViewSetBase):
+    """A partial_update of its own, not scrudful: PATCH is not conditional."""
+
+    @scrudful(etag_func=etag_func, error=ERROR)
+    def update(self, request, pk, partial=False):
+        return super().update(request, pk, partial=partial)
+
+    def partial_update(self, request, pk):
+        return Response({"patched": pk})
+
+
+@scrudful_viewset
 class SubclassedStockViewSet(StockPatchViewSet):
     """Decorates a decorated viewset again, now with an explicit update."""
 
@@ -767,6 +792,8 @@ for prefix, viewset in [
     ("stock-patch", StockPatchViewSet),
     ("stock-explicit", StockExplicitUpdateViewSet),
     ("stock-subclass", SubclassedStockViewSet),
+    ("stock-patch-error", StockPatchErrorViewSet),
+    ("custom-patch", CustomPatchViewSet),
     ("user-partial", UserPartialUpdateViewSet),
     ("actions", ActionViewSet),
     ("headers", HeaderViewSet),
@@ -1953,6 +1980,45 @@ def test_exception_handler_adds_error_links(client):
         assert "detail" in response.json() or status == 400
     assert responses[400].json() == {"name": ["This field is required."]}
     assert responses[405]["Allow"] == "GET, PUT, PATCH, DELETE, HEAD, OPTIONS"
+
+
+def test_stock_partial_update_is_described_and_handled_as_the_update(client):
+    """PATCH through DRF's stock partial_update is the decorated update's."""
+    body = client.options("/stock-patch-error/1/").json()
+    validate_http_schema_resource(body)
+    for key in ("responses", "parameters"):
+        assert body["patch"][key] == body["put"][key], key
+    # The request bodies differ only in their description, by design.
+    assert body["patch"]["requestBody"]["content"] == content(SCHEMA, CONTEXT)
+    assert {"400", "412", "428"} <= set(body["patch"]["responses"])
+    assert body["patch"]["responses"]["200"]["content"] == content(SCHEMA, CONTEXT)
+    # The wire agrees: scrudful's 428, and the serializer's 400 with the
+    # error entity's Links and media type, as for PUT.
+    response = client.patch("/stock-patch-error/1/")
+    assert response.status_code == 428
+    assert response["Link"] == ERROR_LINKS
+    for method in ("put", "patch"):
+        response = getattr(client, method)(
+            "/stock-patch-error/1/",
+            {"raise": True},
+            format="json",
+            headers={"If-Match": '"v1"'},
+        )
+        assert response.status_code == 400, method
+        assert response["Link"] == ERROR_LINKS
+        assert response["Content-Type"] == "application/json"
+        assert (
+            link_problems(method.upper(), 400, dict(response.items()), True, body) == []
+        )
+
+
+def test_a_custom_partial_update_is_not_the_update(client):
+    body = client.options("/custom-patch/1/").json()
+    assert body["patch"] == {"responses": {"200": {"description": "OK"}}}
+    assert "412" in body["put"]["responses"]
+    response = client.patch("/custom-patch/1/")
+    assert response.status_code == 200
+    assert response.json() == {"patched": "1"}
 
 
 def test_exception_handler_405_uses_the_first_allowed_handler_with_an_error(client):
