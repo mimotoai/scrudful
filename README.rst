@@ -213,6 +213,40 @@ instead. Set ``error=`` (or ``Meta.error``) and name
 that the errors DRF raises itself for those views carry the error entity's
 Links too. See ``examples/scrudful_rest_framework`` for a complete project.
 
+A list in the scrud envelope (``count``, ``page_count``, ``first``,
+``previous``, ``next``, ``last`` and ``content``; each entry has ``href``,
+``etag``, ``last_modified``, ``link`` and ``content``), the one django-ninja's
+``scrudful_list`` returns, comes from ``ScrudfulPagination``. It is opt-in as the
+viewset's ``pagination_class``; other views are unchanged. It needs
+``Meta.href_func(view, request, obj)``. With ``Meta.object_validators`` the
+entries' ``etag`` and ``last_modified`` come from ``Meta.etag_func(obj)`` and
+``Meta.last_modified_func(obj)`` (otherwise they are ``null``), and ``link``
+holds the item schema and context links of ``Meta`` (their callbacks get the
+object's lookup value as the URL keyword). ``page`` (at least 1, default 1) and
+``page_size`` (1 to ``max_page_size``; default 100, maximum 1000) outside their
+range are a 400, and a page past the last one a 404. Give the view an ordered
+queryset: an unordered one warns, as with Django's ``Paginator``.
+
+.. code-block:: python
+
+    from scrudful.rest_framework import ScrudfulPagination
+
+
+    def item_href(view, request, obj):
+        return request.build_absolute_uri(f"/items/{obj.pk}")
+
+
+    @scrudful_viewset
+    class ItemViewSet(viewsets.ReadOnlyModelViewSet):
+        queryset = Item.objects.order_by("pk")
+        pagination_class = ScrudfulPagination
+
+        class Meta:
+            href_func = item_href
+            object_validators = True
+            etag_func = item_etag
+            last_modified_func = item_last_modified
+
 Caveats of ``scrudful_viewset``:
 
 * The item link callbacks also run for ``create`` and for OPTIONS and POST on the

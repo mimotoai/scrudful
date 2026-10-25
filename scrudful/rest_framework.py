@@ -102,13 +102,14 @@ import types
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.http import Http404, HttpRequest, HttpResponseBase
 from django.utils.encoding import iri_to_uri
-from rest_framework.exceptions import APIException
+from rest_framework.exceptions import APIException, NotFound, ValidationError
 from rest_framework.decorators import api_view
 from rest_framework.metadata import BaseMetadata, SimpleMetadata
 from rest_framework.mixins import UpdateModelMixin
+from rest_framework.pagination import BasePagination
 from rest_framework.renderers import JSONRenderer
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -141,14 +142,21 @@ from scrudful._adapter import (
     set_validator_headers,
     validator_policy,
 )
-from scrudful._django import aware
+from scrudful._django import aware, page_url, slice_page
 from scrudful._django import conditional_response as django_conditional_response
 from scrudful._django import precondition_headers as django_precondition_headers
 from scrudful.conditional import (
     ConditionalResult,
     evaluate_preconditions,
+    format_http_date,
     http_timestamp,
     quote_etag,
+)
+from scrudful.collection import (
+    InvalidPage,
+    collection_schema,
+    envelope_entry,
+    page_envelope,
 )
 from scrudful.entity import Entity
 from scrudful.utils import join_links, link_content, resolve_uri
@@ -157,6 +165,7 @@ __all__ = [
     "Entity",
     "ScrudfulAPIViewMetadata",
     "ScrudfulMetadata",
+    "ScrudfulPagination",
     "ScrudfulViewFunc",
     "exception_handler",
     "scrudful",
@@ -774,6 +783,10 @@ def scrudful_viewset(cls: type) -> type:
         JSON-LD context link of the ``list`` response.
     list_error : Entity, optional
         Schema and context of the ``list`` response's 400 and 412 bodies.
+    href_func : callable, optional
+        ``href_func(view, request, obj)``, the URL of an item, for
+        :class:`ScrudfulPagination` (required by it; not used by the wrapped
+        methods).
     """
     meta = getattr(cls, "Meta", None)
 
@@ -1459,3 +1472,150 @@ def _media(
         _resolve(context, args) if context else None,
         None if context_type is None else str(context_type),
     )
+
+
+class ScrudfulPagination(BasePagination):
+    """Paginate a list view into the scrud list envelope.
+
+    The response body is the page envelope that django-ninja's
+    ``scrudful_list`` produces (``count``, ``page_count``, ``first``,
+    ``previous``, ``next``, ``last``, ``content``), each entry having ``href``,
+    ``etag``, ``last_modified``, ``link`` and ``content``. Set it as the view's
+    ``pagination_class``; views that don't are unchanged.
+
+    The view needs ``Meta.href_func(view, request, obj)``, returning the URL of
+    an item (``ImproperlyConfigured`` otherwise). With ``Meta.object_validators``
+    an entry's ``etag`` and ``last_modified`` come from ``Meta.etag_func(obj)``
+    and ``Meta.last_modified_func(obj)``; without it they are ``None`` (those
+    callbacks take the URL arguments, not an object). An entry's ``link`` holds
+    the schema and context links of the view's item ``Meta`` options; their
+    callbacks are called as for the item routes, with the object's lookup value
+    as the URL keyword (``pk=...``).
+
+    A non-integer or out of range ``page`` or ``page_size`` is a 400 naming
+    the parameter; a ``page`` past the last one is a 404 (page 1 always
+    exists).
+    """
+
+    page_size = 100
+    max_page_size = 1000
+    page_query_param = "page"
+    page_size_query_param = "page_size"
+
+    def paginate_queryset(
+        self, queryset: Any, request: Request, view: Any = None
+    ) -> list[Any]:
+        """The objects of the requested page of ``queryset``."""
+        meta = getattr(view, "Meta", None)
+        href_func = getattr(meta, "href_func", None)
+        if href_func is None:
+            raise ImproperlyConfigured(
+                f"{type(view).__name__} uses ScrudfulPagination: it needs "
+                "Meta.href_func(view, request, obj), returning an item's URL"
+            )
+        number = self._integer(request, self.page_query_param, 1, None)
+        size = self._integer(
+            request, self.page_size_query_param, self.page_size, self.max_page_size
+        )
+        try:
+            # The unordered-queryset warning points at this method's caller.
+            self.count, self.objects = slice_page(queryset, number, size)
+        except InvalidPage:
+            raise NotFound("Invalid page.") from None
+        self.request, self.view, self.number, self.size = request, view, number, size
+        self.href_func = href_func
+        return self.objects
+
+    def get_paginated_response(self, data: Any) -> Response:
+        """The envelope of the page, ``data`` being the serialized objects."""
+        view, request = self.view, self.request
+        meta = getattr(view, "Meta", None)
+        validators = bool(getattr(meta, "object_validators", False))
+        etag_func = getattr(meta, "etag_func", None) if validators else None
+        modified_func = (
+            getattr(meta, "last_modified_func", None) if validators else None
+        )
+        entity = Entity(**{name: getattr(meta, name, None) for name in _LINK_OPTIONS})
+        entries = []
+        for obj, item in zip(self.objects, data):
+            href = self.href_func(view, request, obj)
+            if href is None:
+                raise TypeError(
+                    f"href_func returned None for {obj!r}: it must return the "
+                    "item's URL"
+                )
+            etag = None
+            if etag_func is not None:
+                value = etag_func(obj)
+                etag = None if value is None else quote_etag(value)
+            last_modified = None
+            if modified_func is not None:
+                last_modified = format_http_date(
+                    http_timestamp(aware(modified_func(obj)))
+                )
+            links = _entity_links(
+                entity,
+                (view, request, *getattr(view, "args", ())),
+                self._item_kwargs(obj),
+            )
+            entries.append(
+                envelope_entry(
+                    href=iri_to_uri(str(href)),
+                    etag=etag,
+                    last_modified=last_modified,
+                    link=join_links(*links),
+                    content=item,
+                )
+            )
+        return Response(
+            page_envelope(
+                count=self.count,
+                number=self.number,
+                size=self.size,
+                page_url=functools.partial(
+                    page_url, request.build_absolute_uri(), request.query_params
+                ),
+                entries=entries,
+            )
+        )
+
+    def get_paginated_response_schema(self, schema: dict[str, Any]) -> dict[str, Any]:
+        """The OpenAPI schema of the envelope; ``schema`` describes the list."""
+        envelope = collection_schema("#")
+        envelope.pop("$schema")
+        envelope["properties"]["content"]["items"]["properties"]["content"] = (
+            schema.get("items", schema)
+        )
+        return envelope
+
+    def _integer(
+        self, request: Request, name: str, default: int, maximum: int | None
+    ) -> int:
+        """The query parameter ``name`` as an integer in ``[1, maximum]``."""
+        raw = request.query_params.get(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValidationError({name: ["A valid integer is required."]}) from None
+        if value < 1:
+            raise ValidationError(
+                {name: ["Ensure this value is greater than or equal to 1."]}
+            )
+        if maximum is not None and value > maximum:
+            raise ValidationError(
+                {name: [f"Ensure this value is less than or equal to {maximum}."]}
+            )
+        return value
+
+    def _item_kwargs(self, obj: Any) -> dict[str, Any]:
+        """The URL keyword of ``obj``, as the item routes' callbacks get it."""
+        field = getattr(self.view, "lookup_field", None)
+        if field is None:
+            return {}
+        name = getattr(self.view, "lookup_url_kwarg", None) or field
+        try:
+            return {name: getattr(obj, field)}
+        except AttributeError:
+            return {}
