@@ -7,13 +7,14 @@ everything that touches their framework's request and response objects.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import http
 import inspect
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol
 
-from scrudful.conditional import SAFE_METHODS, validator_headers
+from scrudful.conditional import SAFE_METHODS, ConditionalResult, validator_headers
 from scrudful.utils import (
     EXPOSABLE_HEADERS,
     join_links,
@@ -479,6 +480,27 @@ def describe_options() -> dict[str, Any]:
 def allow_header(body: Mapping[str, Any]) -> str:
     """The ``Allow`` value for an HTTP Schema Resource ``body``: its methods."""
     return ", ".join(key.upper() for key in body if key in METHOD_KEYS)
+
+
+def check_error_body_func(func: Any) -> None:
+    """Raise ``TypeError`` unless ``func`` is ``None`` or callable."""
+    if func is not None and not callable(func):
+        raise TypeError(f"error_body_func must be callable, not {type(func).__name__}")
+
+
+def with_error_body(
+    error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None,
+    request: Any,
+    result: ConditionalResult,
+) -> ConditionalResult:
+    """``result`` with the body ``error_body_func(request, result)`` returns.
+
+    A 304 (no body) and a missing function leave ``result`` as it is. The
+    status, headers, Links and Content-Type are never changed.
+    """
+    if error_body_func is None or result.body is None:
+        return result
+    return dataclasses.replace(result, body=error_body_func(request, result))
 
 
 def reason_phrase(status: int) -> str:

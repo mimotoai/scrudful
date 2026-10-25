@@ -123,6 +123,7 @@ from scrudful._adapter import (
     DEFAULT_SCHEMA_TYPE,
     METHOD_KEYS,
     allow_header,
+    check_error_body_func,
     check_error_media_type,
     check_validators,
     conditional_header_parameters,
@@ -141,6 +142,7 @@ from scrudful._adapter import (
     reason_phrase,
     set_validator_headers,
     validator_policy,
+    with_error_body,
 )
 from scrudful._django import aware, page_url, slice_page
 from scrudful._django import conditional_response as django_conditional_response
@@ -192,6 +194,9 @@ _CREATED_ATTR = "_scrudful_created"
 # The object ``get_object()`` returned for the request (see ``object_validators``).
 _OBJECT_ATTR = "_scrudful_object"
 _ERROR_OPTIONS = ("error",)
+# What the 400/412/428 bodies are built with; a create never evaluates
+# preconditions, so it has none.
+_ERROR_BODY_OPTIONS = ("error_body_func",)
 #: The media type of the content a view's own links describe.
 _VIEW_MEDIA_TYPE = "application/json"
 
@@ -255,6 +260,16 @@ class ScrudfulViewFunc:
         ``renderer_classes`` with an ``application/json`` or ``+json`` media
         type, else DRF's ``JSONRenderer``) renders them. Without ``error``
         these responses carry no Link and are rendered as before.
+    error_body_func : callable, optional
+        ``error_body_func(request, result)`` returns the body (a ``dict``) of
+        scrudful's own 400, 412 or 428 response in place of
+        ``{"detail": ...}``; ``result`` is the
+        :class:`~scrudful.conditional.ConditionalResult`, whose default body is
+        ``result.body``. The status, headers, Links and Content-Type are
+        unchanged, and it is never called for a 304.
+        :func:`scrudful.problem.problem_details` returns RFC 9457 problem
+        details (pair it with ``error=Entity(media_type=PROBLEM_JSON)``).
+        Without it the bodies are as before.
     object_validators : bool, optional
         For a view method of a generic view (one with ``get_object()``):
         compute the validators from the object ``view.get_object()`` returns,
@@ -306,12 +321,15 @@ class ScrudfulViewFunc:
         context_rel_or_func: Any = None,
         context_type_or_func: Any = None,
         error: Entity | None = None,
+        error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]]
+        | None = None,
         object_validators: bool = False,
         location_func: Callable[..., Any] | None = None,
         creates: bool = False,
     ) -> None:
         check_validators(etag_func, last_modified_func)
         _check_error(error)
+        check_error_body_func(error_body_func)
         _check_sync(view_method)
         if object_validators and etag_func is None and last_modified_func is None:
             raise TypeError(
@@ -330,6 +348,7 @@ class ScrudfulViewFunc:
         self.context_rel_or_func = context_rel_or_func
         self.context_type_or_func = context_type_or_func
         self.error = error
+        self.error_body_func = error_body_func
         self.object_validators = bool(object_validators)
         if location_func is not None and not callable(location_func):
             raise TypeError("location_func must be callable")
@@ -481,6 +500,7 @@ class ScrudfulViewFunc:
         picked (see :func:`_render_as_json`), so that it agrees with the
         OPTIONS body.
         """
+        result = with_error_body(self.error_body_func, request, result)
         if result.body is None or self.error is None:
             return _conditional_response(result, request)
         return _conditional_response(
@@ -567,6 +587,7 @@ def scrudful(
     context_rel_or_func: Any = None,
     context_type_or_func: Any = None,
     error: Entity | None = None,
+    error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
     object_validators: bool = False,
     location_func: Callable[..., Any] | None = None,
     creates: bool = False,
@@ -608,12 +629,14 @@ def scrudful(
         "context_rel_or_func": context_rel_or_func,
         "context_type_or_func": context_type_or_func,
         "error": error,
+        "error_body_func": error_body_func,
         "object_validators": object_validators,
         "location_func": location_func,
         "creates": creates,
     }
     check_validators(etag_func, last_modified_func)
     _check_error(error)
+    check_error_body_func(error_body_func)
     if object_validators and etag_func is None and last_modified_func is None:
         raise TypeError("object_validators needs an etag_func or last_modified_func")
 
@@ -635,6 +658,7 @@ def scrudful_api_view(
     context_rel_or_func: Any = None,
     context_type_or_func: Any = None,
     error: Entity | None = None,
+    error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
     object_validators: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Like DRF's ``api_view``, for a SCRUDful function view.
@@ -683,6 +707,7 @@ def scrudful_api_view(
         context_rel_or_func=context_rel_or_func,
         context_type_or_func=context_type_or_func,
         error=error,
+        error_body_func=error_body_func,
     )
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -783,6 +808,10 @@ def scrudful_viewset(cls: type) -> type:
         JSON-LD context link of the ``list`` response.
     list_error : Entity, optional
         Schema and context of the ``list`` response's 400 and 412 bodies.
+    error_body_func : callable, optional
+        As for :class:`ScrudfulViewFunc`, for the item routes (not the create).
+    list_error_body_func : callable, optional
+        As ``error_body_func``, for the ``list`` response's 400 and 412.
     href_func : callable, optional
         ``href_func(view, request, obj)``, the URL of an item, for
         :class:`ScrudfulPagination` (required by it; not used by the wrapped
@@ -794,7 +823,12 @@ def scrudful_viewset(cls: type) -> type:
         return {name: getattr(meta, prefix + name, None) for name in names}
 
     item = options(
-        "", _VALIDATOR_OPTIONS + _LINK_OPTIONS + _ERROR_OPTIONS + _OBJECT_OPTIONS
+        "",
+        _VALIDATOR_OPTIONS
+        + _LINK_OPTIONS
+        + _ERROR_OPTIONS
+        + _ERROR_BODY_OPTIONS
+        + _OBJECT_OPTIONS,
     )
     create = options("", _LINK_OPTIONS + _ERROR_OPTIONS)
     if item["object_validators"]:
@@ -815,7 +849,10 @@ def scrudful_viewset(cls: type) -> type:
         "update": item,
         "partial_update": item,
         "destroy": item,
-        "list": options("list_", _VALIDATOR_OPTIONS + _LINK_OPTIONS + _ERROR_OPTIONS),
+        "list": options(
+            "list_",
+            _VALIDATOR_OPTIONS + _LINK_OPTIONS + _ERROR_OPTIONS + _ERROR_BODY_OPTIONS,
+        ),
     }
     for name, config in configs.items():
         method = getattr(cls, name, None)

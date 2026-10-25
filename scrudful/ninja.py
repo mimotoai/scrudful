@@ -426,6 +426,7 @@ from scrudful._adapter import (
     SCHEMA_REL,
     SCHEMA_TYPE,
     allow_header,
+    check_error_body_func,
     check_error_media_type,
     check_validators,
     context_defaults,
@@ -444,6 +445,7 @@ from scrudful._adapter import (
     resolved_signature,
     set_validator_headers,
     validator_policy,
+    with_error_body,
 )
 from scrudful._django import (
     aware,
@@ -618,6 +620,8 @@ class _Config:
     )
     #: The entity of scrudful's own 400, 412 and 428 bodies.
     error: Entity | None = None
+    #: ``error_body_func(request, result)``: the body of those responses.
+    error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None
     #: The validators of a list operation's collection (called with the
     #: queryset the handler returned).
     list_etag_func: Callable[[Any], Any] | None = None
@@ -713,6 +717,7 @@ def scrudful(
     request: Entity | None = None,
     responses: Mapping[int, Entity] | None = None,
     error: Entity | None = None,
+    error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation on a single resource to make it SCRUDful.
 
@@ -815,6 +820,17 @@ def scrudful(
         ``+json``, e.g. ``application/problem+json``), since scrudful's error
         bodies are JSON objects; they, and the JSON responses to the errors
         the operation raises, are served with that Content-Type.
+    error_body_func : callable, optional
+        ``error_body_func(request, result)`` returns the body (a ``dict``) of
+        scrudful's own 400, 412 or 428 response in place of
+        ``{"detail": ...}``; ``result`` is the
+        :class:`~scrudful.conditional.ConditionalResult`, whose default body
+        is ``result.body``. It must be a plain (sync) function. The status,
+        headers, Links and Content-Type are unchanged, and it is never called
+        for a 304. :func:`scrudful.problem.problem_details` returns RFC 9457
+        problem details (pair it with
+        ``error=Entity(media_type=PROBLEM_JSON)``). Without it the bodies are
+        as before.
 
     Raises
     ------
@@ -841,6 +857,7 @@ def scrudful(
         raise TypeError(f"load must be callable, not {type(load).__name__}")
     _check_entity("request", request)
     _check_error(error)
+    check_error_body_func(error_body_func)
     config = _Config(
         kind="item",
         load=load,
@@ -856,6 +873,7 @@ def scrudful(
         request=request,
         responses=_entities_by_status(responses),
         error=error,
+        error_body_func=error_body_func,
     )
     if config.has_validators and load is None:
         raise TypeError(
@@ -1016,6 +1034,7 @@ def scrudful_list(
     page_size: int = 100,
     max_page_size: int = 1000,
     error: Entity | None = None,
+    error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation listing a collection (GET on a list).
 
@@ -1118,6 +1137,17 @@ def scrudful_list(
         be JSON content, as for :func:`scrudful`; scrudful's 400 and 412,
         and the JSON responses to the errors the operation raises, are
         served with it.
+    error_body_func : callable, optional
+        ``error_body_func(request, result)`` returns the body (a ``dict``) of
+        scrudful's own 400, 412 or 428 response (with a list validator set) in place of
+        ``{"detail": ...}``; ``result`` is the
+        :class:`~scrudful.conditional.ConditionalResult`, whose default body
+        is ``result.body``. It must be a plain (sync) function. The status,
+        headers, Links and Content-Type are unchanged, and it is never called
+        for a 304. :func:`scrudful.problem.problem_details` returns RFC 9457
+        problem details (pair it with
+        ``error=Entity(media_type=PROBLEM_JSON)``). Without it the bodies are
+        as before.
 
     Raises
     ------
@@ -1155,10 +1185,10 @@ def scrudful_list(
         raise ValueError(f"page_size must be at least 1, not {page_size}")
     if max_page_size < page_size:
         raise ValueError(
-            f"max_page_size ({max_page_size}) must be at least page_size "
-            f"({page_size})"
+            f"max_page_size ({max_page_size}) must be at least page_size ({page_size})"
         )
     _check_error(error)
+    check_error_body_func(error_body_func)
     config = _Config(
         kind="list",
         href_func=href_func,
@@ -1171,6 +1201,7 @@ def scrudful_list(
         context_rel_or_func=context_rel_or_func,
         context_type_or_func=context_type_or_func,
         error=error,
+        error_body_func=error_body_func,
         list_etag_func=list_etag_func,
         list_last_modified_func=list_last_modified_func,
         collection=Entity(
@@ -1608,6 +1639,7 @@ def _early_response(
     callables get ``obj``, and its media type as their Content-Type.
     """
     error = config.error
+    result = with_error_body(config.error_body_func, request, result)
     early = conditional_response(
         result, content_type=None if error is None else error.media_type
     )
@@ -1936,8 +1968,7 @@ def _page(
         href = yield config.href_func, (request, item), {}
         if href is None:
             raise TypeError(
-                f"href_func returned None for {item!r}: it must return the "
-                "item's URL"
+                f"href_func returned None for {item!r}: it must return the item's URL"
             )
         etag, last_modified = yield from _item_validators(config, item)
         link = yield from _links(config.entity, request, item)

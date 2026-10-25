@@ -38,6 +38,7 @@ from scrudful._adapter import (
     METHOD_KEYS,
     SCHEMA_TYPE,
     allow_header,
+    check_error_body_func,
     check_error_media_type,
     check_validators,
     context_defaults,
@@ -57,6 +58,7 @@ from scrudful._adapter import (
     resolve_annotation,
     set_validator_headers,
     validator_policy,
+    with_error_body,
 )
 from scrudful.conditional import (
     ConditionalResult,
@@ -134,6 +136,7 @@ def scrudful(
     context_rel_or_func: Any = None,
     context_type_or_func: Any = None,
     error: Entity | None = None,
+    error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
 ) -> Callable[[Endpoint], Endpoint]:
     """Decorate a FastAPI endpoint to make it SCRUDful.
 
@@ -293,6 +296,17 @@ def scrudful(
         answer for this endpoint get it too, and :func:`add_options`
         describes it; its link callables are then called outside the
         endpoint (see "Callbacks").
+    error_body_func : callable, optional
+        ``error_body_func(request, result)`` returns the body (a ``dict``) of
+        scrudful's own 400, 412 or 428 response in place of
+        ``{"detail": ...}``; ``request`` is the Starlette ``Request`` and
+        ``result`` the :class:`~scrudful.conditional.ConditionalResult`,
+        whose default body is ``result.body``. It must be a plain (sync)
+        function. The status, headers, Links and Content-Type are unchanged,
+        and it is never called for a 304.
+        :func:`scrudful.problem.problem_details` returns RFC 9457 problem
+        details (pair it with ``error=Entity(media_type=PROBLEM_JSON)``).
+        Without it the bodies are as before.
 
     Raises
     ------
@@ -304,6 +318,7 @@ def scrudful(
     """
     check_validators(etag_func, last_modified_func)
     _check_error(error)
+    check_error_body_func(error_body_func)
     has_validators = etag_func is not None or last_modified_func is not None
 
     async def validators(kwargs: Mapping[str, Any]) -> tuple[str | None, int | None]:
@@ -335,11 +350,13 @@ def scrudful(
         return schema, context
 
     async def early_response(
+        request: Request,
         result: ConditionalResult,
         injected: Headers,
         kwargs: Mapping[str, Any],
         base: str,
     ) -> Response:
+        result = with_error_body(error_body_func, request, result)
         if result.body is None or error is None:
             return _conditional_response(result, injected)
         link = join_links(*await _entity_links(error, kwargs, base))
@@ -388,7 +405,9 @@ def scrudful(
                     require_precondition=True,
                 )
                 if result is not None:
-                    return await early_response(result, response.headers, kwargs, base)
+                    return await early_response(
+                        request, result, response.headers, kwargs, base
+                    )
 
             content = await _call(endpoint, kwargs)
 
