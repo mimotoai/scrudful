@@ -22,21 +22,26 @@ of a mixin: each ``APIView`` subclassing the mixin
 (``class ItemView(ItemMixin, APIView)``) gets it when it is created, by the
 same rules (scrudful chains the mixin's ``__init_subclass__`` to do so). A
 ``metadata_class`` or ``options`` that the view, or a class between it and
-the mixin, sets is kept. A function view with
-``@scrudful`` below a plain ``@api_view`` is SCRUDful, but there is no class
-to install it on when ``@scrudful`` runs: it keeps DRF's ``SimpleMetadata``
-and gets no HTTP Schema Resource. Use ``scrudful_api_view`` in place of
-``@api_view`` + ``@scrudful``:
+the mixin, sets is kept.
+
+A function view with ``@scrudful`` below a plain ``@api_view`` is SCRUDful,
+but there is no class to install it on when ``@scrudful`` runs: it keeps DRF's
+``SimpleMetadata`` and gets no HTTP Schema Resource. Nor can
+``exception_handler`` find its ``error`` entity (the view's methods are
+``api_view``'s own), so the errors it raises (a serializer's 400, a
+``NotFound``) get no error Links: only scrudful's own 400, 412 and 428 carry
+them. Use ``scrudful_api_view`` in place of ``@api_view`` + ``@scrudful``:
 
 .. code-block:: python
 
-    # OPTIONS: DRF's SimpleMetadata, no HTTP Schema Resource.
+    # OPTIONS: DRF's SimpleMetadata, no HTTP Schema Resource; raised errors
+    # get no error Links.
     @api_view(["GET", "PUT"])
     @scrudful(etag_func=item_etag, error=ERROR)
     def item(request, pk): ...
 
 
-    # OPTIONS: the HTTP Schema Resource.
+    # OPTIONS: the HTTP Schema Resource; raised errors get ERROR's Links.
     @scrudful_api_view(["GET", "PUT"], etag_func=item_etag, error=ERROR)
     def item(request, pk): ...
 

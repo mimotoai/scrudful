@@ -200,7 +200,9 @@ by ``scrudful_viewset`` viewsets, by classes with a ``@scrudful`` method and by
 ``scrudful_api_view`` views. ``@scrudful`` below a plain ``@api_view`` also
 makes the function view SCRUDful, but there is no class to install
 ``ScrudfulMetadata`` on when it runs: that view keeps DRF's ``SimpleMetadata``
-and gets no HTTP Schema Resource, so use ``scrudful_api_view`` instead. Set
+and gets no HTTP Schema Resource, and the errors it raises get no error Links
+(only scrudful's own 400, 412 and 428 do), so use ``scrudful_api_view``
+instead. Set
 ``error=`` (or ``Meta.error``) and name
 ``scrudful.rest_framework.exception_handler`` as DRF's ``EXCEPTION_HANDLER`` so
 that the errors DRF raises itself for those views carry the error entity's
@@ -425,8 +427,12 @@ scrudful follows `Semantic HTTP 0.1 <https://w3id.org/semantic-http/0.1/>`_
   (``rel="describedby"``, ``type="application/schema+json"``) and, for a
   non-in-band media type, a context Link, and that every ``HEAD`` carries the
   Links of the ``GET``;
-* link values are absolute, link relations are de-duplicated, and a ``Link``
-  your view set with the same relation is kept instead of scrudful's;
+* Link header targets and every URI in the OPTIONS document are absolute,
+  link relations are de-duplicated, and a ``Link`` your view set with the
+  same relation is kept instead of scrudful's. A ``Location`` (which may be
+  relative) and a list entry's ``href`` are the application's, sent as given:
+  return absolute ones from ``location_func`` / ``href_func`` if you want
+  them;
 * ``OPTIONS`` answers 200 with the 0.1 HTTP Schema Resource as
   ``application/json``, the published HTTP Schema Resource Links, an ``Allow``
   listing exactly the body's methods and an ``options`` entry (plus a
@@ -458,7 +464,8 @@ The application must still:
 * **Install the OPTIONS helper in FastAPI:** ``add_options(app)``.
 * **Use** ``scrudful_api_view`` **for DRF function views:** a plain
   ``@api_view`` with ``@scrudful`` keeps DRF's OPTIONS, which is no HTTP
-  Schema Resource.
+  Schema Resource, and ``exception_handler`` can't find its ``error``: the
+  errors it raises get no Links, only scrudful's own 400, 412 and 428 do.
 * **Leave the browsable API out (DRF):** its HTML responses (``Accept:
   text/html``) carry the Links of the JSON content, so they are not
   conformant. For full conformance, drop ``BrowsableAPIRenderer`` from

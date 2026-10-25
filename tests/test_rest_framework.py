@@ -636,6 +636,23 @@ def api_error(request, pk):
     return Response({"id": pk})
 
 
+def raise_for(request):
+    if request.method == "PUT":
+        raise serializers.ValidationError({"name": ["This field is required."]})
+    raise NotFound
+
+
+@scrudful_api_view(["GET", "PUT"], etag_func=etag_func, error=ERROR)
+def api_raising(request, pk):
+    raise_for(request)
+
+
+@api_view(["GET", "PUT"])
+@scrudful(etag_func=lambda request, pk: f"v{store.version}", error=ERROR)
+def plain_api_raising(request, pk):
+    raise_for(request)
+
+
 @scrudful(
     etag_func=lambda request: f"v{store.version}",
     error=Entity(
@@ -849,6 +866,8 @@ urlpatterns = [
     path("function/<int:pk>/", function_view),
     path("django/", django_view),
     path("api-error/<int:pk>/", api_error),
+    path("api-raising/<int:pk>/", api_raising),
+    path("plain-api-raising/<int:pk>/", plain_api_raising),
     path("django-error/", django_error_view),
     path("apiview/<int:pk>/", ThingAPIView.as_view()),
     path("unused-error/<int:pk>/", UnusedErrorAPIView.as_view()),
@@ -2059,6 +2078,25 @@ def test_exception_handler_405_uses_the_first_allowed_handler_with_an_error(clie
     assert response.status_code == 405
     assert response["Link"] == PROBLEM_LINKS
     assert response["Content-Type"] == "application/problem+json"
+
+
+def test_raised_errors_of_function_views(client):
+    """scrudful_api_view gives them the error Links; a plain api_view doesn't."""
+    for url, links in (
+        ("/api-raising/1/", ERROR_LINKS),
+        ("/plain-api-raising/1/", None),
+    ):
+        responses = {
+            404: client.get(url),
+            400: client.put(url, {}, format="json", headers={"If-Match": '"v1"'}),
+        }
+        for status, response in responses.items():
+            assert response.status_code == status, url
+            assert response.get("Link") == links, (url, status)
+        # scrudful's own 428 has them in both.
+        response = client.put(url, {}, format="json")
+        assert response.status_code == 428
+        assert response["Link"] == ERROR_LINKS
 
 
 def test_exception_handler_without_error_unchanged(client):

@@ -36,8 +36,9 @@ change, so clients and tests that compare them must be updated.
   ``SimpleMetadata``; a ``@scrudful`` method of a mixin does so on each
   ``APIView`` subclassing the mixin. So an ``APIView`` with ``@scrudful``
   methods answers OPTIONS with the HTTP Schema Resource; a plain
-  ``@api_view`` + ``@scrudful`` function view does not (use
-  ``scrudful_api_view``).
+  ``@api_view`` + ``@scrudful`` function view does not, and the errors it
+  raises get no error Links through ``exception_handler`` (use
+  ``scrudful_api_view``, which gives them both).
 * DRF: a PATCH that DRF's stock ``partial_update`` serves through an explicit
   ``@scrudful`` ``update`` is described in OPTIONS as that ``update``
   (conditional, with its content and error responses), and
@@ -50,8 +51,12 @@ change, so clients and tests that compare them must be updated.
   ``BrowsableAPIRenderer`` for full conformance.
 * Removed ``options_schema_link`` and ``options_context_link`` from
   ``ScrudfulRouter``: the OPTIONS Links are the fixed w3id.org 0.1 URLs.
-* Every URI scrudful sends or describes is absolute: relative link values are
-  resolved against the request. Links are de-duplicated: a Link that the view
+* Every Link header target scrudful sends and every URI in the OPTIONS
+  document is absolute: relative link values are resolved against the
+  request. A ``Location`` (from ``location_func`` or
+  ``ScrudfulResponse.location``, which RFC 9110 allows to be relative) and a
+  list entry's ``href`` (from ``href_func``) are sent as given: return
+  absolute ones from those callables if you want them. Links are de-duplicated: a Link that the view
   set itself with the relation scrudful's schema (context) link has, compared
   case-insensitively (``describedby`` and the JSON-LD context with the
   defaults, or an overridden ``*_rel_or_func``'s), suppresses scrudful's, and
