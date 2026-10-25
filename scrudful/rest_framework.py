@@ -102,7 +102,9 @@ import types
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from django.http import HttpRequest, HttpResponseBase
+from django.core.exceptions import PermissionDenied
+from django.http import Http404, HttpRequest, HttpResponseBase
+from rest_framework.exceptions import APIException
 from rest_framework.decorators import api_view
 from rest_framework.metadata import BaseMetadata, SimpleMetadata
 from rest_framework.mixins import UpdateModelMixin
@@ -174,6 +176,9 @@ _LINK_OPTIONS = (
     "context_type_or_func",
 )
 _VALIDATOR_OPTIONS = ("etag_func", "last_modified_func")
+_OBJECT_OPTIONS = ("object_validators",)
+# The object ``get_object()`` returned for the request (see ``object_validators``).
+_OBJECT_ATTR = "_scrudful_object"
 _ERROR_OPTIONS = ("error",)
 #: The media type of the content a view's own links describe.
 _VIEW_MEDIA_TYPE = "application/json"
@@ -238,12 +243,26 @@ class ScrudfulViewFunc:
         ``renderer_classes`` with an ``application/json`` or ``+json`` media
         type, else DRF's ``JSONRenderer``) renders them. Without ``error``
         these responses carry no Link and are rendered as before.
+    object_validators : bool, optional
+        For a view method of a generic view (one with ``get_object()``):
+        compute the validators from the object ``view.get_object()`` returns,
+        *before* preconditions are evaluated, so that a missing or forbidden
+        object is a 404/403 and never reveals a validator (or a 412/428).
+        ``etag_func(obj)`` and ``last_modified_func(obj)`` then receive only
+        the object, and the precondition check knows the resource exists.
+        :func:`scrudful_viewset` makes the handler's own ``get_object()``
+        return the same instance for the request, and after a successful
+        PUT/PATCH loads the object again for the validators of the response
+        (none are sent if that fails). Needs ``etag_func`` or
+        ``last_modified_func``. Default ``False``: the callbacks are called as
+        ``func(view, request, **url_kwargs)``, before ``get_object()``.
 
     Raises
     ------
     TypeError
         If a validator callback isn't callable, ``error`` isn't an
-        :class:`Entity`, or the view is ``async def``.
+        :class:`Entity`, the view is ``async def``, or ``object_validators``
+        is set without a validator callback.
     ValueError
         If ``error``'s media type is not JSON content.
     """
@@ -261,10 +280,15 @@ class ScrudfulViewFunc:
         context_rel_or_func: Any = None,
         context_type_or_func: Any = None,
         error: Entity | None = None,
+        object_validators: bool = False,
     ) -> None:
         check_validators(etag_func, last_modified_func)
         _check_error(error)
         _check_sync(view_method)
+        if object_validators and etag_func is None and last_modified_func is None:
+            raise TypeError(
+                "object_validators needs an etag_func or last_modified_func"
+            )
         # Copies __name__, __doc__, __wrapped__ and the wrapped view's
         # attributes (e.g. @action's mapping); our own attributes come after.
         functools.update_wrapper(self, view_method)
@@ -278,6 +302,7 @@ class ScrudfulViewFunc:
         self.context_rel_or_func = context_rel_or_func
         self.context_type_or_func = context_type_or_func
         self.error = error
+        self.object_validators = bool(object_validators)
         self._from_viewset = False
 
     def __get__(self, obj: Any, objtype: type | None = None) -> Any:
@@ -326,13 +351,23 @@ class ScrudfulViewFunc:
         cb_args, cb_kwargs = _callback_arguments(args, kwargs, index)
         method = request.method.upper()
         etag = last_modified = None
+        view = args[0] if index > 0 else None
         if self.has_validators and evaluates_preconditions(method):
-            etag, last_modified = self._validators(cb_args, cb_kwargs)
+            exists = None
+            if self.object_validators:
+                # Authorization comes first: an exception propagates as the
+                # view's own, and no validator is computed.
+                obj = _load_object(view)
+                etag, last_modified = self._validators((obj,), {})
+                exists = True
+            else:
+                etag, last_modified = self._validators(cb_args, cb_kwargs)
             result = evaluate_preconditions(
                 method,
                 django_precondition_headers(request),
                 etag=etag,
                 last_modified=last_modified,
+                exists=exists,
                 require_precondition=True,
             )
             if result is not None:
@@ -342,7 +377,15 @@ class ScrudfulViewFunc:
 
         if self.has_validators:
             refresh, send = validator_policy(method, response.status_code)
-            if refresh:
+            if refresh and self.object_validators:
+                etag = last_modified = None
+                try:
+                    obj = _load_object(view, fresh=True)
+                except (Http404, PermissionDenied, APIException):
+                    pass
+                else:
+                    etag, last_modified = self._validators((obj,), {})
+            elif refresh:
                 etag, last_modified = self._validators(cb_args, cb_kwargs)
             if send:
                 set_validator_headers(response, etag, last_modified)
@@ -462,6 +505,7 @@ def scrudful(
     context_rel_or_func: Any = None,
     context_type_or_func: Any = None,
     error: Entity | None = None,
+    object_validators: bool = False,
 ) -> Callable[[Callable[..., Any]], ScrudfulViewFunc]:
     """Decorate a view method or function view to make it SCRUDful.
 
@@ -500,9 +544,12 @@ def scrudful(
         "context_rel_or_func": context_rel_or_func,
         "context_type_or_func": context_type_or_func,
         "error": error,
+        "object_validators": object_validators,
     }
     check_validators(etag_func, last_modified_func)
     _check_error(error)
+    if object_validators and etag_func is None and last_modified_func is None:
+        raise TypeError("object_validators needs an etag_func or last_modified_func")
 
     def decorator(view_method: Callable[..., Any]) -> ScrudfulViewFunc:
         return ScrudfulViewFunc(view_method, **options)
@@ -522,6 +569,7 @@ def scrudful_api_view(
     context_rel_or_func: Any = None,
     context_type_or_func: Any = None,
     error: Entity | None = None,
+    object_validators: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Like DRF's ``api_view``, for a SCRUDful function view.
 
@@ -557,6 +605,8 @@ def scrudful_api_view(
             "scrudful_api_view expected a list of method names, not "
             f"{type(http_method_names).__name__}"
         )
+    if object_validators:
+        raise TypeError("object_validators needs a view with get_object()")
     decorate = scrudful(
         etag_func=etag_func,
         last_modified_func=last_modified_func,
@@ -648,6 +698,10 @@ def scrudful_viewset(cls: type) -> type:
 
     etag_func, last_modified_func : callable, optional
         Item validators (see :class:`ScrudfulViewFunc`).
+    object_validators : bool, optional
+        Compute the item validators from ``get_object()`` (see
+        :class:`ScrudfulViewFunc`); the class's ``get_object`` is wrapped to
+        return the same instance for the whole request.
     schema_link_or_func, schema_rel_or_func, schema_type_or_func : optional
         Item schema link.
     context_link_or_func, context_rel_or_func, context_type_or_func : optional
@@ -669,7 +723,15 @@ def scrudful_viewset(cls: type) -> type:
     def options(prefix: str, names: Sequence[str]) -> dict[str, Any]:
         return {name: getattr(meta, prefix + name, None) for name in names}
 
-    item = options("", _VALIDATOR_OPTIONS + _LINK_OPTIONS + _ERROR_OPTIONS)
+    item = options(
+        "", _VALIDATOR_OPTIONS + _LINK_OPTIONS + _ERROR_OPTIONS + _OBJECT_OPTIONS
+    )
+    if item["object_validators"]:
+        if not callable(getattr(cls, "get_object", None)):
+            raise TypeError("object_validators needs a view with get_object()")
+        _memoize_get_object(cls)
+    else:
+        item["object_validators"] = False
     configs = {
         "create": options("", _LINK_OPTIONS + _ERROR_OPTIONS),
         "retrieve": item,
@@ -697,6 +759,38 @@ def scrudful_viewset(cls: type) -> type:
         setattr(cls, name, wrapper)
     _install_metadata(cls)
     return cls
+
+
+def _memoize_get_object(cls: type) -> None:
+    """Make ``cls.get_object`` return one instance per request (once wrapped)."""
+    original = cls.get_object  # type: ignore[attr-defined]
+    if getattr(original, "_scrudful_memo", False):
+        return
+
+    @functools.wraps(original)
+    def get_object(self: Any) -> Any:
+        request = self.request
+        obj = getattr(request, _OBJECT_ATTR, None)
+        if obj is None:
+            obj = original(self)
+            setattr(request, _OBJECT_ATTR, obj)
+        return obj
+
+    get_object._scrudful_memo = True  # type: ignore[attr-defined]
+    cls.get_object = get_object  # type: ignore[attr-defined]
+
+
+def _load_object(view: Any, fresh: bool = False) -> Any:
+    """``view.get_object()``, after forgetting the memoized object if ``fresh``."""
+    get_object = getattr(view, "get_object", None)
+    if not callable(get_object):
+        raise TypeError("object_validators needs a view with get_object()")
+    if fresh:
+        try:
+            delattr(view.request, _OBJECT_ATTR)
+        except AttributeError:
+            pass
+    return get_object()
 
 
 def _install_metadata(cls: type) -> None:
