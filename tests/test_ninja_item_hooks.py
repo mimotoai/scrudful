@@ -13,8 +13,11 @@ from typing import Any
 import pytest
 from asgiref.sync import async_to_sync
 from django.core.cache import cache
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.http import HttpResponse
-from ninja import NinjaAPI, Router, Schema
+from django.http.request import RawPostDataException
+from django.test import RequestFactory
+from ninja import File, Form, NinjaAPI, Router, Schema, UploadedFile
 from ninja import operation as ninja_operation
 from ninja.decorators import decorate_view
 from ninja.errors import ConfigError, HttpError
@@ -410,6 +413,50 @@ def test_a_hook_may_read_the_body(asynchronous, method):
     assert response.status_code < 300
     assert response.json()["name"] == "new"
     assert bodies == [BODY]
+
+
+def serve(api: NinjaAPI, request) -> HttpResponse:
+    """Serve a real Django ``request`` (ninja's ``TestClient`` mocks it)."""
+    path = request.path.lstrip("/")
+    for pattern in api.urls[0]:
+        match = pattern.resolve(path)
+        if match:
+            return match.func(request, *match.args, **match.kwargs)
+    raise AssertionError(f"no route for {path}")
+
+
+@pytest.mark.parametrize("parsed", [False, True], ids=["unparsed", "parsed-by-auth"])
+def test_a_hook_may_read_an_upload_through_post_and_files(parsed):
+    """A hook reads a multipart body as ``Form`` and ``File`` parameters do,
+    also once the authentication parsed it (as ninja's CSRF check of a cookie
+    auth does), and the operation still gets it; ``request.body`` can't be
+    read then, as documented."""
+    seen = []
+
+    def before(request, **params):
+        seen.append((request.POST["name"], request.FILES["file"].name))
+
+    def auth(request):
+        if parsed:
+            request.POST.get("csrfmiddlewaretoken")  # as ninja's CSRF check
+        return "alice"
+
+    router = Router()
+
+    @router.post("/p/{parent}/uploads", response={201: ItemOut}, auth=auth)
+    @scrudful_create(location_func=location, before=before)
+    def upload(request, parent: int, name: Form[str], file: File[UploadedFile]):
+        return {"id": 2, "name": f"{name}:{file.read().decode()}", "version": 1}
+
+    request = RequestFactory().post(
+        "/p/7/uploads", {"name": "n", "file": SimpleUploadedFile("a.txt", b"data")}
+    )
+    response = serve(api_for(router), request)
+    assert response.status_code == 201
+    assert json.loads(response.content)["name"] == "n:data"
+    assert seen == [("n", "a.txt")]
+    with pytest.raises(RawPostDataException):
+        request.body
 
 
 @ASYNC

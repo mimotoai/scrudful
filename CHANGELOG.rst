@@ -2,12 +2,16 @@
 Changelog
 =========
 
-0.7.1 (since 0.7.0)
+0.8.0 (since 0.7.0)
 ===================
 
 Additive and backwards compatible: an operation without ``after_throttles=``
-(and an item or create operation without ``before=``) behaves as in 0.7.0, except that the ``RuntimeError`` raised when ``before``
-can't get the path parameters now names the hook as ``before=``.
+(and an item or create operation without ``before=``) behaves as in 0.7.0,
+but for two messages. The ``RuntimeError`` raised when ``before`` can't get
+the path parameters now names the hook as ``before=``. The ``ConfigError``
+of any scrudful operation whose ``view_func`` something replaced now lists
+``before=`` among the places for per-operation authorization ("in before=,
+load or auth=", was "in load or auth=").
 
 New
 ---
@@ -56,7 +60,10 @@ New
   multipart body (ninja's CSRF check or ``fix_request_files_middleware`` may
   have parsed it already, and it would hold the uploaded files in memory);
   the body is still validated after it. The OpenAPI description is
-  unchanged.
+  unchanged. As for a list with ``before=``, the decorated function of an
+  operation with a hook can't be called directly (e.g. in a unit test): it
+  raises ``RuntimeError``, since the hooks didn't run. Test the operation
+  through ninja's ``TestClient``.
 
 0.7.0 (since 0.6.0)
 ===================

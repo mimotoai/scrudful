@@ -136,7 +136,7 @@ when the hidden parameter's annotation is imported only under
 ``TYPE_CHECKING``: each annotation is evaluated on its own.
 
 ``@scrudful`` and ``@scrudful_create`` take the hooks of ``@scrudful_list``
-too (since 0.7.1), with the same contract and guards (see
+too (since 0.8.0), with the same contract and guards (see
 :ref:`before= and after_throttles= <ninja-hooks>`): ``before(request,
 **path_params)`` runs where DRF checks permissions (``has_permission``),
 after ninja's authentication and before its throttles, and
@@ -145,9 +145,13 @@ before ninja validates any parameter or the body, so before ``load`` and the
 preconditions: a client a hook refuses never gets a 304, 412, 428 or 422, or
 a validator, and a throttled client gets 429 only once ``before`` allowed it,
 as on DRF. The path parameters are the URL's values, not validated yet:
-strings, unless the path uses a converter (``pk`` is an ``int`` below). A
-hook gets the raw request, and may read the body as the operation's
-parameters do:
+strings, unless the path uses a converter (``pk`` is an ``int`` below). Never
+deny by testing a raw string for a value: ``"07"`` is 7 to an ``int``
+parameter (see :ref:`below <ninja-hooks>`). Called directly (outside ninja,
+e.g. in a unit test), the decorated function of an operation with a hook
+raises ``RuntimeError``, since the hooks didn't run: test it through ninja's
+``TestClient``. A hook gets the raw request, and may read the body as the
+operation's parameters do:
 
 - a JSON body through ``request.body``, which ninja then reads again from
   memory. A body over Django's ``DATA_UPLOAD_MAX_MEMORY_SIZE`` fails there as
@@ -536,7 +540,7 @@ handler gets:
     def list_context_roles(request, context: str):
         return Role.objects.filter(rbac_context=context).order_by("pk")
 
-``after_throttles=`` (since 0.7.1) runs where DRF's ``list()`` starts:
+``after_throttles=`` (since 0.8.0) runs where DRF's ``list()`` starts:
 ``after_throttles(request, **path_params)`` is called once per request after
 ninja's authentication, after ``before`` (if given) and after ninja's
 throttles, and still before its validation of any parameter. A throttled

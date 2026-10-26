@@ -900,8 +900,10 @@ def scrudful(
         client it refuses never gets a 304, 412 or 428, or a validator. As
         for :func:`scrudful_list`: the path parameters are the URL's values,
         not validated yet (strings, unless the path uses a converter such as
-        ``{int:pk}``), it returns ``None`` to let the request go on (anything
-        else, or an awaitable in a sync operation, raises ``TypeError``) and
+        ``{int:pk}``; never deny by testing a raw string for a value, see
+        :func:`scrudful_list`), it returns ``None`` to let the request go on
+        (anything else, or an awaitable in a sync operation, raises
+        ``TypeError``) and
         raises to answer first (the API's exception handler answers, with the
         operation's error Links, and the request uses none of a throttle's
         quota); neither its error nor a later 422 passes through the
@@ -919,7 +921,9 @@ def scrudful(
         either hook, scrudful runs its own copy of ninja's per-operation
         checks, with the guards described for :func:`scrudful_list`
         (``ConfigError`` when the operation is built, ``RuntimeError`` for a
-        request reaching the function without the hooks having allowed it).
+        request reaching the function without the hooks having allowed it,
+        as does a direct call of the decorated function: test the operation
+        through ninja's ``TestClient``).
 
     Raises
     ------
@@ -942,12 +946,10 @@ def scrudful(
         docstring). Also with a hook, as for :func:`scrudful_list`.
     """
     check_validators(etag_func, last_modified_func)
-    if load is not None and not callable(load):
-        raise TypeError(f"load must be callable, not {type(load).__name__}")
     _check_entity("request", request)
     _check_error(error)
     check_error_body_func(error_body_func)
-    check_callables(before=before, after_throttles=after_throttles)
+    check_callables(load=load, before=before, after_throttles=after_throttles)
     config = _Config(
         kind="item",
         load=load,
@@ -1065,9 +1067,10 @@ def scrudful_create(
         authentication, before its throttles and before it validates any
         parameter or the body. As for :func:`scrudful_list`: the path
         parameters are the URL's values, not validated yet (strings, unless
-        the path uses a converter such as ``{int:pk}``), it returns ``None``
-        to let the request go on (anything else, or an awaitable in a sync
-        operation, raises ``TypeError``) and raises to answer first (the
+        the path uses a converter such as ``{int:pk}``; never deny by testing
+        a raw string for a value, see :func:`scrudful_list`), it returns
+        ``None`` to let the request go on (anything else, or an awaitable in a
+        sync operation, raises ``TypeError``) and raises to answer first (the
         API's exception handler answers, with the Links of
         ``responses[status]``, if any, and the request uses none of a
         throttle's quota); neither its error nor a later 422 passes through
@@ -1085,7 +1088,9 @@ def scrudful_create(
         either hook, scrudful runs its own copy of ninja's per-operation
         checks, with the guards described for :func:`scrudful_list`
         (``ConfigError`` when the operation is built, ``RuntimeError`` for a
-        request reaching the function without the hooks having allowed it).
+        request reaching the function without the hooks having allowed it,
+        as does a direct call of the decorated function: test the operation
+        through ninja's ``TestClient``).
 
     Raises
     ------
@@ -1801,7 +1806,8 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
 
         # Registered with ninja, which replaces it in each operation by the
         # wrapper :func:`bind_operation` binds (called directly, it declares
-        # nothing: a plain return value is a 200).
+        # nothing: a plain return value is a 200; with a hook it raises
+        # ``RuntimeError``, the hooks not having run).
         wrapper = bind(_Answers())
         # ninja calls these at the end of ``Operation.__init__``. A fresh list:
         # ``functools.wraps`` copied the handler's (e.g. from ``@paginate``) by
@@ -2391,7 +2397,7 @@ def _install_hooks(
             if func is None:
                 return None
             try:
-                result = await _call_async(func, (request,), dict(raised.path_params))
+                result = await _call_async(func, (request,), raised.path_params)
             except Exception as exc:
                 return answer(request, exc)
             allowed(hook, result)
