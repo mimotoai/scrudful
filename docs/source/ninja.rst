@@ -430,16 +430,20 @@ listing every bad parameter. The optional list validators are called with the
 queryset, and then a list can answer 304.
 
 ninja validates the parameters before the operation runs, so a bad ``page``
-would be a 422 even for a client the list must refuse. ``before=`` runs first:
-``before(request, **path_params)`` is called once per request after ninja's
-authentication and throttling and before it validates any parameter, with the
-URL's path parameters as they are (not validated yet), as DRF checks
-permissions before it reads parameters. Raise ``HttpError(401, ...)`` or
-``HttpError(403, ...)`` there; the API's exception handler answers it. When it
-returns, ninja validates every parameter as without ``before``: one 422 lists
-every bad one, ``page`` and ``page_size`` included, and the OpenAPI
-description is unchanged. Neither its error nor that 422 passes through the
-decorators added with ``add_decorator(mode="operation")``.
+would be a 422 even for a client the list must refuse. ``before=`` runs where
+DRF checks permissions: ``before(request, **path_params)`` is called once per
+request after ninja's authentication and before its throttles and its
+validation of any parameter, with the URL's path parameters as they are (not
+validated yet). Raise ``HttpError(401, ...)`` or ``HttpError(403, ...)``
+there; the API's exception handler answers it, and the refused request uses
+none of a throttle's quota. When it returns, ninja throttles and validates
+every parameter as without ``before``: one 422 lists every bad one, ``page``
+and ``page_size`` included, and the OpenAPI description is unchanged. Neither
+its error nor that 422 passes through the decorators added with
+``add_decorator(mode="operation")``. scrudful installs ``before`` through
+``Operation.run``: a ``decorate_view`` decorator below ``@scrudful_list``
+must use ``functools.wraps`` (``ConfigError`` otherwise, when the operation is
+built).
 
 .. code-block:: python
 

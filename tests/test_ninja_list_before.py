@@ -12,9 +12,11 @@ from asgiref.sync import async_to_sync
 from items.models import Item
 from ninja import NinjaAPI, Router
 from ninja.decorators import decorate_view
-from ninja.errors import HttpError
+from django.core.cache import cache
+from ninja.errors import ConfigError, HttpError
 from ninja.security import APIKeyHeader
 from ninja.testing import TestAsyncClient, TestClient
+from ninja.throttling import AnonRateThrottle as Throttle
 from scrudful.ninja import Entity, add_error_links, scrudful_list
 
 from tests.test_ninja_adapter import ItemOut
@@ -338,27 +340,59 @@ def opaque(run):
     return wrapped
 
 
-def opaque_router(before) -> Router:
+def test_before_with_an_opaque_view_decorator_is_a_config_error():
+    """``before`` can't be installed: fail when the operation is built."""
+    router = Router()
+    with pytest.raises(ConfigError, match="functools.wraps"):
+
+        @router.get("/p/{parent}/items", response=list[ItemOut])
+        @scrudful_list(href_func=href, before=Recorder())
+        @decorate_view(opaque)
+        def list_items(request, parent: int):
+            return Item.objects.order_by("pk")
+
+
+def test_opaque_view_decorator_without_before_is_fine(items):
     router = Router()
 
     @router.get("/p/{parent}/items", response=list[ItemOut])
-    @scrudful_list(href_func=href, before=before)
+    @scrudful_list(href_func=href)
     @decorate_view(opaque)
     def list_items(request, parent: int):
         return Item.objects.order_by("pk")
 
-    return router
+    assert TestClient(api_for(router)).get("/p/7/items").status_code == 200
 
 
-def test_before_never_skipped_when_the_operation_cannot_be_found(items):
-    """Then it runs in the operation, after ninja validated the parameters."""
-    before = Recorder(HttpError(403, "Denied"))
-    client = TestClient(api_for(opaque_router(before)))
-    assert client.get("/p/7/items").status_code == 403
-    [(_, params)] = before.calls
-    assert params == {"parent": "7"}
+async def _deny(request):
+    raise HttpError(403, "Denied")
+
+
+def test_sync_before_returning_an_awaitable_is_an_error(items):
+    """A sync operation can't await it: never proceed as if authorized."""
+    before = lambda request, **params: _deny(request)  # noqa: E731
+    client = TestClient(api_for(list_router(before=before)))
+    with pytest.raises(TypeError, match="awaitable"):
+        client.get("/p/7/items")
+
+
+@pytest.fixture
+def fresh_cache():
+    cache.clear()
+    yield
+    cache.clear()
+
+
+@ASYNC
+def test_before_runs_before_throttles(items, fresh_cache, asynchronous):
+    """DRF's order: authentication, permissions, throttles. A denied request
+    uses none of the throttle's quota."""
+    denied = Recorder(HttpError(403, "Denied"))
+    api = api_for(list_router(asynchronous, before=denied), throttle=Throttle("1/m"))
+    get = getter(asynchronous, api)
+    assert [get("/p/7/items").status_code for _ in range(3)] == [403, 403, 403]
     allowed = Recorder()
-    client = TestClient(api_for(opaque_router(allowed)))
-    assert client.get("/p/7/items").status_code == 200
-    assert client.get("/p/7/items?page=x").status_code == 422
-    assert len(allowed.calls) == 1
+    api = api_for(list_router(asynchronous, before=allowed), throttle=Throttle("1/m"))
+    get = getter(asynchronous, api)
+    assert [get("/p/7/items").status_code for _ in range(2)] == [200, 429]
+    assert len(allowed.calls) == 2
