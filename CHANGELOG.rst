@@ -64,12 +64,12 @@ New
   bad one, and the OpenAPI description is unchanged. Neither its error nor
   that 422 reaches the decorators added with ``add_decorator(mode="operation")``.
   So does an awaitable in a sync operation (a coroutine is closed and a
-  future cancelled, never awaited). With ``before``, scrudful runs its own copy of ninja's
-  per-operation checks (CSRF flag, authentication, throttles) with ``before``
-  between the last two, relying on ``Operation.run`` to answer their
-  response before it reads any parameter. Both are verified against ninja
-  1.7.0 and 1.7.1. The ``ninja`` extra is now bounded to 1.7.x
-  (``django-ninja>=1.7,<1.8``), so a later 1.7 release scrudful hasn't
+  future cancelled, never awaited). With ``before``, scrudful runs its own
+  copy of ninja's per-operation checks (CSRF flag, authentication,
+  throttles) with ``before`` between the last two, relying on
+  ``Operation.run`` to answer their response before it reads any parameter.
+  Both are verified against ninja 1.7.0 and 1.7.1. The ``ninja`` extra still
+  allows any ninja from 1.7 below 2, so a later release scrudful hasn't
   verified may be installed: an app using ``before=`` should lock its ninja
   version. When the operation is built (at startup), ``before=`` raises
   ``ConfigError`` if the installed ninja's ``_run_checks`` or ``run`` differs

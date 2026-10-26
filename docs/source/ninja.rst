@@ -457,8 +457,9 @@ must use ``functools.wraps`` (``ConfigError`` otherwise, when the operation is
 built). ``before`` runs in scrudful's own copy of ninja's per-operation checks
 (CSRF flag, authentication, throttles), which relies on ``Operation.run``
 answering their response before it reads any parameter. Both are verified
-against ninja 1.7.0 and 1.7.1; the ``ninja`` extra allows any 1.7.x, so a
-later 1.7 release may be installed before scrudful has verified it. When the
+against ninja 1.7.0 and 1.7.1; the ``ninja`` extra allows any ninja from 1.7
+below 2, so a later release may be installed before scrudful has verified
+it. When the
 operation is built, scrudful compares ninja's ``_run_checks`` and ``run``
 with those releases': by a digest of their source (comments, docstrings and
 blank lines aside), or, where the source isn't installed (``.pyc`` only),

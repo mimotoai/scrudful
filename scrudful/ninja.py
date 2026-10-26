@@ -1208,8 +1208,9 @@ def scrudful_list(
         coroutine is closed and a future cancelled: never awaited). scrudful
         runs ``before`` in its own copy of ninja's per-operation checks,
         verified against ninja 1.7.0 and 1.7.1, though the ``ninja`` extra
-        allows any 1.7.x: on a ninja whose checks, or whose ``Operation.run``
-        calling them, differ (compared by a digest of their source,
+        allows any ninja from 1.7 below 2: on a ninja whose checks, or
+        whose ``Operation.run`` calling them, differ (compared by a digest
+        of their source,
         comments, docstrings and blank lines aside, or, without installed
         source, only by the names, locals and arguments they use),
         ``before=`` raises ``ConfigError`` when the operation is built (at
@@ -2179,7 +2180,8 @@ def _checks_error(label: str, reason: str) -> ConfigError:
     """The ``ConfigError`` of an operation that can't run ``before``."""
     return ConfigError(
         f"{label}: before= needs ninja's own Operation._run_checks and the "
-        "Operation.run calling it (ninja 1.7.x), as scrudful runs before "
+        "Operation.run calling it (as in ninja 1.7.0 and 1.7.1), as scrudful runs "
+        "before "
         f"between authentication and throttling; {reason}."
     )
 
@@ -2191,8 +2193,9 @@ def _install_before(
     permissions: after authentication, before throttling.
 
     ``Operation.run`` answers a response its ``_run_checks`` returns before it
-    reads any parameter. These checks are ninja 1.7.x's (CSRF exemption flag,
-    authentication, throttles) with ``before`` called between authentication
+    reads any parameter. These checks are ninja 1.7.0's and 1.7.1's (CSRF
+    exemption flag, authentication, throttles) with ``before`` called between
+    authentication
     and throttling, with the path parameters as the URL gives them, so a
     request it refuses uses none of a throttle's quota. An exception it
     raises is answered by the API's exception handler, as ninja answers its
