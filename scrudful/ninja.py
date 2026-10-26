@@ -84,7 +84,8 @@ Validators
     with 400, a failed precondition with 412 and a matching GET/HEAD with 304
     carrying the validators. POST is evaluated but never required to be
     conditional. These early responses are returned without calling the
-    handler, as a ``JsonResponse`` (304 without a body), so the operation's
+    handler, their JSON bodies written by the API's renderer (304 without a
+    body; see "The API's renderer" in the documentation), so the operation's
     ``response`` schema does not apply to them. With ``error=Entity(...)``
     the 400, 412 and 428 bodies carry that entity's Links (its link callables
     get the loaded object) and are served with its media type, which must be
@@ -408,7 +409,6 @@ from django.http import (
     HttpRequest,
     HttpResponse,
     HttpResponseBase,
-    JsonResponse,
 )
 from django.utils.encoding import iri_to_uri
 from ninja import NinjaAPI, Query, Router, Schema, Status
@@ -450,6 +450,7 @@ from scrudful._adapter import (
 from scrudful._django import (
     aware,
     conditional_response,
+    json_response,
     page_url,
     precondition_headers,
     slice_page,
@@ -1636,12 +1637,15 @@ def _early_response(
     """scrudful's own response to a failed or short-circuited precondition.
 
     The 400, 412 and 428 bodies get the Links of ``config.error``, whose link
-    callables get ``obj``, and its media type as their Content-Type.
+    callables get ``obj``, and its media type as their Content-Type. The
+    serving API's renderer writes them (see :func:`_render`).
     """
     error = config.error
     result = with_error_body(config.error_body_func, request, result)
     early = conditional_response(
-        result, content_type=None if error is None else error.media_type
+        result,
+        content_type=None if error is None else error.media_type,
+        render=_render(request),
     )
     if result.body is not None and error is not None:
         yield from _add_links(early, error, request, obj)
@@ -1702,6 +1706,76 @@ class _Raised:
 _RAISED: ContextVar[_Raised | None] = ContextVar("scrudful_raised", default=None)
 
 
+#: The API serving the scrudful operation (or automatic OPTIONS) running, set
+#: by its ``Operation.run`` decorator (:func:`_raised_links_run`,
+#: :func:`_serving_api_run`); ``None`` outside one.
+_SERVING_API: ContextVar[NinjaAPI | None] = ContextVar(
+    "scrudful_serving_api", default=None
+)
+
+
+def _operation_of(run: Callable[..., Any]) -> Any:
+    """The ninja operation whose ``run`` method ``run`` is, or wraps.
+
+    ninja decorates the bound ``Operation.run`` of each operation and of each
+    of its clones (one per mount); decorators applied before scrudful's are
+    seen through when they use ``functools.wraps``. ``None`` when it can't be
+    found (scrudful's bodies are then written as ``JsonResponse`` writes them).
+    """
+    return getattr(inspect.unwrap(run), "__self__", None)
+
+
+def _serving_api_run(run: Callable[..., Any]) -> Callable[..., Any]:
+    """The ``Operation.run`` decorator of the (sync) automatic OPTIONS operation,
+    setting :data:`_SERVING_API` while it runs."""
+    operation = _operation_of(run)
+
+    @functools.wraps(run)
+    def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
+        token = _SERVING_API.set(getattr(operation, "api", None))
+        try:
+            return run(request, *args, **kw)
+        finally:
+            _SERVING_API.reset(token)
+
+    return scrudful_run
+
+
+def _record_serving_api(operation: Any) -> None:
+    """Decorate ``operation.run`` with :func:`_serving_api_run`, also in the
+    clones ninja makes of ``operation`` (it re-applies ``_run_decorators``)."""
+    operation.run = _serving_api_run(operation.run)
+    if not hasattr(operation, "_run_decorators"):
+        operation._run_decorators = []
+    operation._run_decorators.append(_serving_api_run)
+
+
+def _render(request: HttpRequest) -> Callable[[Any, int], bytes] | None:
+    """How the API serving ``request`` writes a JSON body, for scrudful's own
+    responses (OPTIONS and the early 400, 412 and 428).
+
+    Its renderer, when that writes JSON content (an ``application/json`` or
+    ``+json`` ``media_type``), so these bodies have the bytes of every other
+    response of the API. ``None`` (Django's ``JsonResponse``) outside a
+    scrudful operation, or for a renderer of other content: the bodies are
+    JSON whatever the renderer.
+    """
+    renderer = getattr(_SERVING_API.get(), "renderer", None)
+    media_type = getattr(renderer, "media_type", None)
+    try:
+        if not media_type or not is_json(media_type):
+            return None
+    except ValueError:  # not a media type
+        return None
+    charset = getattr(renderer, "charset", None) or "utf-8"
+
+    def render(data: Any, status: int) -> bytes:
+        content = renderer.render(request, data, response_status=status)
+        return content.encode(charset) if isinstance(content, str) else content
+
+    return render
+
+
 def _note_raised(config: _Config) -> None:
     """Note that the operation of ``config`` raised the error being handled."""
     raised = _RAISED.get()
@@ -1719,18 +1793,24 @@ def _raised_links_run(
     rolling a transaction back), and ninja answers it with the API's
     exception handler. The response ``run`` returns then gets the Links of
     the operation's entity for its status, see :func:`_raised_entity`.
+
+    While ``run`` runs, :data:`_SERVING_API` is the operation's API, whose
+    renderer writes scrudful's own bodies (see :func:`_render`).
     """
 
     def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
+        operation = _operation_of(run)
         if asynchronous:
 
             @functools.wraps(run)
             async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
                 raised = _Raised()
                 token = _RAISED.set(raised)
+                api_token = _SERVING_API.set(getattr(operation, "api", None))
                 try:
                     response = await run(request, *args, **kw)
                 finally:
+                    _SERVING_API.reset(api_token)
                     _RAISED.reset(token)
                 if raised.config is not None:
                     await _run_async(_raised_links(raised.config, request, response))
@@ -1742,9 +1822,11 @@ def _raised_links_run(
             def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
                 raised = _Raised()
                 token = _RAISED.set(raised)
+                api_token = _SERVING_API.set(getattr(operation, "api", None))
                 try:
                     response = run(request, *args, **kw)
                 finally:
+                    _SERVING_API.reset(api_token)
                     _RAISED.reset(token)
                 if raised.config is not None:
                     _run_sync(_raised_links(raised.config, request, response))
@@ -2451,12 +2533,14 @@ def _options_view(path: str, path_view: Any) -> Callable[..., HttpResponseBase]:
     clones of them). It declares the path parameters, as ``Any`` (a
     converter such as ``{int:pk}`` passes an ``int``), so that ninja passes
     them and validates nothing. The response carries the HTTP Schema
-    Resource's own Links and an ``Allow`` listing the body's methods.
+    Resource's own Links and an ``Allow`` listing the body's methods. The
+    body is written by the serving API's renderer (see :func:`_render`), and
+    is ``application/json``.
     """
 
     def scrudful_options(request: HttpRequest, **params: Any) -> HttpResponseBase:
         body = _describe_path(request, path_view)
-        response = JsonResponse(body)
+        response = json_response(body, 200, "application/json", _render(request))
         response["Link"] = options_links()
         response["Allow"] = allow_header(body)
         expose_headers(response)
@@ -2473,6 +2557,10 @@ def _options_view(path: str, path_view: Any) -> Callable[..., HttpResponseBase]:
         ]
     )
     scrudful_options._scrudful_options = True  # type: ignore[attr-defined]
+    # The API's renderer writes the body (see _render).
+    scrudful_options._ninja_contribute_to_operation = [  # type: ignore[attr-defined]
+        _record_serving_api
+    ]
     return scrudful_options
 
 

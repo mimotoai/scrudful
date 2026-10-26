@@ -487,7 +487,9 @@ every POST. It is the same for everyone:
   loaded object, queryset or created item), so they must accept ``None``;
 * the response always has the two fixed HTTP Schema Resource Links, an
   ``Allow`` header listing the body's methods and, for the paths that serve
-  it, a ``head`` entry without content.
+  it, a ``head`` entry without content;
+* the body is written by the API's renderer and served as
+  ``application/json`` (see "The API's renderer" under `Error responses`_).
 
 CORS
 ~~~~
@@ -602,6 +604,16 @@ handlers make for the errors raised inside a scrudful operation and for those
 entity's ``media_type`` whatever the handler chose, so every wrapped handler's
 JSON bodies must be content the entity describes. A handler's response with
 other content (e.g. ``text/plain``) keeps its ``Content-Type``.
+
+**The API's renderer.** scrudful's own bodies (the OPTIONS HTTP Schema
+Resource and the 400, 412 and 428) are written by the renderer of the API
+serving the request (``NinjaAPI(renderer=...)``), as every other response, so
+a renderer with other separators or escapes gives them the same bytes. Their
+``Content-Type`` is still the one described here (``application/json``, or the
+``error`` entity's media type), not the renderer's. A renderer whose
+``media_type`` is not JSON content, a ``decorate_view`` decorator below
+scrudful that wraps ``Operation.run`` without ``functools.wraps`` gets them
+written as Django's ``JsonResponse`` writes them.
 
 **Error bodies.** ``error_body_func(request, result)`` on ``@scrudful`` and
 ``@scrudful_list`` returns the dict that replaces the default
