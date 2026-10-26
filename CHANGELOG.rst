@@ -64,8 +64,10 @@ Fixes
   when both are bad, as ninja's ``scrudful_list`` 422 already did. Each
   parameter still goes through ``_integer``, so a subclass calling or
   overriding it (to clamp ``page_size``, or accept ``page=last``) keeps its
-  behaviour; ``_parse_parameter`` (returning the value and the error, parsed
-  once) is the new hook below it.
+  behaviour, and with an overridden ``_integer`` the 400 names the first bad
+  parameter only, as in 0.6.0 (the override is not called for ``page_size``
+  once ``page`` failed). ``_parse_parameter`` (returning the value and the
+  error, parsed once) is the new hook below it, and keeps both errors.
 
 0.6.0 (since 0.5.0)
 ===================

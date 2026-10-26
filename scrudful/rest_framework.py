@@ -1549,7 +1549,8 @@ class ScrudfulPagination(BasePagination):
     as the URL keyword (``pk=...``).
 
     A non-integer or out of range ``page`` or ``page_size`` is a 400 naming
-    the parameter (both, when both are bad), each error with the code of a DRF
+    the parameter (both, when both are bad, unless a subclass overrides
+    ``_integer``), each error with the code of a DRF
     ``IntegerField``'s: ``invalid`` (not an integer), ``min_value`` (below 1)
     or ``max_value`` (``page_size`` above ``max_page_size``). A ``page`` past
     the last one is a 404 (page 1 always exists).
@@ -1571,8 +1572,11 @@ class ScrudfulPagination(BasePagination):
                 f"{type(view).__name__} uses ScrudfulPagination: it needs "
                 "Meta.href_func(view, request, obj), returning an item's URL"
             )
-        # Each parameter goes through _integer (which a subclass may override),
-        # and their errors are merged, so one 400 names both.
+        # Each parameter goes through _integer. With scrudful's own, their
+        # errors are merged, so one 400 names both; an overridden one stops at
+        # the first error, as in 0.6.0 (it is not called for page_size once
+        # page failed).
+        collect = type(self)._integer is ScrudfulPagination._integer
         values, errors = {}, {}
         for name, default, maximum in (
             (self.page_query_param, 1, None),
@@ -1581,6 +1585,8 @@ class ScrudfulPagination(BasePagination):
             try:
                 values[name] = self._integer(request, name, default, maximum)
             except ValidationError as exc:
+                if not collect:
+                    raise
                 detail = exc.detail
                 if isinstance(detail, dict):
                     errors.update(detail)
@@ -1666,9 +1672,11 @@ class ScrudfulPagination(BasePagination):
         """The query parameter ``name`` as an integer in ``[1, maximum]``.
 
         :meth:`paginate_queryset` calls it for ``page`` and ``page_size`` and
-        merges the errors of both into one ``ValidationError``; a subclass may
-        override it (to clamp ``page_size``, say), or override
-        :meth:`_parse_parameter`.
+        merges the errors of both into one ``ValidationError``. A subclass may
+        override it (to clamp ``page_size``, say): ``paginate_queryset`` then
+        raises the first error, as in 0.6.0, without calling it for
+        ``page_size`` once ``page`` failed. Or override
+        :meth:`_parse_parameter`, which keeps both errors.
 
         Raises
         ------

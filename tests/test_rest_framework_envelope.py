@@ -359,12 +359,10 @@ def test_pagination_subclass_integer_override_clamps(items, client):
     response = client.get("/drf/clamping/", {"page_size": 5000})
     assert response.status_code == 200
     assert len(response.json()["content"]) == 2
-    both = client.get("/drf/clamping/", {"page": "x", "page_size": "0"})
-    assert both.status_code == 400
-    assert both.json() == {
-        "page": ["A valid integer is required."],
-        "page_size": ["Ensure this value is greater than or equal to 1."],
-    }
+    # An overridden _integer: the first error only, as in 0.6.0.
+    first = client.get("/drf/clamping/", {"page": "x", "page_size": "0"})
+    assert first.status_code == 400
+    assert first.json() == {"page": ["A valid integer is required."]}
 
 
 def test_pagination_subclass_integer_override_accepts_last(items, client):
@@ -384,12 +382,29 @@ def test_pagination_page_last_through_either_hook(items, client, url):
     response = client.get(url, {"page": "last"})
     assert response.status_code == 200
     assert [e["content"]["name"] for e in response.json()["content"]] == ["c"]
-    both = client.get(url, {"page": "x", "page_size": "3"})
-    assert both.status_code == 400
-    assert both.json() == {
-        "page": ["A valid integer is required."],
-        "page_size": ["Ensure this value is less than or equal to 2."],
-    }
+    bad = client.get(url, {"page": "x", "page_size": "3"})
+    assert bad.status_code == 400
+    page_error = {"page": ["A valid integer is required."]}
+    if url == "/drf/lastparse/":
+        # The default _integer: both parameters' errors.
+        page_error["page_size"] = ["Ensure this value is less than or equal to 2."]
+    assert bad.json() == page_error
+
+
+def test_pagination_overridden_integer_stops_at_the_first_error(items):
+    """0.6.0's order: an override is not called for page_size once page failed."""
+    calls = []
+
+    class Recording(ClampingPagination):
+        def _integer(self, request, name, default, maximum):
+            calls.append(name)
+            return super()._integer(request, name, default, maximum)
+
+    request = Request(APIRequestFactory().get("/", {"page": "x", "page_size": "y"}))
+    with pytest.raises(ValidationError) as caught:
+        Recording().paginate_queryset(Item.objects.all(), request, SmallViewSet())
+    assert caught.value.get_codes() == {"page": ["invalid"]}
+    assert calls == ["page"]
 
 
 def test_pagination_parse_parameter_returns_value_and_error(items):
