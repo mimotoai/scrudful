@@ -453,6 +453,7 @@ from scrudful._adapter import (
     SCHEMA_TYPE,
     allow_header,
     check_error_body_func,
+    check_callables,
     check_error_media_type,
     check_validators,
     context_defaults,
@@ -613,6 +614,14 @@ class ScrudfulResponse:
     created: Any = _UNSET
 
 
+#: The hooks scrudful runs in its copy of ninja's checks, in DRF's order,
+#: and where each runs (see :func:`_install_hooks`).
+_HOOKS = {
+    "before": "between authentication and throttling",
+    "after_throttles": "after throttling",
+}
+
+
 @dataclass(frozen=True)
 class _Config:
     """What a scrudful decorator declared, set as ``view_func._scrudful``.
@@ -671,24 +680,17 @@ class _Config:
     #: validated (see :func:`_install_hooks`).
     after_throttles: Callable[..., Any] | None = None
 
-    @property
-    def decorator_name(self) -> str:
-        """The public decorator declaring an operation of this kind."""
-        return {"item": "@scrudful", "create": "@scrudful_create"}.get(
-            self.kind, "@scrudful_list"
-        )
+    @functools.cached_property
+    def hooks(self) -> tuple[str, ...]:
+        """The names of the hooks given (see :data:`_HOOKS`), in DRF's order;
+        empty without either. Computed once: each request checks it."""
+        return tuple(name for name in _HOOKS if getattr(self, name) is not None)
 
     @property
-    def hooks(self) -> str | None:
-        """The hooks run in scrudful's copy of ninja's checks, as errors name
-        them (``"before="``, ``"after_throttles="`` or both); ``None``
-        without either."""
-        names = [
-            f"{name}="
-            for name in ("before", "after_throttles")
-            if getattr(self, name) is not None
-        ]
-        return " and ".join(names) or None
+    def hooks_label(self) -> str:
+        """:attr:`hooks` as errors name them (``"before="``,
+        ``"after_throttles="`` or both)."""
+        return " and ".join(f"{name}=" for name in self.hooks)
 
     @property
     def entity(self) -> Entity:
@@ -896,15 +898,20 @@ def scrudful(
         authentication, before its throttles and before it validates any
         parameter or the body, so before ``load`` and the preconditions: a
         client it refuses never gets a 304, 412 or 428, or a validator. As
-        for :func:`scrudful_list`: the path parameters are the URL's raw
-        strings, it returns ``None`` to let the request go on (anything else,
-        or an awaitable in a sync operation, raises ``TypeError``) and raises
-        to answer first (the API's exception handler answers, with the
+        for :func:`scrudful_list`: the path parameters are the URL's values,
+        not validated yet (strings, unless the path uses a converter such as
+        ``{int:pk}``), it returns ``None`` to let the request go on (anything
+        else, or an awaitable in a sync operation, raises ``TypeError``) and
+        raises to answer first (the API's exception handler answers, with the
         operation's error Links, and the request uses none of a throttle's
         quota); neither its error nor a later 422 passes through the
-        ``add_decorator(mode="operation")`` decorators. It may read
-        ``request.body`` (which buffers the whole body, within Django's
-        ``DATA_UPLOAD_MAX_MEMORY_SIZE``), never ``request.POST`` or ``FILES``.
+        ``add_decorator(mode="operation")`` decorators. It may read the body
+        as the operation's parameters do: ``request.body`` for a JSON body,
+        ``request.POST`` and ``request.FILES`` for a form or an upload. Never
+        ``request.body`` of a multipart body: ninja's CSRF check or
+        ``fix_request_files_middleware`` may have parsed it already (Django
+        then raises ``RawPostDataException``), and it would hold the
+        uploaded files in memory, within ``DATA_UPLOAD_MAX_MEMORY_SIZE``.
     after_throttles : callable, optional
         ``after_throttles(request, **path_params)``, the same, called after
         ``before`` and ninja's throttles: a throttled request (429) never
@@ -940,7 +947,7 @@ def scrudful(
     _check_entity("request", request)
     _check_error(error)
     check_error_body_func(error_body_func)
-    _check_hooks(before, after_throttles)
+    check_callables(before=before, after_throttles=after_throttles)
     config = _Config(
         kind="item",
         load=load,
@@ -1057,15 +1064,20 @@ def scrudful_create(
         checks permissions (``has_permission``): after ninja's
         authentication, before its throttles and before it validates any
         parameter or the body. As for :func:`scrudful_list`: the path
-        parameters are the URL's raw strings, it returns ``None`` to let the
-        request go on (anything else, or an awaitable in a sync operation,
-        raises ``TypeError``) and raises to answer first (the API's exception
-        handler answers, with the Links of ``responses[status]``, if any, and
-        the request uses none of a throttle's quota); neither its error nor a
-        later 422 passes through the ``add_decorator(mode="operation")``
-        decorators. It may read
-        ``request.body`` (which buffers the whole body, within Django's
-        ``DATA_UPLOAD_MAX_MEMORY_SIZE``), never ``request.POST`` or ``FILES``.
+        parameters are the URL's values, not validated yet (strings, unless
+        the path uses a converter such as ``{int:pk}``), it returns ``None``
+        to let the request go on (anything else, or an awaitable in a sync
+        operation, raises ``TypeError``) and raises to answer first (the
+        API's exception handler answers, with the Links of
+        ``responses[status]``, if any, and the request uses none of a
+        throttle's quota); neither its error nor a later 422 passes through
+        the ``add_decorator(mode="operation")`` decorators. It may read the
+        body as the operation's parameters do: ``request.body`` for a JSON
+        body, ``request.POST`` and ``request.FILES`` for a form or an upload.
+        Never ``request.body`` of a multipart body: ninja's CSRF check or
+        ``fix_request_files_middleware`` may have parsed it already (Django
+        then raises ``RawPostDataException``), and it would hold the
+        uploaded files in memory, within ``DATA_UPLOAD_MAX_MEMORY_SIZE``.
     after_throttles : callable, optional
         ``after_throttles(request, **path_params)``, the same, called after
         ``before`` and ninja's throttles: a throttled request (429) never
@@ -1098,7 +1110,7 @@ def scrudful_create(
         )
     check_validators(etag_func, last_modified_func)
     _check_entity("request", request)
-    _check_hooks(before, after_throttles)
+    check_callables(before=before, after_throttles=after_throttles)
     item = Entity(
         schema_link_or_func=schema_link_or_func,
         schema_rel_or_func=schema_rel_or_func,
@@ -1122,13 +1134,6 @@ def scrudful_create(
         after_throttles=after_throttles,
     )
     return _decorator(config, "@scrudful_create")
-
-
-def _check_hooks(before: Any, after_throttles: Any) -> None:
-    """Raise ``TypeError`` unless each hook given is callable."""
-    for name, func in (("before", before), ("after_throttles", after_throttles)):
-        if func is not None and not callable(func):
-            raise TypeError(f"{name} must be callable, not {type(func).__name__}")
 
 
 def scrudful_list(
@@ -1357,12 +1362,12 @@ def scrudful_list(
     if not callable(href_func):
         raise TypeError(f"href_func must be callable, not {type(href_func).__name__}")
     check_validators(etag_func, last_modified_func)
-    for name, func in (
-        ("list_etag_func", list_etag_func),
-        ("list_last_modified_func", list_last_modified_func),
-    ):
-        if func is not None and not callable(func):
-            raise TypeError(f"{name} must be callable, not {type(func).__name__}")
+    check_callables(
+        list_etag_func=list_etag_func,
+        list_last_modified_func=list_last_modified_func,
+        before=before,
+        after_throttles=after_throttles,
+    )
     for name, value in (("page_size", page_size), ("max_page_size", max_page_size)):
         if not isinstance(value, int) or isinstance(value, bool):
             raise TypeError(f"{name} must be an int, not {type(value).__name__}")
@@ -1374,7 +1379,6 @@ def scrudful_list(
         )
     _check_error(error)
     check_error_body_func(error_body_func)
-    _check_hooks(before, after_throttles)
     config = _Config(
         kind="list",
         href_func=href_func,
@@ -1792,7 +1796,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             # the API's exception handler, which ``Operation.run`` returns. It
             # is wrapped as ``decorate_view`` wraps it, so that ninja's clones
             # of the operation (one per mount) wrap theirs too.
-            run_decorator = _raised_links_run(asynchronous, config, label)
+            run_decorator = _raised_links_run(asynchronous, config, name, label)
             _add_run_decorator(operation, run_decorator)
 
         # Registered with ninja, which replaces it in each operation by the
@@ -2028,7 +2032,7 @@ def _note_raised(config: _Config, exc: Exception) -> None:
 
 
 def _raised_links_run(
-    asynchronous: bool, config: _Config, label: str
+    asynchronous: bool, config: _Config, name: str, label: str
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """The ``Operation.run`` decorator adding the Links of a raised error.
 
@@ -2042,14 +2046,14 @@ def _raised_links_run(
     renderer writes scrudful's own bodies (see :func:`_render`). The
     operation's hooks (``before``, ``after_throttles``) are installed on the
     operation, and on each clone ninja decorates again (see
-    :func:`_install_hooks`; ``label`` names the
-    operation in its errors).
+    :func:`_install_hooks`; ``name`` is the scrudful decorator and ``label``
+    names the operation in its errors).
     """
 
     def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
         operation = _operation_of(run)
-        if config.hooks is not None:
-            _install_hooks(operation, config, asynchronous, label)
+        if config.hooks:
+            _install_hooks(operation, config, asynchronous, name, label)
         if asynchronous:
 
             @functools.wraps(run)
@@ -2252,7 +2256,7 @@ def _is_ninja_code(func: Any, name: str) -> bool:
 
 
 def _check_ninja_checks(
-    operation: Any, config: _Config, asynchronous: bool, label: str
+    operation: Any, config: _Config, asynchronous: bool, name: str, label: str
 ) -> None:
     """Raise ``ConfigError`` unless ``operation`` can run ``config``'s hooks
     (``before``, ``after_throttles``) in scrudful's copy of ninja's checks
@@ -2263,13 +2267,12 @@ def _check_ninja_checks(
     ``run`` calling them) changed fails when the operation is built instead
     of losing a hook or a check.
     """
-    hooks = config.hooks
+    hooks = config.hooks_label
     if operation is None:
         raise ConfigError(
             f"{label}: {hooks} can't be installed: scrudful can't find the "
             "ninja operation through Operation.run, because a decorate_view "
-            f"decorator below {config.decorator_name} wraps it without "
-            "functools.wraps. "
+            f"decorator below {name} wraps it without functools.wraps. "
             "Use functools.wraps in that decorator, or apply decorate_view "
             "above the operation decorator."
         )
@@ -2297,31 +2300,23 @@ def _check_ninja_checks(
             )
 
 
-def _verb(config: _Config, one: str, both: str) -> str:
-    """``one`` for a single hook, ``both`` for ``before`` and ``after_throttles``."""
-    return (
-        both
-        if config.before is not None and config.after_throttles is not None
-        else one
-    )
+def _verb(config: _Config, one: str, several: str) -> str:
+    """``one`` for a single hook, ``several`` for more."""
+    return one if len(config.hooks) == 1 else several
 
 
 def _checks_error(label: str, config: _Config, reason: str) -> ConfigError:
     """The ``ConfigError`` of an operation that can't run ``config``'s hooks."""
-    where = []
-    if config.before is not None:
-        where.append("before between authentication and throttling")
-    if config.after_throttles is not None:
-        where.append("after_throttles after throttling")
+    where = " and ".join(f"{name} {_HOOKS[name]}" for name in config.hooks)
     return ConfigError(
-        f"{label}: {config.hooks} {_verb(config, 'needs', 'need')} ninja's own "
-        "Operation._run_checks and the Operation.run calling it (as in ninja "
-        f"1.7.0 and 1.7.1), as scrudful runs {' and '.join(where)}; {reason}."
+        f"{label}: {config.hooks_label} {_verb(config, 'needs', 'need')} ninja's "
+        "own Operation._run_checks and the Operation.run calling it (as in "
+        f"ninja 1.7.0 and 1.7.1), as scrudful runs {where}; {reason}."
     )
 
 
 def _install_hooks(
-    operation: Any, config: _Config, asynchronous: bool, label: str
+    operation: Any, config: _Config, asynchronous: bool, name: str, label: str
 ) -> None:
     """Give ``operation`` checks running ``config.before`` where DRF checks
     permissions (after authentication, before throttling) and
@@ -2353,20 +2348,14 @@ def _install_hooks(
     ninja.errors.ConfigError
         See :func:`_check_ninja_checks`.
     """
-    _check_ninja_checks(operation, config, asynchronous, label)
-    # In DRF's order; ``None`` for ninja's throttles.
-    steps: list[tuple[str, Callable[..., Any] | None]] = [("throttles", None)]
-    if config.before is not None:
-        steps.insert(0, ("before", config.before))
-    if config.after_throttles is not None:
-        steps.append(("after_throttles", config.after_throttles))
+    _check_ninja_checks(operation, config, asynchronous, name, label)
 
     def current() -> _Raised:
         raised = _RAISED.get()
         if raised is None:
             raise RuntimeError(
-                f"{label}: {config.hooks} can't get the path parameters: the "
-                "operation's checks ran outside its Operation.run"
+                f"{label}: {config.hooks_label} can't get the path parameters: "
+                "the operation's checks ran outside its Operation.run"
             )
         return raised
 
@@ -2374,6 +2363,11 @@ def _install_hooks(
         """The API's answer to what a hook raised."""
         _note_raised(config, exc)
         return operation.api.on_exception(request, exc)  # type: ignore[no-any-return]
+
+    def allowed(hook: str, result: Any) -> None:
+        """Fail closed unless hook ``hook`` returned ``None``."""
+        if result is not None:
+            _refuse_hook_result(hook, result, asynchronous)
 
     def mark_csrf_exempt(request: HttpRequest) -> None:
         if operation.csrf_exempt:
@@ -2388,6 +2382,21 @@ def _install_hooks(
 
     if asynchronous:
 
+        async def call(
+            hook: str, request: HttpRequest, raised: _Raised
+        ) -> HttpResponseBase | None:
+            """Call hook ``hook``, if given: ``None`` once it allowed the
+            request, else the API's answer to what it raised."""
+            func = getattr(config, hook)
+            if func is None:
+                return None
+            try:
+                result = await _call_async(func, (request,), dict(raised.path_params))
+            except Exception as exc:
+                return answer(request, exc)
+            allowed(hook, result)
+            return None
+
         async def run_checks(request: HttpRequest) -> HttpResponseBase | None:
             mark_csrf_exempt(request)
             if operation.auth_callbacks:
@@ -2395,24 +2404,32 @@ def _install_hooks(
                 if error:
                     return error  # type: ignore[no-any-return]
             raised = current()
-            for name, hook in steps:
-                if hook is None:
-                    error = throttle(request)
-                    if error is not None:
-                        return error
-                    continue
-                try:
-                    result = await _call_async(
-                        hook, (request,), dict(raised.path_params)
-                    )
-                except Exception as exc:
-                    return answer(request, exc)
-                if result is not None:
-                    _refuse_hook_result(name, result, asynchronous)
-            raised.hooks_allowed = True
-            return None
+            # DRF's order: before, throttles, after_throttles.
+            error = await call("before", request, raised)
+            if error is None:
+                error = throttle(request)
+            if error is None:
+                error = await call("after_throttles", request, raised)
+            if error is None:
+                raised.hooks_allowed = True
+            return error
 
     else:
+
+        def call(  # type: ignore[misc]
+            hook: str, request: HttpRequest, raised: _Raised
+        ) -> HttpResponseBase | None:
+            """Call hook ``hook``, if given: ``None`` once it allowed the
+            request, else the API's answer to what it raised."""
+            func = getattr(config, hook)
+            if func is None:
+                return None
+            try:
+                result = func(request, **raised.path_params)
+            except Exception as exc:
+                return answer(request, exc)
+            allowed(hook, result)
+            return None
 
         def run_checks(  # type: ignore[misc]
             request: HttpRequest,
@@ -2423,20 +2440,15 @@ def _install_hooks(
                 if error:
                     return error  # type: ignore[no-any-return]
             raised = current()
-            for name, hook in steps:
-                if hook is None:
-                    error = throttle(request)
-                    if error is not None:
-                        return error
-                    continue
-                try:
-                    result = hook(request, **raised.path_params)
-                except Exception as exc:
-                    return answer(request, exc)
-                if result is not None:
-                    _refuse_hook_result(name, result, asynchronous)
-            raised.hooks_allowed = True
-            return None
+            # DRF's order: before, throttles, after_throttles.
+            error = call("before", request, raised)
+            if error is None:
+                error = throttle(request)
+            if error is None:
+                error = call("after_throttles", request, raised)
+            if error is None:
+                raised.hooks_allowed = True
+            return error
 
     operation._run_checks = run_checks
 
@@ -2450,13 +2462,12 @@ def _check_hooks_allowed(config: _Config, label: str) -> None:
     re-applying ``Operation.run``'s decorators), the request fails instead
     of going on unchecked.
     """
-    hooks = config.hooks
-    if hooks is None:
+    if not config.hooks:
         return
     raised = _RAISED.get()
     if raised is None or not raised.hooks_allowed:
         raise RuntimeError(
-            f"{label}: {hooks} didn't run for this request: the operation "
+            f"{label}: {config.hooks_label} didn't run for this request: the operation "
             "ninja served lacks scrudful's checks. Refusing the request."
         )
 

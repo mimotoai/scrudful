@@ -341,6 +341,23 @@ def test_hook_error_beats_a_bad_path_parameter(asynchronous, hook, method):
     )
 
 
+@pytest.mark.parametrize("hook", HOOKS)
+def test_hook_gets_converted_path_parameters(hook):
+    """A path converter's value, not the URL's string, as documented."""
+    allowed = Recorder()
+    router = Router()
+
+    @router.get("/things/{int:pk}", response=ItemOut)
+    @scrudful(**{hook: allowed})
+    def get_thing(request, pk: int):
+        return {"id": pk, "name": "a", "version": 1}
+
+    assert TestClient(api_for(router)).get("/things/5").status_code == 200
+    [(_, params)] = allowed.calls
+    assert params == {"pk": 5}
+    assert type(params["pk"]) is int
+
+
 @ASYNC
 @pytest.mark.parametrize("method", [*METHODS, "POST"])
 @pytest.mark.parametrize(

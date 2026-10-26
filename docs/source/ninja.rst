@@ -144,10 +144,26 @@ after ninja's authentication and before its throttles, and
 before ninja validates any parameter or the body, so before ``load`` and the
 preconditions: a client a hook refuses never gets a 304, 412, 428 or 422, or
 a validator, and a throttled client gets 429 only once ``before`` allowed it,
-as on DRF. A hook gets the raw request and may read ``request.body``, which
-buffers the whole body (a body over Django's ``DATA_UPLOAD_MAX_MEMORY_SIZE``
-is then Django's own 400); it must not read ``request.POST`` or ``FILES``, after
-which the body can no longer be read:
+as on DRF. The path parameters are the URL's values, not validated yet:
+strings, unless the path uses a converter (``pk`` is an ``int`` below). A
+hook gets the raw request, and may read the body as the operation's
+parameters do:
+
+- a JSON body through ``request.body``, which ninja then reads again from
+  memory. A body over Django's ``DATA_UPLOAD_MAX_MEMORY_SIZE`` fails there as
+  when ninja reads it: Django's 400 (with ``DEBUG``, ninja's 500 traceback).
+- a form or an upload (``Form`` and ``File`` parameters) through
+  ``request.POST`` and ``request.FILES``, never ``request.body``. A multipart
+  body may already be parsed when the hook runs: on a POST by ninja's CSRF
+  check (an ``APIKeyCookie`` or ``SessionAuth`` such as ``django_auth``, which
+  check CSRF by default), on a PUT, PATCH or DELETE by
+  ``fix_request_files_middleware``. ``request.body`` then raises Django's
+  ``RawPostDataException`` (a 500). Otherwise it would hold every uploaded
+  file in memory, failing beyond ``DATA_UPLOAD_MAX_MEMORY_SIZE``, a limit
+  Django doesn't apply to uploaded files.
+
+An item operation refusing, before its throttles, a client that can edit
+nowhere:
 
 .. code-block:: python
 

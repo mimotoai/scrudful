@@ -139,10 +139,12 @@ class Headers(Protocol):
 
 def check_validators(etag_func: Any, last_modified_func: Any) -> None:
     """Raise ``TypeError`` unless each validator callback is ``None`` or callable."""
-    for name, func in (
-        ("etag_func", etag_func),
-        ("last_modified_func", last_modified_func),
-    ):
+    check_callables(etag_func=etag_func, last_modified_func=last_modified_func)
+
+
+def check_callables(**funcs: Any) -> None:
+    """Raise ``TypeError`` unless each argument is ``None`` or callable."""
+    for name, func in funcs.items():
         if func is not None and not callable(func):
             raise TypeError(f"{name} must be callable, not {type(func).__name__}")
 
