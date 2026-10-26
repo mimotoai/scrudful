@@ -4,7 +4,11 @@ before a bad parameter is answered (DRF's order: authentication, permissions,
 then the parameters)."""
 
 import functools
+import importlib.util
+import inspect
 import json
+import textwrap
+import tokenize
 import uuid
 from typing import Any
 
@@ -71,8 +75,6 @@ class OperationDecorator:
 
 
 def _is_coroutine(func) -> bool:
-    import inspect
-
     return inspect.iscoroutinefunction(func)
 
 
@@ -452,7 +454,8 @@ def test_changed_ninja_checks_are_a_config_error(monkeypatch, cls):
     message = str(caught.value)
     assert "needs ninja's own Operation._run_checks" in message
     assert "ninja 1.7.x" in message
-    assert "pin django-ninja<1.8 or upgrade scrudful" in message
+    assert "upgrade scrudful" in message
+    assert "pin" not in message
     assert "1.6" not in message
 
 
@@ -485,21 +488,133 @@ def test_changed_checks_with_the_same_names_are_a_config_error(monkeypatch):
         list_router(before=Recorder())
 
 
-def test_without_source_the_code_fingerprint_is_checked(monkeypatch, items):
+@pytest.fixture
+def fresh_checks_cache():
+    """The check of ninja's checks is memoized per function: start afresh."""
+    import scrudful.ninja
+
+    scrudful.ninja._is_ninja_checks.cache_clear()
+    yield
+    scrudful.ninja._is_ninja_checks.cache_clear()
+
+
+def _different_names_run_checks(self, request):
+    return self._check_permissions(request)
+
+
+def test_without_source_the_code_fingerprint_is_checked(
+    monkeypatch, items, fresh_checks_cache
+):
     """Where the source isn't available (e.g. only .pyc installed)."""
     import scrudful.ninja
 
-    monkeypatch.setattr(scrudful.ninja, "_source_of", lambda func: None)
+    monkeypatch.setattr(scrudful.ninja, "_source_digest", lambda func: None)
     before = Recorder(HttpError(403, "Denied"))
     response = TestClient(api_for(list_router(before=before))).get("/p/7/items")
     assert response.status_code == 403
-
-    def _run_checks(self, request):
-        return self._check_permissions(request)
-
-    monkeypatch.setattr(ninja_operation.Operation, "_run_checks", _run_checks)
+    monkeypatch.setattr(
+        ninja_operation.Operation, "_run_checks", _different_names_run_checks
+    )
     with pytest.raises(ConfigError, match="needs ninja's own Operation._run_checks"):
         list_router(before=Recorder())
+
+
+@pytest.mark.parametrize(
+    "error",
+    [tokenize.TokenError("EOF in multi-line statement"), IndentationError("x")],
+)
+def test_tokenize_failure_falls_back_to_the_code_fingerprint(
+    monkeypatch, items, fresh_checks_cache, error
+):
+    import scrudful.ninja
+
+    def fail(readline):
+        raise error
+
+    monkeypatch.setattr(scrudful.ninja.tokenize, "generate_tokens", fail)
+    assert scrudful.ninja._source_digest(ninja_operation.Operation._run_checks) is None
+    before = Recorder(HttpError(403, "Denied"))
+    response = TestClient(api_for(list_router(before=before))).get("/p/7/items")
+    assert response.status_code == 403
+    monkeypatch.setattr(
+        ninja_operation.Operation, "_run_checks", _different_names_run_checks
+    )
+    with pytest.raises(ConfigError, match="needs ninja's own Operation._run_checks"):
+        list_router(before=Recorder())
+
+
+def _edited_checks(tmp_path, cls, edit):
+    """``cls._run_checks`` as a module function whose source is ninja's with
+    ``edit`` applied to its lines (so ``inspect.getsource`` finds it)."""
+    lines = textwrap.dedent(inspect.getsource(cls._run_checks)).splitlines()
+    module = tmp_path / f"edited_{cls.__name__}.py"
+    module.write_text(
+        "from typing import Optional\n"
+        "from django.http import HttpRequest, HttpResponse\n\n\n"
+        + "\n".join(edit(lines))
+        + "\n"
+    )
+    spec = importlib.util.spec_from_file_location(module.stem, module)
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded._run_checks
+
+
+def _comments_and_blank_lines(lines):
+    out = [lines[0], "    # an added comment", ""]
+    for line in lines[1:]:
+        out.append(line + "  # trailing" if line.strip().endswith(":") else line)
+        if not line.strip():
+            continue
+        out.append("")
+    return out
+
+
+@ASYNC
+def test_comment_and_blank_line_edits_of_ninja_checks_pass(
+    monkeypatch, tmp_path, items, asynchronous, fresh_checks_cache
+):
+    cls = ninja_operation.AsyncOperation if asynchronous else ninja_operation.Operation
+    edited = _edited_checks(tmp_path, cls, _comments_and_blank_lines)
+    assert inspect.getsource(edited) != inspect.getsource(cls._run_checks)
+    monkeypatch.setattr(cls, "_run_checks", edited)
+    before = Recorder(HttpError(403, "Denied"))
+    get = getter(asynchronous, api_for(list_router(asynchronous, before=before)))
+    assert get("/p/7/items").status_code == 403
+
+
+def test_reordered_ninja_checks_fail(monkeypatch, tmp_path, fresh_checks_cache):
+    """Throttles before authentication: the same tokens, another order."""
+
+    def reorder(lines):
+        text = "\n".join(lines)
+        auth = text[text.index("    # auth:") : text.index("    # Throttling:")]
+        throttle = text[text.index("    # Throttling:") : text.index("    return None")]
+        return text.replace(auth + throttle, throttle + auth).splitlines()
+
+    cls = ninja_operation.Operation
+    edited = _edited_checks(tmp_path, cls, reorder)
+    monkeypatch.setattr(cls, "_run_checks", edited)
+    with pytest.raises(ConfigError, match="needs ninja's own Operation._run_checks"):
+        list_router(before=Recorder())
+
+
+def test_ninja_checks_are_checked_once_per_function(monkeypatch, fresh_checks_cache):
+    import scrudful.ninja
+
+    calls = []
+    original = scrudful.ninja._source_digest
+
+    def counting(func):
+        calls.append(func)
+        return original(func)
+
+    monkeypatch.setattr(scrudful.ninja, "_source_digest", counting)
+    routers = [list_router(before=Recorder()) for _ in range(3)]
+    for router in routers:
+        api_for(router)
+        api_for(router)
+    assert calls == [ninja_operation.Operation._run_checks]
 
 
 def test_router_mounted_with_and_without_auth(items):

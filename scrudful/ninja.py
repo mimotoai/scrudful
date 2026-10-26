@@ -398,8 +398,10 @@ from __future__ import annotations
 import functools
 import hashlib
 import inspect
+import io
 import re
 import textwrap
+import tokenize
 import types
 from collections.abc import Callable, Generator, Iterator, Mapping
 from contextvars import ContextVar
@@ -1184,10 +1186,12 @@ def scrudful_list(
         operation runs in a thread. In a sync operation, returning an
         awaitable raises ``TypeError`` (it is closed, never awaited, and the
         request does not go on). scrudful runs ``before`` in its own copy of
-        ninja's per-operation checks, verified against ninja 1.7.x: on a
-        ninja whose checks differ, ``before=`` raises ``ConfigError`` when the
-        operation is built (at startup), so an upgrade of ninja never
-        silently skips a check; pin ``django-ninja<1.8`` or upgrade scrudful.
+        ninja's per-operation checks, verified against ninja 1.7.x (the range
+        of the ``ninja`` extra): on a ninja whose checks differ (compared by a
+        digest of their source, comments and blank lines aside, or, without
+        installed source, only by the names, locals and arguments they use),
+        ``before=`` raises ``ConfigError`` when the operation is built (at
+        startup); upgrade scrudful then.
 
     Raises
     ------
@@ -1895,19 +1899,21 @@ def _raised_links_run(
     return decorator
 
 
-#: The SHA-256 of the dedented source of ninja's own ``Operation._run_checks``
+#: The digest (:func:`_source_digest`) of ninja's own ``Operation._run_checks``
 #: and ``AsyncOperation._run_checks``, which scrudful's copy
-#: (:func:`_install_before`) was written from: ninja 1.7.0 and 1.7.1.
+#: (:func:`_install_before`) was written from: ninja 1.7.0 and 1.7.1, the same
+#: on Python 3.10 to 3.14.
 _NINJA_CHECKS_SOURCES = {
     "Operation": frozenset(
-        {"8c43cca4686ca0c0cfa7708a592f8732b3faeccd5da7262954749cf6a90f4617"}
+        {"e21feae7f13cba6868acc7043a759c05d702e1a94bdc999cb1ff9ebe0484631d"}
     ),
     "AsyncOperation": frozenset(
-        {"b31f1e8b8257794593fe5c71249347c5e7a5882d0c5c955275c49420d5c37b2a"}
+        {"f985c50cd57cd58a728d0e616c8952f80a789fbff3eaa13c8d76ae151116ba4a"}
     ),
 }
 #: Where the source isn't available: the names, local variables and argument
-#: count of both (the same in ninja 1.7.x on Python 3.10 to 3.14).
+#: count of both (the same in ninja 1.7.x on Python 3.10 to 3.14). Weaker: a
+#: body using the same names in another order passes.
 _NINJA_CHECKS_CODE = (
     (
         "csrf_exempt",
@@ -1920,22 +1926,42 @@ _NINJA_CHECKS_CODE = (
     ("self", "request", "error"),
     2,
 )
+#: Tokens that don't change the code: comments and blank lines.
+_IGNORED_TOKENS = frozenset({tokenize.COMMENT, tokenize.NL})
+#: Tokens kept by type only (their text is whitespace).
+_STRUCTURE_TOKENS = frozenset(
+    {tokenize.INDENT, tokenize.DEDENT, tokenize.NEWLINE, tokenize.ENDMARKER}
+)
 
 
-def _source_of(func: Any) -> str | None:
-    """``func``'s source, dedented, or ``None`` when it isn't available."""
+def _source_digest(func: Any) -> str | None:
+    """The SHA-256 of ``func``'s source tokens, insensitive to comments and
+    blank lines; ``None`` when the source isn't available or can't be read.
+
+    Each token but comments and blank lines counts, as its type and text
+    (only the type for indentation and line ends).
+    """
     try:
-        return textwrap.dedent(inspect.getsource(func))
-    except (OSError, TypeError):
+        source = textwrap.dedent(inspect.getsource(func))
+        digest = hashlib.sha256()
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type in _IGNORED_TOKENS:
+                continue
+            text = "" if token.type in _STRUCTURE_TOKENS else token.string
+            digest.update(f"{tokenize.tok_name[token.type]}\0{text}\1".encode())
+    except (OSError, TypeError, tokenize.TokenError, SyntaxError):
         return None
+    return digest.hexdigest()
 
 
+@functools.cache
 def _is_ninja_checks(checks: Any, ninja_class: type) -> bool:
     """Whether ``checks`` is the code scrudful's copy was written from: by the
-    hash of its source, else (no source) by its names, locals and arguments."""
-    source = _source_of(checks)
-    if source is not None:
-        digest = hashlib.sha256(source.encode()).hexdigest()
+    digest of its source, else (no source) by its names, locals and
+    arguments. Memoized: each function is read once, whatever the number of
+    operations and mounts."""
+    digest = _source_digest(checks)
+    if digest is not None:
         return digest in _NINJA_CHECKS_SOURCES[ninja_class.__name__]
     code = getattr(checks, "__code__", None)
     return (
@@ -1977,8 +2003,7 @@ def _check_ninja_checks(operation: Any, asynchronous: bool, label: str) -> None:
     elif not _is_ninja_checks(checks, ninja_class):
         reason = (
             "the installed ninja's checks differ from ninja 1.7.x's, which "
-            "scrudful's before= is verified against: pin django-ninja<1.8 or "
-            "upgrade scrudful"
+            "scrudful's before= is verified against: upgrade scrudful"
         )
     else:
         return
@@ -1996,7 +2021,7 @@ def _install_before(
     permissions: after authentication, before throttling.
 
     ``Operation.run`` answers a response its ``_run_checks`` returns before it
-    reads any parameter. These checks are ninja 1.x's (CSRF exemption flag,
+    reads any parameter. These checks are ninja 1.7.x's (CSRF exemption flag,
     authentication, throttles) with ``before`` called between authentication
     and throttling, with the path parameters as the URL gives them, so a
     request it refuses uses none of a throttle's quota. An exception it
