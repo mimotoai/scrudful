@@ -2,10 +2,38 @@
 Changelog
 =========
 
-0.6.1 (since 0.6.0)
+0.7.0 (since 0.6.0)
 ===================
 
-Bug fixes.
+Behaviour change (DRF)
+----------------------
+
+* DRF: ``ScrudfulPagination`` parses ``page`` and ``page_size`` as ninja's
+  ``scrudful_list`` does, with pydantic v2's lax ``int`` from a string, not
+  Python's ``int()``, so both front ends accept the same values. ``?page=2.0``
+  (and ``2.00``) is now page 2, where it was a 400; ``?page=٣`` (and other
+  non-ASCII digits, e.g. ``３``) is now a 400 ("A valid integer is
+  required."), where it was page 3. Only Unicode ``White_Space`` is stripped
+  around the value (not U+001C..U+001F, which ``int()`` strips). pydantic is
+  not a dependency of the DRF adapter: the rules are implemented in
+  ``scrudful._adapter.parse_query_int`` and tested against pydantic. A
+  subclass overriding ``_integer`` decides for itself, as before.
+
+New
+---
+
+* ninja: ``scrudful_list(before=...)`` (optional):
+  ``before(request, **path_params)`` is called once per request after ninja's
+  authentication and throttling and before it validates any parameter, with
+  the URL's path parameters as they are, so a list can answer 401 or 403
+  before the 422 of a bad parameter, in DRF's order (permission checks
+  first). When it returns, ninja validates every parameter as without it: one
+  422 lists every bad one, and the OpenAPI description is unchanged. Neither
+  its error nor that 422 reaches the decorators added with
+  ``add_decorator(mode="operation")``. Without ``before`` nothing changes.
+
+Fixes
+-----
 
 * DRF: a create calling ``self.perform_create(serializer, ...)`` with extra
   arguments (``owner=request.user``, as DRF documents) no longer raises
@@ -19,19 +47,6 @@ Bug fixes.
   parameter still goes through ``_integer``, so a subclass calling or
   overriding it (to clamp ``page_size``, or accept ``page=last``) keeps its
   behaviour; ``_parameter_error`` is the new helper.
-* DRF: ``ScrudfulPagination`` accepts exactly the ``page`` and ``page_size``
-  values ninja's ``scrudful_list`` accepts, pydantic v2's lax ``int`` from a
-  string (it used Python's ``int()``): ``2.0`` and ``2.00`` are 2, ``٣`` and
-  other non-ASCII digits are not integers, only Unicode ``White_Space`` is
-  stripped. pydantic is not a dependency of the DRF adapter: the rules are
-  implemented in ``scrudful._adapter.parse_query_int`` and tested against
-  pydantic.
-* ninja: ``scrudful_list(before=...)`` (new, optional):
-  ``before(request, **params)`` runs once per request before ``page`` and
-  ``page_size`` are validated, so a list can answer 401 or 403 before the 422
-  of a bad page parameter, in DRF's order (permissions, then pagination). The
-  operation then validates them itself with the same 422, and the OpenAPI
-  description is unchanged. Without ``before`` nothing changes.
 * ninja: the automatic OPTIONS body and scrudful's own 400, 412 and 428 bodies
   are written by the serving API's renderer (``NinjaAPI(renderer=...)``),
   not Django's ``JsonResponse``, so they have the same bytes as the API's other
