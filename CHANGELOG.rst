@@ -17,20 +17,38 @@ Behaviour change (DRF)
   around the value (not U+001C..U+001F, which ``int()`` strips). pydantic is
   not a dependency of the DRF adapter: the rules are implemented in
   ``scrudful._adapter.parse_query_int`` and tested against pydantic. A
-  subclass overriding ``_integer`` decides for itself, as before.
+  subclass overriding ``_integer`` (or ``_parse_parameter``) decides for
+  itself.
+
+Behaviour change (ninja)
+------------------------
+
+* ninja: the automatic OPTIONS body and scrudful's own 400, 412 and 428 bodies
+  are now written by the serving API's renderer (``NinjaAPI(renderer=...)``),
+  as its other responses are, not by Django's ``JsonResponse``. With ninja's
+  default ``JSONRenderer`` the bytes are unchanged; an API with another JSON
+  renderer (compact separators, ORJSON, ``ensure_ascii=False`` ...) gets other
+  bytes on those responses than with 0.6.0. Their ``Content-Type``, Links,
+  ``Allow`` and expose headers are unchanged, a 304 still has no body, and a
+  renderer whose ``media_type`` is not JSON content keeps the ``JsonResponse``
+  bytes.
 
 New
 ---
 
 * ninja: ``scrudful_list(before=...)`` (optional):
-  ``before(request, **path_params)`` is called once per request after ninja's
-  authentication and throttling and before it validates any parameter, with
-  the URL's path parameters as they are, so a list can answer 401 or 403
-  before the 422 of a bad parameter, in DRF's order (permission checks
-  first). When it returns, ninja validates every parameter as without it: one
-  422 lists every bad one, and the OpenAPI description is unchanged. Neither
-  its error nor that 422 reaches the decorators added with
-  ``add_decorator(mode="operation")``. Without ``before`` nothing changes.
+  ``before(request, **path_params)`` is called once per request where DRF
+  checks permissions: after ninja's authentication, before its throttles and
+  before it validates any parameter, with the URL's path parameters as they
+  are. So a list can answer 401 or 403 before the 422 of a bad parameter, and
+  a refused request uses none of a throttle's quota. When it returns, ninja
+  throttles and validates every parameter as without it: one 422 lists every
+  bad one, and the OpenAPI description is unchanged. Neither its error nor
+  that 422 reaches the decorators added with ``add_decorator(mode="operation")``.
+  A sync ``before`` returning an awaitable in a sync operation raises
+  ``TypeError``; a ``decorate_view`` below ``@scrudful_list`` without
+  ``functools.wraps`` is a ``ConfigError`` when ``before`` is set. Without
+  ``before`` nothing changes.
 
 Fixes
 -----
@@ -48,13 +66,6 @@ Fixes
   overriding it (to clamp ``page_size``, or accept ``page=last``) keeps its
   behaviour; ``_parse_parameter`` (returning the value and the error, parsed
   once) is the new hook below it.
-* ninja: the automatic OPTIONS body and scrudful's own 400, 412 and 428 bodies
-  are written by the serving API's renderer (``NinjaAPI(renderer=...)``),
-  not Django's ``JsonResponse``, so they have the same bytes as the API's other
-  responses (separators, escapes). Their ``Content-Type``, Links, ``Allow``
-  and expose headers are unchanged, a 304 still has no body, and a renderer
-  whose ``media_type`` is not JSON content keeps the ``JsonResponse`` bytes.
-  With ninja's default ``JSONRenderer`` the bytes are unchanged.
 
 0.6.0 (since 0.5.0)
 ===================
