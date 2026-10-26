@@ -3,6 +3,7 @@ ninja validates any parameter of the operation, so a list can be authorized
 before a bad parameter is answered (DRF's order: authentication, permissions,
 then the parameters)."""
 
+import asyncio
 import functools
 import importlib.util
 import inspect
@@ -387,6 +388,19 @@ def test_sync_before_returning_an_awaitable_is_an_error(items):
         client.get("/p/7/items")
 
 
+def test_sync_before_returning_a_future_cancels_it(items):
+    loop = asyncio.new_event_loop()
+    try:
+        future = loop.create_future()
+        before = lambda request, **params: future  # noqa: E731
+        client = TestClient(api_for(list_router(before=before)))
+        with pytest.raises(TypeError, match="awaitable"):
+            client.get("/p/7/items")
+        assert future.cancelled()
+    finally:
+        loop.close()
+
+
 @pytest.fixture
 def fresh_cache():
     cache.clear()
@@ -493,9 +507,9 @@ def fresh_checks_cache():
     """The check of ninja's checks is memoized per function: start afresh."""
     import scrudful.ninja
 
-    scrudful.ninja._is_ninja_checks.cache_clear()
+    scrudful.ninja._is_ninja_code.cache_clear()
     yield
-    scrudful.ninja._is_ninja_checks.cache_clear()
+    scrudful.ninja._is_ninja_code.cache_clear()
 
 
 def _different_names_run_checks(self, request):
@@ -543,21 +557,21 @@ def test_tokenize_failure_falls_back_to_the_code_fingerprint(
         list_router(before=Recorder())
 
 
-def _edited_checks(tmp_path, cls, edit):
-    """``cls._run_checks`` as a module function whose source is ninja's with
+def _edited_checks(tmp_path, cls, edit, method="_run_checks"):
+    """``cls``'s ``method`` as a module function whose source is ninja's with
     ``edit`` applied to its lines (so ``inspect.getsource`` finds it)."""
-    lines = textwrap.dedent(inspect.getsource(cls._run_checks)).splitlines()
-    module = tmp_path / f"edited_{cls.__name__}.py"
+    lines = textwrap.dedent(inspect.getsource(getattr(cls, method))).splitlines()
+    module = tmp_path / f"edited_{cls.__name__}{method}.py"
     module.write_text(
-        "from typing import Optional\n"
-        "from django.http import HttpRequest, HttpResponse\n\n\n"
+        "from typing import Any, Optional\n"
+        "from django.http import HttpRequest, HttpResponse, HttpResponseBase\n\n\n"
         + "\n".join(edit(lines))
         + "\n"
     )
     spec = importlib.util.spec_from_file_location(module.stem, module)
     loaded = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(loaded)
-    return loaded._run_checks
+    return getattr(loaded, method)
 
 
 def _comments_and_blank_lines(lines):
@@ -581,6 +595,95 @@ def test_comment_and_blank_line_edits_of_ninja_checks_pass(
     before = Recorder(HttpError(403, "Denied"))
     get = getter(asynchronous, api_for(list_router(asynchronous, before=before)))
     assert get("/p/7/items").status_code == 403
+
+
+def _reworded_docstring(lines):
+    """Another docstring, or one where there was none."""
+    body = 1 if lines[1].lstrip().startswith(('"', "'")) else 0
+    return [lines[0], '    """Reworded."""', *lines[1 + body :]]
+
+
+@ASYNC
+def test_docstring_edits_of_ninja_code_pass(
+    monkeypatch, tmp_path, items, asynchronous, fresh_checks_cache
+):
+    cls = ninja_operation.AsyncOperation if asynchronous else ninja_operation.Operation
+    for method in ("_run_checks", "run"):
+        edited = _edited_checks(tmp_path, cls, _reworded_docstring, method)
+        assert inspect.getdoc(edited) == "Reworded."
+        monkeypatch.setattr(cls, method, edited)
+    before = Recorder(HttpError(403, "Denied"))
+    get = getter(asynchronous, api_for(list_router(asynchronous, before=before)))
+    assert get("/p/7/items").status_code == 403
+
+
+class Documented:
+    def f(self):
+        "A docstring."
+        return 1
+
+
+class OtherDoc:
+    def f(self):
+        """Another, in two
+        parts.""" " implicitly joined"
+        return 1
+
+
+class Undocumented:
+    def f(self):
+        return 1
+
+
+class StringStatement:
+    def f(self):
+        "not a docstring".strip()
+        return 1
+
+
+def test_digest_ignores_only_the_docstring():
+    from scrudful.ninja import _source_digest as digest
+
+    assert digest(Documented.f) == digest(OtherDoc.f) == digest(Undocumented.f)
+    assert digest(StringStatement.f) != digest(Undocumented.f)
+
+
+@ASYNC
+def test_ninja_run_reading_parameters_before_its_checks_fails(
+    monkeypatch, tmp_path, asynchronous, fresh_checks_cache
+):
+    """``before`` relies on ``run`` answering the checks' response first."""
+    awaiting = "await " if asynchronous else ""
+    checks = (
+        f"    error = {awaiting}self._run_checks(request)\n"
+        "    if error:\n"
+        "        return error\n"
+    )
+    values = "        values = self._get_values(request, kw, temporal_response)\n"
+
+    def checks_after_values(lines):
+        text = "\n".join(lines)
+        assert checks in text and values in text
+        moved = values + textwrap.indent(checks, "    ")
+        return text.replace(checks, "").replace(values, moved).splitlines()
+
+    cls = ninja_operation.AsyncOperation if asynchronous else ninja_operation.Operation
+    edited = _edited_checks(tmp_path, cls, checks_after_values, "run")
+    monkeypatch.setattr(cls, "run", edited)
+    with pytest.raises(ConfigError, match=rf"{cls.__name__}\.run differs") as caught:
+        list_router(asynchronous, before=Recorder())
+    assert "upgrade scrudful" in str(caught.value)
+
+
+class CustomRun(ninja_operation.Operation):
+    def run(self, request, **kw):
+        return super().run(request, **kw)
+
+
+def test_operation_subclass_overriding_run_is_a_config_error(monkeypatch):
+    monkeypatch.setattr(ninja_operation, "Operation", CustomRun)
+    with pytest.raises(ConfigError, match="CustomRun overrides run of ninja's"):
+        list_router(before=Recorder())
 
 
 def test_reordered_ninja_checks_fail(monkeypatch, tmp_path, fresh_checks_cache):
@@ -614,7 +717,10 @@ def test_ninja_checks_are_checked_once_per_function(monkeypatch, fresh_checks_ca
     for router in routers:
         api_for(router)
         api_for(router)
-    assert calls == [ninja_operation.Operation._run_checks]
+    assert calls == [
+        ninja_operation.Operation._run_checks,
+        ninja_operation.Operation.run,
+    ]
 
 
 def test_router_mounted_with_and_without_auth(items):

@@ -1,8 +1,12 @@
 """``page`` and ``page_size``: DRF accepts exactly the integers ninja's pydantic
 query model accepts (pydantic v2's lax ``int`` from a string)."""
 
+import sys
+
 import pytest
+from django.utils import translation
 from items.models import Item
+from rest_framework.fields import IntegerField
 from rest_framework.test import APIClient
 from scrudful._adapter import parse_query_int
 
@@ -127,3 +131,42 @@ def test_drf_accepts_pydantic_forms(items):
     client = APIClient()
     body = client.get("/drf/items/", {"page": "2.0", "page_size": " 2 "}).json()
     assert [entry["content"]["name"] for entry in body["content"]] == ["c"]
+
+
+@pytest.fixture
+def lowered_int_digits():
+    """``int()``'s digit limit lowered below pydantic's 4300, as an app may."""
+    limit = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(640)
+    yield
+    sys.set_int_max_str_digits(limit)
+
+
+@pytest.mark.parametrize("raw", ["9" * 1000, "0" + "9" * 1000, "9" * 1000 + ".0"])
+def test_parse_query_int_past_the_interpreter_limit(lowered_int_digits, raw):
+    assert parse_query_int(raw) is None
+
+
+def test_drf_page_past_the_interpreter_limit_is_a_400(items, lowered_int_digits):
+    response = APIClient().get("/drf/items/", {"page": "9" * 1000})
+    assert response.status_code == 400
+    assert response.json()["page"] == ["A valid integer is required."]
+
+
+@pytest.mark.parametrize("value, code", [("x", "invalid"), ("0", "min_value")])
+def test_drf_page_errors_are_translated_as_drf_s(items, value, code):
+    from rest_framework.exceptions import ValidationError
+    from rest_framework.request import Request
+    from rest_framework.test import APIRequestFactory
+
+    from tests.test_rest_framework_envelope import SmallPagination, SmallViewSet
+
+    with translation.override("fr"):
+        request = Request(APIRequestFactory().get("/drf/small/", {"page": value}))
+        with pytest.raises(ValidationError) as caught:
+            SmallPagination().paginate_queryset(
+                Item.objects.all(), request, SmallViewSet()
+            )
+        expected = IntegerField.default_error_messages[code].format(min_value=1)
+    assert caught.value.detail == {"page": [expected]}
+    assert "valid integer" not in expected and "Ensure" not in expected

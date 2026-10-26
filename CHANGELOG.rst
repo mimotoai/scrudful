@@ -16,7 +16,9 @@ Behaviour change (DRF)
   required."), where it was page 3. Only Unicode ``White_Space`` is stripped
   around the value (not U+001C..U+001F, which ``int()`` strips). pydantic is
   not a dependency of the DRF adapter: the rules are implemented in
-  ``scrudful._adapter.parse_query_int`` and tested against pydantic. A
+  ``scrudful._adapter.parse_query_int`` and tested against pydantic. A value
+  with more digits than the interpreter allows ``int()``
+  (``sys.set_int_max_str_digits``) is a 400, as in 0.6.0. A
   subclass overriding ``_integer`` (or ``_parse_parameter``) decides for
   itself.
 
@@ -28,10 +30,16 @@ Behaviour change (ninja)
   as its other responses are, not by Django's ``JsonResponse``. With ninja's
   default ``JSONRenderer`` the bytes are unchanged; an API with another JSON
   renderer (compact separators, ORJSON, ``ensure_ascii=False`` ...) gets other
-  bytes on those responses than with 0.6.0. Their ``Content-Type``, Links,
-  ``Allow`` and expose headers are unchanged, a 304 still has no body, and a
-  renderer whose ``media_type`` is not JSON content keeps the ``JsonResponse``
-  bytes.
+  bytes on those responses than with 0.6.0. Their ``Content-Type`` keeps its
+  media type (``application/json``, or the ``error`` entity's) and now
+  carries the renderer's ``charset`` parameter, as ninja's own responses do
+  (``application/json; charset=utf-8`` by default). The body is first reduced
+  to JSON values as ninja's ``NinjaJSONEncoder`` (a ``DjangoJSONEncoder``)
+  writes them, so a datetime, ``Decimal``, ``UUID`` or lazy string from an
+  ``error_body_func`` is still written as in 0.6.0 by a renderer of plain
+  JSON (ORJSON, ``json.dumps``). Links, ``Allow`` and expose headers are
+  unchanged, a 304 still has no body, and a renderer whose ``media_type`` is
+  not JSON content keeps the ``JsonResponse`` bytes and ``Content-Type``.
 
 New
 ---
@@ -46,17 +54,23 @@ New
   bad one, and the OpenAPI description is unchanged. Neither its error nor
   that 422 reaches the decorators added with ``add_decorator(mode="operation")``.
   A sync ``before`` returning an awaitable in a sync operation raises
-  ``TypeError``. With ``before``, scrudful runs its own copy of ninja's
+  ``TypeError`` (a coroutine is closed and a future cancelled, never
+  awaited). With ``before``, scrudful runs its own copy of ninja's
   per-operation checks (CSRF flag, authentication, throttles) with ``before``
-  between the last two. It is verified against ninja 1.7.x, so the ``ninja``
-  extra is now bounded to it (``django-ninja>=1.7,<1.8``). When the operation
-  is built (at startup), ``before=`` raises ``ConfigError`` if the installed
-  ninja's checks differ from 1.7.x's (upgrade scrudful), if an ``Operation``
-  subclass overrides ``_run_checks``, or if a ``decorate_view`` below
-  ``@scrudful_list`` hides the operation (no ``functools.wraps``). ninja's
-  checks are compared by a digest of their source, comments and blank lines
-  aside; where the source isn't installed (``.pyc`` only), only the names,
-  local variables and arguments they use are compared.
+  between the last two, relying on ``Operation.run`` to answer their
+  response before it reads any parameter. Both are verified against ninja
+  1.7.0 and 1.7.1. The ``ninja`` extra is now bounded to 1.7.x
+  (``django-ninja>=1.7,<1.8``), so a later 1.7 release scrudful hasn't
+  verified may be installed: an app using ``before=`` should lock its ninja
+  version. When the operation is built (at startup), ``before=`` raises
+  ``ConfigError`` if the installed ninja's ``_run_checks`` or ``run`` differs
+  from those releases' (upgrade scrudful, or keep ninja at a verified
+  release), if an ``Operation`` subclass overrides either, or if a
+  ``decorate_view`` below ``@scrudful_list`` hides the operation (no
+  ``functools.wraps``). They are compared by a digest of their source,
+  comments, docstrings and blank lines aside; where the source isn't
+  installed (``.pyc`` only), only the names, local variables and arguments
+  they use are compared.
   ``request.auth`` exists only when an auth callback succeeded: where
   ``before`` may run without one, fail closed (``getattr(request, "auth",
   None)`` and a 401 when it is ``None``). Without ``before`` nothing changes.
@@ -71,7 +85,8 @@ Fixes
   created object's ``Location`` and validators.
 * DRF: ``ScrudfulPagination``'s bad ``page`` and ``page_size`` errors carry
   the codes of a DRF ``IntegerField``'s (``invalid``, ``min_value``,
-  ``max_value``), with the same messages, and one 400 names both parameters
+  ``max_value``), with its messages (translated, as DRF's are), and one 400
+  names both parameters
   when both are bad, as ninja's ``scrudful_list`` 422 already did. Each
   parameter still goes through ``_integer``, so a subclass calling or
   overriding it (to clamp ``page_size``, or accept ``page=last``) keeps its

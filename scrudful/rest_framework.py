@@ -114,6 +114,7 @@ from rest_framework.exceptions import (
     ValidationError,
 )
 from rest_framework.decorators import api_view
+from rest_framework.fields import IntegerField
 from rest_framework.metadata import BaseMetadata, SimpleMetadata
 from rest_framework.mixins import UpdateModelMixin
 from rest_framework.pagination import BasePagination
@@ -1699,24 +1700,25 @@ class ScrudfulPagination(BasePagination):
         ``"٣"`` is not an integer), see
         :func:`scrudful._adapter.parse_query_int`. The error's code is
         ``invalid`` (not an integer), ``min_value`` (below 1) or ``max_value``
-        (above ``maximum``), as a DRF ``IntegerField``'s. A subclass may
+        (above ``maximum``), with the message a DRF ``IntegerField`` gives
+        (translated as DRF's are). A subclass may
         override it to accept other values (``page=last``, say) by returning
         their integer.
         """
         raw = request.query_params.get(name)
         if raw is None:
             return default, None
+        messages = IntegerField.default_error_messages
         value = parse_query_int(raw)
         if value is None:
-            return None, ErrorDetail("A valid integer is required.", code="invalid")
+            return None, ErrorDetail(str(messages["invalid"]), code="invalid")
         if value < 1:
             return None, ErrorDetail(
-                "Ensure this value is greater than or equal to 1.", code="min_value"
+                messages["min_value"].format(min_value=1), code="min_value"
             )
         if maximum is not None and value > maximum:
             return None, ErrorDetail(
-                f"Ensure this value is less than or equal to {maximum}.",
-                code="max_value",
+                messages["max_value"].format(max_value=maximum), code="max_value"
             )
         return value, None
 

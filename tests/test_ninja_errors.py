@@ -550,7 +550,10 @@ def test_early_errors_are_served_as_the_error_media_type(store):
     ]
     assert [response.status_code for _, response in early] == [412, 428, 400, 412]
     for method, response in early:
-        assert response.headers["Content-Type"] == "application/problem+json"
+        assert (
+            response.headers["Content-Type"]
+            == "application/problem+json; charset=utf-8"
+        )
         assert response.headers["Link"] == PROBLEM_LINK
         assert "detail" in response.json()
         problems = link_problems(
@@ -574,7 +577,7 @@ def test_early_errors_without_error_are_json(store):
 
     response = TestClient(router).get("/items/1", headers={"If-Match": '"x"'})
     assert response.status_code == 412
-    assert response.headers["Content-Type"] == "application/json"
+    assert response.headers["Content-Type"] == "application/json; charset=utf-8"
     assert "Link" not in response.headers
 
 

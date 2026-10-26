@@ -341,7 +341,7 @@ def parse_query_int(raw: str) -> int | None:
         if prefix is not None and prefix.end() == run.end():
             return None  # int_parsing_size
     if _JSON_INT.fullmatch(text):
-        return int(text)
+        return _int(text)
     point = text.find(".")
     if point >= 0 and text[point + 1 :] and not text[point + 1 :].strip("0"):
         text = text[:point]
@@ -358,7 +358,16 @@ def parse_query_int(raw: str) -> int | None:
         text = "-" + text
     if len(text) > _MAX_INT_LENGTH or not _JSON_INT.fullmatch(text):
         return None
-    return int(text)
+    return _int(text)
+
+
+def _int(text: str) -> int | None:
+    """``int(text)``, or ``None`` for more digits than the interpreter's limit
+    (``sys.set_int_max_str_digits``), which may be below pydantic's."""
+    try:
+        return int(text)
+    except ValueError:
+        return None
 
 
 def _strip_underscores(text: str) -> str | None:

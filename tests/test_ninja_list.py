@@ -365,7 +365,7 @@ def test_list_early_responses_keep_handler_headers(items):
         assert "Cache-Control" not in response.headers
         assert "Vary" not in response.headers
         assert "Content-Language" not in response.headers
-        assert response.headers["Content-Type"] == "application/json"
+        assert response.headers["Content-Type"] == "application/json; charset=utf-8"
         assert response.headers["Link"] == ERROR_LINK
 
 

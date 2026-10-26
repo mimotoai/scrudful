@@ -395,10 +395,13 @@ Async operations
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import functools
 import hashlib
 import inspect
 import io
+import json
 import re
 import textwrap
 import tokenize
@@ -422,6 +425,7 @@ from ninja import errors as ninja_errors
 from ninja.constants import NOT_SET
 from ninja.errors import ConfigError, HttpError
 from ninja.operation import AsyncOperation, Operation
+from ninja.responses import NinjaJSONEncoder
 from ninja.signature.details import is_collection_type
 from ninja.signature.utils import get_path_param_names
 from pydantic import Field, create_model
@@ -455,6 +459,7 @@ from scrudful._adapter import (
     with_error_body,
 )
 from scrudful._django import (
+    Render,
     aware,
     conditional_response,
     json_response,
@@ -1184,14 +1189,16 @@ def scrudful_list(
         decorators added with ``add_decorator(mode="operation")``. It may be
         ``async def`` in an ``async def`` operation; a sync one in an async
         operation runs in a thread. In a sync operation, returning an
-        awaitable raises ``TypeError`` (it is closed, never awaited, and the
-        request does not go on). scrudful runs ``before`` in its own copy of
-        ninja's per-operation checks, verified against ninja 1.7.x (the range
-        of the ``ninja`` extra): on a ninja whose checks differ (compared by a
-        digest of their source, comments and blank lines aside, or, without
-        installed source, only by the names, locals and arguments they use),
+        awaitable raises ``TypeError``, and the request does not go on (a
+        coroutine is closed and a future cancelled: never awaited). scrudful
+        runs ``before`` in its own copy of ninja's per-operation checks,
+        verified against ninja 1.7.0 and 1.7.1, though the ``ninja`` extra
+        allows any 1.7.x: on a ninja whose checks, or whose ``Operation.run``
+        calling them, differ (compared by a digest of their source,
+        comments, docstrings and blank lines aside, or, without installed
+        source, only by the names, locals and arguments they use),
         ``before=`` raises ``ConfigError`` when the operation is built (at
-        startup); upgrade scrudful then.
+        startup); upgrade scrudful then, or keep ninja at a verified release.
 
     Raises
     ------
@@ -1214,8 +1221,9 @@ def scrudful_list(
         module docstring). Also with ``before``, if a ``decorate_view``
         decorator below the decorator wraps ``Operation.run`` without
         ``functools.wraps`` (scrudful then can't install ``before``), if the
-        installed ninja's per-operation checks differ from ninja 1.7.x's, or
-        if an ``Operation`` subclass overrides them.
+        installed ninja's per-operation checks, or the ``Operation.run``
+        calling them, differ from ninja 1.7.0's and 1.7.1's, or if an
+        ``Operation`` subclass overrides either.
     """
     if not callable(href_func):
         raise TypeError(f"href_func must be callable, not {type(href_func).__name__}")
@@ -1654,10 +1662,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             run_decorator = _raised_links_run(
                 asynchronous, config, f"{name}: {handler.__qualname__}()"
             )
-            if not hasattr(operation, "_run_decorators"):
-                operation._run_decorators = []  # type: ignore[attr-defined]
-            operation.run = run_decorator(operation.run)  # type: ignore[method-assign]
-            operation._run_decorators.append(run_decorator)
+            _add_run_decorator(operation, run_decorator)
 
         # Registered with ninja, which replaces it in each operation by the
         # wrapper :func:`bind_operation` binds (called directly, it declares
@@ -1779,6 +1784,28 @@ def _operation_of(run: Callable[..., Any]) -> Any:
     return getattr(inspect.unwrap(run), "__self__", None)
 
 
+@contextlib.contextmanager
+def _serving(operation: Any) -> Iterator[None]:
+    """:data:`_SERVING_API` is ``operation``'s API within."""
+    token = _SERVING_API.set(getattr(operation, "api", None))
+    try:
+        yield
+    finally:
+        _SERVING_API.reset(token)
+
+
+def _add_run_decorator(
+    operation: Any, decorator: Callable[[Callable[..., Any]], Callable[..., Any]]
+) -> None:
+    """Decorate ``operation.run`` with ``decorator``, as ``decorate_view``
+    does, so the clones ninja makes of ``operation`` (one per mount) are
+    decorated too: ninja re-applies ``_run_decorators`` to each."""
+    if not hasattr(operation, "_run_decorators"):
+        operation._run_decorators = []
+    operation.run = decorator(operation.run)
+    operation._run_decorators.append(decorator)
+
+
 def _serving_api_run(run: Callable[..., Any]) -> Callable[..., Any]:
     """The ``Operation.run`` decorator of the (sync) automatic OPTIONS operation,
     setting :data:`_SERVING_API` while it runs."""
@@ -1786,46 +1813,45 @@ def _serving_api_run(run: Callable[..., Any]) -> Callable[..., Any]:
 
     @functools.wraps(run)
     def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-        token = _SERVING_API.set(getattr(operation, "api", None))
-        try:
+        with _serving(operation):
             return run(request, *args, **kw)
-        finally:
-            _SERVING_API.reset(token)
 
     return scrudful_run
 
 
 def _record_serving_api(operation: Any) -> None:
-    """Decorate ``operation.run`` with :func:`_serving_api_run`, also in the
-    clones ninja makes of ``operation`` (it re-applies ``_run_decorators``)."""
-    operation.run = _serving_api_run(operation.run)
-    if not hasattr(operation, "_run_decorators"):
-        operation._run_decorators = []
-    operation._run_decorators.append(_serving_api_run)
+    """Decorate ``operation.run`` with :func:`_serving_api_run`."""
+    _add_run_decorator(operation, _serving_api_run)
 
 
-def _render(request: HttpRequest) -> Callable[[Any, int], bytes] | None:
+def _render(request: HttpRequest) -> Render | None:
     """How the API serving ``request`` writes a JSON body, for scrudful's own
     responses (OPTIONS and the early 400, 412 and 428).
 
-    Its renderer, when that writes JSON content (an ``application/json`` or
-    ``+json`` ``media_type``), so these bodies have the bytes of every other
-    response of the API. ``None`` (Django's ``JsonResponse``) outside a
-    scrudful operation, or for a renderer of other content: the bodies are
-    JSON whatever the renderer.
+    Its ``create_response``, when its renderer writes JSON content (an
+    ``application/json`` or ``+json`` ``media_type``), so these bodies have
+    the bytes and charset of every other response of the API; their
+    Content-Type is the body's media type with that charset. The body is
+    first reduced to JSON values as ninja's ``NinjaJSONEncoder`` (a
+    ``DjangoJSONEncoder``) writes them, so a renderer of plain JSON
+    (``orjson``, ``json.dumps``) writes a datetime, ``Decimal``, ``UUID`` or
+    lazy string as ``JsonResponse`` did. ``None`` (Django's ``JsonResponse``)
+    outside a scrudful operation, or for a renderer of other content: the
+    bodies are JSON whatever the renderer.
     """
-    renderer = getattr(_SERVING_API.get(), "renderer", None)
-    media_type = getattr(renderer, "media_type", None)
+    api = _SERVING_API.get()
+    media_type = getattr(getattr(api, "renderer", None), "media_type", None)
     try:
         if not media_type or not is_json(media_type):
             return None
     except ValueError:  # not a media type
         return None
-    charset = getattr(renderer, "charset", None) or "utf-8"
 
-    def render(data: Any, status: int) -> bytes:
-        content = renderer.render(request, data, response_status=status)
-        return content.encode(charset) if isinstance(content, str) else content
+    def render(data: Any, status: int, content_type: str) -> HttpResponse:
+        plain = json.loads(json.dumps(data, cls=NinjaJSONEncoder))
+        response: HttpResponse = api.create_response(request, plain, status=status)
+        response["Content-Type"] = f"{content_type}; charset={response.charset}"
+        return response
 
     return render
 
@@ -1868,11 +1894,10 @@ def _raised_links_run(
             async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
                 raised = _Raised(path_params=kw)
                 token = _RAISED.set(raised)
-                api_token = _SERVING_API.set(getattr(operation, "api", None))
                 try:
-                    response = await run(request, *args, **kw)
+                    with _serving(operation):
+                        response = await run(request, *args, **kw)
                 finally:
-                    _SERVING_API.reset(api_token)
                     _RAISED.reset(token)
                 if raised.config is not None:
                     await _run_async(_raised_links(raised.config, request, response))
@@ -1884,11 +1909,10 @@ def _raised_links_run(
             def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
                 raised = _Raised(path_params=kw)
                 token = _RAISED.set(raised)
-                api_token = _SERVING_API.set(getattr(operation, "api", None))
                 try:
-                    response = run(request, *args, **kw)
+                    with _serving(operation):
+                        response = run(request, *args, **kw)
                 finally:
-                    _SERVING_API.reset(api_token)
                     _RAISED.reset(token)
                 if raised.config is not None:
                     _run_sync(_raised_links(raised.config, request, response))
@@ -1899,22 +1923,31 @@ def _raised_links_run(
     return decorator
 
 
-#: The digest (:func:`_source_digest`) of ninja's own ``Operation._run_checks``
-#: and ``AsyncOperation._run_checks``, which scrudful's copy
-#: (:func:`_install_before`) was written from: ninja 1.7.0 and 1.7.1, the same
-#: on Python 3.10 to 3.14.
-_NINJA_CHECKS_SOURCES = {
-    "Operation": frozenset(
-        {"e21feae7f13cba6868acc7043a759c05d702e1a94bdc999cb1ff9ebe0484631d"}
+#: The digests (:func:`_source_digest`) of the methods of ninja's
+#: ``Operation`` and ``AsyncOperation`` that scrudful's copy of the checks
+#: (:func:`_install_before`) was written from: ``_run_checks``, which it
+#: copies, and ``run``, which answers the response it returns before reading
+#: any parameter. ninja 1.7.0 and 1.7.1 on Python 3.10 to 3.14 (``run``'s
+#: f-string is tokenized differently from Python 3.12 on).
+_NINJA_SOURCES = {
+    "Operation._run_checks": frozenset(
+        {"1f879fdc88dd517f7ff2f3961c324160638e3de021cf294b6e4e9f9ecccfc2d4"}
     ),
-    "AsyncOperation": frozenset(
-        {"f985c50cd57cd58a728d0e616c8952f80a789fbff3eaa13c8d76ae151116ba4a"}
+    "Operation.run": frozenset(
+        {
+            "0ff387914c346a2460656c70de211ba5041530c8244a7c25db9b0f49fa4e9ac0",
+            "66dd21c42a3edd6b7a60a54586afd7e6cf7ae0026afef83629e444aafa46b628",
+        }
+    ),
+    "AsyncOperation._run_checks": frozenset(
+        {"a15261992147f87c4ec2ad74fd67ebe1984020a2f4b2476679771d2c4e920cea"}
+    ),
+    "AsyncOperation.run": frozenset(
+        {"5189477ffad3b05335304fa19f3900e208d8d234ca99626b9117cf7067921fc7"}
     ),
 }
-#: Where the source isn't available: the names, local variables and argument
-#: count of both (the same in ninja 1.7.x on Python 3.10 to 3.14). Weaker: a
-#: body using the same names in another order passes.
-_NINJA_CHECKS_CODE = (
+#: The code fingerprint of ``_run_checks``, sync and async (see :data:`_NINJA_CODE`).
+_CHECKS_CODE = (
     (
         "csrf_exempt",
         "_ninja_csrf_exempt",
@@ -1926,6 +1959,68 @@ _NINJA_CHECKS_CODE = (
     ("self", "request", "error"),
     2,
 )
+#: Where the source isn't available: the names, local variables and argument
+#: count of each (the same in ninja 1.7.0 and 1.7.1 on Python 3.10 to 3.14).
+#: Weaker: a body using the same names in another order passes.
+_NINJA_CODE = {
+    "Operation._run_checks": _CHECKS_CODE,
+    "Operation.run": (
+        (
+            "_run_checks",
+            "api",
+            "create_temporal_response",
+            "_get_values",
+            "view_func",
+            "stream_format",
+            "_stream_response",
+            "_result_to_response",
+            "Exception",
+            "isinstance",
+            "TypeError",
+            "str",
+            "args",
+            "on_exception",
+        ),
+        (
+            "self",
+            "request",
+            "kw",
+            "error",
+            "temporal_response",
+            "values",
+            "result",
+            "e",
+            "msg",
+        ),
+        2,
+    ),
+    "AsyncOperation._run_checks": _CHECKS_CODE,
+    "AsyncOperation.run": (
+        (
+            "_run_checks",
+            "api",
+            "create_temporal_response",
+            "_get_values",
+            "stream_format",
+            "view_func",
+            "_async_stream_response",
+            "_result_to_response",
+            "Exception",
+            "on_exception",
+        ),
+        (
+            "self",
+            "request",
+            "kw",
+            "error",
+            "temporal_response",
+            "values",
+            "result",
+            "e",
+        ),
+        2,
+    ),
+}
 #: Tokens that don't change the code: comments and blank lines.
 _IGNORED_TOKENS = frozenset({tokenize.COMMENT, tokenize.NL})
 #: Tokens kept by type only (their text is whitespace).
@@ -1935,43 +2030,62 @@ _STRUCTURE_TOKENS = frozenset(
 
 
 def _source_digest(func: Any) -> str | None:
-    """The SHA-256 of ``func``'s source tokens, insensitive to comments and
-    blank lines; ``None`` when the source isn't available or can't be read.
+    """The SHA-256 of ``func``'s source tokens, insensitive to comments, blank
+    lines and its docstring; ``None`` when the source isn't available or
+    can't be read.
 
-    Each token but comments and blank lines counts, as its type and text
-    (only the type for indentation and line ends).
+    Each other token counts, as its type and text (only the type for
+    indentation and line ends).
     """
     try:
         source = textwrap.dedent(inspect.getsource(func))
-        digest = hashlib.sha256()
-        for token in tokenize.generate_tokens(io.StringIO(source).readline):
-            if token.type in _IGNORED_TOKENS:
-                continue
-            text = "" if token.type in _STRUCTURE_TOKENS else token.string
-            digest.update(f"{tokenize.tok_name[token.type]}\0{text}\1".encode())
+        tokens = [
+            token
+            for token in tokenize.generate_tokens(io.StringIO(source).readline)
+            if token.type not in _IGNORED_TOKENS
+        ]
     except (OSError, TypeError, tokenize.TokenError, SyntaxError):
         return None
+    digest = hashlib.sha256()
+    for token in _without_docstring(tokens):
+        text = "" if token.type in _STRUCTURE_TOKENS else token.string
+        digest.update(f"{tokenize.tok_name[token.type]}\0{text}\1".encode())
     return digest.hexdigest()
 
 
+def _without_docstring(tokens: list[tokenize.TokenInfo]) -> list[tokenize.TokenInfo]:
+    """The tokens of a function but its docstring: the strings alone on the
+    first line of its body."""
+    body = next(
+        (
+            index + 1
+            for index, token in enumerate(tokens)
+            if token.type == tokenize.INDENT
+        ),
+        len(tokens),
+    )
+    end = body
+    while end < len(tokens) and tokens[end].type == tokenize.STRING:
+        end += 1
+    if end == body or end == len(tokens) or tokens[end].type != tokenize.NEWLINE:
+        return tokens
+    return tokens[:body] + tokens[end + 1 :]
+
+
 @functools.cache
-def _is_ninja_checks(checks: Any, ninja_class: type) -> bool:
-    """Whether ``checks`` is the code scrudful's copy was written from: by the
-    digest of its source, else (no source) by its names, locals and
+def _is_ninja_code(func: Any, name: str) -> bool:
+    """Whether ``func`` is the code of ninja's method ``name`` (e.g.
+    ``"Operation.run"``) scrudful's copy of the checks was written from: by
+    the digest of its source, else (no source) by its names, locals and
     arguments. Memoized: each function is read once, whatever the number of
     operations and mounts."""
-    digest = _source_digest(checks)
+    digest = _source_digest(func)
     if digest is not None:
-        return digest in _NINJA_CHECKS_SOURCES[ninja_class.__name__]
-    code = getattr(checks, "__code__", None)
+        return digest in _NINJA_SOURCES[name]
+    code = getattr(func, "__code__", None)
     return (
         code is not None
-        and (
-            code.co_names,
-            code.co_varnames,
-            code.co_argcount,
-        )
-        == _NINJA_CHECKS_CODE
+        and (code.co_names, code.co_varnames, code.co_argcount) == _NINJA_CODE[name]
     )
 
 
@@ -1980,8 +2094,9 @@ def _check_ninja_checks(operation: Any, asynchronous: bool, label: str) -> None:
     scrudful's copy of ninja's checks (:func:`_install_before`).
 
     So an opaque decorator hiding the operation, an ``Operation`` subclass
-    overriding ``_run_checks``, or a ninja whose checks changed fails when the
-    operation is built instead of losing ``before`` or a check.
+    overriding ``_run_checks`` or ``run``, or a ninja whose checks (or the
+    ``run`` calling them) changed fails when the operation is built instead
+    of losing ``before`` or a check.
     """
     if operation is None:
         raise ConfigError(
@@ -1992,25 +2107,33 @@ def _check_ninja_checks(operation: Any, asynchronous: bool, label: str) -> None:
             "above the operation decorator."
         )
     ninja_class = AsyncOperation if asynchronous else Operation
-    checks = getattr(type(operation), "_run_checks", None)
+    cls = type(operation)
     if "_run_checks" in vars(operation):
-        reason = "the operation has its own _run_checks"
-    elif checks is not ninja_class._run_checks:
-        reason = (
-            f"{type(operation).__qualname__} overrides _run_checks of "
-            f"ninja's {ninja_class.__name__}"
-        )
-    elif not _is_ninja_checks(checks, ninja_class):
-        reason = (
-            "the installed ninja's checks differ from ninja 1.7.x's, which "
-            "scrudful's before= is verified against: upgrade scrudful"
-        )
-    else:
-        return
-    raise ConfigError(
-        f"{label}: before= needs ninja's own Operation._run_checks (ninja "
-        f"1.7.x), which scrudful runs with before between authentication and "
-        f"throttling; {reason}."
+        raise _checks_error(label, "the operation has its own _run_checks")
+    for method in ("_run_checks", "run"):
+        func = getattr(cls, method, None)
+        if func is not getattr(ninja_class, method):
+            raise _checks_error(
+                label,
+                f"{cls.__qualname__} overrides {method} of ninja's "
+                f"{ninja_class.__name__}",
+            )
+        if not _is_ninja_code(func, f"{ninja_class.__name__}.{method}"):
+            raise _checks_error(
+                label,
+                f"the installed ninja's {ninja_class.__name__}.{method} differs "
+                "from ninja 1.7.0's and 1.7.1's, which scrudful's before= is "
+                "verified against: upgrade scrudful, or keep ninja at one of "
+                "those releases",
+            )
+
+
+def _checks_error(label: str, reason: str) -> ConfigError:
+    """The ``ConfigError`` of an operation that can't run ``before``."""
+    return ConfigError(
+        f"{label}: before= needs ninja's own Operation._run_checks and the "
+        "Operation.run calling it (ninja 1.7.x), as scrudful runs before "
+        f"between authentication and throttling; {reason}."
     )
 
 
@@ -2030,7 +2153,8 @@ def _install_before(
     ``add_decorator(mode="operation")``, which wrap the operation's function.
     In a sync operation, a ``before`` returning an awaitable raises
     ``TypeError``: it can't be awaited there, and the request must not go on
-    as if it were allowed.
+    as if it were allowed. A coroutine is closed and a future (or task)
+    cancelled, so neither runs on unawaited.
 
     Raises
     ------
@@ -2084,6 +2208,8 @@ def _install_before(
             if inspect.isawaitable(result):
                 if inspect.iscoroutine(result):
                     result.close()
+                elif asyncio.isfuture(result):
+                    result.cancel()
                 raise TypeError(
                     f"before returned an awaitable ({result!r}) in a sync "
                     "operation, which can't await it: make the operation async "

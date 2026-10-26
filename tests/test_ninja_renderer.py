@@ -4,7 +4,12 @@
 import functools
 import json
 import uuid
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
+
+from django.core.serializers.json import DjangoJSONEncoder
+from django.utils.translation import gettext_lazy
 
 import pytest
 from asgiref.sync import async_to_sync
@@ -41,6 +46,23 @@ class TextRenderer(BaseRenderer):
 
     def render(self, request, data, *, response_status):
         return f"status {response_status}"
+
+
+class Latin1Renderer(JSONRenderer):
+    """Writes non-ASCII as is, in Latin-1."""
+
+    charset = "latin-1"
+    json_dumps_params = {"ensure_ascii": False}
+
+
+class PlainRenderer(BaseRenderer):
+    """Plain ``json.dumps``, as orjson: no datetime, Decimal, UUID or lazy
+    strings of its own."""
+
+    media_type = "application/json"
+
+    def render(self, request, data, *, response_status):
+        return json.dumps(data)
 
 
 def compact(body: Any) -> bytes:
@@ -125,7 +147,7 @@ def test_custom_renderer_writes_scrudful_bodies(asynchronous, method, headers, s
     assert response.content == compact(response.json())
     assert response.json() == default.json()
     assert dict(response.headers) == dict(default.headers)
-    assert response.headers["Content-Type"] == "application/json"
+    assert response.headers["Content-Type"] == "application/json; charset=utf-8"
     if method == "OPTIONS":
         assert response.headers["Allow"]
         assert 'rel="describedby"' in response.headers["Link"]
@@ -142,7 +164,7 @@ def test_custom_renderer_error_entity_media_type(asynchronous, method, headers, 
     assert response.status_code == status
     assert response.json()["title"] == "Précondition échouée"
     assert response.content == compact(response.json())
-    assert response.headers["Content-Type"] == PROBLEM_JSON
+    assert response.headers["Content-Type"] == f"{PROBLEM_JSON}; charset=utf-8"
     assert "/schemas/problem" in response.headers["Link"]
     assert "Link" in response.headers["Access-Control-Expose-Headers"]
 
@@ -154,7 +176,7 @@ def test_default_renderer_bodies_unchanged(asynchronous, method, headers, status
     response = request(method, "/items/1", json={"name": "x"}, headers=headers)
     assert response.status_code == status
     assert response.content == json.dumps(response.json()).encode()
-    assert response.headers["Content-Type"] == "application/json"
+    assert response.headers["Content-Type"] == "application/json; charset=utf-8"
 
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
@@ -218,3 +240,45 @@ def test_renderer_found_through_earlier_run_decorators():
     response = client.put("/items/1", json={"name": "x"})
     assert response.status_code == 428
     assert response.content == compact(response.json())
+
+
+@pytest.mark.parametrize("method, headers, status", EARLY)
+def test_renderer_charset_encodes_and_labels_scrudful_bodies(method, headers, status):
+    items = router(Store(), error=PROBLEM, error_body_func=accented_problem)
+    client = TestClient(api_for(items, Latin1Renderer()))
+    response = client.request(method, "/items/1", json={"name": "x"}, headers=headers)
+    assert response.status_code == status
+    media_type = "application/json" if method == "OPTIONS" else PROBLEM_JSON
+    assert response.headers["Content-Type"] == f"{media_type}; charset=latin-1"
+    body = json.loads(response.content.decode("latin-1"))
+    if method != "OPTIONS":
+        assert body["title"] == "Précondition échouée"
+        assert "é".encode("latin-1") in response.content
+
+
+#: Values ``JsonResponse`` (``DjangoJSONEncoder``) writes, plain JSON doesn't.
+DJANGO_VALUES = {
+    "at": datetime(2026, 10, 26, 7, 45, tzinfo=timezone.utc),
+    "amount": Decimal("1.50"),
+    "id": uuid.UUID(int=7),
+    "detail": gettext_lazy("Precondition failed"),
+}
+
+
+def django_values_problem(request, result):
+    return {**problem_details(request, result), **DJANGO_VALUES}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("method, headers, status", EARLY[1:])
+def test_plain_renderer_writes_what_json_response_did(
+    asynchronous, method, headers, status
+):
+    items = router(
+        Store(), asynchronous, error=PROBLEM, error_body_func=django_values_problem
+    )
+    request = requests(asynchronous, api_for(items, PlainRenderer()))
+    response = request(method, "/items/1", json={"name": "x"}, headers=headers)
+    assert response.status_code == status
+    expected = json.loads(json.dumps(DJANGO_VALUES, cls=DjangoJSONEncoder))
+    assert {key: response.json()[key] for key in DJANGO_VALUES} == expected

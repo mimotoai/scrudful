@@ -478,7 +478,7 @@ def options(client, path, **headers):
 def test_options_item(client, role):
     response = options(client, detail(role.pk))
     assert response.status_code == 200
-    assert response.headers["Content-Type"] == "application/json"
+    assert response.headers["Content-Type"] == "application/json; charset=utf-8"
     assert response.headers["Link"] == options_links()
     body = response.json()
     validate_http_schema_resource(body)

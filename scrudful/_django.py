@@ -51,8 +51,9 @@ def precondition_headers(request: HttpRequest) -> dict[str, str]:
     return _adapter.precondition_headers(getlist)
 
 
-#: Writes a JSON body: ``render(data, status)`` returns its bytes.
-Render = Callable[[Any, int], bytes]
+#: Writes a JSON body: ``render(data, status, content_type)`` returns the
+#: response carrying it, with that status and Content-Type.
+Render = Callable[[Any, int, str], HttpResponse]
 
 
 def conditional_response(
@@ -91,7 +92,7 @@ def json_response(
     else by Django's ``JsonResponse``, and this status and Content-Type."""
     if render is None:
         return JsonResponse(data, status=status, content_type=content_type)
-    return HttpResponse(render(data, status), status=status, content_type=content_type)
+    return render(data, status, content_type)
 
 
 def aware(value: Any) -> Any:

@@ -447,17 +447,24 @@ its error nor that 422 passes through the decorators added with
 ``Operation.run``: a ``decorate_view`` decorator below ``@scrudful_list``
 must use ``functools.wraps`` (``ConfigError`` otherwise, when the operation is
 built). ``before`` runs in scrudful's own copy of ninja's per-operation checks
-(CSRF flag, authentication, throttles), verified against ninja 1.7.x, the
-range scrudful's ``ninja`` extra allows. When the operation is built, scrudful
-compares ninja's checks with 1.7.x's: by a digest of their source (comments
-and blank lines aside), or, where the source isn't installed (``.pyc`` only),
+(CSRF flag, authentication, throttles), which relies on ``Operation.run``
+answering their response before it reads any parameter. Both are verified
+against ninja 1.7.0 and 1.7.1; the ``ninja`` extra allows any 1.7.x, so a
+later 1.7 release may be installed before scrudful has verified it. When the
+operation is built, scrudful compares ninja's ``_run_checks`` and ``run``
+with those releases': by a digest of their source (comments, docstrings and
+blank lines aside), or, where the source isn't installed (``.pyc`` only),
 only by the names, local variables and arguments they use. On a ninja whose
-checks differ, or with an ``Operation`` subclass overriding them, ``before=``
-raises ``ConfigError`` at startup instead of skipping a check: upgrade
-scrudful then.
+code differs, or with an ``Operation`` subclass overriding either method,
+``before=`` raises ``ConfigError`` at startup instead of skipping a check:
+upgrade scrudful, or keep ninja at a verified release (an app using
+``before=`` should lock its ninja version). Without ``before=`` the check is
+never made.
 
-Here the API's auth callback returns the caller's ``rbac_context``, and the
-path names the context listed:
+Here the API's auth callback returns the caller's ``rbac_context`` (a
+string, as in the example project), and the path names the context listed.
+The path parameter is declared ``str``, so ``before`` compares the value the
+handler gets:
 
 .. code-block:: python
 
@@ -465,12 +472,12 @@ path names the context listed:
         context = getattr(request, "auth", None)
         if context is None:  # no auth callback succeeded: fail closed
             raise HttpError(401, "Unauthorized")
-        if path_params["context"] != str(context):
+        if path_params["context"] != context:
             raise HttpError(403, "Forbidden")
 
     @roles.get("/contexts/{context}/roles", response=List[RoleOut])
     @scrudful_list(href_func=role_href, before=same_context)
-    def list_context_roles(request, context: int):
+    def list_context_roles(request, context: str):
         return Role.objects.filter(rbac_context=context).order_by("pk")
 
 The collection response is a list, set or tuple of the item schema
@@ -533,7 +540,8 @@ every POST. It is the same for everyone:
   ``Allow`` header listing the body's methods and, for the paths that serve
   it, a ``head`` entry without content;
 * the body is written by the API's renderer and served as
-  ``application/json`` (see "The API's renderer" under `Error responses`_).
+  ``application/json`` with the renderer's charset (see "The API's renderer"
+  under `Error responses`_).
 
 CORS
 ~~~~
@@ -653,8 +661,14 @@ other content (e.g. ``text/plain``) keeps its ``Content-Type``.
 Resource and the 400, 412 and 428) are written by the renderer of the API
 serving the request (``NinjaAPI(renderer=...)``), as every other response, so
 a renderer with other separators or escapes gives them the same bytes. Their
-``Content-Type`` is still the one described here (``application/json``, or the
-``error`` entity's media type), not the renderer's. A renderer whose
+``Content-Type`` is still the media type described here (``application/json``,
+or the ``error`` entity's media type), not the renderer's, with the
+renderer's ``charset`` parameter, as ninja's own responses carry it
+(``application/json; charset=utf-8`` by default). The body is first reduced
+to JSON values as ninja's ``NinjaJSONEncoder`` (a ``DjangoJSONEncoder``)
+writes them, so a renderer of plain JSON (ORJSON, ``json.dumps``) writes a
+datetime, ``Decimal``, ``UUID`` or lazy string in an ``error_body_func``
+body as ``JsonResponse`` did. A renderer whose
 ``media_type`` is not JSON content, a ``decorate_view`` decorator below
 scrudful that wraps ``Operation.run`` without ``functools.wraps`` gets them
 written as Django's ``JsonResponse`` writes them.

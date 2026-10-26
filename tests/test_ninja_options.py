@@ -322,7 +322,7 @@ def test_options_headers(store):
     for url in DESCRIBED_PATHS:
         response = options(client, url)
         assert response.status_code == 200, url
-        assert response.headers["Content-Type"] == "application/json"
+        assert response.headers["Content-Type"] == "application/json; charset=utf-8"
         assert response.headers["Link"] == options_links()
         body = response.json()
         assert response.headers["Allow"] == allow_header(body)
@@ -619,7 +619,7 @@ def test_router_rejects_options_links():
 def test_options_auto_added(store):
     response = options(TestClient(item_router(store)), "/items/1")
     assert response.status_code == 200
-    assert response.headers["Content-Type"] == "application/json"
+    assert response.headers["Content-Type"] == "application/json; charset=utf-8"
     body = response.json()
     assert list(body) == ["get", "put", "delete", "options"]
     assert response.headers["Allow"] == "GET, PUT, DELETE, OPTIONS"
