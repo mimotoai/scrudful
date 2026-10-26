@@ -466,6 +466,7 @@ from scrudful._adapter import (
     resolved_signature,
     set_validator_headers,
     validator_policy,
+    with_charset,
     with_error_body,
 )
 from scrudful._django import (
@@ -1846,10 +1847,12 @@ def _render(request: HttpRequest) -> Render | None:
     """How the API serving ``request`` writes a JSON body, for scrudful's own
     responses (OPTIONS and the early 400, 412 and 428).
 
-    Its ``create_response``, when its renderer writes JSON content (an
-    ``application/json`` or ``+json`` ``media_type``), so these bodies have
-    the bytes and charset of every other response of the API; their
-    Content-Type is the body's media type with that charset. Unless the
+    Its renderer, when that writes JSON content (an ``application/json`` or
+    ``+json`` ``media_type``), so these bodies have the bytes and charset of
+    every other response of the API; their Content-Type is the body's media
+    type with that charset. Not the API's ``create_response``, which a
+    subclass may override to add headers (a public ``Cache-Control``, say)
+    a 400 or 412 must not carry. Unless the
     renderer is ninja's ``JSONRenderer`` with its encoder, which writes them
     so itself, the body is first reduced to JSON values as ninja's
     ``NinjaJSONEncoder`` (a ``DjangoJSONEncoder``) writes them, so a renderer
@@ -1864,48 +1867,20 @@ def _render(request: HttpRequest) -> Render | None:
     if not media_type or not is_json_syntax(media_type):
         return None
 
-    as_is = _writes_ninja_json(api.renderer)
+    renderer = api.renderer
+    as_is = _writes_ninja_json(renderer)
 
     def render(data: Any, status: int, content_type: str) -> HttpResponse:
         plain = data if as_is else _json_values(data)
-        response: HttpResponse = api.create_response(request, plain, status=status)
-        response["Content-Type"] = _with_charset(content_type, response.charset)
-        return response
+        content = renderer.render(request, plain, response_status=status)
+        # A str is encoded in the charset the Content-Type names.
+        return HttpResponse(
+            content,
+            status=status,
+            content_type=with_charset(content_type, renderer.charset),
+        )
 
     return render
-
-
-def _with_charset(media_type: str, charset: str) -> str:
-    """``media_type`` with the ``charset`` parameter ``charset`` (the encoding
-    of the bytes it labels), in place of any charset it names."""
-    name, *parameters = _split_parameters(media_type)
-    kept = [
-        parameter.strip()
-        for parameter in parameters
-        if parameter.strip()
-        and parameter.partition("=")[0].strip().lower() != "charset"
-    ]
-    return "; ".join([name.strip(), *kept, f"charset={charset}"])
-
-
-def _split_parameters(media_type: str) -> list[str]:
-    """``media_type`` split at each ``;`` outside a quoted string (whose text,
-    a ``;`` included, is kept as written)."""
-    parts = []
-    start = 0
-    quoted = escaped = False
-    for index, char in enumerate(media_type):
-        if escaped:
-            escaped = False
-        elif quoted and char == "\\":
-            escaped = True
-        elif char == '"':
-            quoted = not quoted
-        elif char == ";" and not quoted:
-            parts.append(media_type[start:index])
-            start = index + 1
-    parts.append(media_type[start:])
-    return parts
 
 
 def _writes_ninja_json(renderer: Any) -> bool:
@@ -2395,7 +2370,7 @@ def _error_links(
     yield from _add_links(response, entity, request, None)
     content_type = response.get("Content-Type")
     if content_type and is_json_syntax(content_type) and is_json(entity.media_type):
-        response["Content-Type"] = _with_charset(entity.media_type, response.charset)
+        response["Content-Type"] = with_charset(entity.media_type, response.charset)
     expose_headers(response)
 
 

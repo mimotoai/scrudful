@@ -170,3 +170,20 @@ def test_drf_page_errors_are_translated_as_drf_s(items, value, code):
         expected = IntegerField.default_error_messages[code].format(min_value=1)
     assert caught.value.detail == {"page": [expected]}
     assert "valid integer" not in expected and "Ensure" not in expected
+
+
+def test_drf_page_and_page_size_sharing_a_parameter_name(items):
+    """Each parameter keeps its own value (and default) whatever its name."""
+    from rest_framework.request import Request
+    from rest_framework.test import APIRequestFactory
+
+    from tests.test_rest_framework_envelope import SmallPagination, SmallViewSet
+
+    class SharedName(SmallPagination):
+        page_size = 2
+        page_query_param = page_size_query_param = "p"
+
+    pagination = SharedName()
+    request = Request(APIRequestFactory().get("/drf/small/"))
+    pagination.paginate_queryset(Item.objects.order_by("pk"), request, SmallViewSet())
+    assert (pagination.number, pagination.size) == (1, 2)

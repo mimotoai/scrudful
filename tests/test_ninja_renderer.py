@@ -385,9 +385,9 @@ def test_quoted_media_type_parameters_kept_as_written():
     ],
 )
 def test_split_parameters_respects_quoted_strings(media_type, parts):
-    from scrudful.ninja import _split_parameters
+    from scrudful._adapter import split_parameters
 
-    assert _split_parameters(media_type) == parts
+    assert split_parameters(media_type) == parts
 
 
 class JSONLDRenderer(CompactRenderer):
@@ -401,3 +401,27 @@ def test_json_ld_renderer_writes_scrudful_bodies(method, headers, status):
     assert response.status_code == status
     assert response.content == compact(response.json())
     assert response.headers["Content-Type"] == "application/json; charset=utf-8"
+
+
+class CachingAPI(NinjaAPI):
+    """An API whose create_response marks every response publicly cacheable."""
+
+    def create_response(self, request, data, *args, **kwargs):
+        response = super().create_response(request, data, *args, **kwargs)
+        response["Cache-Control"] = "public, max-age=60"
+        return response
+
+
+@pytest.mark.parametrize("method, headers, status", EARLY[1:])
+def test_overridden_create_response_never_adds_headers_to_early_errors(
+    method, headers, status
+):
+    """A shared cache must not store a 400, 412 or 428."""
+    api = CachingAPI(renderer=CompactRenderer(), urls_namespace=uuid.uuid4().hex)
+    api.add_router("", router(Store()))
+    response = TestClient(api).request(
+        method, "/items/1", json={"name": "x"}, headers=headers
+    )
+    assert response.status_code == status
+    assert "Cache-Control" not in response.headers
+    assert response.content == compact(response.json())

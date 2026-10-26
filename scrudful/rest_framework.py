@@ -1578,13 +1578,13 @@ class ScrudfulPagination(BasePagination):
         # the first error, as in 0.6.0 (it is not called for page_size once
         # page failed).
         collect = type(self)._integer is ScrudfulPagination._integer
-        values, errors = {}, {}
+        values, errors = [], {}
         for name, default, maximum in (
             (self.page_query_param, 1, None),
             (self.page_size_query_param, self.page_size, self.max_page_size),
         ):
             try:
-                values[name] = self._integer(request, name, default, maximum)
+                values.append(self._integer(request, name, default, maximum))
             except ValidationError as exc:
                 if not collect:
                     raise
@@ -1595,8 +1595,7 @@ class ScrudfulPagination(BasePagination):
                     errors[name] = detail
         if errors:
             raise ValidationError(errors)
-        number = values[self.page_query_param]
-        size = values[self.page_size_query_param]
+        number, size = values
         try:
             # The unordered-queryset warning points at this method's caller.
             self.count, self.objects = slice_page(queryset, number, size)
