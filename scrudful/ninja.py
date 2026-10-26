@@ -455,6 +455,7 @@ from scrudful._adapter import (
     describe_options,
     describe_read,
     describe_write,
+    essence,
     evaluates_preconditions,
     expose_headers,
     has_default_entity,
@@ -1860,7 +1861,7 @@ def _render(request: HttpRequest) -> Render | None:
     """
     api = _SERVING_API.get()
     media_type = getattr(getattr(api, "renderer", None), "media_type", None)
-    if not media_type or not is_json(media_type):
+    if not media_type or not _is_json_syntax(media_type):
         return None
 
     as_is = _writes_ninja_json(api.renderer)
@@ -1877,14 +1878,42 @@ def _render(request: HttpRequest) -> Render | None:
 def _with_charset(media_type: str, charset: str) -> str:
     """``media_type`` with the ``charset`` parameter ``charset`` (the encoding
     of the bytes it labels), in place of any charset it names."""
-    name, _, parameters = media_type.partition(";")
+    name, *parameters = _split_parameters(media_type)
     kept = [
         parameter.strip()
-        for parameter in parameters.split(";")
+        for parameter in parameters
         if parameter.strip()
         and parameter.partition("=")[0].strip().lower() != "charset"
     ]
     return "; ".join([name.strip(), *kept, f"charset={charset}"])
+
+
+def _split_parameters(media_type: str) -> list[str]:
+    """``media_type`` split at each ``;`` outside a quoted string (whose text,
+    a ``;`` included, is kept as written)."""
+    parts = []
+    start = 0
+    quoted = escaped = False
+    for index, char in enumerate(media_type):
+        if escaped:
+            escaped = False
+        elif quoted and char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif char == ";" and not quoted:
+            parts.append(media_type[start:index])
+            start = index + 1
+    parts.append(media_type[start:])
+    return parts
+
+
+def _is_json_syntax(media_type: str) -> bool:
+    """Whether ``media_type`` is written as JSON: ``application/json`` or
+    ``+json``, JSON-LD included (unlike :func:`is_json`, which asks whether
+    its context is out of band)."""
+    name = essence(media_type)
+    return name == "application/json" or name.endswith("+json")
 
 
 def _writes_ninja_json(renderer: Any) -> bool:

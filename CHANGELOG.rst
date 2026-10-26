@@ -29,8 +29,12 @@ Behaviour change (ninja)
   are now written by the serving API's renderer (``NinjaAPI(renderer=...)``),
   as its other responses are, not by Django's ``JsonResponse``. With ninja's
   default ``JSONRenderer`` the bytes are unchanged; an API with another JSON
-  renderer (compact separators, ORJSON, ``ensure_ascii=False`` ...) gets other
-  bytes on those responses than with 0.6.0. Their ``Content-Type`` keeps its
+  renderer (compact separators, ORJSON, ``ensure_ascii=False``, JSON-LD ...)
+  gets other bytes on those responses than with 0.6.0. A renderer that
+  changes the data's shape (renames keys, e.g. to camelCase, or wraps each
+  body) now changes these bodies too, as it does ninja's own 422s: the
+  OPTIONS HTTP Schema Resource then no longer has the spec's shape, so use
+  one that changes only how the data is written. Their ``Content-Type`` keeps its
   media type (``application/json``, or the ``error`` entity's) and now
   carries the renderer's ``charset`` parameter, as ninja's own responses do
   (``application/json; charset=utf-8`` by default). The body is first reduced

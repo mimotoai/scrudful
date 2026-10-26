@@ -671,7 +671,14 @@ other content (e.g. ``text/plain``) keeps its ``Content-Type``.
 **The API's renderer.** scrudful's own bodies (the OPTIONS HTTP Schema
 Resource and the 400, 412 and 428) are written by the renderer of the API
 serving the request (``NinjaAPI(renderer=...)``), as every other response, so
-a renderer with other separators or escapes gives them the same bytes. Their
+a renderer with other separators or escapes gives them the same bytes (a
+JSON-LD renderer, ``application/ld+json``, too). The renderer writes them as
+it writes the API's other data: one that changes the data's shape (renames
+keys, e.g. to camelCase, or wraps each body, e.g. in ``{"data": ...}``)
+changes them too, as it changes ninja's own 422 bodies, and the HTTP Schema
+Resource then no longer has the shape the semantic-http spec gives it (nor
+names the parameters as the API reads them). Use a renderer that changes
+only how the data is written. Their
 ``Content-Type`` is still the media type described here (``application/json``,
 or the ``error`` entity's media type), not the renderer's, with the
 renderer's ``charset`` parameter, as ninja's own responses carry it

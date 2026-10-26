@@ -353,3 +353,44 @@ def test_raised_and_early_errors_share_the_content_type(asynchronous):
     assert (raised.status_code, early.status_code) == (404, 412)
     expected = f"{PROBLEM_JSON}; charset=latin-1"
     assert raised.headers["Content-Type"] == early.headers["Content-Type"] == expected
+
+
+def test_quoted_media_type_parameters_kept_as_written():
+    entity = Entity(
+        schema_link_or_func="/schemas/problem",
+        media_type='application/problem+json; profile="https://ex.com/a;b"',
+    )
+    client = TestClient(api_for(router(Store(), error=entity)))
+    early = client.put("/items/1", json={"name": "x"}, headers={"If-Match": '"v0"'})
+    raised = client.get("/items/999")
+    expected = 'application/problem+json; profile="https://ex.com/a;b"; charset=utf-8'
+    assert (early.status_code, raised.status_code) == (412, 404)
+    assert early.headers["Content-Type"] == raised.headers["Content-Type"] == expected
+
+
+@pytest.mark.parametrize(
+    "media_type, parts",
+    [
+        ("a/b", ["a/b"]),
+        ("a/b; x=1;y=2", ["a/b", " x=1", "y=2"]),
+        ('a/b; p="1;2"; q=3', ["a/b", ' p="1;2"', " q=3"]),
+        ('a/b; p="say \\"x;y\\""; q', ["a/b", ' p="say \\"x;y\\""', " q"]),
+    ],
+)
+def test_split_parameters_respects_quoted_strings(media_type, parts):
+    from scrudful.ninja import _split_parameters
+
+    assert _split_parameters(media_type) == parts
+
+
+class JSONLDRenderer(CompactRenderer):
+    media_type = "application/ld+json"
+
+
+@pytest.mark.parametrize("method, headers, status", EARLY)
+def test_json_ld_renderer_writes_scrudful_bodies(method, headers, status):
+    client = TestClient(api_for(router(Store()), JSONLDRenderer()))
+    response = client.request(method, "/items/1", json={"name": "x"}, headers=headers)
+    assert response.status_code == status
+    assert response.content == compact(response.json())
+    assert response.headers["Content-Type"] == "application/json; charset=utf-8"
