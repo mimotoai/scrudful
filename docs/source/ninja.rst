@@ -468,7 +468,10 @@ code differs, or with an ``Operation`` subclass overriding either method,
 ``before=`` raises ``ConfigError`` at startup instead of skipping a check:
 upgrade scrudful, or keep ninja at a verified release (an app using
 ``before=`` should lock its ninja version). Without ``before=`` the check is
-never made.
+never made. Each request is checked too: one that reaches the operation's
+function without ``before`` having allowed it (ninja served a copy of the
+operation without scrudful's checks) fails with ``RuntimeError``, never goes
+on unchecked.
 
 Here the API's auth callback returns the caller's ``rbac_context`` (a
 string, as in the example project), and the path names the context listed.
@@ -683,11 +686,12 @@ only how the data is written. Their
 or the ``error`` entity's media type), not the renderer's, with the
 renderer's ``charset`` parameter, as ninja's own responses carry it
 (``application/json; charset=utf-8`` by default). Unless the renderer is
-ninja's ``JSONRenderer`` with its encoder, which writes them so itself, the
-body is first reduced to JSON values as ninja's ``NinjaJSONEncoder`` (a
-``DjangoJSONEncoder``) writes them, so a renderer of plain JSON (ORJSON, ``json.dumps``) writes a
-datetime, ``Decimal``, ``UUID`` or lazy string in an ``error_body_func``
-body as ``JsonResponse`` did. A renderer whose
+ninja's ``JSONRenderer`` with a ``DjangoJSONEncoder`` (its default
+``NinjaJSONEncoder`` is one), which writes them its own way, the body is first
+reduced to JSON values as ninja's ``NinjaJSONEncoder`` (a
+``DjangoJSONEncoder``) writes them, so a renderer of plain JSON (ORJSON,
+``json.dumps``) writes a datetime, ``Decimal``, ``UUID`` or lazy string in an
+``error_body_func`` body as ``JsonResponse`` did. A renderer whose
 ``media_type`` is not JSON content, or a ``decorate_view`` decorator below
 scrudful that wraps ``Operation.run`` without ``functools.wraps``, gets them
 written as Django's ``JsonResponse`` writes them.

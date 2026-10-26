@@ -421,6 +421,7 @@ from typing import (
 )
 
 from asgiref.sync import async_to_sync, sync_to_async
+from django.core.serializers.json import DjangoJSONEncoder
 from django.http import (
     Http404,
     HttpRequest,
@@ -1466,6 +1467,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
         hidden = _wrapper_signature(handler, load_as if load is not None else None)
         response_name = hidden.response_name
         asynchronous = inspect.iscoroutinefunction(handler)
+        label = f"{name}: {handler.__qualname__}()"
         # In an async operation with sync per-item callables, a page is built
         # in one call (one thread hop), not one call per callable.
         page_in_one_call = asynchronous and not _has_async_item_callables(config)
@@ -1615,6 +1617,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
 
                 @functools.wraps(handler)
                 async def wrapper(request: HttpRequest, **values: Any) -> Any:
+                    _check_before_allowed(config, label)
                     try:
                         return await _run_async(flow(request, values, answers))
                     except Exception as exc:
@@ -1625,6 +1628,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
 
                 @functools.wraps(handler)
                 def wrapper(request: HttpRequest, **values: Any) -> Any:
+                    _check_before_allowed(config, label)
                     try:
                         return _run_sync(flow(request, values, answers))
                     except Exception as exc:
@@ -1677,9 +1681,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             # the API's exception handler, which ``Operation.run`` returns. It
             # is wrapped as ``decorate_view`` wraps it, so that ninja's clones
             # of the operation (one per mount) wrap theirs too.
-            run_decorator = _raised_links_run(
-                asynchronous, config, f"{name}: {handler.__qualname__}()"
-            )
+            run_decorator = _raised_links_run(asynchronous, config, label)
             _add_run_decorator(operation, run_decorator)
 
         # Registered with ninja, which replaces it in each operation by the
@@ -1777,6 +1779,9 @@ class _Raised:
     #: The path parameters, as the URL gives them (strings, unless the path
     #: uses a converter).
     path_params: dict[str, Any] = field(default_factory=dict)
+    #: Whether the operation's ``before`` ran and allowed the request (see
+    #: :func:`_check_before_allowed`).
+    before_allowed: bool = False
 
 
 #: Set by :func:`_raised_links_run` while ``Operation.run`` runs. A mutable
@@ -1868,7 +1873,7 @@ def _render(request: HttpRequest) -> Render | None:
         return None
 
     renderer = api.renderer
-    as_is = _writes_ninja_json(renderer)
+    as_is = _writes_django_values(renderer)
 
     def render(data: Any, status: int, content_type: str) -> HttpResponse:
         plain = data if as_is else _json_values(data)
@@ -1883,15 +1888,16 @@ def _render(request: HttpRequest) -> Render | None:
     return render
 
 
-def _writes_ninja_json(renderer: Any) -> bool:
-    """Whether ``renderer`` writes values as ``NinjaJSONEncoder`` does: ninja's
-    ``JSONRenderer`` (its ``render``) with that encoder or a subclass. Its
-    bodies need no reduction (:func:`_json_values`) first."""
+def _writes_django_values(renderer: Any) -> bool:
+    """Whether ``renderer`` writes Django's values itself: ninja's
+    ``JSONRenderer`` (its ``render``) with a ``DjangoJSONEncoder`` (ninja's
+    ``NinjaJSONEncoder`` is one), which writes them its own way. Its bodies
+    get no reduction (:func:`_json_values`) first."""
     encoder = getattr(renderer, "encoder_class", None)
     return (
         type(renderer).render is JSONRenderer.render
         and isinstance(encoder, type)
-        and issubclass(encoder, NinjaJSONEncoder)
+        and issubclass(encoder, DjangoJSONEncoder)
     )
 
 
@@ -2213,14 +2219,14 @@ def _install_before(
     """
     _check_ninja_checks(operation, asynchronous, label)
 
-    def path_params() -> dict[str, Any]:
+    def current() -> _Raised:
         raised = _RAISED.get()
         if raised is None:
             raise RuntimeError(
                 f"{label}: before can't get the path parameters: the "
                 "operation's checks ran outside its Operation.run"
             )
-        return dict(raised.path_params)
+        return raised
 
     def answer(request: HttpRequest, exc: Exception) -> HttpResponseBase:
         _note_raised(config, exc)
@@ -2230,10 +2236,13 @@ def _install_before(
         if operation.csrf_exempt:
             request._ninja_csrf_exempt = True  # type: ignore[attr-defined]
 
-    def after_before(request: HttpRequest, result: Any) -> HttpResponseBase | None:
+    def after_before(
+        request: HttpRequest, raised: _Raised, result: Any
+    ) -> HttpResponseBase | None:
         """Fail closed unless ``before`` returned ``None``; then throttle."""
         if result is not None:
             _refuse_before_result(result, asynchronous)
+        raised.before_allowed = True
         if operation.throttle_objects:
             error = operation._check_throttles(request)
             if error:
@@ -2248,12 +2257,13 @@ def _install_before(
                 error = await operation._run_authentication(request)
                 if error:
                     return error  # type: ignore[no-any-return]
-            params = path_params()
+            raised = current()
+            params = dict(raised.path_params)
             try:
                 result = await _call_async(config.before, (request,), params)
             except Exception as exc:
                 return answer(request, exc)
-            return after_before(request, result)
+            return after_before(request, raised, result)
 
     else:
 
@@ -2265,14 +2275,34 @@ def _install_before(
                 error = operation._run_authentication(request)
                 if error:
                     return error  # type: ignore[no-any-return]
-            params = path_params()
+            raised = current()
+            params = dict(raised.path_params)
             try:
                 result = config.before(request, **params)  # type: ignore[misc]
             except Exception as exc:
                 return answer(request, exc)
-            return after_before(request, result)
+            return after_before(request, raised, result)
 
     operation._run_checks = run_checks
+
+
+def _check_before_allowed(config: _Config, label: str) -> None:
+    """Raise ``RuntimeError`` unless the operation's ``before`` (if any) ran
+    and allowed this request.
+
+    So a request never reaches the function without it: if ninja served an
+    operation without scrudful's checks (e.g. a copy it made without
+    re-applying ``Operation.run``'s decorators), the request fails instead
+    of going on unchecked.
+    """
+    if config.before is None:
+        return
+    raised = _RAISED.get()
+    if raised is None or not raised.before_allowed:
+        raise RuntimeError(
+            f"{label}: before= didn't run for this request: the operation "
+            "ninja served lacks scrudful's checks. Refusing the request."
+        )
 
 
 def _refuse_before_result(result: Any, asynchronous: bool) -> NoReturn:

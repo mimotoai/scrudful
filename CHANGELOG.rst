@@ -44,6 +44,11 @@ Behaviour change (ninja)
   JSON (ORJSON, ``json.dumps``). Links, ``Allow`` and expose headers are
   unchanged, a 304 still has no body, and a renderer whose ``media_type`` is
   not JSON content keeps the ``JsonResponse`` bytes and ``Content-Type``.
+  Written by the renderer, these responses are ``HttpResponse`` objects, no
+  longer ``JsonResponse``. A ``JSONRenderer`` with a ``DjangoJSONEncoder``
+  subclass writes Django's values (datetime, ``Decimal`` ...) its own way in
+  them too; another renderer gets them reduced as ``NinjaJSONEncoder``
+  writes them.
 * ninja: an error the API's exception handler answers for a scrudful
   operation (or under ``add_error_links``), served as the ``error`` entity's
   media type, now also carries the charset of its bytes
@@ -84,7 +89,9 @@ New
   ``functools.wraps``). They are compared by a digest of their source,
   comments, docstrings and blank lines aside; where the source isn't
   installed (``.pyc`` only), only the names, local variables and arguments
-  they use are compared.
+  they use are compared. A request that reaches the function without
+  ``before`` having allowed it (ninja served a copy of the operation without
+  scrudful's checks) fails with ``RuntimeError`` instead of going on.
   ``request.auth`` exists only when an auth callback succeeded: where
   ``before`` may run without one, fail closed (``getattr(request, "auth",
   None)`` and a 401 when it is ``None``). Without ``before`` nothing changes.

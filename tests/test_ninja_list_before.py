@@ -10,6 +10,7 @@ import inspect
 import json
 import textwrap
 import tokenize
+import types
 import uuid
 from typing import Any
 
@@ -416,6 +417,28 @@ def test_async_before_returning_an_awaitable_fails_closed(items):
     get = getter(True, api_for(list_router(True, before=before)))
     with pytest.raises(TypeError, match="never by returning"):
         get("/p/7/items")
+
+
+@ASYNC
+def test_clone_without_run_decorators_fails_closed(monkeypatch, items, asynchronous):
+    """If ninja's copy of the operation lost scrudful's Operation.run
+    decorators (and so before), the request fails instead of going on."""
+    for cls in (ninja_operation.Operation, ninja_operation.AsyncOperation):
+        original = cls.clone
+
+        def clone(self, original=original):
+            copy = original(self)
+            copy.run = types.MethodType(type(copy).run, copy)
+            vars(copy).pop("_run_checks", None)
+            copy._run_decorators = []
+            return copy
+
+        monkeypatch.setattr(cls, "clone", clone)
+    before = Recorder()
+    get = getter(asynchronous, api_for(list_router(asynchronous, before=before)))
+    with pytest.raises(RuntimeError, match="before= didn't run"):
+        get("/p/7/items")
+    assert before.calls == []
 
 
 def test_sync_before_returning_a_future_cancels_it(items):

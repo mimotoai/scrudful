@@ -284,6 +284,17 @@ def test_plain_renderer_writes_what_json_response_did(
     assert {key: response.json()[key] for key in DJANGO_VALUES} == expected
 
 
+class EpochEncoder(DjangoJSONEncoder):
+    def default(self, o):
+        if isinstance(o, datetime):
+            return int(o.timestamp())
+        return super().default(o)
+
+
+class EpochRenderer(JSONRenderer):
+    encoder_class = EpochEncoder
+
+
 class OwnRenderJSONRenderer(JSONRenderer):
     """ninja's renderer class, with a ``render`` of its own."""
 
@@ -303,8 +314,9 @@ class OtherEncoderRenderer(JSONRenderer):
         (PlainRenderer(), True),
         (OwnRenderJSONRenderer(), True),
         (OtherEncoderRenderer(), True),
+        (EpochRenderer(), False),
     ],
-    ids=["default", "compact", "plain", "own-render", "other-encoder"],
+    ids=["default", "compact", "plain", "own-render", "other-encoder", "django"],
 )
 def test_bodies_reduced_only_for_other_renderers(monkeypatch, renderer, reduced):
     """ninja's JSONRenderer with its encoder writes Django's values itself."""
@@ -425,3 +437,13 @@ def test_overridden_create_response_never_adds_headers_to_early_errors(
     assert response.status_code == status
     assert "Cache-Control" not in response.headers
     assert response.content == compact(response.json())
+
+
+def test_django_encoder_renderer_writes_scrudful_bodies_its_own_way():
+    """The API's own encoding of Django's values, as in its other responses."""
+    items = router(Store(), error=PROBLEM, error_body_func=django_values_problem)
+    client = TestClient(api_for(items, EpochRenderer()))
+    response = client.put("/items/1", json={"name": "x"}, headers={"If-Match": '"v0"'})
+    assert response.status_code == 412
+    assert response.json()["at"] == int(DJANGO_VALUES["at"].timestamp())
+    assert response.json()["amount"] == "1.50"
