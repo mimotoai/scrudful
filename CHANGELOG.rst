@@ -19,6 +19,13 @@ Bug fixes.
   parameter still goes through ``_integer``, so a subclass calling or
   overriding it (to clamp ``page_size``, or accept ``page=last``) keeps its
   behaviour; ``_parameter_error`` is the new helper.
+* DRF: ``ScrudfulPagination`` accepts exactly the ``page`` and ``page_size``
+  values ninja's ``scrudful_list`` accepts, pydantic v2's lax ``int`` from a
+  string (``Python int()`` before): ``2.0`` and ``2.00`` are 2, ``٣`` and
+  other non-ASCII digits are not integers, only Unicode ``White_Space`` is
+  stripped. pydantic is not a dependency of the DRF adapter: the rules are
+  implemented in ``scrudful._adapter.parse_query_int`` and tested against
+  pydantic.
 * ninja: the automatic OPTIONS body and scrudful's own 400, 412 and 428 bodies
   are written by the serving API's renderer (``NinjaAPI(renderer=...)``),
   not Django's ``JsonResponse``, so they have the same bytes as the API's other

@@ -146,6 +146,7 @@ from scrudful._adapter import (
     is_json,
     merge_links,
     options_links,
+    parse_query_int,
     reason_phrase,
     set_validator_headers,
     validator_policy,
@@ -1677,7 +1678,7 @@ class ScrudfulPagination(BasePagination):
         if error is not None:
             raise ValidationError({name: [error]})
         raw = request.query_params.get(name)
-        return default if raw is None else int(raw)
+        return default if raw is None else parse_query_int(raw)
 
     def _parameter_error(
         self, request: Request, name: str, maximum: int | None
@@ -1686,14 +1687,16 @@ class ScrudfulPagination(BasePagination):
         an integer in ``[1, maximum]``.
 
         Its code is ``invalid`` (not an integer), ``min_value`` (below 1) or
-        ``max_value`` (above ``maximum``), as a DRF ``IntegerField``'s.
+        ``max_value`` (above ``maximum``), as a DRF ``IntegerField``'s. An
+        integer is what django-ninja's ``scrudful_list`` accepts (pydantic's lax
+        ``int``: ``"2.0"`` is 2, ``"٣"`` is not an integer), see
+        :func:`scrudful._adapter.parse_query_int`.
         """
         raw = request.query_params.get(name)
         if raw is None:
             return None
-        try:
-            value = int(raw)
-        except ValueError:
+        value = parse_query_int(raw)
+        if value is None:
             return ErrorDetail("A valid integer is required.", code="invalid")
         if value < 1:
             return ErrorDetail(
