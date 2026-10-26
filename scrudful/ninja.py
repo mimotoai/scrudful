@@ -455,11 +455,11 @@ from scrudful._adapter import (
     describe_options,
     describe_read,
     describe_write,
-    essence,
     evaluates_preconditions,
     expose_headers,
     has_default_entity,
     is_json,
+    is_json_syntax,
     merge_links,
     options_links,
     resolve_annotation,
@@ -1770,8 +1770,8 @@ class _Raised:
     """What the scrudful operation running ``Operation.run`` raised, and the
     path parameters ``run`` got (for ``before``, see :func:`_install_before`)."""
 
-    #: The operation's, once its wrapper raised an ``HttpError`` or
-    #: ``Http404``.
+    #: The operation's, once its wrapper or its ``before`` raised an
+    #: ``HttpError`` or ``Http404``.
     config: _Config | None = None
     #: The path parameters, as the URL gives them (strings, unless the path
     #: uses a converter).
@@ -1861,7 +1861,7 @@ def _render(request: HttpRequest) -> Render | None:
     """
     api = _SERVING_API.get()
     media_type = getattr(getattr(api, "renderer", None), "media_type", None)
-    if not media_type or not _is_json_syntax(media_type):
+    if not media_type or not is_json_syntax(media_type):
         return None
 
     as_is = _writes_ninja_json(api.renderer)
@@ -1906,14 +1906,6 @@ def _split_parameters(media_type: str) -> list[str]:
             start = index + 1
     parts.append(media_type[start:])
     return parts
-
-
-def _is_json_syntax(media_type: str) -> bool:
-    """Whether ``media_type`` is written as JSON: ``application/json`` or
-    ``+json``, JSON-LD included (unlike :func:`is_json`, which asks whether
-    its context is out of band)."""
-    name = essence(media_type)
-    return name == "application/json" or name.endswith("+json")
 
 
 def _writes_ninja_json(renderer: Any) -> bool:
@@ -2402,7 +2394,7 @@ def _error_links(
     """
     yield from _add_links(response, entity, request, None)
     content_type = response.get("Content-Type")
-    if content_type and is_json(content_type) and is_json(entity.media_type):
+    if content_type and is_json_syntax(content_type) and is_json(entity.media_type):
         response["Content-Type"] = _with_charset(entity.media_type, response.charset)
     expose_headers(response)
 

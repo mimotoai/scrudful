@@ -404,6 +404,14 @@ def is_json(media_type: str) -> bool:
     )
 
 
+def is_json_syntax(media_type: str) -> bool:
+    """Whether ``media_type`` is written as JSON: ``application/json`` or
+    ``+json``, JSON-LD included (unlike :func:`is_json`, which asks whether
+    its context is out of band)."""
+    name = essence(media_type)
+    return name == "application/json" or name.endswith("+json")
+
+
 def is_in_band(media_type: str) -> bool:
     """Whether ``media_type`` carries RDF in-band (no context link needed)."""
     return essence(media_type) in IN_BAND_MEDIA_TYPES

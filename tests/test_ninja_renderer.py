@@ -342,12 +342,19 @@ def test_error_media_type_charset_names_the_renderer_s(method, headers, status):
     )
 
 
+class JSONLDLatin1Renderer(Latin1Renderer):
+    media_type = "application/ld+json"
+
+
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
-def test_raised_and_early_errors_share_the_content_type(asynchronous):
+@pytest.mark.parametrize(
+    "renderer", [Latin1Renderer, JSONLDLatin1Renderer], ids=["json", "json-ld"]
+)
+def test_raised_and_early_errors_share_the_content_type(asynchronous, renderer):
     """A raised error's body is the renderer's too: the same label as
     scrudful's own error bodies."""
     items = router(Store(), asynchronous, error=PROBLEM)
-    request = requests(asynchronous, api_for(items, Latin1Renderer()))
+    request = requests(asynchronous, api_for(items, renderer()))
     raised = request("GET", "/items/999")  # load raises HttpError(404)
     early = request("PUT", "/items/1", json={"name": "x"}, headers={"If-Match": '"v0"'})
     assert (raised.status_code, early.status_code) == (404, 412)
