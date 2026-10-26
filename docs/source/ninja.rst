@@ -429,21 +429,21 @@ callbacks as the detail GET. ``page`` and ``page_size`` (default 100, at most
 listing every bad parameter. The optional list validators are called with the
 queryset, and then a list can answer 304.
 
-ninja validates query parameters before the operation runs, so a bad ``page``
+ninja validates the parameters before the operation runs, so a bad ``page``
 would be a 422 even for a client the list must refuse. ``before=`` runs first:
-``before(request, **params)`` gets the operation's parameters (as ``load``
-does, without ``page`` and ``page_size``), once per request, before those two
-are validated and before the handler. Raise ``HttpError(401, ...)`` or
-``HttpError(403, ...)`` there to answer as DRF does, whose permission checks
-come before its pagination. Afterwards the operation validates ``page`` and
-``page_size`` itself, with the same 422 (built by the API's
-``validation_error_from_error_contexts``), and the OpenAPI description is the
-same as without ``before``. The operation's other parameters are still
-validated by ninja before ``before`` runs.
+``before(request, **path_params)`` is called once per request after ninja's
+authentication and throttling and before it validates any parameter, with the
+URL's path parameters as they are (not validated yet), as DRF checks
+permissions before it reads parameters. Raise ``HttpError(401, ...)`` or
+``HttpError(403, ...)`` there; the API's exception handler answers it. When it
+returns, ninja validates every parameter as without ``before``: one 422 lists
+every bad one, ``page`` and ``page_size`` included, and the OpenAPI
+description is unchanged. Neither its error nor that 422 passes through the
+decorators added with ``add_decorator(mode="operation")``.
 
 .. code-block:: python
 
-    def authorize(request, **params):
+    def authorize(request, **path_params):
         if not request.user.has_perm("items.view_item"):
             raise HttpError(403, "Forbidden")
 

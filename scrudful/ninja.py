@@ -223,7 +223,7 @@ Collections
       by default, at most ``max_page_size``) are added to the operation and
       not passed to the handler. Invalid values are answered with 422 by
       ninja, a page past the last one with 404 (page 1 always exists). A
-      ``before`` callable runs before they are validated (see
+      ``before`` callable runs before ninja validates any parameter (see
       :func:`scrudful_list`), e.g. to answer 401 or 403 first.
     - ``count`` is ``queryset.count()`` for a ``QuerySet``, else ``len()``;
       ``page_count`` is ``ceil(count / page_size)``. An unordered
@@ -403,7 +403,7 @@ from collections.abc import Callable, Generator, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
-from typing import Annotated, Any, NamedTuple, TypeVar, Union, get_args, get_origin
+from typing import Any, NamedTuple, TypeVar, Union, get_args, get_origin
 
 from asgiref.sync import async_to_sync, sync_to_async
 from django.http import (
@@ -419,8 +419,7 @@ from ninja.constants import NOT_SET
 from ninja.errors import ConfigError, HttpError
 from ninja.signature.details import is_collection_type
 from ninja.signature.utils import get_path_param_names
-from pydantic import Field, WithJsonSchema, create_model
-from pydantic import ValidationError as PydanticValidationError
+from pydantic import Field, create_model
 
 from scrudful import _adapter
 from scrudful._adapter import (
@@ -1157,22 +1156,26 @@ def scrudful_list(
         ``error=Entity(media_type=PROBLEM_JSON)``). Without it the bodies are
         as before.
     before : callable, optional
-        ``before(request, **params)``, called with the operation's parameters
-        (as ``load`` is: path and query parameters by name, without ``page``
-        and ``page_size``) once per request, before ``page`` and
-        ``page_size`` are validated, and before the handler; its return value
-        is ignored. Raise ninja's ``HttpError`` (or another exception the API
-        handles) there to answer first, e.g. a 401 or 403 that must win over
-        the 422 of a bad page parameter, as DRF checks permissions before it
-        paginates. It is called whatever the page parameters are. The
-        operation then validates them itself, with the 422 ninja gives
-        without ``before`` (built by the API's
-        ``validation_error_from_error_contexts``); the operation's other
-        parameters are still validated by ninja before it runs, so their
-        errors come first and are reported without the page parameters'.
-        The OpenAPI description is unchanged. It may be ``async def`` in an
-        ``async def`` operation; a sync one in an async operation runs in a
-        thread.
+        ``before(request, **path_params)``, called once per request after
+        ninja's authentication and throttling and before it validates any
+        parameter of the operation (path, query or body) or calls its
+        function: the place of DRF's permission checks. ``path_params`` are
+        the URL's values, not validated yet (strings, unless the path uses a
+        converter such as ``{int:pk}``). Its return value is ignored. Raise
+        ninja's ``HttpError`` (or another exception the API handles) to answer
+        first, e.g. with 401 or 403 whatever the parameters are; the API's
+        exception handler answers it, as ninja answers its own errors, and an
+        ``HttpError`` gets the operation's error Links as when the operation
+        raises it. When it returns, ninja validates every parameter as
+        without ``before``: one 422 lists every bad one, ``page`` and
+        ``page_size`` included, and the OpenAPI description is the same.
+        Neither its error nor that 422 passes through the decorators added
+        with ``add_decorator(mode="operation")``. It may be ``async def`` in
+        an ``async def`` operation; a sync one in an async operation runs in
+        a thread. If scrudful can't find the operation (a ``decorate_view``
+        decorator below it that wraps ``Operation.run`` without
+        ``functools.wraps``), ``before`` still runs, in the operation, after
+        the parameters are validated.
 
     Raises
     ------
@@ -1440,9 +1443,12 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 name: value for name, value in values.items() if name != response_name
             }
             if config.before is not None:
-                yield config.before, (request,), params
-                if pagination is not None:
-                    pagination = _validate_pagination(config, pagination)
+                run = _RAISED.get()
+                if run is None or not run.before_called:
+                    # Not run before the parameters were validated: the
+                    # operation could not be found (see _install_before).
+                    path_params = {} if run is None else run.path_params
+                    yield config.before, (request,), dict(path_params)
             meta = ScrudfulResponse()
             if hidden.meta_name is not None:
                 values[hidden.meta_name] = meta
@@ -1632,7 +1638,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             # the API's exception handler, which ``Operation.run`` returns. It
             # is wrapped as ``decorate_view`` wraps it, so that ninja's clones
             # of the operation (one per mount) wrap theirs too.
-            run_decorator = _raised_links_run(asynchronous)
+            run_decorator = _raised_links_run(asynchronous, config)
             if not hasattr(operation, "_run_decorators"):
                 operation._run_decorators = []  # type: ignore[attr-defined]
             operation.run = run_decorator(operation.run)  # type: ignore[method-assign]
@@ -1654,15 +1660,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             # (as ninja's ``contribute_operation_args`` does, on a fresh list).
             wrapper._ninja_contribute_args = [  # type: ignore[attr-defined]
                 *getattr(handler, "_ninja_contribute_args", []),
-                (
-                    _PAGINATION,
-                    (
-                        _pagination_model(config)
-                        if config.before is None
-                        else _unvalidated_pagination_model(config)
-                    ),
-                    Query(...),
-                ),
+                (_PAGINATION, _pagination_model(config), Query(...)),
             ]
         return wrapper  # type: ignore[return-value]
 
@@ -1732,11 +1730,16 @@ _ERROR_CLASSES: tuple[type[Exception], ...] = tuple(
 
 @dataclass(eq=False, slots=True)
 class _Raised:
-    """What the scrudful operation running ``Operation.run`` raised."""
+    """What the scrudful operation running ``Operation.run`` raised, and the
+    state of its ``before`` hook."""
 
     #: The operation's, once its wrapper raised an ``HttpError`` or
     #: ``Http404``.
     config: _Config | None = None
+    #: The path parameters ``run`` got, as the URL gives them.
+    path_params: dict[str, Any] = field(default_factory=dict)
+    #: Whether a list operation's ``before`` ran (see :func:`_install_before`).
+    before_called: bool = False
 
 
 #: Set by :func:`_raised_links_run` while ``Operation.run`` runs. A mutable
@@ -1822,7 +1825,7 @@ def _note_raised(config: _Config) -> None:
 
 
 def _raised_links_run(
-    asynchronous: bool,
+    asynchronous: bool, config: _Config
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """The ``Operation.run`` decorator adding the Links of a raised error.
 
@@ -1833,16 +1836,20 @@ def _raised_links_run(
     the operation's entity for its status, see :func:`_raised_entity`.
 
     While ``run`` runs, :data:`_SERVING_API` is the operation's API, whose
-    renderer writes scrudful's own bodies (see :func:`_render`).
+    renderer writes scrudful's own bodies (see :func:`_render`). A list
+    operation's ``before`` is installed on the operation (and on each clone,
+    which ninja decorates again), see :func:`_install_before`.
     """
 
     def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
         operation = _operation_of(run)
+        if config.before is not None and operation is not None:
+            _install_before(operation, config, asynchronous)
         if asynchronous:
 
             @functools.wraps(run)
             async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                raised = _Raised()
+                raised = _Raised(path_params=kw)
                 token = _RAISED.set(raised)
                 api_token = _SERVING_API.set(getattr(operation, "api", None))
                 try:
@@ -1858,7 +1865,7 @@ def _raised_links_run(
 
             @functools.wraps(run)
             def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                raised = _Raised()
+                raised = _Raised(path_params=kw)
                 token = _RAISED.set(raised)
                 api_token = _SERVING_API.set(getattr(operation, "api", None))
                 try:
@@ -1873,6 +1880,66 @@ def _raised_links_run(
         return scrudful_run
 
     return decorator
+
+
+def _install_before(operation: Any, config: _Config, asynchronous: bool) -> None:
+    """Run ``config.before`` in ``operation``'s checks, after authentication and
+    throttling and before ninja validates any parameter.
+
+    ``Operation.run`` answers a response its ``_run_checks`` returns (as for a
+    failed authentication) before it reads the parameters, so ``before`` is
+    called there, with the path parameters as the URL gives them, and an
+    exception it raises is answered by the API's exception handler, as ninja
+    answers its own. Neither reaches the decorators added with
+    ``add_decorator(mode="operation")``, which wrap the operation's function.
+    """
+    checks = operation._run_checks
+    if getattr(checks, "_scrudful_before", False):
+        return
+
+    def params() -> dict[str, Any]:
+        """The path parameters, noting that ``before`` runs (see ``flow``)."""
+        run = _RAISED.get()
+        if run is None:
+            return {}
+        run.before_called = True
+        return dict(run.path_params)
+
+    def answer(request: HttpRequest, exc: Exception) -> HttpResponseBase:
+        if isinstance(exc, (HttpError, Http404)):
+            # Its Links: the operation's entity for the status, as when the
+            # operation raises it.
+            _note_raised(config)
+        return operation.api.on_exception(request, exc)  # type: ignore[no-any-return]
+
+    if asynchronous:
+
+        async def run_checks(request: HttpRequest) -> HttpResponseBase | None:
+            error = await checks(request)
+            if error:
+                return error  # type: ignore[no-any-return]
+            try:
+                await _call_async(config.before, (request,), params())
+            except Exception as exc:
+                return answer(request, exc)
+            return None
+
+    else:
+
+        def run_checks(  # type: ignore[misc]
+            request: HttpRequest,
+        ) -> HttpResponseBase | None:
+            error = checks(request)
+            if error:
+                return error  # type: ignore[no-any-return]
+            try:
+                config.before(request, **params())  # type: ignore[misc]
+            except Exception as exc:
+                return answer(request, exc)
+            return None
+
+    run_checks._scrudful_before = True  # type: ignore[attr-defined]
+    operation._run_checks = run_checks
 
 
 def _raised_links(
@@ -2067,71 +2134,6 @@ def _pagination_model(config: _Config) -> type[Schema]:
         page=(int, Field(1, ge=1)),
         page_size=(int, Field(config.page_size, ge=1, le=config.max_page_size)),
     )
-
-
-def _unvalidated_pagination_model(config: _Config) -> type[Schema]:
-    """:func:`_pagination_model` with the values left as ninja reads them.
-
-    For a list operation with ``before``, which validates them itself (see
-    :func:`_validate_pagination`). The fields' JSON Schemas are those of
-    :func:`_pagination_model`, so the OpenAPI description is the same.
-    """
-    model = _pagination_model(config)
-    properties = model.model_json_schema()["properties"]
-    fields: dict[str, Any] = {}
-    for name, info in model.model_fields.items():
-        # The field's default and title are added back from Field and name.
-        schema = {
-            key: value
-            for key, value in properties[name].items()
-            if key not in ("default", "title")
-        }
-        fields[name] = (Annotated[Any, WithJsonSchema(schema)], Field(info.default))
-    return create_model(  # type: ignore[call-overload,no-any-return]
-        "ScrudfulPagination", __base__=Schema, **fields
-    )
-
-
-@functools.lru_cache(maxsize=None)
-def _query_pagination_model(page_size: int, max_page_size: int) -> type[Schema]:
-    """:func:`_pagination_model` for these sizes, located as the query model
-    ninja builds locates its errors (``("query", name)``)."""
-    model = _pagination_model(
-        _Config(kind="list", page_size=page_size, max_page_size=max_page_size)
-    )
-    model.__ninja_param_source__ = "query"  # type: ignore[attr-defined]
-    model.__ninja_flatten_map_reverse__ = {}  # type: ignore[attr-defined]
-    return model
-
-
-def _validate_pagination(config: _Config, raw: Any) -> Any:
-    """The page parameters ``raw`` validated, as ninja validates them without
-    ``before``.
-
-    Raises
-    ------
-    ninja.errors.ValidationError
-        The 422 ninja gives for them, built by the serving API's
-        ``validation_error_from_error_contexts`` with the query parameters'
-        source, so a custom builder sees them as it would.
-    """
-    model = _query_pagination_model(config.page_size, config.max_page_size)
-    try:
-        return model.model_validate(
-            {name: getattr(raw, name) for name in model.model_fields}
-        )
-    except PydanticValidationError as exc:
-        context = ninja_errors.ValidationErrorContext(
-            pydantic_validation_error=exc, model=model
-        )
-        api = _SERVING_API.get()
-        if api is None:
-            # Not served by an API (see _operation_of): ninja's default, which
-            # uses no state of the API.
-            raise NinjaAPI.validation_error_from_error_contexts(
-                None, [context]  # type: ignore[arg-type]
-            ) from None
-        raise api.validation_error_from_error_contexts([context]) from None
 
 
 def _page(
