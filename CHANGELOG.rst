@@ -52,8 +52,9 @@ New
   built if those checks aren't ninja 1.6/1.7's own (an ``Operation`` subclass
   overriding ``_run_checks``, a changed ninja) or if a ``decorate_view`` below
   ``@scrudful_list`` hides the operation (no ``functools.wraps``).
-  ``request.auth`` exists only when an auth callback succeeded: read it with
-  ``getattr(request, "auth", None)``. Without ``before`` nothing changes.
+  ``request.auth`` exists only when an auth callback succeeded: where
+  ``before`` may run without one, fail closed (``getattr(request, "auth",
+  None)`` and a 401 when it is ``None``). Without ``before`` nothing changes.
 
 Fixes
 -----

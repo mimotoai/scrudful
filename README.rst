@@ -472,7 +472,7 @@ and so does the handler. It does not need Django REST Framework.
 
     def authorized_role(request, pk: int, **params):
         # Missing and hidden are both 404, for every method and If-* header.
-        return get_object_or_404(Role, pk=pk, rbac_context=getattr(request, "auth", None))
+        return get_object_or_404(Role, pk=pk, rbac_context=request.auth)
 
 
     ROLE = dict(
@@ -506,7 +506,7 @@ and so does the handler. It does not need Django REST Framework.
     @roles.get("", response=List[RoleOut])  # the scrud list envelope, paginated
     @scrudful_list(href_func=role_url, **ROLE)
     def list_roles(request):
-        return Role.objects.filter(rbac_context=getattr(request, "auth", None)).order_by("pk")
+        return Role.objects.filter(rbac_context=request.auth).order_by("pk")
 
 Notes:
 

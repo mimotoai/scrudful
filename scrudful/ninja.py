@@ -1050,7 +1050,8 @@ def scrudful_list(
     ``@scrudful_list(...)`` must sit *below* the operation decorator, which
     must declare a collection response (as for ninja's ``@paginate``)::
 
-        @router.get("/items", response=List[ItemOut])
+        # auth=: request.auth exists only when an auth callback succeeded.
+        @router.get("/items", response=List[ItemOut], auth=...)
         @scrudful_list(
             href_func=lambda request, item: request.build_absolute_uri(
                 f"/items/{item.pk}"
@@ -1063,7 +1064,7 @@ def scrudful_list(
             list_context_link_or_func="/contexts/items",
         )
         def list_items(request):
-            return Item.objects.filter(owner=getattr(request, "auth", None))
+            return Item.objects.filter(owner=request.auth)
 
     The handler returns the authorized queryset (or a sequence); the wrapper
     paginates it and returns the scrud envelope, whose response schema
@@ -1164,9 +1165,10 @@ def scrudful_list(
         (path, query or body) or calls its function. ``path_params`` are the
         URL's values, not validated yet (strings, unless the path uses a
         converter such as ``{int:pk}``). ``request.auth`` is set only when an
-        auth callback succeeded (it is missing on an operation without
-        ``auth``): read it with ``getattr(request, "auth", None)``. Its
-        return value is ignored. Raise ninja's ``HttpError`` (or another
+        auth callback succeeded: on an operation that may run without
+        ``auth``, fail closed (``user = getattr(request, "auth", None)``, and
+        ``raise HttpError(401, ...)`` when it is ``None``) before using it.
+        Its return value is ignored. Raise ninja's ``HttpError`` (or another
         exception the API handles) to answer first, e.g. with 401 or 403 whatever the
         parameters are; the API's exception handler answers it, as ninja
         answers its own errors, an ``HttpError`` gets the operation's error
