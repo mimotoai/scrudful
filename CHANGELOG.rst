@@ -6,7 +6,7 @@ Changelog
 ===================
 
 Additive and backwards compatible: an operation without ``after_throttles=``
-behaves as in 0.7.0, except that the ``RuntimeError`` raised when ``before``
+(and an item or create operation without ``before=``) behaves as in 0.7.0, except that the ``RuntimeError`` raised when ``before``
 can't get the path parameters now names the hook as ``before=``.
 
 New
@@ -39,6 +39,19 @@ New
   parameter, and the OpenAPI description is unchanged. The ``ConfigError``
   and ``RuntimeError`` messages name the hooks the operation has
   (``before=``, ``after_throttles=`` or both).
+* ninja: item and create operations take the same hooks:
+  ``scrudful(before=..., after_throttles=...)`` and
+  ``scrudful_create(before=..., after_throttles=...)`` (optional), with
+  ``scrudful_list``'s contract, machinery and guards (the ``ConfigError``
+  of a ``decorate_view`` hiding the operation names ``@scrudful`` or
+  ``@scrudful_create``). The order is DRF's for these operations too:
+  authentication, ``before`` (where DRF's ``has_permission`` runs, before
+  its throttles), throttles, ``after_throttles``, then the parameters and
+  body, ``load`` and the preconditions. So a client ``before`` refuses gets
+  its 401 or 403 even when throttled, and a client either hook refuses never
+  gets a 422 for a bad body, or a 304, 412 or 428 (nor a validator). A hook
+  gets the raw request and may read ``request.body``; the body is still
+  validated after it. The OpenAPI description is unchanged.
 
 0.7.0 (since 0.6.0)
 ===================

@@ -10,7 +10,10 @@ Order of execution
     ``@scrudful`` wraps the operation's function, so everything it does runs
     inside the operation, after ninja's own steps:
 
-    1. ninja's authentication and throttling (401, 429 as usual);
+    1. ninja's authentication and throttling (401, 429 as usual), with the
+       optional ``before`` and ``after_throttles`` hooks, which scrudful runs
+       in its copy of ninja's checks: authentication, ``before``, throttling,
+       ``after_throttles`` (DRF's order; see :func:`scrudful_list`);
     2. ninja's parameter parsing and validation (422 as usual);
     3. ``load(request, **params)``, with the parameters ninja validated;
     4. the validator callbacks, called with the loaded object, and the
@@ -659,14 +662,21 @@ class _Config:
     #: A list operation's default and maximum ``page_size``.
     page_size: int | None = None
     max_page_size: int | None = None
-    #: ``before(request, **path_params)`` of a list operation: run after
-    #: authentication, before throttling and before any parameter is
-    #: validated (see :func:`_install_hooks`).
+    #: ``before(request, **path_params)``: run after authentication, before
+    #: throttling and before any parameter is validated (see
+    #: :func:`_install_hooks`).
     before: Callable[..., Any] | None = None
-    #: ``after_throttles(request, **path_params)`` of a list operation: run
-    #: after authentication, ``before`` and throttling, before any parameter
-    #: is validated (see :func:`_install_hooks`).
+    #: ``after_throttles(request, **path_params)``: run after
+    #: authentication, ``before`` and throttling, before any parameter is
+    #: validated (see :func:`_install_hooks`).
     after_throttles: Callable[..., Any] | None = None
+
+    @property
+    def decorator_name(self) -> str:
+        """The public decorator declaring an operation of this kind."""
+        return {"item": "@scrudful", "create": "@scrudful_create"}.get(
+            self.kind, "@scrudful_list"
+        )
 
     @property
     def hooks(self) -> str | None:
@@ -765,6 +775,8 @@ def scrudful(
     responses: Mapping[int, Entity] | None = None,
     error: Entity | None = None,
     error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
+    before: Callable[..., Any] | None = None,
+    after_throttles: Callable[..., Any] | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation on a single resource to make it SCRUDful.
 
@@ -878,18 +890,40 @@ def scrudful(
         problem details (pair it with
         ``error=Entity(media_type=PROBLEM_JSON)``). Without it the bodies are
         as before.
+    before : callable, optional
+        ``before(request, **path_params)``, called once per request where DRF
+        checks permissions (``has_permission``): after ninja's
+        authentication, before its throttles and before it validates any
+        parameter or the body, so before ``load`` and the preconditions: a
+        client it refuses never gets a 304, 412 or 428, or a validator. As
+        for :func:`scrudful_list`: the path parameters are the URL's raw
+        strings, it returns ``None`` to let the request go on (anything else,
+        or an awaitable in a sync operation, raises ``TypeError``) and raises
+        to answer first (the API's exception handler answers, with the
+        operation's error Links, and the request uses none of a throttle's
+        quota); neither its error nor a later 422 passes through the
+        ``add_decorator(mode="operation")`` decorators. It may read
+        ``request.body``.
+    after_throttles : callable, optional
+        ``after_throttles(request, **path_params)``, the same, called after
+        ``before`` and ninja's throttles: a throttled request (429) never
+        calls it, and one it refuses has used its quota, as in DRF. With
+        either hook, scrudful runs its own copy of ninja's per-operation
+        checks, with the guards described for :func:`scrudful_list`
+        (``ConfigError`` when the operation is built, ``RuntimeError`` for a
+        request reaching the function without the hooks having allowed it).
 
     Raises
     ------
     TypeError
-        If a validator callback is set without ``load``, if ``load`` or a
-        validator callback isn't callable, if ``request``, ``error`` or a value
+        If a validator callback is set without ``load``, if ``load``, a hook
+        or a validator callback isn't callable, if ``request``, ``error`` or a value
         of ``responses`` isn't an :class:`Entity` or a key of ``responses``
         isn't an HTTP status code, if ``load`` is set and the handler has no
         ``load_as`` parameter, if the handler is a generator or already a
         ninja operation (the decorator sits above the operation decorator),
-        or if the handler is sync and ``load``, a validator callback or a
-        link callable (also inside an entity) is ``async def``.
+        or if the handler is sync and ``load``, a hook, a validator callback
+        or a link callable (also inside an entity) is ``async def``.
     ValueError
         If ``error``'s media type is not JSON content.
     ninja.errors.ConfigError
@@ -897,7 +931,7 @@ def scrudful(
         before the decorator bound it: a ``_ninja_contribute_to_operation``
         callback contributed below the decorator, or a decorator between it
         and the operation decorator (see "Placement" in the module
-        docstring).
+        docstring). Also with a hook, as for :func:`scrudful_list`.
     """
     check_validators(etag_func, last_modified_func)
     if load is not None and not callable(load):
@@ -905,6 +939,7 @@ def scrudful(
     _check_entity("request", request)
     _check_error(error)
     check_error_body_func(error_body_func)
+    _check_hooks(before, after_throttles)
     config = _Config(
         kind="item",
         load=load,
@@ -921,6 +956,8 @@ def scrudful(
         responses=_entities_by_status(responses),
         error=error,
         error_body_func=error_body_func,
+        before=before,
+        after_throttles=after_throttles,
     )
     if config.has_validators and load is None:
         raise TypeError(
@@ -944,6 +981,8 @@ def scrudful_create(
     context_type_or_func: Any = None,
     request: Entity | None = None,
     responses: Mapping[int, Entity] | None = None,
+    before: Callable[..., Any] | None = None,
+    after_throttles: Callable[..., Any] | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation creating an item (POST on a collection).
 
@@ -1012,23 +1051,43 @@ def scrudful_create(
         ``responses[201]`` replaces the item entity's Links on 201 responses.
         There is no ``error`` argument: a create produces no 400, 412 or 428
         of its own.
+    before : callable, optional
+        ``before(request, **path_params)``, called once per request where DRF
+        checks permissions (``has_permission``): after ninja's
+        authentication, before its throttles and before it validates any
+        parameter or the body. As for :func:`scrudful_list`: the path
+        parameters are the URL's raw strings, it returns ``None`` to let the
+        request go on (anything else, or an awaitable in a sync operation,
+        raises ``TypeError``) and raises to answer first (the API's exception
+        handler answers, with the operation's error Links, and the request
+        uses none of a throttle's quota); neither its error nor a later 422
+        passes through the ``add_decorator(mode="operation")`` decorators. It
+        may read ``request.body``.
+    after_throttles : callable, optional
+        ``after_throttles(request, **path_params)``, the same, called after
+        ``before`` and ninja's throttles: a throttled request (429) never
+        calls it, and one it refuses has used its quota, as in DRF. With
+        either hook, scrudful runs its own copy of ninja's per-operation
+        checks, with the guards described for :func:`scrudful_list`
+        (``ConfigError`` when the operation is built, ``RuntimeError`` for a
+        request reaching the function without the hooks having allowed it).
 
     Raises
     ------
     TypeError
-        If ``location_func`` or a validator callback isn't callable, if
+        If ``location_func``, a hook or a validator callback isn't callable, if
         ``request`` or a value of ``responses`` isn't an :class:`Entity` or a
         key of ``responses`` isn't an HTTP status code, if the handler is a
         generator or already a ninja operation (the decorator sits above the
         operation decorator), or if the handler is sync and
-        ``location_func``, a validator callback or a link callable (also
-        inside an entity) is ``async def``.
+        ``location_func``, a hook, a validator callback or a link callable
+        (also inside an entity) is ``async def``.
     ninja.errors.ConfigError
         When the operation is built, if something replaced its ``view_func``
         before the decorator bound it: a ``_ninja_contribute_to_operation``
         callback contributed below the decorator, or a decorator between it
         and the operation decorator (see "Placement" in the module
-        docstring).
+        docstring). Also with a hook, as for :func:`scrudful_list`.
     """
     if not callable(location_func):
         raise TypeError(
@@ -1036,6 +1095,7 @@ def scrudful_create(
         )
     check_validators(etag_func, last_modified_func)
     _check_entity("request", request)
+    _check_hooks(before, after_throttles)
     item = Entity(
         schema_link_or_func=schema_link_or_func,
         schema_rel_or_func=schema_rel_or_func,
@@ -1055,8 +1115,17 @@ def scrudful_create(
         },
         request=item if request is None else request,
         responses=_entities_by_status(responses),
+        before=before,
+        after_throttles=after_throttles,
     )
     return _decorator(config, "@scrudful_create")
+
+
+def _check_hooks(before: Any, after_throttles: Any) -> None:
+    """Raise ``TypeError`` unless each hook given is callable."""
+    for name, func in (("before", before), ("after_throttles", after_throttles)):
+        if func is not None and not callable(func):
+            raise TypeError(f"{name} must be callable, not {type(func).__name__}")
 
 
 def scrudful_list(
@@ -1288,8 +1357,6 @@ def scrudful_list(
     for name, func in (
         ("list_etag_func", list_etag_func),
         ("list_last_modified_func", list_last_modified_func),
-        ("before", before),
-        ("after_throttles", after_throttles),
     ):
         if func is not None and not callable(func):
             raise TypeError(f"{name} must be callable, not {type(func).__name__}")
@@ -1304,6 +1371,7 @@ def scrudful_list(
         )
     _check_error(error)
     check_error_body_func(error_body_func)
+    _check_hooks(before, after_throttles)
     config = _Config(
         kind="list",
         href_func=href_func,
@@ -2197,7 +2265,8 @@ def _check_ninja_checks(
         raise ConfigError(
             f"{label}: {hooks} can't be installed: scrudful can't find the "
             "ninja operation through Operation.run, because a decorate_view "
-            "decorator below @scrudful_list wraps it without functools.wraps. "
+            f"decorator below {config.decorator_name} wraps it without "
+            "functools.wraps. "
             "Use functools.wraps in that decorator, or apply decorate_view "
             "above the operation decorator."
         )

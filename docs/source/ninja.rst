@@ -135,6 +135,29 @@ Handlers in modules with ``from __future__ import annotations`` work, including
 when the hidden parameter's annotation is imported only under
 ``TYPE_CHECKING``: each annotation is evaluated on its own.
 
+``@scrudful`` and ``@scrudful_create`` take the hooks of ``@scrudful_list``
+too (since 0.7.1), with the same contract and guards (see
+:ref:`before= and after_throttles= <ninja-hooks>`): ``before(request,
+**path_params)`` runs where DRF checks permissions (``has_permission``),
+after ninja's authentication and before its throttles, and
+``after_throttles(request, **path_params)`` after the throttles. Both run
+before ninja validates any parameter or the body, so before ``load`` and the
+preconditions: a client a hook refuses never gets a 304, 412, 428 or 422, or
+a validator, and a throttled client gets 429 only once ``before`` allowed it,
+as on DRF. A hook gets the raw request and may read ``request.body``:
+
+.. code-block:: python
+
+    def may_edit_somewhere(request, **path_params):
+        if not can_edit_in_some_context(getattr(request, "auth", None)):
+            raise HttpError(403, "Forbidden")
+
+    @roles.put("/{int:pk}", response=RoleOut,
+               openapi_extra={"responses": CONDITIONAL_WRITE_RESPONSES})
+    @scrudful(load=authorized_role, error=ERROR, before=may_edit_somewhere, **ROLE)
+    def replace_role(request, pk: int, payload: RoleIn, obj: Role):
+        return save_role(obj, **payload.dict())
+
 Choosing what ``load`` returns
 ------------------------------
 
@@ -428,6 +451,8 @@ callbacks as the detail GET. ``page`` and ``page_size`` (default 100, at most
 1000) are query parameters; bad values are ninja's 422 validation error,
 listing every bad parameter. The optional list validators are called with the
 queryset, and then a list can answer 304.
+
+.. _ninja-hooks:
 
 ninja validates the parameters before the operation runs, so a bad ``page``
 would be a 422 even for a client the list must refuse. ``before=`` runs where
