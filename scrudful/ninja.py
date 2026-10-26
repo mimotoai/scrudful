@@ -1859,10 +1859,7 @@ def _render(request: HttpRequest) -> Render | None:
     """
     api = _SERVING_API.get()
     media_type = getattr(getattr(api, "renderer", None), "media_type", None)
-    try:
-        if not media_type or not is_json(media_type):
-            return None
-    except ValueError:  # not a media type
+    if not media_type or not is_json(media_type):
         return None
 
     as_is = _writes_ninja_json(api.renderer)
@@ -1870,10 +1867,23 @@ def _render(request: HttpRequest) -> Render | None:
     def render(data: Any, status: int, content_type: str) -> HttpResponse:
         plain = data if as_is else _json_values(data)
         response: HttpResponse = api.create_response(request, plain, status=status)
-        response["Content-Type"] = f"{content_type}; charset={response.charset}"
+        response["Content-Type"] = _with_charset(content_type, response.charset)
         return response
 
     return render
+
+
+def _with_charset(media_type: str, charset: str) -> str:
+    """``media_type`` with the ``charset`` parameter ``charset`` (the encoding
+    of the bytes it labels), in place of any charset it names."""
+    name, _, parameters = media_type.partition(";")
+    kept = [
+        parameter.strip()
+        for parameter in parameters.split(";")
+        if parameter.strip()
+        and parameter.partition("=")[0].strip().lower() != "charset"
+    ]
+    return "; ".join([name.strip(), *kept, f"charset={charset}"])
 
 
 def _writes_ninja_json(renderer: Any) -> bool:
@@ -2354,13 +2364,14 @@ def _error_links(
 
     Its link callables get ``None``. A response with JSON content, as
     ninja's renderer makes, is served as ``entity.media_type`` when that is
-    JSON content too (an ``error`` entity's always is), so that it agrees
-    with the OPTIONS body; other content keeps its Content-Type.
+    JSON content too (an ``error`` entity's always is), with the charset its
+    bytes are in, as scrudful's own error bodies are; other content keeps
+    its Content-Type.
     """
     yield from _add_links(response, entity, request, None)
     content_type = response.get("Content-Type")
     if content_type and is_json(content_type) and is_json(entity.media_type):
-        response["Content-Type"] = entity.media_type
+        response["Content-Type"] = _with_charset(entity.media_type, response.charset)
     expose_headers(response)
 
 

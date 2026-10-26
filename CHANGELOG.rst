@@ -40,6 +40,12 @@ Behaviour change (ninja)
   JSON (ORJSON, ``json.dumps``). Links, ``Allow`` and expose headers are
   unchanged, a 304 still has no body, and a renderer whose ``media_type`` is
   not JSON content keeps the ``JsonResponse`` bytes and ``Content-Type``.
+* ninja: an error the API's exception handler answers for a scrudful
+  operation (or under ``add_error_links``), served as the ``error`` entity's
+  media type, now also carries the charset of its bytes
+  (``application/problem+json; charset=utf-8``), where 0.6.0 dropped it; a
+  charset the entity's ``media_type`` names is replaced by the bytes' one,
+  never repeated.
 
 New
 ---

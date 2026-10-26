@@ -325,3 +325,31 @@ def test_bodies_reduced_only_for_other_renderers(monkeypatch, renderer, reduced)
         )
         assert response.status_code == status
     assert len(calls) == (len(EARLY) if reduced else 0)
+
+
+@pytest.mark.parametrize("method, headers, status", EARLY[1:])
+def test_error_media_type_charset_names_the_renderer_s(method, headers, status):
+    """An entity's own charset is replaced by the one the bytes are in."""
+    entity = Entity(
+        schema_link_or_func="/schemas/problem",
+        media_type="application/problem+json; charset=UTF-16; profile=x",
+    )
+    client = TestClient(api_for(router(Store(), error=entity), Latin1Renderer()))
+    response = client.request(method, "/items/1", json={"name": "x"}, headers=headers)
+    assert response.status_code == status
+    assert response.headers["Content-Type"] == (
+        "application/problem+json; profile=x; charset=latin-1"
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_raised_and_early_errors_share_the_content_type(asynchronous):
+    """A raised error's body is the renderer's too: the same label as
+    scrudful's own error bodies."""
+    items = router(Store(), asynchronous, error=PROBLEM)
+    request = requests(asynchronous, api_for(items, Latin1Renderer()))
+    raised = request("GET", "/items/999")  # load raises HttpError(404)
+    early = request("PUT", "/items/1", json={"name": "x"}, headers={"If-Match": '"v0"'})
+    assert (raised.status_code, early.status_code) == (404, 412)
+    expected = f"{PROBLEM_JSON}; charset=latin-1"
+    assert raised.headers["Content-Type"] == early.headers["Content-Type"] == expected

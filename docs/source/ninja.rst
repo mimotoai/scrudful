@@ -661,8 +661,10 @@ scrudful's own 400, 412 and 428, and the responses the API's exception
 handlers make for the errors raised inside a scrudful operation and for those
 :func:`~scrudful.ninja.add_error_links` covers. ninja renders those
 ``application/json``, and scrudful replaces that ``Content-Type`` with the
-entity's ``media_type`` whatever the handler chose, so every wrapped handler's
-JSON bodies must be content the entity describes. A handler's response with
+entity's ``media_type`` whatever the handler chose, with the ``charset``
+parameter of the bytes (the renderer's; one the entity's ``media_type``
+names is replaced), so every wrapped handler's JSON bodies must be content
+the entity describes. A handler's response with
 other content (e.g. ``text/plain``) keeps its ``Content-Type``.
 
 **The API's renderer.** scrudful's own bodies (the OPTIONS HTTP Schema
@@ -672,9 +674,10 @@ a renderer with other separators or escapes gives them the same bytes. Their
 ``Content-Type`` is still the media type described here (``application/json``,
 or the ``error`` entity's media type), not the renderer's, with the
 renderer's ``charset`` parameter, as ninja's own responses carry it
-(``application/json; charset=utf-8`` by default). The body is first reduced
-to JSON values as ninja's ``NinjaJSONEncoder`` (a ``DjangoJSONEncoder``)
-writes them, so a renderer of plain JSON (ORJSON, ``json.dumps``) writes a
+(``application/json; charset=utf-8`` by default). Unless the renderer is
+ninja's ``JSONRenderer`` with its encoder, which writes them so itself, the
+body is first reduced to JSON values as ninja's ``NinjaJSONEncoder`` (a
+``DjangoJSONEncoder``) writes them, so a renderer of plain JSON (ORJSON, ``json.dumps``) writes a
 datetime, ``Decimal``, ``UUID`` or lazy string in an ``error_body_func``
 body as ``JsonResponse`` did. A renderer whose
 ``media_type`` is not JSON content, or a ``decorate_view`` decorator below

@@ -373,7 +373,7 @@ def test_add_error_links_again_replaces_the_earlier_entity(store):
         '<http://testlocation/schemas/b>; rel="describedby"; '
         'type="application/schema+json"'
     )
-    assert response.headers["Content-Type"] == "application/problem+json"
+    assert response.headers["Content-Type"] == "application/problem+json; charset=utf-8"
     assert calls == ["b"]
 
 
@@ -620,7 +620,7 @@ def test_raised_error_is_served_as_the_error_media_type(store, asynchronous):
     response = get(client, "/items/1")
     assert response.status_code == 400
     assert response.json() == {"detail": "bad"}
-    assert response.headers["Content-Type"] == "application/problem+json"
+    assert response.headers["Content-Type"] == "application/problem+json; charset=utf-8"
     assert response.headers["Link"] == PROBLEM_LINK
     assert link_problems("GET", 400, response.headers, True, hsr=hsr) == []
 
@@ -638,7 +638,10 @@ def test_add_error_links_serves_the_error_media_type(store):
     }
     for status, response in responses.items():
         assert response.status_code == status
-        assert response.headers["Content-Type"] == "application/problem+json"
+        assert (
+            response.headers["Content-Type"]
+            == "application/problem+json; charset=utf-8"
+        )
         assert response.headers["Link"] == PROBLEM_LINK
         assert response.json()
     # A success keeps its own media type.
