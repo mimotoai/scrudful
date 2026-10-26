@@ -46,9 +46,14 @@ New
   bad one, and the OpenAPI description is unchanged. Neither its error nor
   that 422 reaches the decorators added with ``add_decorator(mode="operation")``.
   A sync ``before`` returning an awaitable in a sync operation raises
-  ``TypeError``; a ``decorate_view`` below ``@scrudful_list`` without
-  ``functools.wraps`` is a ``ConfigError`` when ``before`` is set. Without
-  ``before`` nothing changes.
+  ``TypeError``. With ``before``, scrudful runs its own copy of ninja's
+  per-operation checks (CSRF flag, authentication, throttles) with ``before``
+  between the last two, so it is a ``ConfigError`` when the operation is
+  built if those checks aren't ninja 1.6/1.7's own (an ``Operation`` subclass
+  overriding ``_run_checks``, a changed ninja) or if a ``decorate_view`` below
+  ``@scrudful_list`` hides the operation (no ``functools.wraps``).
+  ``request.auth`` exists only when an auth callback succeeded: read it with
+  ``getattr(request, "auth", None)``. Without ``before`` nothing changes.
 
 Fixes
 -----

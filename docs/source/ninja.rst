@@ -81,7 +81,7 @@ by default), hidden from ninja's signature and OpenAPI:
 
 
     def authorized_role(request, pk: int, **params):
-        return get_object_or_404(Role, pk=pk, rbac_context=request.auth)
+        return get_object_or_404(Role, pk=pk, rbac_context=getattr(request, "auth", None))
 
 
     ROLE = dict(
@@ -191,7 +191,7 @@ overwrites an existing row.
 
     def authorized_role(request, pk: int, **params):
         # Missing, or in another rbac_context: 404 either way.
-        return get_object_or_404(Role, pk=pk, rbac_context=request.auth)
+        return get_object_or_404(Role, pk=pk, rbac_context=getattr(request, "auth", None))
 
 **PUT-create, nothing hidden**: every row is visible to every caller.
 
@@ -218,7 +218,7 @@ hidden one.
 
     def role_or_none_unless_hidden(request, pk: int, **params):
         role = Role.objects.filter(pk=pk).first()
-        if role is not None and role.rbac_context != request.auth:
+        if role is not None and role.rbac_context != getattr(request, "auth", None):
             raise Http404
         return role
 
@@ -231,7 +231,7 @@ and without a 500:
 .. code-block:: python
 
     def visible_role_or_none(request, pk: int, **params):
-        return Role.objects.filter(pk=pk, rbac_context=request.auth).first()
+        return Role.objects.filter(pk=pk, rbac_context=getattr(request, "auth", None)).first()
 
 
     @roles.put("/{int:pk}", response={200: RoleOut, 201: RoleOut, 404: Message})
@@ -278,7 +278,7 @@ item operations' callbacks:
     @roles.post("", response={201: RoleOut, 403: Message})
     @scrudful_create(location_func=role_url, **ROLE)
     def create_role(request, payload: RoleIn):
-        if payload.rbac_context != request.auth:
+        if payload.rbac_context != getattr(request, "auth", None):
             return Status(403, {"detail": "Forbidden"})
         return Role.objects.create(**payload.dict())
 
@@ -387,7 +387,7 @@ the result:
         context_link_or_func="/contexts/role-search-result",
     )
     async def search_roles(request, search: RoleSearch):
-        roles = Role.objects.filter(rbac_context=request.auth,
+        roles = Role.objects.filter(rbac_context=getattr(request, "auth", None),
                                     name__icontains=search.name)
         return [role async for role in roles]
 
@@ -411,7 +411,7 @@ so ninja's validation and OpenAPI describe the real body:
         list_context_link_or_func="/contexts/roles",
     )
     def list_roles(request):
-        return Role.objects.filter(rbac_context=request.auth).order_by("pk")
+        return Role.objects.filter(rbac_context=getattr(request, "auth", None)).order_by("pk")
 
 .. code-block:: json
 
@@ -434,7 +434,10 @@ would be a 422 even for a client the list must refuse. ``before=`` runs where
 DRF checks permissions: ``before(request, **path_params)`` is called once per
 request after ninja's authentication and before its throttles and its
 validation of any parameter, with the URL's path parameters as they are (not
-validated yet). Raise ``HttpError(401, ...)`` or ``HttpError(403, ...)``
+validated yet). ``request.auth`` is set only when an auth callback succeeded
+(it is missing on an operation without ``auth``), so read it with
+``getattr(request, "auth", None)``. Raise ``HttpError(401, ...)`` or
+``HttpError(403, ...)``
 there; the API's exception handler answers it, and the refused request uses
 none of a throttle's quota. When it returns, ninja throttles and validates
 every parameter as without ``before``: one 422 lists every bad one, ``page``
