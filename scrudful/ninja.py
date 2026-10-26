@@ -417,6 +417,7 @@ from ninja import NinjaAPI, Query, Router, Schema, Status
 from ninja import errors as ninja_errors
 from ninja.constants import NOT_SET
 from ninja.errors import ConfigError, HttpError
+from ninja.operation import AsyncOperation, Operation
 from ninja.signature.details import is_collection_type
 from ninja.signature.utils import get_path_param_names
 from pydantic import Field, create_model
@@ -1062,7 +1063,7 @@ def scrudful_list(
             list_context_link_or_func="/contexts/items",
         )
         def list_items(request):
-            return Item.objects.filter(owner=request.auth)
+            return Item.objects.filter(owner=getattr(request, "auth", None))
 
     The handler returns the authorized queryset (or a sequence); the wrapper
     paginates it and returns the scrud envelope, whose response schema
@@ -1158,13 +1159,15 @@ def scrudful_list(
         as before.
     before : callable, optional
         ``before(request, **path_params)``, called once per request where DRF
-        checks permissions: after ninja's authentication (``request.auth`` is
-        set), before its throttles and before it validates any parameter of
-        the operation (path, query or body) or calls its function.
-        ``path_params`` are the URL's values, not validated yet (strings,
-        unless the path uses a converter such as ``{int:pk}``). Its return
-        value is ignored. Raise ninja's ``HttpError`` (or another exception
-        the API handles) to answer first, e.g. with 401 or 403 whatever the
+        checks permissions: after ninja's authentication, before its
+        throttles and before it validates any parameter of the operation
+        (path, query or body) or calls its function. ``path_params`` are the
+        URL's values, not validated yet (strings, unless the path uses a
+        converter such as ``{int:pk}``). ``request.auth`` is set only when an
+        auth callback succeeded (it is missing on an operation without
+        ``auth``): read it with ``getattr(request, "auth", None)``. Its
+        return value is ignored. Raise ninja's ``HttpError`` (or another
+        exception the API handles) to answer first, e.g. with 401 or 403 whatever the
         parameters are; the API's exception handler answers it, as ninja
         answers its own errors, an ``HttpError`` gets the operation's error
         Links as when the operation raises it, and the request uses none of
@@ -1575,7 +1578,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                     try:
                         return await _run_async(flow(request, values, answers))
                     except Exception as exc:
-                        _note_error(config, exc)
+                        _note_raised(config, exc)
                         raise
 
             else:
@@ -1585,7 +1588,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                     try:
                         return _run_sync(flow(request, values, answers))
                     except Exception as exc:
-                        _note_error(config, exc)
+                        _note_raised(config, exc)
                         raise
 
             wrapper.__signature__ = hidden.signature  # type: ignore[attr-defined]
@@ -1634,20 +1637,13 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             # the API's exception handler, which ``Operation.run`` returns. It
             # is wrapped as ``decorate_view`` wraps it, so that ninja's clones
             # of the operation (one per mount) wrap theirs too.
-            run_decorators = [_raised_links_run(asynchronous)]
-            if config.before is not None:
-                run_decorators.append(
-                    _before_run(
-                        config, asynchronous, f"{name}: {handler.__qualname__}()"
-                    )
-                )
+            run_decorator = _raised_links_run(
+                asynchronous, config, f"{name}: {handler.__qualname__}()"
+            )
             if not hasattr(operation, "_run_decorators"):
                 operation._run_decorators = []  # type: ignore[attr-defined]
-            for run_decorator in run_decorators:
-                operation.run = run_decorator(  # type: ignore[method-assign]
-                    operation.run
-                )
-                operation._run_decorators.append(run_decorator)
+            operation.run = run_decorator(operation.run)  # type: ignore[method-assign]
+            operation._run_decorators.append(run_decorator)
 
         # Registered with ninja, which replaces it in each operation by the
         # wrapper :func:`bind_operation` binds (called directly, it declares
@@ -1735,11 +1731,14 @@ _ERROR_CLASSES: tuple[type[Exception], ...] = tuple(
 
 @dataclass(eq=False, slots=True)
 class _Raised:
-    """What the scrudful operation running ``Operation.run`` raised."""
+    """What the scrudful operation running ``Operation.run`` raised, and the
+    path parameters ``run`` got (for ``before``, see :func:`_install_before`)."""
 
     #: The operation's, once its wrapper raised an ``HttpError`` or
     #: ``Http404``.
     config: _Config | None = None
+    #: The path parameters, as the URL gives them.
+    path_params: dict[str, Any] = field(default_factory=dict)
 
 
 #: Set by :func:`_raised_links_run` while ``Operation.run`` runs. A mutable
@@ -1817,23 +1816,18 @@ def _render(request: HttpRequest) -> Callable[[Any, int], bytes] | None:
     return render
 
 
-def _note_error(config: _Config, exc: Exception) -> None:
-    """Note an ``HttpError`` or ``Http404`` the operation of ``config`` raised
-    (the wrapper, or its ``before``): its response gets the Links of the
-    operation's entity for the status (see :func:`_raised_links_run`)."""
-    if isinstance(exc, (HttpError, Http404)):
-        _note_raised(config)
-
-
-def _note_raised(config: _Config) -> None:
-    """Note that the operation of ``config`` raised the error being handled."""
+def _note_raised(config: _Config, exc: Exception) -> None:
+    """Note ``exc`` if it is an ``HttpError`` or ``Http404`` the operation of
+    ``config`` raised (its wrapper, or its ``before``): its response gets the
+    Links of the operation's entity for the status (see
+    :func:`_raised_links_run`)."""
     raised = _RAISED.get()
-    if raised is not None:
+    if raised is not None and isinstance(exc, (HttpError, Http404)):
         raised.config = config
 
 
 def _raised_links_run(
-    asynchronous: bool,
+    asynchronous: bool, config: _Config, label: str
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """The ``Operation.run`` decorator adding the Links of a raised error.
 
@@ -1844,16 +1838,21 @@ def _raised_links_run(
     the operation's entity for its status, see :func:`_raised_entity`.
 
     While ``run`` runs, :data:`_SERVING_API` is the operation's API, whose
-    renderer writes scrudful's own bodies (see :func:`_render`).
+    renderer writes scrudful's own bodies (see :func:`_render`). A list
+    operation's ``before`` is installed on the operation, and on each clone
+    ninja decorates again (see :func:`_install_before`; ``label`` names the
+    operation in its errors).
     """
 
     def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
         operation = _operation_of(run)
+        if config.before is not None:
+            _install_before(operation, config, asynchronous, label)
         if asynchronous:
 
             @functools.wraps(run)
             async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                raised = _Raised()
+                raised = _Raised(path_params=kw)
                 token = _RAISED.set(raised)
                 api_token = _SERVING_API.set(getattr(operation, "api", None))
                 try:
@@ -1869,7 +1868,7 @@ def _raised_links_run(
 
             @functools.wraps(run)
             def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                raised = _Raised()
+                raised = _Raised(path_params=kw)
                 token = _RAISED.set(raised)
                 api_token = _SERVING_API.set(getattr(operation, "api", None))
                 try:
@@ -1886,67 +1885,75 @@ def _raised_links_run(
     return decorator
 
 
-#: The path parameters of the list operation with ``before`` running, as the
-#: URL gives them (set by :func:`_before_run`).
-_PATH_PARAMS: ContextVar[dict[str, Any] | None] = ContextVar(
-    "scrudful_path_params", default=None
+#: What scrudful's copy of ninja's checks (:func:`_install_before`) was written
+#: from: the names, local variables and argument count of
+#: ``Operation._run_checks`` and ``AsyncOperation._run_checks``, the same in
+#: ninja 1.6.0 to 1.7.1 on Python 3.10 to 3.14.
+_NINJA_CHECKS = (
+    (
+        "csrf_exempt",
+        "_ninja_csrf_exempt",
+        "auth_callbacks",
+        "_run_authentication",
+        "throttle_objects",
+        "_check_throttles",
+    ),
+    ("self", "request", "error"),
+    2,
 )
 
 
-def _before_run(
-    config: _Config, asynchronous: bool, label: str
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """The ``Operation.run`` decorator of a list operation with ``before``.
+def _check_ninja_checks(operation: Any, asynchronous: bool, label: str) -> None:
+    """Raise ``ConfigError`` unless ``operation``'s checks are ninja's own, as
+    :func:`_install_before` copies them.
 
-    It installs ``before`` in the operation's checks (:func:`_install_before`),
-    also in the clones ninja makes (it decorates them again), and passes the
-    path parameters ``run`` gets to it through :data:`_PATH_PARAMS`.
-
-    Raises
-    ------
-    ninja.errors.ConfigError
-        When the operation is built, if the operation can't be found through
-        ``run`` (see :func:`_operation_of`): ``before`` could not run.
+    So an ``Operation`` subclass overriding ``_run_checks``, or a ninja whose
+    checks changed, fails when the operation is built instead of losing a
+    check.
     """
-
-    def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
-        operation = _operation_of(run)
-        if operation is None:
-            raise ConfigError(
-                f"{label}: before= runs in the operation's checks, but "
-                "scrudful can't find the operation through Operation.run: a "
-                "decorate_view decorator below the scrudful decorator wraps it "
-                "without functools.wraps. Use functools.wraps in that "
-                "decorator, or apply decorate_view above the operation "
-                "decorator."
+    if operation is None:
+        reason = (
+            "scrudful can't find the operation through Operation.run: a "
+            "decorate_view decorator below the scrudful decorator wraps it "
+            "without functools.wraps. Use functools.wraps in that decorator, "
+            "or apply decorate_view above the operation decorator"
+        )
+    else:
+        ninja_class = AsyncOperation if asynchronous else Operation
+        checks = getattr(type(operation), "_run_checks", None)
+        code = getattr(checks, "__code__", None)
+        if "_run_checks" in vars(operation):
+            reason = "the operation has its own _run_checks"
+        elif checks is not ninja_class._run_checks:
+            reason = (
+                f"{type(operation).__qualname__} overrides _run_checks of "
+                f"ninja's {ninja_class.__name__}"
             )
-        _install_before(operation, config, asynchronous)
-        if asynchronous:
-
-            @functools.wraps(run)
-            async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                token = _PATH_PARAMS.set(kw)
-                try:
-                    return await run(request, *args, **kw)
-                finally:
-                    _PATH_PARAMS.reset(token)
-
+        elif (
+            code is None
+            or (
+                code.co_names,
+                code.co_varnames,
+                code.co_argcount,
+            )
+            != _NINJA_CHECKS
+        ):
+            reason = (
+                "the installed ninja's checks differ from those scrudful runs "
+                "before in (ninja 1.6 to 1.7)"
+            )
         else:
-
-            @functools.wraps(run)
-            def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                token = _PATH_PARAMS.set(kw)
-                try:
-                    return run(request, *args, **kw)
-                finally:
-                    _PATH_PARAMS.reset(token)
-
-        return scrudful_run
-
-    return decorator
+            return
+    raise ConfigError(
+        f"{label}: before= needs ninja's own Operation._run_checks, which "
+        f"scrudful runs with before between authentication and throttling; "
+        f"{reason}."
+    )
 
 
-def _install_before(operation: Any, config: _Config, asynchronous: bool) -> None:
+def _install_before(
+    operation: Any, config: _Config, asynchronous: bool, label: str
+) -> None:
     """Give ``operation`` checks running ``config.before`` where DRF checks
     permissions: after authentication, before throttling.
 
@@ -1961,14 +1968,21 @@ def _install_before(operation: Any, config: _Config, asynchronous: bool) -> None
     In a sync operation, a ``before`` returning an awaitable raises
     ``TypeError``: it can't be awaited there, and the request must not go on
     as if it were allowed.
+
+    Raises
+    ------
+    ninja.errors.ConfigError
+        See :func:`_check_ninja_checks`.
     """
+    _check_ninja_checks(operation, asynchronous, label)
 
     def answer(request: HttpRequest, exc: Exception) -> HttpResponseBase:
-        _note_error(config, exc)
+        _note_raised(config, exc)
         return operation.api.on_exception(request, exc)  # type: ignore[no-any-return]
 
     def path_params() -> dict[str, Any]:
-        return dict(_PATH_PARAMS.get() or {})
+        raised = _RAISED.get()
+        return {} if raised is None else dict(raised.path_params)
 
     if asynchronous:
 

@@ -3,6 +3,7 @@ ninja validates any parameter of the operation, so a list can be authorized
 before a bad parameter is answered (DRF's order: authentication, permissions,
 then the parameters)."""
 
+import functools
 import json
 import uuid
 from typing import Any
@@ -13,6 +14,8 @@ from items.models import Item
 from ninja import NinjaAPI, Router
 from ninja.decorators import decorate_view
 from django.core.cache import cache
+from django.test import RequestFactory
+from ninja import operation as ninja_operation
 from ninja.errors import ConfigError, HttpError
 from ninja.security import APIKeyHeader
 from ninja.testing import TestAsyncClient, TestClient
@@ -396,3 +399,96 @@ def test_before_runs_before_throttles(items, fresh_cache, asynchronous):
     get = getter(asynchronous, api)
     assert [get("/p/7/items").status_code for _ in range(2)] == [200, 429]
     assert len(allowed.calls) == 2
+
+
+# --- The copy of ninja's checks (scrudful runs before between auth and
+# throttles): guarded against an override or a changed ninja.
+
+
+class CustomChecks(ninja_operation.Operation):
+    def _run_checks(self, request):
+        return super()._run_checks(request)
+
+
+def test_operation_subclass_overriding_checks_is_a_config_error(monkeypatch):
+    monkeypatch.setattr(ninja_operation, "Operation", CustomChecks)
+    with pytest.raises(ConfigError, match="needs ninja's own Operation._run_checks"):
+        list_router(before=Recorder())
+
+
+def test_operation_subclass_without_its_own_checks_is_fine(monkeypatch, items):
+    class Plain(ninja_operation.Operation):
+        pass
+
+    monkeypatch.setattr(ninja_operation, "Operation", Plain)
+    before = Recorder(HttpError(403, "Denied"))
+    assert (
+        TestClient(api_for(list_router(before=before))).get("/p/7/items").status_code
+        == 403
+    )
+
+
+@pytest.mark.parametrize(
+    "cls", [ninja_operation.Operation, ninja_operation.AsyncOperation]
+)
+def test_changed_ninja_checks_are_a_config_error(monkeypatch, cls):
+    """A ninja whose checks do something the copy doesn't."""
+
+    def _run_checks(self, request):
+        error = self._check_permissions(request)
+        if error:
+            return error
+        return None
+
+    monkeypatch.setattr(cls, "_run_checks", _run_checks)
+    with pytest.raises(ConfigError, match="needs ninja's own Operation._run_checks"):
+        list_router(cls is ninja_operation.AsyncOperation, before=Recorder())
+
+
+def test_router_mounted_with_and_without_auth(items):
+    """ninja applies a mount's auth to its clone of the operation."""
+    before = Recorder()
+    router = list_router(before=before)
+    open_api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    open_api.add_router("", router)
+    auth_api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    auth_api.add_router("", router, auth=Key())
+    assert TestClient(open_api).get("/p/7/items").status_code == 200
+    assert len(before.calls) == 1
+    assert TestClient(auth_api).get("/p/7/items").status_code == 401
+    assert len(before.calls) == 1
+    response = TestClient(auth_api).get("/p/7/items", headers={"X-API-Key": "alice"})
+    assert response.status_code == 200
+    assert len(before.calls) == 2
+    assert before.calls[-1][0].auth == "alice"
+    assert getattr(before.calls[0][0], "auth", None) is None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("csrf_exempt", [False, True])
+def test_checks_copy_sets_the_csrf_flag_as_ninja(asynchronous, csrf_exempt):
+    router = list_router(asynchronous, before=Recorder())
+    [operation] = [
+        op
+        for path_view in router.path_operations.values()
+        for op in path_view.operations
+    ]
+    operation.csrf_exempt = csrf_exempt
+    operation.auth_callbacks = []
+    operation.throttle_objects = []
+    flags = []
+    for checks in (
+        operation._run_checks,
+        functools.partial(type(operation)._run_checks, operation),
+    ):
+        request = RequestFactory().get("/p/7/items")
+        result = checks(request)
+        if asynchronous:
+            result = async_to_sync(_awaited)(result)
+        assert result is None
+        flags.append(getattr(request, "_ninja_csrf_exempt", None))
+    assert flags[0] == flags[1] == (True if csrf_exempt else None)
+
+
+async def _awaited(awaitable):
+    return await awaitable
