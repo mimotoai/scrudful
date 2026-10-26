@@ -492,6 +492,40 @@ handler gets:
     def list_context_roles(request, context: str):
         return Role.objects.filter(rbac_context=context).order_by("pk")
 
+``after_throttles=`` (since 0.7.1) runs where DRF's ``list()`` starts:
+``after_throttles(request, **path_params)`` is called once per request after
+ninja's authentication, after ``before`` (if given) and after ninja's
+throttles, and still before its validation of any parameter. A throttled
+request (429) never calls it, so a client can't force an expensive check
+(e.g. a per-row authorization filter that may answer 400) by sending
+requests over its quota, and its error beats the 422 of a bad ``page``, as
+in DRF, where ``list()`` filters before it paginates. A request it refuses
+has used its throttle quota, as in DRF. Its contract is ``before``'s: the
+same raw path parameters (each hook gets its own copy), ``None`` to go on
+(anything else, or an awaitable in a sync operation, raises ``TypeError``),
+an error raised to answer first, answered by the API's exception handler
+with the operation's error Links and never passing through the
+``add_decorator(mode="operation")`` decorators, ``async def`` in an
+``async def`` operation, the same ``ConfigError`` at startup and the same
+``RuntimeError`` for a request that reaches the function without it having
+allowed it. When it returns, one 422 lists every bad parameter, and the
+OpenAPI description is unchanged. Use it alone or with ``before``; with both,
+the order is DRF's: authentication, ``before``, throttles,
+``after_throttles``, then the parameters:
+
+.. code-block:: python
+
+    def not_too_large(request, **path_params):
+        if conditional_rows(request.auth) > LIMIT:
+            raise HttpError(400, "conditional_list_too_large")
+
+    @roles.get("/contexts/{context}/roles", response=List[RoleOut])
+    @scrudful_list(
+        href_func=role_href, before=same_context, after_throttles=not_too_large
+    )
+    def list_context_roles(request, context: str):
+        return Role.objects.filter(rbac_context=context).order_by("pk")
+
 The collection response is a list, set or tuple of the item schema
 (``List[RoleOut]``, ``list[RoleOut]``). ``Optional[List[RoleOut]]`` or another
 union raises ``ConfigError`` when the operation is built, since the envelope is

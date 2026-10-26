@@ -2,6 +2,43 @@
 Changelog
 =========
 
+0.7.1 (since 0.7.0)
+===================
+
+Additive and backwards compatible: an operation without ``after_throttles=``
+behaves exactly as in 0.7.0.
+
+New
+---
+
+* ninja: ``scrudful_list(after_throttles=...)`` (optional):
+  ``after_throttles(request, **path_params)`` is called once per request
+  where DRF's ``list()`` starts: after ninja's authentication, after
+  ``before`` (if given) and after ninja's throttles, and before ninja
+  validates any parameter. So DRF's whole order can be reproduced
+  (authentication, ``before``, throttles, ``after_throttles``, then the
+  parameters): a throttled request (429) never calls it, so a client over
+  its quota can't force an expensive check (e.g. a per-row authorization
+  filter that may answer 400) on every request, and its error beats the 422
+  of a bad ``page``, as DRF's ``list()`` filters before it paginates. A
+  request it refuses has used its throttle quota, as in DRF. Its contract is
+  ``before``'s: the URL's path parameters as they are (each hook gets its own
+  copy), ``None`` to let the request go on (anything else, or an awaitable in
+  a sync operation, whose coroutine is closed or future cancelled, raises
+  ``TypeError``), an error raised to answer first (answered by the API's
+  exception handler, with the operation's error Links), neither that error
+  nor the 422 that follows reaching the ``add_decorator(mode="operation")``
+  decorators, ``async def`` in an ``async def`` operation, and the same
+  guards: ``ConfigError`` when the operation is built (an installed ninja's
+  ``_run_checks`` or ``run`` differing from 1.7.0's and 1.7.1's, an
+  ``Operation`` subclass overriding either, or a ``decorate_view`` below
+  ``@scrudful_list`` without ``functools.wraps``), and ``RuntimeError`` for a
+  request that reaches the function without the hooks having allowed it.
+  Use it alone or with ``before``. When it returns, one 422 lists every bad
+  parameter, and the OpenAPI description is unchanged. The ``ConfigError``
+  and ``RuntimeError`` messages name the hooks the operation has
+  (``before=``, ``after_throttles=`` or both).
+
 0.7.0 (since 0.6.0)
 ===================
 

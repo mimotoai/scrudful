@@ -224,7 +224,9 @@ Collections
       not passed to the handler. Invalid values are answered with 422 by
       ninja, a page past the last one with 404 (page 1 always exists). A
       ``before`` callable runs before ninja validates any parameter (see
-      :func:`scrudful_list`), e.g. to answer 401 or 403 first.
+      :func:`scrudful_list`), e.g. to answer 401 or 403 first, and an
+      ``after_throttles`` one too, but after ninja's throttles, e.g. for an
+      expensive check DRF makes in ``list()``.
     - ``count`` is ``queryset.count()`` for a ``QuerySet``, else ``len()``;
       ``page_count`` is ``ceil(count / page_size)``. An unordered
       ``QuerySet`` (no ``order_by()`` and no ``Meta.ordering``) gets Django's
@@ -659,8 +661,24 @@ class _Config:
     max_page_size: int | None = None
     #: ``before(request, **path_params)`` of a list operation: run after
     #: authentication, before throttling and before any parameter is
-    #: validated (see :func:`_install_before`).
+    #: validated (see :func:`_install_hooks`).
     before: Callable[..., Any] | None = None
+    #: ``after_throttles(request, **path_params)`` of a list operation: run
+    #: after authentication, ``before`` and throttling, before any parameter
+    #: is validated (see :func:`_install_hooks`).
+    after_throttles: Callable[..., Any] | None = None
+
+    @property
+    def hooks(self) -> str | None:
+        """The hooks run in scrudful's copy of ninja's checks, as errors name
+        them (``"before="``, ``"after_throttles="`` or both); ``None``
+        without either."""
+        names = [
+            f"{name}="
+            for name in ("before", "after_throttles")
+            if getattr(self, name) is not None
+        ]
+        return " and ".join(names) or None
 
     @property
     def entity(self) -> Entity:
@@ -1065,6 +1083,7 @@ def scrudful_list(
     error: Entity | None = None,
     error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
     before: Callable[..., Any] | None = None,
+    after_throttles: Callable[..., Any] | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation listing a collection (GET on a list).
 
@@ -1218,16 +1237,34 @@ def scrudful_list(
         source, only by the names, locals and arguments they use),
         ``before=`` raises ``ConfigError`` when the operation is built (at
         startup); upgrade scrudful then, or keep ninja at a verified release.
+    after_throttles : callable, optional
+        ``after_throttles(request, **path_params)``, called once per request
+        where DRF's ``list()`` starts (e.g. its filters): after ninja's
+        authentication, after ``before`` (if given) and after ninja's
+        throttles, and before ninja validates any parameter of the operation
+        or calls its function. Its contract is ``before``'s (above): the
+        same raw path parameters, ``None`` to let the request go on (anything
+        else, or an awaitable in a sync operation, raises ``TypeError``), an
+        error raised to answer first (the API's exception handler answers
+        it, with the operation's error Links), neither that error nor the 422
+        that follows passes through the ``add_decorator(mode="operation")``
+        decorators, ``async def`` in an ``async def`` operation, and the same
+        ``ConfigError`` and ``RuntimeError`` guards. A throttled request (429)
+        never calls it, and a request it refuses has used its throttle quota,
+        as in DRF. So an expensive check (e.g. a filter that may answer 400)
+        can't be forced by a throttled client, and its error beats the 422 of
+        a bad ``page``. Use it alone or with ``before``.
 
     Raises
     ------
     TypeError
-        If ``href_func``, ``before`` or a validator callback isn't callable, if
-        ``page_size`` or ``max_page_size`` isn't an ``int``, if ``error``
-        isn't an :class:`Entity`, if the handler is a generator or already a
-        ninja operation (the decorator sits above the operation decorator),
-        or if the handler is sync and ``href_func``, a validator callback or
-        a link callable (also inside ``error``) or ``before`` is ``async def``.
+        If ``href_func``, ``before``, ``after_throttles`` or a validator
+        callback isn't callable, if ``page_size`` or ``max_page_size`` isn't
+        an ``int``, if ``error`` isn't an :class:`Entity`, if the handler is a
+        generator or already a ninja operation (the decorator sits above the
+        operation decorator), or if the handler is sync and ``href_func``, a
+        validator callback or a link callable (also inside ``error``),
+        ``before`` or ``after_throttles`` is ``async def``.
     ValueError
         If ``page_size`` is less than 1 or ``max_page_size`` less than
         ``page_size``, or if ``error``'s media type is not JSON content.
@@ -1237,9 +1274,10 @@ def scrudful_list(
         ``Optional[List[ItemOut]]``: the envelope is never ``None``) or names
         no item type (a bare ``list``), or if something replaced its
         ``view_func`` before the decorator bound it (see "Placement" in the
-        module docstring). Also with ``before``, if a ``decorate_view``
-        decorator below the decorator wraps ``Operation.run`` without
-        ``functools.wraps`` (scrudful then can't install ``before``), if the
+        module docstring). Also with ``before`` or ``after_throttles``, if a
+        ``decorate_view`` decorator below the decorator wraps
+        ``Operation.run`` without ``functools.wraps`` (scrudful then can't
+        install them), if the
         installed ninja's per-operation checks, or the ``Operation.run``
         calling them, differ from ninja 1.7.0's and 1.7.1's, or if an
         ``Operation`` subclass overrides either.
@@ -1251,6 +1289,7 @@ def scrudful_list(
         ("list_etag_func", list_etag_func),
         ("list_last_modified_func", list_last_modified_func),
         ("before", before),
+        ("after_throttles", after_throttles),
     ):
         if func is not None and not callable(func):
             raise TypeError(f"{name} must be callable, not {type(func).__name__}")
@@ -1291,6 +1330,7 @@ def scrudful_list(
         page_size=page_size,
         max_page_size=max_page_size,
         before=before,
+        after_throttles=after_throttles,
     )
     return _decorator(config, "@scrudful_list")
 
@@ -1617,7 +1657,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
 
                 @functools.wraps(handler)
                 async def wrapper(request: HttpRequest, **values: Any) -> Any:
-                    _check_before_allowed(config, label)
+                    _check_hooks_allowed(config, label)
                     try:
                         return await _run_async(flow(request, values, answers))
                     except Exception as exc:
@@ -1628,7 +1668,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
 
                 @functools.wraps(handler)
                 def wrapper(request: HttpRequest, **values: Any) -> Any:
-                    _check_before_allowed(config, label)
+                    _check_hooks_allowed(config, label)
                     try:
                         return _run_sync(flow(request, values, answers))
                     except Exception as exc:
@@ -1771,17 +1811,17 @@ _ERROR_CLASSES: tuple[type[Exception], ...] = tuple(
 @dataclass(eq=False, slots=True)
 class _Raised:
     """What the scrudful operation running ``Operation.run`` raised, and the
-    path parameters ``run`` got (for ``before``, see :func:`_install_before`)."""
+    path parameters ``run`` got (for the hooks, see :func:`_install_hooks`)."""
 
-    #: The operation's, once its wrapper or its ``before`` raised an
+    #: The operation's, once its wrapper or one of its hooks raised an
     #: ``HttpError`` or ``Http404``.
     config: _Config | None = None
     #: The path parameters, as the URL gives them (strings, unless the path
     #: uses a converter).
     path_params: dict[str, Any] = field(default_factory=dict)
-    #: Whether the operation's ``before`` ran and allowed the request (see
-    #: :func:`_check_before_allowed`).
-    before_allowed: bool = False
+    #: Whether the operation's hooks (``before``, ``after_throttles``) ran
+    #: and allowed the request (see :func:`_check_hooks_allowed`).
+    hooks_allowed: bool = False
 
 
 #: Set by :func:`_raised_links_run` while ``Operation.run`` runs. A mutable
@@ -1908,7 +1948,7 @@ def _json_values(data: Any) -> Any:
 
 def _note_raised(config: _Config, exc: Exception) -> None:
     """Note ``exc`` if it is an ``HttpError`` or ``Http404`` the operation of
-    ``config`` raised (its wrapper, or its ``before``): its response gets the
+    ``config`` raised (its wrapper, or a hook): its response gets the
     Links of the operation's entity for the status (see
     :func:`_raised_links_run`)."""
     raised = _RAISED.get()
@@ -1929,15 +1969,16 @@ def _raised_links_run(
 
     While ``run`` runs, :data:`_SERVING_API` is the operation's API, whose
     renderer writes scrudful's own bodies (see :func:`_render`). A list
-    operation's ``before`` is installed on the operation, and on each clone
-    ninja decorates again (see :func:`_install_before`; ``label`` names the
+    operation's hooks (``before``, ``after_throttles``) are installed on the
+    operation, and on each clone ninja decorates again (see
+    :func:`_install_hooks`; ``label`` names the
     operation in its errors).
     """
 
     def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
         operation = _operation_of(run)
-        if config.before is not None:
-            _install_before(operation, config, asynchronous, label)
+        if config.hooks is not None:
+            _install_hooks(operation, config, asynchronous, label)
         if asynchronous:
 
             @functools.wraps(run)
@@ -1975,7 +2016,7 @@ def _raised_links_run(
 
 #: The digests (:func:`_source_digest`) of the methods of ninja's
 #: ``Operation`` and ``AsyncOperation`` that scrudful's copy of the checks
-#: (:func:`_install_before`) was written from: ``_run_checks``, which it
+#: (:func:`_install_hooks`) was written from: ``_run_checks``, which it
 #: copies, and ``run``, which answers the response it returns before reading
 #: any parameter. ninja 1.7.0 and 1.7.1 on Python 3.10 to 3.14 (``run``'s
 #: f-string is tokenized differently from Python 3.12 on).
@@ -2139,18 +2180,22 @@ def _is_ninja_code(func: Any, name: str) -> bool:
     )
 
 
-def _check_ninja_checks(operation: Any, asynchronous: bool, label: str) -> None:
-    """Raise ``ConfigError`` unless ``operation`` can run ``before`` in
-    scrudful's copy of ninja's checks (:func:`_install_before`).
+def _check_ninja_checks(
+    operation: Any, config: _Config, asynchronous: bool, label: str
+) -> None:
+    """Raise ``ConfigError`` unless ``operation`` can run ``config``'s hooks
+    (``before``, ``after_throttles``) in scrudful's copy of ninja's checks
+    (:func:`_install_hooks`).
 
     So an opaque decorator hiding the operation, an ``Operation`` subclass
     overriding ``_run_checks`` or ``run``, or a ninja whose checks (or the
     ``run`` calling them) changed fails when the operation is built instead
-    of losing ``before`` or a check.
+    of losing a hook or a check.
     """
+    hooks = config.hooks
     if operation is None:
         raise ConfigError(
-            f"{label}: before= can't be installed: scrudful can't find the "
+            f"{label}: {hooks} can't be installed: scrudful can't find the "
             "ninja operation through Operation.run, because a decorate_view "
             "decorator below @scrudful_list wraps it without functools.wraps. "
             "Use functools.wraps in that decorator, or apply decorate_view "
@@ -2159,76 +2204,102 @@ def _check_ninja_checks(operation: Any, asynchronous: bool, label: str) -> None:
     ninja_class = AsyncOperation if asynchronous else Operation
     cls = type(operation)
     if "_run_checks" in vars(operation):
-        raise _checks_error(label, "the operation has its own _run_checks")
+        raise _checks_error(label, config, "the operation has its own _run_checks")
     for method in ("_run_checks", "run"):
         func = getattr(cls, method, None)
         if func is not getattr(ninja_class, method):
             raise _checks_error(
                 label,
+                config,
                 f"{cls.__qualname__} overrides {method} of ninja's "
                 f"{ninja_class.__name__}",
             )
         if not _is_ninja_code(func, f"{ninja_class.__name__}.{method}"):
             raise _checks_error(
                 label,
+                config,
                 f"the installed ninja's {ninja_class.__name__}.{method} differs "
-                "from ninja 1.7.0's and 1.7.1's, which scrudful's before= is "
-                "verified against: upgrade scrudful, or keep ninja at one of "
-                "those releases",
+                f"from ninja 1.7.0's and 1.7.1's, which scrudful's {hooks} "
+                f"{_verb(config, 'is', 'are')} verified against: upgrade "
+                "scrudful, or keep ninja at one of those releases",
             )
 
 
-def _checks_error(label: str, reason: str) -> ConfigError:
-    """The ``ConfigError`` of an operation that can't run ``before``."""
-    return ConfigError(
-        f"{label}: before= needs ninja's own Operation._run_checks and the "
-        "Operation.run calling it (as in ninja 1.7.0 and 1.7.1), as scrudful runs "
-        "before "
-        f"between authentication and throttling; {reason}."
+def _verb(config: _Config, one: str, both: str) -> str:
+    """``one`` for a single hook, ``both`` for ``before`` and ``after_throttles``."""
+    return (
+        both
+        if config.before is not None and config.after_throttles is not None
+        else one
     )
 
 
-def _install_before(
+def _checks_error(label: str, config: _Config, reason: str) -> ConfigError:
+    """The ``ConfigError`` of an operation that can't run ``config``'s hooks."""
+    where = []
+    if config.before is not None:
+        where.append("before between authentication and throttling")
+    if config.after_throttles is not None:
+        where.append("after_throttles after throttling")
+    return ConfigError(
+        f"{label}: {config.hooks} {_verb(config, 'needs', 'need')} ninja's own "
+        "Operation._run_checks and the Operation.run calling it (as in ninja "
+        f"1.7.0 and 1.7.1), as scrudful runs {' and '.join(where)}; {reason}."
+    )
+
+
+def _install_hooks(
     operation: Any, config: _Config, asynchronous: bool, label: str
 ) -> None:
     """Give ``operation`` checks running ``config.before`` where DRF checks
-    permissions: after authentication, before throttling.
+    permissions (after authentication, before throttling) and
+    ``config.after_throttles`` where DRF's ``list()`` starts (after
+    throttling).
 
     ``Operation.run`` answers a response its ``_run_checks`` returns before it
     reads any parameter. These checks are ninja 1.7.0's and 1.7.1's (CSRF
     exemption flag, authentication, throttles) with ``before`` called between
-    authentication
-    and throttling, with the path parameters as the URL gives them, so a
-    request it refuses uses none of a throttle's quota. An exception it
-    raises is answered by the API's exception handler, as ninja answers its
-    own; neither reaches the decorators added with
+    authentication and throttling, so a request it refuses uses none of a
+    throttle's quota, and ``after_throttles`` after throttling, so a
+    throttled request never calls it. Each gets its own copy of the path
+    parameters, as the URL gives them. An exception either raises is
+    answered by the API's exception handler, as ninja answers its own;
+    neither reaches the decorators added with
     ``add_decorator(mode="operation")``, which wrap the operation's function.
-    ``before`` allows the request by returning ``None`` and refuses it by
+    A hook allows the request by returning ``None`` and refuses it by
     raising: anything else it returns raises ``TypeError`` (a returned
     ``HttpResponse`` or ``False`` must not let the request go on as if it
     were allowed). So does an awaitable in a sync operation, which can't
     await it; a coroutine is closed and a future (or task) cancelled, so
     neither runs on unawaited. Without the path parameters (the checks run
     outside the operation's ``Operation.run``) it raises ``RuntimeError``
-    instead of calling ``before`` without them.
+    instead of calling a hook without them. The request is marked allowed
+    (:func:`_check_hooks_allowed`) once every hook allowed it.
 
     Raises
     ------
     ninja.errors.ConfigError
         See :func:`_check_ninja_checks`.
     """
-    _check_ninja_checks(operation, asynchronous, label)
+    _check_ninja_checks(operation, config, asynchronous, label)
+    # In DRF's order; ``None`` for ninja's throttles.
+    steps: list[tuple[str, Callable[..., Any] | None]] = [("throttles", None)]
+    if config.before is not None:
+        steps.insert(0, ("before", config.before))
+    if config.after_throttles is not None:
+        steps.append(("after_throttles", config.after_throttles))
 
     def current() -> _Raised:
         raised = _RAISED.get()
         if raised is None:
             raise RuntimeError(
-                f"{label}: before can't get the path parameters: the "
+                f"{label}: {config.hooks} can't get the path parameters: the "
                 "operation's checks ran outside its Operation.run"
             )
         return raised
 
     def answer(request: HttpRequest, exc: Exception) -> HttpResponseBase:
+        """The API's answer to what a hook raised."""
         _note_raised(config, exc)
         return operation.api.on_exception(request, exc)  # type: ignore[no-any-return]
 
@@ -2236,13 +2307,7 @@ def _install_before(
         if operation.csrf_exempt:
             request._ninja_csrf_exempt = True  # type: ignore[attr-defined]
 
-    def after_before(
-        request: HttpRequest, raised: _Raised, result: Any
-    ) -> HttpResponseBase | None:
-        """Fail closed unless ``before`` returned ``None``; then throttle."""
-        if result is not None:
-            _refuse_before_result(result, asynchronous)
-        raised.before_allowed = True
+    def throttle(request: HttpRequest) -> HttpResponseBase | None:
         if operation.throttle_objects:
             error = operation._check_throttles(request)
             if error:
@@ -2258,12 +2323,22 @@ def _install_before(
                 if error:
                     return error  # type: ignore[no-any-return]
             raised = current()
-            params = dict(raised.path_params)
-            try:
-                result = await _call_async(config.before, (request,), params)
-            except Exception as exc:
-                return answer(request, exc)
-            return after_before(request, raised, result)
+            for name, hook in steps:
+                if hook is None:
+                    error = throttle(request)
+                    if error is not None:
+                        return error
+                    continue
+                try:
+                    result = await _call_async(
+                        hook, (request,), dict(raised.path_params)
+                    )
+                except Exception as exc:
+                    return answer(request, exc)
+                if result is not None:
+                    _refuse_hook_result(name, result, asynchronous)
+            raised.hooks_allowed = True
+            return None
 
     else:
 
@@ -2276,38 +2351,48 @@ def _install_before(
                 if error:
                     return error  # type: ignore[no-any-return]
             raised = current()
-            params = dict(raised.path_params)
-            try:
-                result = config.before(request, **params)  # type: ignore[misc]
-            except Exception as exc:
-                return answer(request, exc)
-            return after_before(request, raised, result)
+            for name, hook in steps:
+                if hook is None:
+                    error = throttle(request)
+                    if error is not None:
+                        return error
+                    continue
+                try:
+                    result = hook(request, **raised.path_params)
+                except Exception as exc:
+                    return answer(request, exc)
+                if result is not None:
+                    _refuse_hook_result(name, result, asynchronous)
+            raised.hooks_allowed = True
+            return None
 
     operation._run_checks = run_checks
 
 
-def _check_before_allowed(config: _Config, label: str) -> None:
-    """Raise ``RuntimeError`` unless the operation's ``before`` (if any) ran
-    and allowed this request.
+def _check_hooks_allowed(config: _Config, label: str) -> None:
+    """Raise ``RuntimeError`` unless the operation's hooks (``before``,
+    ``after_throttles``; if any) ran and allowed this request.
 
-    So a request never reaches the function without it: if ninja served an
+    So a request never reaches the function without them: if ninja served an
     operation without scrudful's checks (e.g. a copy it made without
     re-applying ``Operation.run``'s decorators), the request fails instead
     of going on unchecked.
     """
-    if config.before is None:
+    hooks = config.hooks
+    if hooks is None:
         return
     raised = _RAISED.get()
-    if raised is None or not raised.before_allowed:
+    if raised is None or not raised.hooks_allowed:
         raise RuntimeError(
-            f"{label}: before= didn't run for this request: the operation "
+            f"{label}: {hooks} didn't run for this request: the operation "
             "ninja served lacks scrudful's checks. Refusing the request."
         )
 
 
-def _refuse_before_result(result: Any, asynchronous: bool) -> NoReturn:
-    """Raise ``TypeError`` for what ``before`` returned instead of ``None``;
-    an awaitable is closed (a coroutine) or cancelled (a future) first."""
+def _refuse_hook_result(name: str, result: Any, asynchronous: bool) -> NoReturn:
+    """Raise ``TypeError`` for what hook ``name`` (``before`` or
+    ``after_throttles``) returned instead of ``None``; an awaitable is closed
+    (a coroutine) or cancelled (a future) first."""
     if inspect.isawaitable(result):
         if inspect.iscoroutine(result):
             result.close()
@@ -2315,12 +2400,12 @@ def _refuse_before_result(result: Any, asynchronous: bool) -> NoReturn:
             result.cancel()
         if not asynchronous:
             raise TypeError(
-                f"before returned an awaitable ({result!r}) in a sync "
+                f"{name} returned an awaitable ({result!r}) in a sync "
                 "operation, which can't await it: make the operation async "
-                "def, or before a plain function"
+                f"def, or {name} a plain function"
             )
     raise TypeError(
-        f"before returned {result!r}: it allows the request by returning "
+        f"{name} returned {result!r}: it allows the request by returning "
         "None and refuses it by raising (e.g. HttpError(403, ...)), never by "
         "returning a response or a value"
     )
@@ -2714,6 +2799,7 @@ def _declared_callables(config: _Config) -> Iterator[tuple[str, Any]]:
     """``(name, value)`` of every argument that may be a callable."""
     yield "load", config.load
     yield "before", config.before
+    yield "after_throttles", config.after_throttles
     yield "location_func", config.location_func
     yield "href_func", config.href_func
     yield "etag_func", config.etag_func
