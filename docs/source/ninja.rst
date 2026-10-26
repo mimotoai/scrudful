@@ -144,7 +144,10 @@ after ninja's authentication and before its throttles, and
 before ninja validates any parameter or the body, so before ``load`` and the
 preconditions: a client a hook refuses never gets a 304, 412, 428 or 422, or
 a validator, and a throttled client gets 429 only once ``before`` allowed it,
-as on DRF. A hook gets the raw request and may read ``request.body``:
+as on DRF. A hook gets the raw request and may read ``request.body``, which
+buffers the whole body (a body over Django's ``DATA_UPLOAD_MAX_MEMORY_SIZE``
+is then Django's own 400); it must not read ``request.POST`` or ``FILES``, after
+which the body can no longer be read:
 
 .. code-block:: python
 

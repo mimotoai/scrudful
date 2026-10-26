@@ -34,8 +34,8 @@ Placement
     when a 304, 412 or 428, or an ETag, may already be decided: never put an
     authorization or caching decorator there. Instead:
 
-    - per-operation authorization goes in ``load`` (fetch-if-allowed) or
-      ninja's ``auth=``;
+    - per-operation authorization goes in ``before=`` (before the throttles,
+      as DRF's permissions), ``load`` (fetch-if-allowed) or ninja's ``auth=``;
     - a decorator for every operation of a router or the API is added with
       ``add_decorator(decorator, mode="operation")``: it wraps ``view_func``,
       so it runs inside ``Operation.run``, after ninja's authentication and
@@ -903,7 +903,8 @@ def scrudful(
         operation's error Links, and the request uses none of a throttle's
         quota); neither its error nor a later 422 passes through the
         ``add_decorator(mode="operation")`` decorators. It may read
-        ``request.body``.
+        ``request.body`` (which buffers the whole body, within Django's
+        ``DATA_UPLOAD_MAX_MEMORY_SIZE``), never ``request.POST`` or ``FILES``.
     after_throttles : callable, optional
         ``after_throttles(request, **path_params)``, the same, called after
         ``before`` and ninja's throttles: a throttled request (429) never
@@ -1059,10 +1060,12 @@ def scrudful_create(
         parameters are the URL's raw strings, it returns ``None`` to let the
         request go on (anything else, or an awaitable in a sync operation,
         raises ``TypeError``) and raises to answer first (the API's exception
-        handler answers, with the operation's error Links, and the request
-        uses none of a throttle's quota); neither its error nor a later 422
-        passes through the ``add_decorator(mode="operation")`` decorators. It
-        may read ``request.body``.
+        handler answers, with the Links of ``responses[status]``, if any, and
+        the request uses none of a throttle's quota); neither its error nor a
+        later 422 passes through the ``add_decorator(mode="operation")``
+        decorators. It may read
+        ``request.body`` (which buffers the whole body, within Django's
+        ``DATA_UPLOAD_MAX_MEMORY_SIZE``), never ``request.POST`` or ``FILES``.
     after_throttles : callable, optional
         ``after_throttles(request, **path_params)``, the same, called after
         ``before`` and ninja's throttles: a throttled request (429) never
@@ -1773,7 +1776,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                     "the operation decorator, and never move an authorization "
                     f"or caching decorator below {name}: code there runs after "
                     "load and the preconditions. Put per-operation "
-                    "authorization in load or auth=, and wrap a router's or "
+                    "authorization in before=, load or auth=, and wrap a router's or "
                     "the API's operations with add_decorator(mode='operation'). "
                     "Stacking two scrudful decorators is not supported. See "
                     '"Placement of other decorators" in the scrudful.ninja '
@@ -2036,7 +2039,7 @@ def _raised_links_run(
     the operation's entity for its status, see :func:`_raised_entity`.
 
     While ``run`` runs, :data:`_SERVING_API` is the operation's API, whose
-    renderer writes scrudful's own bodies (see :func:`_render`). A list
+    renderer writes scrudful's own bodies (see :func:`_render`). The
     operation's hooks (``before``, ``after_throttles``) are installed on the
     operation, and on each clone ninja decorates again (see
     :func:`_install_hooks`; ``label`` names the

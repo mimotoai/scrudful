@@ -50,8 +50,10 @@ New
   body, ``load`` and the preconditions. So a client ``before`` refuses gets
   its 401 or 403 even when throttled, and a client either hook refuses never
   gets a 422 for a bad body, or a 304, 412 or 428 (nor a validator). A hook
-  gets the raw request and may read ``request.body``; the body is still
-  validated after it. The OpenAPI description is unchanged.
+  gets the raw request and may read ``request.body`` (buffering the whole
+  body, within Django's ``DATA_UPLOAD_MAX_MEMORY_SIZE``; never
+  ``request.POST`` or ``FILES``, after which the body can't be read); the
+  body is still validated after it. The OpenAPI description is unchanged.
 
 0.7.0 (since 0.6.0)
 ===================
