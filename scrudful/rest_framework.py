@@ -1570,21 +1570,25 @@ class ScrudfulPagination(BasePagination):
                 f"{type(view).__name__} uses ScrudfulPagination: it needs "
                 "Meta.href_func(view, request, obj), returning an item's URL"
             )
-        # Both parameters are checked before raising, so one 400 names both.
-        errors = {}
-        for name, maximum in (
-            (self.page_query_param, None),
-            (self.page_size_query_param, self.max_page_size),
+        # Each parameter goes through _integer (which a subclass may override),
+        # and their errors are merged, so one 400 names both.
+        values, errors = {}, {}
+        for name, default, maximum in (
+            (self.page_query_param, 1, None),
+            (self.page_size_query_param, self.page_size, self.max_page_size),
         ):
-            error = self._parameter_error(request, name, maximum)
-            if error is not None:
-                errors[name] = [error]
+            try:
+                values[name] = self._integer(request, name, default, maximum)
+            except ValidationError as exc:
+                detail = exc.detail
+                if isinstance(detail, dict):
+                    errors.update(detail)
+                else:
+                    errors[name] = detail
         if errors:
             raise ValidationError(errors)
-        number = self._integer(request, self.page_query_param, 1, None)
-        size = self._integer(
-            request, self.page_size_query_param, self.page_size, self.max_page_size
-        )
+        number = values[self.page_query_param]
+        size = values[self.page_size_query_param]
         try:
             # The unordered-queryset warning points at this method's caller.
             self.count, self.objects = slice_page(queryset, number, size)
@@ -1659,6 +1663,10 @@ class ScrudfulPagination(BasePagination):
         self, request: Request, name: str, default: int, maximum: int | None
     ) -> int:
         """The query parameter ``name`` as an integer in ``[1, maximum]``.
+
+        :meth:`paginate_queryset` calls it for ``page`` and ``page_size`` and
+        merges the errors of both into one ``ValidationError``; a subclass may
+        override it (to clamp ``page_size``, say).
 
         Raises
         ------

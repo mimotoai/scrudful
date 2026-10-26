@@ -96,6 +96,34 @@ class SmallViewSet(BareViewSet):
     pagination_class = SmallPagination
 
 
+class ClampingPagination(SmallPagination):
+    """A 0.6.0 subclass clamping page_size, as DRF's PageNumberPagination does."""
+
+    def _integer(self, request, name, default, maximum):
+        if name == self.page_size_query_param:
+            raw = request.query_params.get(name)
+            if raw is not None and raw.isdigit() and int(raw) > maximum:
+                return maximum
+        return super()._integer(request, name, default, maximum)
+
+
+class ClampingViewSet(BareViewSet):
+    pagination_class = ClampingPagination
+
+
+class LastPagePagination(SmallPagination):
+    """A 0.6.0 subclass accepting ``page=last``."""
+
+    def _integer(self, request, name, default, maximum):
+        if name == self.page_query_param and request.query_params.get(name) == "last":
+            return Item.objects.count()
+        return super()._integer(request, name, default, maximum)
+
+
+class LastPageViewSet(BareViewSet):
+    pagination_class = LastPagePagination
+
+
 def none_modified(obj):
     return None
 
@@ -135,6 +163,8 @@ router.register("bare", BareViewSet, basename="bare")
 router.register("nohref", NoHrefViewSet, basename="nohref")
 router.register("unordered", UnorderedViewSet, basename="unordered")
 router.register("small", SmallViewSet, basename="small")
+router.register("clamping", ClampingViewSet, basename="clamping")
+router.register("lastpage", LastPageViewSet, basename="lastpage")
 
 ninja_router = Router()
 
@@ -309,6 +339,30 @@ def test_pagination_integer_helper_still_raises_with_code(items):
     request = Request(APIRequestFactory().get("/drf/small/", {"page_size": "2"}))
     assert SmallPagination()._integer(request, "page_size", 1, 2) == 2
     assert SmallPagination()._integer(request, "page", 7, None) == 7
+
+
+def test_pagination_subclass_integer_override_clamps(items, client):
+    response = client.get("/drf/clamping/", {"page_size": 5000})
+    assert response.status_code == 200
+    assert len(response.json()["content"]) == 2
+    both = client.get("/drf/clamping/", {"page": "x", "page_size": "0"})
+    assert both.status_code == 400
+    assert both.json() == {
+        "page": ["A valid integer is required."],
+        "page_size": ["Ensure this value is greater than or equal to 1."],
+    }
+
+
+def test_pagination_subclass_integer_override_accepts_last(items, client):
+    response = client.get("/drf/lastpage/", {"page": "last"})
+    assert response.status_code == 200
+    body = response.json()
+    assert [entry["content"]["name"] for entry in body["content"]] == ["c"]
+    bad = client.get("/drf/lastpage/", {"page": "last", "page_size": "3"})
+    assert bad.status_code == 400
+    assert bad.json() == {
+        "page_size": ["Ensure this value is less than or equal to 2."]
+    }
 
 
 def test_pagination_max_page_size(items, client):

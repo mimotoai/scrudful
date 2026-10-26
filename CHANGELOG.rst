@@ -15,8 +15,10 @@ Bug fixes.
 * DRF: ``ScrudfulPagination``'s bad ``page`` and ``page_size`` errors carry
   the codes of a DRF ``IntegerField``'s (``invalid``, ``min_value``,
   ``max_value``), with the same messages, and one 400 names both parameters
-  when both are bad, as ninja's ``scrudful_list`` 422 already did. Subclasses
-  calling ``_integer`` keep working; ``_parameter_error`` is the new helper.
+  when both are bad, as ninja's ``scrudful_list`` 422 already did. Each
+  parameter still goes through ``_integer``, so a subclass calling or
+  overriding it (to clamp ``page_size``, or accept ``page=last``) keeps its
+  behaviour; ``_parameter_error`` is the new helper.
 * ninja: the automatic OPTIONS body and scrudful's own 400, 412 and 428 bodies
   are written by the serving API's renderer (``NinjaAPI(renderer=...)``),
   not Django's ``JsonResponse``, so they have the same bytes as the API's other
