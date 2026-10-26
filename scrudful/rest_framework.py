@@ -325,8 +325,9 @@ class ScrudfulViewFunc:
         context_rel_or_func: Any = None,
         context_type_or_func: Any = None,
         error: Entity | None = None,
-        error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]]
-        | None = None,
+        error_body_func: (
+            Callable[[Any, ConditionalResult], dict[str, Any]] | None
+        ) = None,
         object_validators: bool = False,
         location_func: Callable[..., Any] | None = None,
         creates: bool = False,
