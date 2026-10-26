@@ -124,6 +124,19 @@ class LastPageViewSet(BareViewSet):
     pagination_class = LastPagePagination
 
 
+class LastPageParsePagination(SmallPagination):
+    """``page=last`` through the parsing hook, not ``_integer``."""
+
+    def _parse_parameter(self, request, name, default, maximum):
+        if name == self.page_query_param and request.query_params.get(name) == "last":
+            return Item.objects.count(), None
+        return super()._parse_parameter(request, name, default, maximum)
+
+
+class LastPageParseViewSet(BareViewSet):
+    pagination_class = LastPageParsePagination
+
+
 def none_modified(obj):
     return None
 
@@ -165,6 +178,7 @@ router.register("unordered", UnorderedViewSet, basename="unordered")
 router.register("small", SmallViewSet, basename="small")
 router.register("clamping", ClampingViewSet, basename="clamping")
 router.register("lastpage", LastPageViewSet, basename="lastpage")
+router.register("lastparse", LastPageParseViewSet, basename="lastparse")
 
 ninja_router = Router()
 
@@ -363,6 +377,32 @@ def test_pagination_subclass_integer_override_accepts_last(items, client):
     assert bad.json() == {
         "page_size": ["Ensure this value is less than or equal to 2."]
     }
+
+
+@pytest.mark.parametrize("url", ["/drf/lastpage/", "/drf/lastparse/"])
+def test_pagination_page_last_through_either_hook(items, client, url):
+    response = client.get(url, {"page": "last"})
+    assert response.status_code == 200
+    assert [e["content"]["name"] for e in response.json()["content"]] == ["c"]
+    both = client.get(url, {"page": "x", "page_size": "3"})
+    assert both.status_code == 400
+    assert both.json() == {
+        "page": ["A valid integer is required."],
+        "page_size": ["Ensure this value is less than or equal to 2."],
+    }
+
+
+def test_pagination_parse_parameter_returns_value_and_error(items):
+    def parse(params, name, maximum=None):
+        request = Request(APIRequestFactory().get("/drf/small/", params))
+        return SmallPagination()._parse_parameter(request, name, 7, maximum)
+
+    assert parse({}, "page") == (7, None)
+    assert parse({"page": " 2.0 "}, "page") == (2, None)
+    value, error = parse({"page": "٣"}, "page")
+    assert value is None and error.code == "invalid"
+    value, error = parse({"page_size": "3"}, "page_size", 2)
+    assert value is None and error.code == "max_value"
 
 
 def test_pagination_max_page_size(items, client):

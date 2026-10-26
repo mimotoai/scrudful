@@ -1667,47 +1667,50 @@ class ScrudfulPagination(BasePagination):
 
         :meth:`paginate_queryset` calls it for ``page`` and ``page_size`` and
         merges the errors of both into one ``ValidationError``; a subclass may
-        override it (to clamp ``page_size``, say).
+        override it (to clamp ``page_size``, say), or override
+        :meth:`_parse_parameter`.
 
         Raises
         ------
         rest_framework.exceptions.ValidationError
-            ``{name: [error]}``, the error of :meth:`_parameter_error`.
+            ``{name: [error]}``, the error of :meth:`_parse_parameter`.
         """
-        error = self._parameter_error(request, name, maximum)
+        value, error = self._parse_parameter(request, name, default, maximum)
         if error is not None:
             raise ValidationError({name: [error]})
-        raw = request.query_params.get(name)
-        return default if raw is None else parse_query_int(raw)
+        return value  # type: ignore[return-value]
 
-    def _parameter_error(
-        self, request: Request, name: str, maximum: int | None
-    ) -> ErrorDetail | None:
-        """The error of the query parameter ``name``, ``None`` if it is absent or
-        an integer in ``[1, maximum]``.
+    def _parse_parameter(
+        self, request: Request, name: str, default: int, maximum: int | None
+    ) -> tuple[int, None] | tuple[None, ErrorDetail]:
+        """The query parameter ``name`` parsed once: ``(value, None)``, or
+        ``(None, error)``.
 
-        Its code is ``invalid`` (not an integer), ``min_value`` (below 1) or
-        ``max_value`` (above ``maximum``), as a DRF ``IntegerField``'s. An
-        integer is what django-ninja's ``scrudful_list`` accepts (pydantic's lax
-        ``int``: ``"2.0"`` is 2, ``"٣"`` is not an integer), see
-        :func:`scrudful._adapter.parse_query_int`.
+        ``default`` when it is absent. An integer is what django-ninja's
+        ``scrudful_list`` accepts (pydantic's lax ``int``: ``"2.0"`` is 2,
+        ``"٣"`` is not an integer), see
+        :func:`scrudful._adapter.parse_query_int`. The error's code is
+        ``invalid`` (not an integer), ``min_value`` (below 1) or ``max_value``
+        (above ``maximum``), as a DRF ``IntegerField``'s. A subclass may
+        override it to accept other values (``page=last``, say) by returning
+        their integer.
         """
         raw = request.query_params.get(name)
         if raw is None:
-            return None
+            return default, None
         value = parse_query_int(raw)
         if value is None:
-            return ErrorDetail("A valid integer is required.", code="invalid")
+            return None, ErrorDetail("A valid integer is required.", code="invalid")
         if value < 1:
-            return ErrorDetail(
+            return None, ErrorDetail(
                 "Ensure this value is greater than or equal to 1.", code="min_value"
             )
         if maximum is not None and value > maximum:
-            return ErrorDetail(
+            return None, ErrorDetail(
                 f"Ensure this value is less than or equal to {maximum}.",
                 code="max_value",
             )
-        return None
+        return value, None
 
     def _item_kwargs(self, obj: Any) -> dict[str, Any]:
         """The URL keywords of ``obj``'s detail route, as its callbacks get them.
