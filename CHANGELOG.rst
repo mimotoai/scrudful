@@ -2,6 +2,29 @@
 Changelog
 =========
 
+0.6.1 (since 0.6.0)
+===================
+
+Bug fixes.
+
+* DRF: a create calling ``self.perform_create(serializer, ...)`` with extra
+  arguments (``owner=request.user``, as DRF documents) no longer raises
+  ``TypeError``: the wrapper ``scrudful_viewset`` puts on ``perform_create``
+  passes them through and returns its result, and the 201 still gets the
+  created object's ``Location`` and validators.
+* DRF: ``ScrudfulPagination``'s bad ``page`` and ``page_size`` errors carry
+  the codes of a DRF ``IntegerField``'s (``invalid``, ``min_value``,
+  ``max_value``), with the same messages, and one 400 names both parameters
+  when both are bad, as ninja's ``scrudful_list`` 422 already did. Subclasses
+  calling ``_integer`` keep working; ``_parameter_error`` is the new helper.
+* ninja: the automatic OPTIONS body and scrudful's own 400, 412 and 428 bodies
+  are written by the serving API's renderer (``NinjaAPI(renderer=...)``),
+  not Django's ``JsonResponse``, so they have the same bytes as the API's other
+  responses (separators, escapes). Their ``Content-Type``, Links, ``Allow``
+  and expose headers are unchanged, a 304 still has no body, and a renderer
+  whose ``media_type`` is not JSON content keeps the ``JsonResponse`` bytes.
+  With ninja's default ``JSONRenderer`` the bytes are unchanged.
+
 0.6.0 (since 0.5.0)
 ===================
 
