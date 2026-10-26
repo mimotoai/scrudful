@@ -48,10 +48,12 @@ New
   A sync ``before`` returning an awaitable in a sync operation raises
   ``TypeError``. With ``before``, scrudful runs its own copy of ninja's
   per-operation checks (CSRF flag, authentication, throttles) with ``before``
-  between the last two, so it is a ``ConfigError`` when the operation is
-  built if those checks aren't ninja 1.6/1.7's own (an ``Operation`` subclass
-  overriding ``_run_checks``, a changed ninja) or if a ``decorate_view`` below
-  ``@scrudful_list`` hides the operation (no ``functools.wraps``).
+  between the last two. It is verified against ninja 1.7.x: when the
+  operation is built (at startup), ``before=`` raises ``ConfigError`` if the
+  installed ninja's checks differ from 1.7.x's (pin ``django-ninja<1.8`` or
+  upgrade scrudful), if an ``Operation`` subclass overrides ``_run_checks``,
+  or if a ``decorate_view`` below ``@scrudful_list`` hides the operation (no
+  ``functools.wraps``). So upgrading ninja never silently skips a check.
   ``request.auth`` exists only when an auth callback succeeded: where
   ``before`` may run without one, fail closed (``getattr(request, "auth",
   None)`` and a 401 when it is ``None``). Without ``before`` nothing changes.

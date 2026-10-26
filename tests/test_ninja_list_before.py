@@ -346,13 +346,19 @@ def opaque(run):
 def test_before_with_an_opaque_view_decorator_is_a_config_error():
     """``before`` can't be installed: fail when the operation is built."""
     router = Router()
-    with pytest.raises(ConfigError, match="functools.wraps"):
+    with pytest.raises(ConfigError) as caught:
 
         @router.get("/p/{parent}/items", response=list[ItemOut])
         @scrudful_list(href_func=href, before=Recorder())
         @decorate_view(opaque)
         def list_items(request, parent: int):
             return Item.objects.order_by("pk")
+
+    message = str(caught.value)
+    assert message.startswith("@scrudful_list: test_before_with_an_opaque_")
+    assert "decorate_view decorator below @scrudful_list" in message
+    assert "functools.wraps" in message
+    assert "_run_checks" not in message
 
 
 def test_opaque_view_decorator_without_before_is_fine(items):
@@ -441,8 +447,59 @@ def test_changed_ninja_checks_are_a_config_error(monkeypatch, cls):
         return None
 
     monkeypatch.setattr(cls, "_run_checks", _run_checks)
-    with pytest.raises(ConfigError, match="needs ninja's own Operation._run_checks"):
+    with pytest.raises(ConfigError) as caught:
         list_router(cls is ninja_operation.AsyncOperation, before=Recorder())
+    message = str(caught.value)
+    assert "needs ninja's own Operation._run_checks" in message
+    assert "ninja 1.7.x" in message
+    assert "pin django-ninja<1.8 or upgrade scrudful" in message
+    assert "1.6" not in message
+
+
+def _same_names_run_checks(self, request):
+    """ninja's sync checks with an authentication failure ignored: the same
+    names, locals and arguments, another behaviour."""
+    if self.csrf_exempt:
+        request._ninja_csrf_exempt = True
+    if self.auth_callbacks:
+        error = self._run_authentication(request)
+    if self.throttle_objects:
+        error = self._check_throttles(request)
+        if error:
+            return error
+    return None
+
+
+def _code_fingerprint(func):
+    code = func.__code__
+    return code.co_names, code.co_varnames, code.co_argcount
+
+
+def test_changed_checks_with_the_same_names_are_a_config_error(monkeypatch):
+    original = ninja_operation.Operation._run_checks
+    assert _code_fingerprint(_same_names_run_checks) == _code_fingerprint(original)
+    monkeypatch.setattr(
+        ninja_operation.Operation, "_run_checks", _same_names_run_checks
+    )
+    with pytest.raises(ConfigError, match="needs ninja's own Operation._run_checks"):
+        list_router(before=Recorder())
+
+
+def test_without_source_the_code_fingerprint_is_checked(monkeypatch, items):
+    """Where the source isn't available (e.g. only .pyc installed)."""
+    import scrudful.ninja
+
+    monkeypatch.setattr(scrudful.ninja, "_source_of", lambda func: None)
+    before = Recorder(HttpError(403, "Denied"))
+    response = TestClient(api_for(list_router(before=before))).get("/p/7/items")
+    assert response.status_code == 403
+
+    def _run_checks(self, request):
+        return self._check_permissions(request)
+
+    monkeypatch.setattr(ninja_operation.Operation, "_run_checks", _run_checks)
+    with pytest.raises(ConfigError, match="needs ninja's own Operation._run_checks"):
+        list_router(before=Recorder())
 
 
 def test_router_mounted_with_and_without_auth(items):

@@ -396,8 +396,10 @@ Async operations
 from __future__ import annotations
 
 import functools
+import hashlib
 import inspect
 import re
+import textwrap
 import types
 from collections.abc import Callable, Generator, Iterator, Mapping
 from contextvars import ContextVar
@@ -1181,7 +1183,11 @@ def scrudful_list(
         ``async def`` in an ``async def`` operation; a sync one in an async
         operation runs in a thread. In a sync operation, returning an
         awaitable raises ``TypeError`` (it is closed, never awaited, and the
-        request does not go on).
+        request does not go on). scrudful runs ``before`` in its own copy of
+        ninja's per-operation checks, verified against ninja 1.7.x: on a
+        ninja whose checks differ, ``before=`` raises ``ConfigError`` when the
+        operation is built (at startup), so an upgrade of ninja never
+        silently skips a check; pin ``django-ninja<1.8`` or upgrade scrudful.
 
     Raises
     ------
@@ -1203,7 +1209,9 @@ def scrudful_list(
         ``view_func`` before the decorator bound it (see "Placement" in the
         module docstring). Also with ``before``, if a ``decorate_view``
         decorator below the decorator wraps ``Operation.run`` without
-        ``functools.wraps`` (scrudful then can't install ``before``).
+        ``functools.wraps`` (scrudful then can't install ``before``), if the
+        installed ninja's per-operation checks differ from ninja 1.7.x's, or
+        if an ``Operation`` subclass overrides them.
     """
     if not callable(href_func):
         raise TypeError(f"href_func must be callable, not {type(href_func).__name__}")
@@ -1887,11 +1895,20 @@ def _raised_links_run(
     return decorator
 
 
-#: What scrudful's copy of ninja's checks (:func:`_install_before`) was written
-#: from: the names, local variables and argument count of
-#: ``Operation._run_checks`` and ``AsyncOperation._run_checks``, the same in
-#: ninja 1.6.0 to 1.7.1 on Python 3.10 to 3.14.
-_NINJA_CHECKS = (
+#: The SHA-256 of the dedented source of ninja's own ``Operation._run_checks``
+#: and ``AsyncOperation._run_checks``, which scrudful's copy
+#: (:func:`_install_before`) was written from: ninja 1.7.0 and 1.7.1.
+_NINJA_CHECKS_SOURCES = {
+    "Operation": frozenset(
+        {"8c43cca4686ca0c0cfa7708a592f8732b3faeccd5da7262954749cf6a90f4617"}
+    ),
+    "AsyncOperation": frozenset(
+        {"b31f1e8b8257794593fe5c71249347c5e7a5882d0c5c955275c49420d5c37b2a"}
+    ),
+}
+#: Where the source isn't available: the names, local variables and argument
+#: count of both (the same in ninja 1.7.x on Python 3.10 to 3.14).
+_NINJA_CHECKS_CODE = (
     (
         "csrf_exempt",
         "_ninja_csrf_exempt",
@@ -1905,51 +1922,70 @@ _NINJA_CHECKS = (
 )
 
 
-def _check_ninja_checks(operation: Any, asynchronous: bool, label: str) -> None:
-    """Raise ``ConfigError`` unless ``operation``'s checks are ninja's own, as
-    :func:`_install_before` copies them.
+def _source_of(func: Any) -> str | None:
+    """``func``'s source, dedented, or ``None`` when it isn't available."""
+    try:
+        return textwrap.dedent(inspect.getsource(func))
+    except (OSError, TypeError):
+        return None
 
-    So an ``Operation`` subclass overriding ``_run_checks``, or a ninja whose
-    checks changed, fails when the operation is built instead of losing a
-    check.
+
+def _is_ninja_checks(checks: Any, ninja_class: type) -> bool:
+    """Whether ``checks`` is the code scrudful's copy was written from: by the
+    hash of its source, else (no source) by its names, locals and arguments."""
+    source = _source_of(checks)
+    if source is not None:
+        digest = hashlib.sha256(source.encode()).hexdigest()
+        return digest in _NINJA_CHECKS_SOURCES[ninja_class.__name__]
+    code = getattr(checks, "__code__", None)
+    return (
+        code is not None
+        and (
+            code.co_names,
+            code.co_varnames,
+            code.co_argcount,
+        )
+        == _NINJA_CHECKS_CODE
+    )
+
+
+def _check_ninja_checks(operation: Any, asynchronous: bool, label: str) -> None:
+    """Raise ``ConfigError`` unless ``operation`` can run ``before`` in
+    scrudful's copy of ninja's checks (:func:`_install_before`).
+
+    So an opaque decorator hiding the operation, an ``Operation`` subclass
+    overriding ``_run_checks``, or a ninja whose checks changed fails when the
+    operation is built instead of losing ``before`` or a check.
     """
     if operation is None:
+        raise ConfigError(
+            f"{label}: before= can't be installed: scrudful can't find the "
+            "ninja operation through Operation.run, because a decorate_view "
+            "decorator below @scrudful_list wraps it without functools.wraps. "
+            "Use functools.wraps in that decorator, or apply decorate_view "
+            "above the operation decorator."
+        )
+    ninja_class = AsyncOperation if asynchronous else Operation
+    checks = getattr(type(operation), "_run_checks", None)
+    if "_run_checks" in vars(operation):
+        reason = "the operation has its own _run_checks"
+    elif checks is not ninja_class._run_checks:
         reason = (
-            "scrudful can't find the operation through Operation.run: a "
-            "decorate_view decorator below the scrudful decorator wraps it "
-            "without functools.wraps. Use functools.wraps in that decorator, "
-            "or apply decorate_view above the operation decorator"
+            f"{type(operation).__qualname__} overrides _run_checks of "
+            f"ninja's {ninja_class.__name__}"
+        )
+    elif not _is_ninja_checks(checks, ninja_class):
+        reason = (
+            "the installed ninja's checks differ from ninja 1.7.x's, which "
+            "scrudful's before= is verified against: pin django-ninja<1.8 or "
+            "upgrade scrudful"
         )
     else:
-        ninja_class = AsyncOperation if asynchronous else Operation
-        checks = getattr(type(operation), "_run_checks", None)
-        code = getattr(checks, "__code__", None)
-        if "_run_checks" in vars(operation):
-            reason = "the operation has its own _run_checks"
-        elif checks is not ninja_class._run_checks:
-            reason = (
-                f"{type(operation).__qualname__} overrides _run_checks of "
-                f"ninja's {ninja_class.__name__}"
-            )
-        elif (
-            code is None
-            or (
-                code.co_names,
-                code.co_varnames,
-                code.co_argcount,
-            )
-            != _NINJA_CHECKS
-        ):
-            reason = (
-                "the installed ninja's checks differ from those scrudful runs "
-                "before in (ninja 1.6 to 1.7)"
-            )
-        else:
-            return
+        return
     raise ConfigError(
-        f"{label}: before= needs ninja's own Operation._run_checks, which "
-        f"scrudful runs with before between authentication and throttling; "
-        f"{reason}."
+        f"{label}: before= needs ninja's own Operation._run_checks (ninja "
+        f"1.7.x), which scrudful runs with before between authentication and "
+        f"throttling; {reason}."
     )
 
 

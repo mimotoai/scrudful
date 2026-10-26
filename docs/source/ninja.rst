@@ -446,7 +446,11 @@ its error nor that 422 passes through the decorators added with
 ``add_decorator(mode="operation")``. scrudful installs ``before`` through
 ``Operation.run``: a ``decorate_view`` decorator below ``@scrudful_list``
 must use ``functools.wraps`` (``ConfigError`` otherwise, when the operation is
-built).
+built). ``before`` runs in scrudful's own copy of ninja's per-operation checks
+(CSRF flag, authentication, throttles), verified against ninja 1.7.x: on a
+ninja whose checks differ, or with an ``Operation`` subclass overriding them,
+``before=`` raises ``ConfigError`` at startup instead of skipping a check. Pin
+``django-ninja<1.8`` or upgrade scrudful then.
 
 .. code-block:: python
 
