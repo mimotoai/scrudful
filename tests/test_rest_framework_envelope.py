@@ -8,7 +8,9 @@ from items.models import Item
 from ninja import NinjaAPI, Router, Schema
 from rest_framework import serializers, viewsets
 from rest_framework.routers import SimpleRouter
-from rest_framework.test import APIClient
+from rest_framework.exceptions import ValidationError
+from rest_framework.request import Request
+from rest_framework.test import APIClient, APIRequestFactory
 
 from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS
 from scrudful.ninja import scrudful_list
@@ -253,6 +255,60 @@ def test_pagination_bad_page_size_is_400(items, client):
     response = client.get("/drf/small/", {"page_size": 3})
     assert response.status_code == 400
     assert list(response.json()) == ["page_size"]
+
+
+@pytest.mark.parametrize(
+    "params, name, message, code",
+    [
+        ({"page": "x"}, "page", "A valid integer is required.", "invalid"),
+        ({"page": "1.5"}, "page", "A valid integer is required.", "invalid"),
+        ({"page": ""}, "page", "A valid integer is required.", "invalid"),
+        (
+            {"page": "0"},
+            "page",
+            "Ensure this value is greater than or equal to 1.",
+            "min_value",
+        ),
+        ({"page_size": "y"}, "page_size", "A valid integer is required.", "invalid"),
+        (
+            {"page_size": "-1"},
+            "page_size",
+            "Ensure this value is greater than or equal to 1.",
+            "min_value",
+        ),
+        (
+            {"page_size": "3"},
+            "page_size",
+            "Ensure this value is less than or equal to 2.",
+            "max_value",
+        ),
+    ],
+)
+def test_pagination_errors_carry_codes(items, params, name, message, code):
+    request = Request(APIRequestFactory().get("/drf/small/", params))
+    with pytest.raises(ValidationError) as caught:
+        SmallPagination().paginate_queryset(Item.objects.all(), request, SmallViewSet())
+    assert caught.value.detail == {name: [message]}
+    assert caught.value.get_codes() == {name: [code]}
+
+
+def test_pagination_reports_both_bad_parameters(items, client):
+    response = client.get("/drf/small/", {"page": "x", "page_size": "3"})
+    assert response.status_code == 400
+    assert response.json() == {
+        "page": ["A valid integer is required."],
+        "page_size": ["Ensure this value is less than or equal to 2."],
+    }
+
+
+def test_pagination_integer_helper_still_raises_with_code(items):
+    request = Request(APIRequestFactory().get("/drf/small/", {"page_size": "0"}))
+    with pytest.raises(ValidationError) as caught:
+        SmallPagination()._integer(request, "page_size", 1, 2)
+    assert caught.value.get_codes() == {"page_size": ["min_value"]}
+    request = Request(APIRequestFactory().get("/drf/small/", {"page_size": "2"}))
+    assert SmallPagination()._integer(request, "page_size", 1, 2) == 2
+    assert SmallPagination()._integer(request, "page", 7, None) == 7
 
 
 def test_pagination_max_page_size(items, client):

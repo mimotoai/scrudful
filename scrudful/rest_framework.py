@@ -107,7 +107,12 @@ from typing import Any
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.http import Http404, HttpRequest, HttpResponseBase
 from django.utils.encoding import iri_to_uri
-from rest_framework.exceptions import APIException, NotFound, ValidationError
+from rest_framework.exceptions import (
+    APIException,
+    ErrorDetail,
+    NotFound,
+    ValidationError,
+)
 from rest_framework.decorators import api_view
 from rest_framework.metadata import BaseMetadata, SimpleMetadata
 from rest_framework.mixins import UpdateModelMixin
@@ -1543,8 +1548,10 @@ class ScrudfulPagination(BasePagination):
     as the URL keyword (``pk=...``).
 
     A non-integer or out of range ``page`` or ``page_size`` is a 400 naming
-    the parameter; a ``page`` past the last one is a 404 (page 1 always
-    exists).
+    the parameter (both, when both are bad), each error with the code of a DRF
+    ``IntegerField``'s: ``invalid`` (not an integer), ``min_value`` (below 1)
+    or ``max_value`` (``page_size`` above ``max_page_size``). A ``page`` past
+    the last one is a 404 (page 1 always exists).
     """
 
     page_size = 100
@@ -1563,6 +1570,17 @@ class ScrudfulPagination(BasePagination):
                 f"{type(view).__name__} uses ScrudfulPagination: it needs "
                 "Meta.href_func(view, request, obj), returning an item's URL"
             )
+        # Both parameters are checked before raising, so one 400 names both.
+        errors = {}
+        for name, maximum in (
+            (self.page_query_param, None),
+            (self.page_size_query_param, self.max_page_size),
+        ):
+            error = self._parameter_error(request, name, maximum)
+            if error is not None:
+                errors[name] = [error]
+        if errors:
+            raise ValidationError(errors)
         number = self._integer(request, self.page_query_param, 1, None)
         size = self._integer(
             request, self.page_size_query_param, self.page_size, self.max_page_size
@@ -1640,23 +1658,45 @@ class ScrudfulPagination(BasePagination):
     def _integer(
         self, request: Request, name: str, default: int, maximum: int | None
     ) -> int:
-        """The query parameter ``name`` as an integer in ``[1, maximum]``."""
+        """The query parameter ``name`` as an integer in ``[1, maximum]``.
+
+        Raises
+        ------
+        rest_framework.exceptions.ValidationError
+            ``{name: [error]}``, the error of :meth:`_parameter_error`.
+        """
+        error = self._parameter_error(request, name, maximum)
+        if error is not None:
+            raise ValidationError({name: [error]})
+        raw = request.query_params.get(name)
+        return default if raw is None else int(raw)
+
+    def _parameter_error(
+        self, request: Request, name: str, maximum: int | None
+    ) -> ErrorDetail | None:
+        """The error of the query parameter ``name``, ``None`` if it is absent or
+        an integer in ``[1, maximum]``.
+
+        Its code is ``invalid`` (not an integer), ``min_value`` (below 1) or
+        ``max_value`` (above ``maximum``), as a DRF ``IntegerField``'s.
+        """
         raw = request.query_params.get(name)
         if raw is None:
-            return default
+            return None
         try:
             value = int(raw)
         except ValueError:
-            raise ValidationError({name: ["A valid integer is required."]}) from None
+            return ErrorDetail("A valid integer is required.", code="invalid")
         if value < 1:
-            raise ValidationError(
-                {name: ["Ensure this value is greater than or equal to 1."]}
+            return ErrorDetail(
+                "Ensure this value is greater than or equal to 1.", code="min_value"
             )
         if maximum is not None and value > maximum:
-            raise ValidationError(
-                {name: [f"Ensure this value is less than or equal to {maximum}."]}
+            return ErrorDetail(
+                f"Ensure this value is less than or equal to {maximum}.",
+                code="max_value",
             )
-        return value
+        return None
 
     def _item_kwargs(self, obj: Any) -> dict[str, Any]:
         """The URL keywords of ``obj``'s detail route, as its callbacks get them.

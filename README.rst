@@ -230,8 +230,10 @@ entries' ``etag`` and ``last_modified`` come from ``Meta.etag_func(obj)`` and
 ``Meta.last_modified_func(obj)`` (otherwise they are ``null``), and ``link``
 holds the item schema and context links of ``Meta`` (their callbacks get the
 object's lookup value as the URL keyword). ``page`` (at least 1, default 1) and
-``page_size`` (1 to ``max_page_size``; default 100, maximum 1000) outside their
-range are a 400, and a page past the last one a 404. Give the view an ordered
+``page_size`` (1 to ``max_page_size``; default 100, maximum 1000) that are not
+integers or are outside their range are one 400 naming each bad parameter, with
+DRF's ``IntegerField`` codes (``invalid``, ``min_value``, ``max_value``) on the
+errors, and a page past the last one is a 404. Give the view an ordered
 queryset: an unordered one warns, as with Django's ``Paginator``.
 
 .. code-block:: python

@@ -425,7 +425,8 @@ so ninja's validation and OpenAPI describe the real body:
 
 Each entry's ``etag``, ``last_modified`` and ``link`` come from the same item
 callbacks as the detail GET. ``page`` and ``page_size`` (default 100, at most
-1000) are query parameters. The optional list validators are called with the
+1000) are query parameters; bad values are ninja's 422 validation error,
+listing every bad parameter. The optional list validators are called with the
 queryset, and then a list can answer 304.
 
 The collection response is a list, set or tuple of the item schema
