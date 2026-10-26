@@ -467,11 +467,11 @@ only by the names, local variables and arguments they use. On a ninja whose
 code differs, or with an ``Operation`` subclass overriding either method,
 ``before=`` raises ``ConfigError`` at startup instead of skipping a check:
 upgrade scrudful, or keep ninja at a verified release (an app using
-``before=`` should lock its ninja version). Without ``before=`` the check is
-never made. Each request is checked too: one that reaches the operation's
-function without ``before`` having allowed it (ninja served a copy of the
-operation without scrudful's checks) fails with ``RuntimeError``, never goes
-on unchecked.
+``before=`` should lock its ninja version). Without ``before=`` or
+``after_throttles=`` the check is never made. Each request is checked too:
+one that reaches the operation's function without the hooks having allowed it
+(ninja served a copy of the operation without scrudful's checks) fails with
+``RuntimeError``, never goes on unchecked.
 
 Here the API's auth callback returns the caller's ``rbac_context`` (a
 string, as in the example project), and the path names the context listed.

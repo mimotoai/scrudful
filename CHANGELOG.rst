@@ -6,7 +6,8 @@ Changelog
 ===================
 
 Additive and backwards compatible: an operation without ``after_throttles=``
-behaves exactly as in 0.7.0.
+behaves as in 0.7.0, except that the ``RuntimeError`` raised when ``before``
+can't get the path parameters now names the hook as ``before=``.
 
 New
 ---
