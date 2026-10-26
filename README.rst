@@ -34,7 +34,7 @@ Installation
 .. code-block:: console
 
     $ pip install "scrudful[drf]"      # Django >= 4.2, djangorestframework >= 3.15
-    $ pip install "scrudful[ninja]"    # Django >= 4.2, django-ninja >= 1.7, < 2
+    $ pip install "scrudful[ninja]"    # Django >= 4.2, django-ninja 1.7.x
     $ pip install "scrudful[fastapi]"  # fastapi >= 0.100
 
 Python 3.10 or newer is required.
