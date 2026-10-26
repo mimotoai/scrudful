@@ -429,6 +429,29 @@ callbacks as the detail GET. ``page`` and ``page_size`` (default 100, at most
 listing every bad parameter. The optional list validators are called with the
 queryset, and then a list can answer 304.
 
+ninja validates query parameters before the operation runs, so a bad ``page``
+would be a 422 even for a client the list must refuse. ``before=`` runs first:
+``before(request, **params)`` gets the operation's parameters (as ``load``
+does, without ``page`` and ``page_size``), once per request, before those two
+are validated and before the handler. Raise ``HttpError(401, ...)`` or
+``HttpError(403, ...)`` there to answer as DRF does, whose permission checks
+come before its pagination. Afterwards the operation validates ``page`` and
+``page_size`` itself, with the same 422 (built by the API's
+``validation_error_from_error_contexts``), and the OpenAPI description is the
+same as without ``before``. The operation's other parameters are still
+validated by ninja before ``before`` runs.
+
+.. code-block:: python
+
+    def authorize(request, **params):
+        if not request.user.has_perm("items.view_item"):
+            raise HttpError(403, "Forbidden")
+
+    @router.get("/items", response=List[ItemOut])
+    @scrudful_list(href_func=item_href, before=authorize)
+    def list_items(request):
+        return Item.objects.order_by("pk")
+
 The collection response is a list, set or tuple of the item schema
 (``List[RoleOut]``, ``list[RoleOut]``). ``Optional[List[RoleOut]]`` or another
 union raises ``ConfigError`` when the operation is built, since the envelope is

@@ -222,7 +222,9 @@ Collections
     - The query parameters ``page`` (from 1) and ``page_size`` (``page_size``
       by default, at most ``max_page_size``) are added to the operation and
       not passed to the handler. Invalid values are answered with 422 by
-      ninja, a page past the last one with 404 (page 1 always exists).
+      ninja, a page past the last one with 404 (page 1 always exists). A
+      ``before`` callable runs before they are validated (see
+      :func:`scrudful_list`), e.g. to answer 401 or 403 first.
     - ``count`` is ``queryset.count()`` for a ``QuerySet``, else ``len()``;
       ``page_count`` is ``ceil(count / page_size)``. An unordered
       ``QuerySet`` (no ``order_by()`` and no ``Meta.ordering``) gets Django's
@@ -401,7 +403,7 @@ from collections.abc import Callable, Generator, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
-from typing import Any, NamedTuple, TypeVar, Union, get_args, get_origin
+from typing import Annotated, Any, NamedTuple, TypeVar, Union, get_args, get_origin
 
 from asgiref.sync import async_to_sync, sync_to_async
 from django.http import (
@@ -417,7 +419,8 @@ from ninja.constants import NOT_SET
 from ninja.errors import ConfigError, HttpError
 from ninja.signature.details import is_collection_type
 from ninja.signature.utils import get_path_param_names
-from pydantic import Field, create_model
+from pydantic import Field, WithJsonSchema, create_model
+from pydantic import ValidationError as PydanticValidationError
 
 from scrudful import _adapter
 from scrudful._adapter import (
@@ -633,6 +636,9 @@ class _Config:
     #: A list operation's default and maximum ``page_size``.
     page_size: int | None = None
     max_page_size: int | None = None
+    #: ``before(request, **params)`` of a list operation: run before its
+    #: ``page`` and ``page_size`` are validated.
+    before: Callable[..., Any] | None = None
 
     @property
     def entity(self) -> Entity:
@@ -1036,6 +1042,7 @@ def scrudful_list(
     max_page_size: int = 1000,
     error: Entity | None = None,
     error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
+    before: Callable[..., Any] | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation listing a collection (GET on a list).
 
@@ -1149,16 +1156,33 @@ def scrudful_list(
         problem details (pair it with
         ``error=Entity(media_type=PROBLEM_JSON)``). Without it the bodies are
         as before.
+    before : callable, optional
+        ``before(request, **params)``, called with the operation's parameters
+        (as ``load`` is: path and query parameters by name, without ``page``
+        and ``page_size``) once per request, before ``page`` and
+        ``page_size`` are validated, and before the handler; its return value
+        is ignored. Raise ninja's ``HttpError`` (or another exception the API
+        handles) there to answer first, e.g. a 401 or 403 that must win over
+        the 422 of a bad page parameter, as DRF checks permissions before it
+        paginates. It is called whatever the page parameters are. The
+        operation then validates them itself, with the 422 ninja gives
+        without ``before`` (built by the API's
+        ``validation_error_from_error_contexts``); the operation's other
+        parameters are still validated by ninja before it runs, so their
+        errors come first and are reported without the page parameters'.
+        The OpenAPI description is unchanged. It may be ``async def`` in an
+        ``async def`` operation; a sync one in an async operation runs in a
+        thread.
 
     Raises
     ------
     TypeError
-        If ``href_func`` or a validator callback isn't callable, if
+        If ``href_func``, ``before`` or a validator callback isn't callable, if
         ``page_size`` or ``max_page_size`` isn't an ``int``, if ``error``
         isn't an :class:`Entity`, if the handler is a generator or already a
         ninja operation (the decorator sits above the operation decorator),
         or if the handler is sync and ``href_func``, a validator callback or
-        a link callable (also inside ``error``) is ``async def``.
+        a link callable (also inside ``error``) or ``before`` is ``async def``.
     ValueError
         If ``page_size`` is less than 1 or ``max_page_size`` less than
         ``page_size``, or if ``error``'s media type is not JSON content.
@@ -1176,6 +1200,7 @@ def scrudful_list(
     for name, func in (
         ("list_etag_func", list_etag_func),
         ("list_last_modified_func", list_last_modified_func),
+        ("before", before),
     ):
         if func is not None and not callable(func):
             raise TypeError(f"{name} must be callable, not {type(func).__name__}")
@@ -1215,6 +1240,7 @@ def scrudful_list(
         ),
         page_size=page_size,
         max_page_size=max_page_size,
+        before=before,
     )
     return _decorator(config, "@scrudful_list")
 
@@ -1413,6 +1439,10 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             params = {
                 name: value for name, value in values.items() if name != response_name
             }
+            if config.before is not None:
+                yield config.before, (request,), params
+                if pagination is not None:
+                    pagination = _validate_pagination(config, pagination)
             meta = ScrudfulResponse()
             if hidden.meta_name is not None:
                 values[hidden.meta_name] = meta
@@ -1624,7 +1654,15 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             # (as ninja's ``contribute_operation_args`` does, on a fresh list).
             wrapper._ninja_contribute_args = [  # type: ignore[attr-defined]
                 *getattr(handler, "_ninja_contribute_args", []),
-                (_PAGINATION, _pagination_model(config), Query(...)),
+                (
+                    _PAGINATION,
+                    (
+                        _pagination_model(config)
+                        if config.before is None
+                        else _unvalidated_pagination_model(config)
+                    ),
+                    Query(...),
+                ),
             ]
         return wrapper  # type: ignore[return-value]
 
@@ -2031,6 +2069,71 @@ def _pagination_model(config: _Config) -> type[Schema]:
     )
 
 
+def _unvalidated_pagination_model(config: _Config) -> type[Schema]:
+    """:func:`_pagination_model` with the values left as ninja reads them.
+
+    For a list operation with ``before``, which validates them itself (see
+    :func:`_validate_pagination`). The fields' JSON Schemas are those of
+    :func:`_pagination_model`, so the OpenAPI description is the same.
+    """
+    model = _pagination_model(config)
+    properties = model.model_json_schema()["properties"]
+    fields: dict[str, Any] = {}
+    for name, info in model.model_fields.items():
+        # The field's default and title are added back from Field and name.
+        schema = {
+            key: value
+            for key, value in properties[name].items()
+            if key not in ("default", "title")
+        }
+        fields[name] = (Annotated[Any, WithJsonSchema(schema)], Field(info.default))
+    return create_model(  # type: ignore[call-overload,no-any-return]
+        "ScrudfulPagination", __base__=Schema, **fields
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _query_pagination_model(page_size: int, max_page_size: int) -> type[Schema]:
+    """:func:`_pagination_model` for these sizes, located as the query model
+    ninja builds locates its errors (``("query", name)``)."""
+    model = _pagination_model(
+        _Config(kind="list", page_size=page_size, max_page_size=max_page_size)
+    )
+    model.__ninja_param_source__ = "query"  # type: ignore[attr-defined]
+    model.__ninja_flatten_map_reverse__ = {}  # type: ignore[attr-defined]
+    return model
+
+
+def _validate_pagination(config: _Config, raw: Any) -> Any:
+    """The page parameters ``raw`` validated, as ninja validates them without
+    ``before``.
+
+    Raises
+    ------
+    ninja.errors.ValidationError
+        The 422 ninja gives for them, built by the serving API's
+        ``validation_error_from_error_contexts`` with the query parameters'
+        source, so a custom builder sees them as it would.
+    """
+    model = _query_pagination_model(config.page_size, config.max_page_size)
+    try:
+        return model.model_validate(
+            {name: getattr(raw, name) for name in model.model_fields}
+        )
+    except PydanticValidationError as exc:
+        context = ninja_errors.ValidationErrorContext(
+            pydantic_validation_error=exc, model=model
+        )
+        api = _SERVING_API.get()
+        if api is None:
+            # Not served by an API (see _operation_of): ninja's default, which
+            # uses no state of the API.
+            raise NinjaAPI.validation_error_from_error_contexts(
+                None, [context]  # type: ignore[arg-type]
+            ) from None
+        raise api.validation_error_from_error_contexts([context]) from None
+
+
 def _page(
     config: _Config, request: HttpRequest, queryset: Any, pagination: Any
 ) -> _Flow[dict[str, Any]]:
@@ -2223,6 +2326,7 @@ def _check_sync_callables(config: _Config, handler: Callable[..., Any]) -> None:
 def _declared_callables(config: _Config) -> Iterator[tuple[str, Any]]:
     """``(name, value)`` of every argument that may be a callable."""
     yield "load", config.load
+    yield "before", config.before
     yield "location_func", config.location_func
     yield "href_func", config.href_func
     yield "etag_func", config.etag_func
