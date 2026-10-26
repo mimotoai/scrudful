@@ -447,24 +447,31 @@ its error nor that 422 passes through the decorators added with
 ``Operation.run``: a ``decorate_view`` decorator below ``@scrudful_list``
 must use ``functools.wraps`` (``ConfigError`` otherwise, when the operation is
 built). ``before`` runs in scrudful's own copy of ninja's per-operation checks
-(CSRF flag, authentication, throttles), verified against ninja 1.7.x: on a
-ninja whose checks differ, or with an ``Operation`` subclass overriding them,
-``before=`` raises ``ConfigError`` at startup instead of skipping a check. Pin
-``django-ninja<1.8`` or upgrade scrudful then.
+(CSRF flag, authentication, throttles), verified against ninja 1.7.x, the
+range scrudful's ``ninja`` extra allows. When the operation is built, scrudful
+compares ninja's checks with 1.7.x's: by a digest of their source (comments
+and blank lines aside), or, where the source isn't installed (``.pyc`` only),
+only by the names, local variables and arguments they use. On a ninja whose
+checks differ, or with an ``Operation`` subclass overriding them, ``before=``
+raises ``ConfigError`` at startup instead of skipping a check: upgrade
+scrudful then.
+
+Here the API's auth callback returns the caller's ``rbac_context``, and the
+path names the context listed:
 
 .. code-block:: python
 
-    def authorize(request, **path_params):
-        user = getattr(request, "auth", None)
-        if user is None:  # no auth callback succeeded: fail closed
+    def same_context(request, **path_params):
+        context = getattr(request, "auth", None)
+        if context is None:  # no auth callback succeeded: fail closed
             raise HttpError(401, "Unauthorized")
-        if not user.has_perm("items.view_item"):
+        if path_params["context"] != str(context):
             raise HttpError(403, "Forbidden")
 
-    @router.get("/items", response=List[ItemOut])
-    @scrudful_list(href_func=item_href, before=authorize)
-    def list_items(request):
-        return Item.objects.order_by("pk")
+    @roles.get("/contexts/{context}/roles", response=List[RoleOut])
+    @scrudful_list(href_func=role_href, before=same_context)
+    def list_context_roles(request, context: int):
+        return Role.objects.filter(rbac_context=context).order_by("pk")
 
 The collection response is a list, set or tuple of the item schema
 (``List[RoleOut]``, ``list[RoleOut]``). ``Optional[List[RoleOut]]`` or another
