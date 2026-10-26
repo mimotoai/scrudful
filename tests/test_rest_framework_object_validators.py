@@ -4,6 +4,7 @@ import pytest
 from django.urls import include, path
 from rest_framework import generics, serializers, viewsets
 from rest_framework.permissions import BasePermission
+from rest_framework.response import Response
 from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient
 
@@ -165,6 +166,22 @@ class NoLocationViewSet(viewsets.ModelViewSet):
         etag_func = object_etag
 
 
+@scrudful_viewset
+class ExtraArgsCreateViewSet(CreateViewSet):
+    """A create passing extra arguments to ``perform_create``, as DRF documents."""
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        result = self.perform_create(serializer, "extra", description="from kwargs")
+        calls.append(("result", result))
+        return Response(serializer.data, status=201)
+
+    def perform_create(self, serializer, suffix, **kwargs):
+        serializer.save(name=f"{serializer.validated_data['name']}-{suffix}", **kwargs)
+        return "performed"
+
+
 class ManyViewSet(CreateViewSet):
     def get_serializer(self, *args, **kwargs):
         if isinstance(kwargs.get("data"), list):
@@ -187,6 +204,7 @@ class ProblemViewSet(viewsets.ModelViewSet):
 router = SimpleRouter()
 router.register("problems", ProblemViewSet, basename="problem")
 router.register("many", ManyViewSet, basename="many")
+router.register("extras", ExtraArgsCreateViewSet, basename="extra")
 router.register("nolocs", NoLocationViewSet, basename="noloc")
 router.register("creates", CreateViewSet, basename="create")
 router.register("keeps", KeepLocationViewSet, basename="keep")
@@ -429,6 +447,17 @@ def test_create_without_location_func_sends_validators_only(client):
     post = client.options("/nolocs/").json()["post"]
     assert list(post["responses"]) == ["201"]
     assert "parameters" not in post
+
+
+def test_create_forwards_perform_create_arguments(client):
+    response = client.post("/extras/", {"name": "new"}, format="json")
+    assert response.status_code == 201
+    created = Item.objects.get(name="new-extra")
+    assert created.description == "from kwargs"
+    assert ("result", "performed") in calls
+    assert response["ETag"] == f'"v{created.version}"'
+    assert response["Location"] == f"/created/{created.pk}/%20%C3%A9"
+    assert "Last-Modified" in response
 
 
 def test_many_create_gets_no_location_or_validators(client):

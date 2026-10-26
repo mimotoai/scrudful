@@ -84,7 +84,8 @@ Validators
     with 400, a failed precondition with 412 and a matching GET/HEAD with 304
     carrying the validators. POST is evaluated but never required to be
     conditional. These early responses are returned without calling the
-    handler, as a ``JsonResponse`` (304 without a body), so the operation's
+    handler, their JSON bodies written by the API's renderer (304 without a
+    body; see "The API's renderer" in the documentation), so the operation's
     ``response`` schema does not apply to them. With ``error=Entity(...)``
     the 400, 412 and 428 bodies carry that entity's Links (its link callables
     get the loaded object) and are served with its media type, which must be
@@ -221,7 +222,9 @@ Collections
     - The query parameters ``page`` (from 1) and ``page_size`` (``page_size``
       by default, at most ``max_page_size``) are added to the operation and
       not passed to the handler. Invalid values are answered with 422 by
-      ninja, a page past the last one with 404 (page 1 always exists).
+      ninja, a page past the last one with 404 (page 1 always exists). A
+      ``before`` callable runs before ninja validates any parameter (see
+      :func:`scrudful_list`), e.g. to answer 401 or 403 first.
     - ``count`` is ``queryset.count()`` for a ``QuerySet``, else ``len()``;
       ``page_count`` is ``ceil(count / page_size)``. An unordered
       ``QuerySet`` (no ``order_by()`` and no ``Meta.ordering``) gets Django's
@@ -392,29 +395,47 @@ Async operations
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import functools
+import hashlib
 import inspect
+import io
+import json
 import re
+import textwrap
+import tokenize
 import types
 from collections.abc import Callable, Generator, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
-from typing import Any, NamedTuple, TypeVar, Union, get_args, get_origin
+from typing import (
+    Any,
+    NamedTuple,
+    NoReturn,
+    TypeVar,
+    Union,
+    get_args,
+    get_origin,
+)
 
 from asgiref.sync import async_to_sync, sync_to_async
+from django.core.serializers.json import DjangoJSONEncoder
 from django.http import (
     Http404,
     HttpRequest,
     HttpResponse,
     HttpResponseBase,
-    JsonResponse,
 )
 from django.utils.encoding import iri_to_uri
 from ninja import NinjaAPI, Query, Router, Schema, Status
 from ninja import errors as ninja_errors
 from ninja.constants import NOT_SET
 from ninja.errors import ConfigError, HttpError
+from ninja.operation import AsyncOperation, Operation
+from ninja.renderers import JSONRenderer
+from ninja.responses import NinjaJSONEncoder
 from ninja.signature.details import is_collection_type
 from ninja.signature.utils import get_path_param_names
 from pydantic import Field, create_model
@@ -439,17 +460,21 @@ from scrudful._adapter import (
     expose_headers,
     has_default_entity,
     is_json,
+    is_json_syntax,
     merge_links,
     options_links,
     resolve_annotation,
     resolved_signature,
     set_validator_headers,
     validator_policy,
+    with_charset,
     with_error_body,
 )
 from scrudful._django import (
+    Render,
     aware,
     conditional_response,
+    json_response,
     page_url,
     precondition_headers,
     slice_page,
@@ -632,6 +657,10 @@ class _Config:
     #: A list operation's default and maximum ``page_size``.
     page_size: int | None = None
     max_page_size: int | None = None
+    #: ``before(request, **path_params)`` of a list operation: run after
+    #: authentication, before throttling and before any parameter is
+    #: validated (see :func:`_install_before`).
+    before: Callable[..., Any] | None = None
 
     @property
     def entity(self) -> Entity:
@@ -1035,13 +1064,15 @@ def scrudful_list(
     max_page_size: int = 1000,
     error: Entity | None = None,
     error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
+    before: Callable[..., Any] | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation listing a collection (GET on a list).
 
     ``@scrudful_list(...)`` must sit *below* the operation decorator, which
     must declare a collection response (as for ninja's ``@paginate``)::
 
-        @router.get("/items", response=List[ItemOut])
+        # auth=: request.auth exists only when an auth callback succeeded.
+        @router.get("/items", response=List[ItemOut], auth=...)
         @scrudful_list(
             href_func=lambda request, item: request.build_absolute_uri(
                 f"/items/{item.pk}"
@@ -1148,16 +1179,55 @@ def scrudful_list(
         problem details (pair it with
         ``error=Entity(media_type=PROBLEM_JSON)``). Without it the bodies are
         as before.
+    before : callable, optional
+        ``before(request, **path_params)``, called once per request where DRF
+        checks permissions: after ninja's authentication, before its
+        throttles and before it validates any parameter of the operation
+        (path, query or body) or calls its function. ``path_params`` are the
+        URL's values, not validated yet (strings, unless the path uses a
+        converter such as ``{int:pk}``): ``"07"``, ``"+7"`` and ``" 7"`` are
+        all 7 to an ``int`` parameter. Never deny by testing a raw string for
+        a value: compare the value the function gets (declare the parameter
+        ``str``), or parse it as its type does and refuse what doesn't
+        parse. ``request.auth`` is set only when an
+        auth callback succeeded: on an operation that may run without
+        ``auth``, fail closed (``user = getattr(request, "auth", None)``, and
+        ``raise HttpError(401, ...)`` when it is ``None``) before using it.
+        It returns ``None`` to let the request go on; anything else it
+        returns (``False``, a response) raises ``TypeError``, as a refusal is
+        raised, never returned. Raise ninja's ``HttpError`` (or another
+        exception the API handles) to answer first, e.g. with 401 or 403 whatever the
+        parameters are; the API's exception handler answers it, as ninja
+        answers its own errors, an ``HttpError`` gets the operation's error
+        Links as when the operation raises it, and the request uses none of
+        a throttle's quota. When it returns, ninja throttles and validates
+        every parameter as without ``before``: one 422 lists every bad one,
+        ``page`` and ``page_size`` included, and the OpenAPI description is
+        the same. Neither its error nor that 422 passes through the
+        decorators added with ``add_decorator(mode="operation")``. It may be
+        ``async def`` in an ``async def`` operation; a sync one in an async
+        operation runs in a thread. In a sync operation, returning an
+        awaitable raises ``TypeError``, and the request does not go on (a
+        coroutine is closed and a future cancelled: never awaited). scrudful
+        runs ``before`` in its own copy of ninja's per-operation checks,
+        verified against ninja 1.7.0 and 1.7.1, though the ``ninja`` extra
+        allows any ninja from 1.7 below 2: on a ninja whose checks, or
+        whose ``Operation.run`` calling them, differ (compared by a digest
+        of their source,
+        comments, docstrings and blank lines aside, or, without installed
+        source, only by the names, locals and arguments they use),
+        ``before=`` raises ``ConfigError`` when the operation is built (at
+        startup); upgrade scrudful then, or keep ninja at a verified release.
 
     Raises
     ------
     TypeError
-        If ``href_func`` or a validator callback isn't callable, if
+        If ``href_func``, ``before`` or a validator callback isn't callable, if
         ``page_size`` or ``max_page_size`` isn't an ``int``, if ``error``
         isn't an :class:`Entity`, if the handler is a generator or already a
         ninja operation (the decorator sits above the operation decorator),
         or if the handler is sync and ``href_func``, a validator callback or
-        a link callable (also inside ``error``) is ``async def``.
+        a link callable (also inside ``error``) or ``before`` is ``async def``.
     ValueError
         If ``page_size`` is less than 1 or ``max_page_size`` less than
         ``page_size``, or if ``error``'s media type is not JSON content.
@@ -1167,7 +1237,12 @@ def scrudful_list(
         ``Optional[List[ItemOut]]``: the envelope is never ``None``) or names
         no item type (a bare ``list``), or if something replaced its
         ``view_func`` before the decorator bound it (see "Placement" in the
-        module docstring).
+        module docstring). Also with ``before``, if a ``decorate_view``
+        decorator below the decorator wraps ``Operation.run`` without
+        ``functools.wraps`` (scrudful then can't install ``before``), if the
+        installed ninja's per-operation checks, or the ``Operation.run``
+        calling them, differ from ninja 1.7.0's and 1.7.1's, or if an
+        ``Operation`` subclass overrides either.
     """
     if not callable(href_func):
         raise TypeError(f"href_func must be callable, not {type(href_func).__name__}")
@@ -1175,6 +1250,7 @@ def scrudful_list(
     for name, func in (
         ("list_etag_func", list_etag_func),
         ("list_last_modified_func", list_last_modified_func),
+        ("before", before),
     ):
         if func is not None and not callable(func):
             raise TypeError(f"{name} must be callable, not {type(func).__name__}")
@@ -1214,6 +1290,7 @@ def scrudful_list(
         ),
         page_size=page_size,
         max_page_size=max_page_size,
+        before=before,
     )
     return _decorator(config, "@scrudful_list")
 
@@ -1390,6 +1467,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
         hidden = _wrapper_signature(handler, load_as if load is not None else None)
         response_name = hidden.response_name
         asynchronous = inspect.iscoroutinefunction(handler)
+        label = f"{name}: {handler.__qualname__}()"
         # In an async operation with sync per-item callables, a page is built
         # in one call (one thread hop), not one call per callable.
         page_in_one_call = asynchronous and not _has_async_item_callables(config)
@@ -1539,20 +1617,22 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
 
                 @functools.wraps(handler)
                 async def wrapper(request: HttpRequest, **values: Any) -> Any:
+                    _check_before_allowed(config, label)
                     try:
                         return await _run_async(flow(request, values, answers))
-                    except (HttpError, Http404):
-                        _note_raised(config)
+                    except Exception as exc:
+                        _note_raised(config, exc)
                         raise
 
             else:
 
                 @functools.wraps(handler)
                 def wrapper(request: HttpRequest, **values: Any) -> Any:
+                    _check_before_allowed(config, label)
                     try:
                         return _run_sync(flow(request, values, answers))
-                    except (HttpError, Http404):
-                        _note_raised(config)
+                    except Exception as exc:
+                        _note_raised(config, exc)
                         raise
 
             wrapper.__signature__ = hidden.signature  # type: ignore[attr-defined]
@@ -1601,11 +1681,8 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
             # the API's exception handler, which ``Operation.run`` returns. It
             # is wrapped as ``decorate_view`` wraps it, so that ninja's clones
             # of the operation (one per mount) wrap theirs too.
-            run_decorator = _raised_links_run(asynchronous)
-            if not hasattr(operation, "_run_decorators"):
-                operation._run_decorators = []  # type: ignore[attr-defined]
-            operation.run = run_decorator(operation.run)  # type: ignore[method-assign]
-            operation._run_decorators.append(run_decorator)
+            run_decorator = _raised_links_run(asynchronous, config, label)
+            _add_run_decorator(operation, run_decorator)
 
         # Registered with ninja, which replaces it in each operation by the
         # wrapper :func:`bind_operation` binds (called directly, it declares
@@ -1636,12 +1713,15 @@ def _early_response(
     """scrudful's own response to a failed or short-circuited precondition.
 
     The 400, 412 and 428 bodies get the Links of ``config.error``, whose link
-    callables get ``obj``, and its media type as their Content-Type.
+    callables get ``obj``, and its media type as their Content-Type. The
+    serving API's renderer writes them (see :func:`_render`).
     """
     error = config.error
     result = with_error_body(config.error_body_func, request, result)
     early = conditional_response(
-        result, content_type=None if error is None else error.media_type
+        result,
+        content_type=None if error is None else error.media_type,
+        render=_render(request),
     )
     if result.body is not None and error is not None:
         yield from _add_links(early, error, request, obj)
@@ -1690,11 +1770,18 @@ _ERROR_CLASSES: tuple[type[Exception], ...] = tuple(
 
 @dataclass(eq=False, slots=True)
 class _Raised:
-    """What the scrudful operation running ``Operation.run`` raised."""
+    """What the scrudful operation running ``Operation.run`` raised, and the
+    path parameters ``run`` got (for ``before``, see :func:`_install_before`)."""
 
-    #: The operation's, once its wrapper raised an ``HttpError`` or
-    #: ``Http404``.
+    #: The operation's, once its wrapper or its ``before`` raised an
+    #: ``HttpError`` or ``Http404``.
     config: _Config | None = None
+    #: The path parameters, as the URL gives them (strings, unless the path
+    #: uses a converter).
+    path_params: dict[str, Any] = field(default_factory=dict)
+    #: Whether the operation's ``before`` ran and allowed the request (see
+    #: :func:`_check_before_allowed`).
+    before_allowed: bool = False
 
 
 #: Set by :func:`_raised_links_run` while ``Operation.run`` runs. A mutable
@@ -1702,15 +1789,135 @@ class _Raised:
 _RAISED: ContextVar[_Raised | None] = ContextVar("scrudful_raised", default=None)
 
 
-def _note_raised(config: _Config) -> None:
-    """Note that the operation of ``config`` raised the error being handled."""
+#: The API serving the scrudful operation (or automatic OPTIONS) running, set
+#: by its ``Operation.run`` decorator (:func:`_raised_links_run`,
+#: :func:`_serving_api_run`); ``None`` outside one.
+_SERVING_API: ContextVar[NinjaAPI | None] = ContextVar(
+    "scrudful_serving_api", default=None
+)
+
+
+def _operation_of(run: Callable[..., Any]) -> Any:
+    """The ninja operation whose ``run`` method ``run`` is, or wraps.
+
+    ninja decorates the bound ``Operation.run`` of each operation and of each
+    of its clones (one per mount); decorators applied before scrudful's are
+    seen through when they use ``functools.wraps``. ``None`` when it can't be
+    found (scrudful's bodies are then written as ``JsonResponse`` writes them).
+    """
+    return getattr(inspect.unwrap(run), "__self__", None)
+
+
+@contextlib.contextmanager
+def _serving(operation: Any) -> Iterator[None]:
+    """:data:`_SERVING_API` is ``operation``'s API within."""
+    token = _SERVING_API.set(getattr(operation, "api", None))
+    try:
+        yield
+    finally:
+        _SERVING_API.reset(token)
+
+
+def _add_run_decorator(
+    operation: Any, decorator: Callable[[Callable[..., Any]], Callable[..., Any]]
+) -> None:
+    """Decorate ``operation.run`` with ``decorator``, as ``decorate_view``
+    does, so the clones ninja makes of ``operation`` (one per mount) are
+    decorated too: ninja re-applies ``_run_decorators`` to each."""
+    if not hasattr(operation, "_run_decorators"):
+        operation._run_decorators = []
+    operation.run = decorator(operation.run)
+    operation._run_decorators.append(decorator)
+
+
+def _serving_api_run(run: Callable[..., Any]) -> Callable[..., Any]:
+    """The ``Operation.run`` decorator of the (sync) automatic OPTIONS operation,
+    setting :data:`_SERVING_API` while it runs."""
+    operation = _operation_of(run)
+
+    @functools.wraps(run)
+    def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
+        with _serving(operation):
+            return run(request, *args, **kw)
+
+    return scrudful_run
+
+
+def _record_serving_api(operation: Any) -> None:
+    """Decorate ``operation.run`` with :func:`_serving_api_run`."""
+    _add_run_decorator(operation, _serving_api_run)
+
+
+def _render(request: HttpRequest) -> Render | None:
+    """How the API serving ``request`` writes a JSON body, for scrudful's own
+    responses (OPTIONS and the early 400, 412 and 428).
+
+    Its renderer, when that writes JSON content (an ``application/json`` or
+    ``+json`` ``media_type``), so these bodies have the bytes and charset of
+    every other response of the API; their Content-Type is the body's media
+    type with that charset. Not the API's ``create_response``, which a
+    subclass may override to add headers (a public ``Cache-Control``, say)
+    a 400 or 412 must not carry. Unless the
+    renderer is ninja's ``JSONRenderer`` with its encoder, which writes them
+    so itself, the body is first reduced to JSON values as ninja's
+    ``NinjaJSONEncoder`` (a ``DjangoJSONEncoder``) writes them, so a renderer
+    of plain JSON (``orjson``, ``json.dumps``) writes a datetime,
+    ``Decimal``, ``UUID`` or lazy string as ``JsonResponse`` did. ``None``
+    (Django's ``JsonResponse``)
+    outside a scrudful operation, or for a renderer of other content: the
+    bodies are JSON whatever the renderer.
+    """
+    api = _SERVING_API.get()
+    media_type = getattr(getattr(api, "renderer", None), "media_type", None)
+    if not media_type or not is_json_syntax(media_type):
+        return None
+
+    renderer = api.renderer
+    as_is = _writes_django_values(renderer)
+
+    def render(data: Any, status: int, content_type: str) -> HttpResponse:
+        plain = data if as_is else _json_values(data)
+        content = renderer.render(request, plain, response_status=status)
+        # A str is encoded in the charset the Content-Type names.
+        return HttpResponse(
+            content,
+            status=status,
+            content_type=with_charset(content_type, renderer.charset),
+        )
+
+    return render
+
+
+def _writes_django_values(renderer: Any) -> bool:
+    """Whether ``renderer`` writes Django's values itself: ninja's
+    ``JSONRenderer`` (its ``render``) with a ``DjangoJSONEncoder`` (ninja's
+    ``NinjaJSONEncoder`` is one), which writes them its own way. Its bodies
+    get no reduction (:func:`_json_values`) first."""
+    encoder = getattr(renderer, "encoder_class", None)
+    return (
+        type(renderer).render is JSONRenderer.render
+        and isinstance(encoder, type)
+        and issubclass(encoder, DjangoJSONEncoder)
+    )
+
+
+def _json_values(data: Any) -> Any:
+    """``data`` as JSON values, written as ``NinjaJSONEncoder`` writes them."""
+    return json.loads(json.dumps(data, cls=NinjaJSONEncoder))
+
+
+def _note_raised(config: _Config, exc: Exception) -> None:
+    """Note ``exc`` if it is an ``HttpError`` or ``Http404`` the operation of
+    ``config`` raised (its wrapper, or its ``before``): its response gets the
+    Links of the operation's entity for the status (see
+    :func:`_raised_links_run`)."""
     raised = _RAISED.get()
-    if raised is not None:
+    if raised is not None and isinstance(exc, (HttpError, Http404)):
         raised.config = config
 
 
 def _raised_links_run(
-    asynchronous: bool,
+    asynchronous: bool, config: _Config, label: str
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """The ``Operation.run`` decorator adding the Links of a raised error.
 
@@ -1719,17 +1926,27 @@ def _raised_links_run(
     rolling a transaction back), and ninja answers it with the API's
     exception handler. The response ``run`` returns then gets the Links of
     the operation's entity for its status, see :func:`_raised_entity`.
+
+    While ``run`` runs, :data:`_SERVING_API` is the operation's API, whose
+    renderer writes scrudful's own bodies (see :func:`_render`). A list
+    operation's ``before`` is installed on the operation, and on each clone
+    ninja decorates again (see :func:`_install_before`; ``label`` names the
+    operation in its errors).
     """
 
     def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
+        operation = _operation_of(run)
+        if config.before is not None:
+            _install_before(operation, config, asynchronous, label)
         if asynchronous:
 
             @functools.wraps(run)
             async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                raised = _Raised()
+                raised = _Raised(path_params=kw)
                 token = _RAISED.set(raised)
                 try:
-                    response = await run(request, *args, **kw)
+                    with _serving(operation):
+                        response = await run(request, *args, **kw)
                 finally:
                     _RAISED.reset(token)
                 if raised.config is not None:
@@ -1740,10 +1957,11 @@ def _raised_links_run(
 
             @functools.wraps(run)
             def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                raised = _Raised()
+                raised = _Raised(path_params=kw)
                 token = _RAISED.set(raised)
                 try:
-                    response = run(request, *args, **kw)
+                    with _serving(operation):
+                        response = run(request, *args, **kw)
                 finally:
                     _RAISED.reset(token)
                 if raised.config is not None:
@@ -1753,6 +1971,359 @@ def _raised_links_run(
         return scrudful_run
 
     return decorator
+
+
+#: The digests (:func:`_source_digest`) of the methods of ninja's
+#: ``Operation`` and ``AsyncOperation`` that scrudful's copy of the checks
+#: (:func:`_install_before`) was written from: ``_run_checks``, which it
+#: copies, and ``run``, which answers the response it returns before reading
+#: any parameter. ninja 1.7.0 and 1.7.1 on Python 3.10 to 3.14 (``run``'s
+#: f-string is tokenized differently from Python 3.12 on).
+_NINJA_SOURCES = {
+    "Operation._run_checks": frozenset(
+        {"1f879fdc88dd517f7ff2f3961c324160638e3de021cf294b6e4e9f9ecccfc2d4"}
+    ),
+    "Operation.run": frozenset(
+        {
+            "0ff387914c346a2460656c70de211ba5041530c8244a7c25db9b0f49fa4e9ac0",
+            "66dd21c42a3edd6b7a60a54586afd7e6cf7ae0026afef83629e444aafa46b628",
+        }
+    ),
+    "AsyncOperation._run_checks": frozenset(
+        {"a15261992147f87c4ec2ad74fd67ebe1984020a2f4b2476679771d2c4e920cea"}
+    ),
+    "AsyncOperation.run": frozenset(
+        {"5189477ffad3b05335304fa19f3900e208d8d234ca99626b9117cf7067921fc7"}
+    ),
+}
+#: The code fingerprint of ``_run_checks``, sync and async (see :data:`_NINJA_CODE`).
+_CHECKS_CODE = (
+    (
+        "csrf_exempt",
+        "_ninja_csrf_exempt",
+        "auth_callbacks",
+        "_run_authentication",
+        "throttle_objects",
+        "_check_throttles",
+    ),
+    ("self", "request", "error"),
+    2,
+)
+#: Where the source isn't available: the names, local variables and argument
+#: count of each (the same in ninja 1.7.0 and 1.7.1 on Python 3.10 to 3.14).
+#: Weaker: a body using the same names in another order passes.
+_NINJA_CODE = {
+    "Operation._run_checks": _CHECKS_CODE,
+    "Operation.run": (
+        (
+            "_run_checks",
+            "api",
+            "create_temporal_response",
+            "_get_values",
+            "view_func",
+            "stream_format",
+            "_stream_response",
+            "_result_to_response",
+            "Exception",
+            "isinstance",
+            "TypeError",
+            "str",
+            "args",
+            "on_exception",
+        ),
+        (
+            "self",
+            "request",
+            "kw",
+            "error",
+            "temporal_response",
+            "values",
+            "result",
+            "e",
+            "msg",
+        ),
+        2,
+    ),
+    "AsyncOperation._run_checks": _CHECKS_CODE,
+    "AsyncOperation.run": (
+        (
+            "_run_checks",
+            "api",
+            "create_temporal_response",
+            "_get_values",
+            "stream_format",
+            "view_func",
+            "_async_stream_response",
+            "_result_to_response",
+            "Exception",
+            "on_exception",
+        ),
+        (
+            "self",
+            "request",
+            "kw",
+            "error",
+            "temporal_response",
+            "values",
+            "result",
+            "e",
+        ),
+        2,
+    ),
+}
+#: Tokens that don't change the code: comments and blank lines.
+_IGNORED_TOKENS = frozenset({tokenize.COMMENT, tokenize.NL})
+#: Tokens kept by type only (their text is whitespace).
+_STRUCTURE_TOKENS = frozenset(
+    {tokenize.INDENT, tokenize.DEDENT, tokenize.NEWLINE, tokenize.ENDMARKER}
+)
+
+
+def _source_digest(func: Any) -> str | None:
+    """The SHA-256 of ``func``'s source tokens, insensitive to comments, blank
+    lines and its docstring; ``None`` when the source isn't available or
+    can't be read.
+
+    Each other token counts, as its type and text (only the type for
+    indentation and line ends).
+    """
+    try:
+        source = textwrap.dedent(inspect.getsource(func))
+        tokens = [
+            token
+            for token in tokenize.generate_tokens(io.StringIO(source).readline)
+            if token.type not in _IGNORED_TOKENS
+        ]
+    except (OSError, TypeError, tokenize.TokenError, SyntaxError):
+        return None
+    digest = hashlib.sha256()
+    for token in _without_docstring(tokens):
+        text = "" if token.type in _STRUCTURE_TOKENS else token.string
+        digest.update(f"{tokenize.tok_name[token.type]}\0{text}\1".encode())
+    return digest.hexdigest()
+
+
+def _without_docstring(tokens: list[tokenize.TokenInfo]) -> list[tokenize.TokenInfo]:
+    """The tokens of a function but its docstring: the strings alone on the
+    first line of its body."""
+    body = next(
+        (
+            index + 1
+            for index, token in enumerate(tokens)
+            if token.type == tokenize.INDENT
+        ),
+        len(tokens),
+    )
+    end = body
+    while end < len(tokens) and tokens[end].type == tokenize.STRING:
+        end += 1
+    if end == body or end == len(tokens) or tokens[end].type != tokenize.NEWLINE:
+        return tokens
+    return tokens[:body] + tokens[end + 1 :]
+
+
+@functools.cache
+def _is_ninja_code(func: Any, name: str) -> bool:
+    """Whether ``func`` is the code of ninja's method ``name`` (e.g.
+    ``"Operation.run"``) scrudful's copy of the checks was written from: by
+    the digest of its source, else (no source) by its names, locals and
+    arguments. Memoized: each function is read once, whatever the number of
+    operations and mounts."""
+    digest = _source_digest(func)
+    if digest is not None:
+        return digest in _NINJA_SOURCES[name]
+    code = getattr(func, "__code__", None)
+    return (
+        code is not None
+        and (code.co_names, code.co_varnames, code.co_argcount) == _NINJA_CODE[name]
+    )
+
+
+def _check_ninja_checks(operation: Any, asynchronous: bool, label: str) -> None:
+    """Raise ``ConfigError`` unless ``operation`` can run ``before`` in
+    scrudful's copy of ninja's checks (:func:`_install_before`).
+
+    So an opaque decorator hiding the operation, an ``Operation`` subclass
+    overriding ``_run_checks`` or ``run``, or a ninja whose checks (or the
+    ``run`` calling them) changed fails when the operation is built instead
+    of losing ``before`` or a check.
+    """
+    if operation is None:
+        raise ConfigError(
+            f"{label}: before= can't be installed: scrudful can't find the "
+            "ninja operation through Operation.run, because a decorate_view "
+            "decorator below @scrudful_list wraps it without functools.wraps. "
+            "Use functools.wraps in that decorator, or apply decorate_view "
+            "above the operation decorator."
+        )
+    ninja_class = AsyncOperation if asynchronous else Operation
+    cls = type(operation)
+    if "_run_checks" in vars(operation):
+        raise _checks_error(label, "the operation has its own _run_checks")
+    for method in ("_run_checks", "run"):
+        func = getattr(cls, method, None)
+        if func is not getattr(ninja_class, method):
+            raise _checks_error(
+                label,
+                f"{cls.__qualname__} overrides {method} of ninja's "
+                f"{ninja_class.__name__}",
+            )
+        if not _is_ninja_code(func, f"{ninja_class.__name__}.{method}"):
+            raise _checks_error(
+                label,
+                f"the installed ninja's {ninja_class.__name__}.{method} differs "
+                "from ninja 1.7.0's and 1.7.1's, which scrudful's before= is "
+                "verified against: upgrade scrudful, or keep ninja at one of "
+                "those releases",
+            )
+
+
+def _checks_error(label: str, reason: str) -> ConfigError:
+    """The ``ConfigError`` of an operation that can't run ``before``."""
+    return ConfigError(
+        f"{label}: before= needs ninja's own Operation._run_checks and the "
+        "Operation.run calling it (as in ninja 1.7.0 and 1.7.1), as scrudful runs "
+        "before "
+        f"between authentication and throttling; {reason}."
+    )
+
+
+def _install_before(
+    operation: Any, config: _Config, asynchronous: bool, label: str
+) -> None:
+    """Give ``operation`` checks running ``config.before`` where DRF checks
+    permissions: after authentication, before throttling.
+
+    ``Operation.run`` answers a response its ``_run_checks`` returns before it
+    reads any parameter. These checks are ninja 1.7.0's and 1.7.1's (CSRF
+    exemption flag, authentication, throttles) with ``before`` called between
+    authentication
+    and throttling, with the path parameters as the URL gives them, so a
+    request it refuses uses none of a throttle's quota. An exception it
+    raises is answered by the API's exception handler, as ninja answers its
+    own; neither reaches the decorators added with
+    ``add_decorator(mode="operation")``, which wrap the operation's function.
+    ``before`` allows the request by returning ``None`` and refuses it by
+    raising: anything else it returns raises ``TypeError`` (a returned
+    ``HttpResponse`` or ``False`` must not let the request go on as if it
+    were allowed). So does an awaitable in a sync operation, which can't
+    await it; a coroutine is closed and a future (or task) cancelled, so
+    neither runs on unawaited. Without the path parameters (the checks run
+    outside the operation's ``Operation.run``) it raises ``RuntimeError``
+    instead of calling ``before`` without them.
+
+    Raises
+    ------
+    ninja.errors.ConfigError
+        See :func:`_check_ninja_checks`.
+    """
+    _check_ninja_checks(operation, asynchronous, label)
+
+    def current() -> _Raised:
+        raised = _RAISED.get()
+        if raised is None:
+            raise RuntimeError(
+                f"{label}: before can't get the path parameters: the "
+                "operation's checks ran outside its Operation.run"
+            )
+        return raised
+
+    def answer(request: HttpRequest, exc: Exception) -> HttpResponseBase:
+        _note_raised(config, exc)
+        return operation.api.on_exception(request, exc)  # type: ignore[no-any-return]
+
+    def mark_csrf_exempt(request: HttpRequest) -> None:
+        if operation.csrf_exempt:
+            request._ninja_csrf_exempt = True  # type: ignore[attr-defined]
+
+    def after_before(
+        request: HttpRequest, raised: _Raised, result: Any
+    ) -> HttpResponseBase | None:
+        """Fail closed unless ``before`` returned ``None``; then throttle."""
+        if result is not None:
+            _refuse_before_result(result, asynchronous)
+        raised.before_allowed = True
+        if operation.throttle_objects:
+            error = operation._check_throttles(request)
+            if error:
+                return error  # type: ignore[no-any-return]
+        return None
+
+    if asynchronous:
+
+        async def run_checks(request: HttpRequest) -> HttpResponseBase | None:
+            mark_csrf_exempt(request)
+            if operation.auth_callbacks:
+                error = await operation._run_authentication(request)
+                if error:
+                    return error  # type: ignore[no-any-return]
+            raised = current()
+            params = dict(raised.path_params)
+            try:
+                result = await _call_async(config.before, (request,), params)
+            except Exception as exc:
+                return answer(request, exc)
+            return after_before(request, raised, result)
+
+    else:
+
+        def run_checks(  # type: ignore[misc]
+            request: HttpRequest,
+        ) -> HttpResponseBase | None:
+            mark_csrf_exempt(request)
+            if operation.auth_callbacks:
+                error = operation._run_authentication(request)
+                if error:
+                    return error  # type: ignore[no-any-return]
+            raised = current()
+            params = dict(raised.path_params)
+            try:
+                result = config.before(request, **params)  # type: ignore[misc]
+            except Exception as exc:
+                return answer(request, exc)
+            return after_before(request, raised, result)
+
+    operation._run_checks = run_checks
+
+
+def _check_before_allowed(config: _Config, label: str) -> None:
+    """Raise ``RuntimeError`` unless the operation's ``before`` (if any) ran
+    and allowed this request.
+
+    So a request never reaches the function without it: if ninja served an
+    operation without scrudful's checks (e.g. a copy it made without
+    re-applying ``Operation.run``'s decorators), the request fails instead
+    of going on unchecked.
+    """
+    if config.before is None:
+        return
+    raised = _RAISED.get()
+    if raised is None or not raised.before_allowed:
+        raise RuntimeError(
+            f"{label}: before= didn't run for this request: the operation "
+            "ninja served lacks scrudful's checks. Refusing the request."
+        )
+
+
+def _refuse_before_result(result: Any, asynchronous: bool) -> NoReturn:
+    """Raise ``TypeError`` for what ``before`` returned instead of ``None``;
+    an awaitable is closed (a coroutine) or cancelled (a future) first."""
+    if inspect.isawaitable(result):
+        if inspect.iscoroutine(result):
+            result.close()
+        elif asyncio.isfuture(result):
+            result.cancel()
+        if not asynchronous:
+            raise TypeError(
+                f"before returned an awaitable ({result!r}) in a sync "
+                "operation, which can't await it: make the operation async "
+                "def, or before a plain function"
+            )
+    raise TypeError(
+        f"before returned {result!r}: it allows the request by returning "
+        "None and refuses it by raising (e.g. HttpError(403, ...)), never by "
+        "returning a response or a value"
+    )
 
 
 def _raised_links(
@@ -1822,13 +2393,14 @@ def _error_links(
 
     Its link callables get ``None``. A response with JSON content, as
     ninja's renderer makes, is served as ``entity.media_type`` when that is
-    JSON content too (an ``error`` entity's always is), so that it agrees
-    with the OPTIONS body; other content keeps its Content-Type.
+    JSON content too (an ``error`` entity's always is), with the charset its
+    bytes are in, as scrudful's own error bodies are; other content keeps
+    its Content-Type.
     """
     yield from _add_links(response, entity, request, None)
     content_type = response.get("Content-Type")
-    if content_type and is_json(content_type) and is_json(entity.media_type):
-        response["Content-Type"] = entity.media_type
+    if content_type and is_json_syntax(content_type) and is_json(entity.media_type):
+        response["Content-Type"] = with_charset(entity.media_type, response.charset)
     expose_headers(response)
 
 
@@ -2141,6 +2713,7 @@ def _check_sync_callables(config: _Config, handler: Callable[..., Any]) -> None:
 def _declared_callables(config: _Config) -> Iterator[tuple[str, Any]]:
     """``(name, value)`` of every argument that may be a callable."""
     yield "load", config.load
+    yield "before", config.before
     yield "location_func", config.location_func
     yield "href_func", config.href_func
     yield "etag_func", config.etag_func
@@ -2451,12 +3024,14 @@ def _options_view(path: str, path_view: Any) -> Callable[..., HttpResponseBase]:
     clones of them). It declares the path parameters, as ``Any`` (a
     converter such as ``{int:pk}`` passes an ``int``), so that ninja passes
     them and validates nothing. The response carries the HTTP Schema
-    Resource's own Links and an ``Allow`` listing the body's methods.
+    Resource's own Links and an ``Allow`` listing the body's methods. The
+    body is written by the serving API's renderer (see :func:`_render`), and
+    is ``application/json``.
     """
 
     def scrudful_options(request: HttpRequest, **params: Any) -> HttpResponseBase:
         body = _describe_path(request, path_view)
-        response = JsonResponse(body)
+        response = json_response(body, 200, "application/json", _render(request))
         response["Link"] = options_links()
         response["Allow"] = allow_header(body)
         expose_headers(response)
@@ -2473,6 +3048,10 @@ def _options_view(path: str, path_view: Any) -> Callable[..., HttpResponseBase]:
         ]
     )
     scrudful_options._scrudful_options = True  # type: ignore[attr-defined]
+    # The API's renderer writes the body (see _render).
+    scrudful_options._ninja_contribute_to_operation = [  # type: ignore[attr-defined]
+        _record_serving_api
+    ]
     return scrudful_options
 
 

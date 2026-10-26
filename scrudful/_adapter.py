@@ -10,6 +10,7 @@ import copy
 import dataclasses
 import http
 import inspect
+import re
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol
@@ -302,13 +303,143 @@ def media_type_key(media_type: str) -> str:
     return f"{main}/{sub}{semicolon}{parameters}"
 
 
+# --- Integer query parameters --------------------------------------------------
+
+#: The characters pydantic strips around a string (Rust's ``str::trim``: the
+#: Unicode ``White_Space`` property, which ``str.isspace`` widens with
+#: U+001C..U+001F).
+_WHITE_SPACE = (
+    "\t\n\x0b\x0c\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+)
+#: A JSON integer: no sign but ``-``, no leading zero, ASCII digits only.
+_JSON_INT = re.compile(r"-?(?:0|[1-9][0-9]*)", re.ASCII)
+_DIGIT_RUN = re.compile(r"-?[0-9]+", re.ASCII)
+#: The longest integer string pydantic parses (CPython's default
+#: ``sys.int_info.default_max_str_digits``), sign included.
+_MAX_INT_LENGTH = 4300
+
+
+def parse_query_int(raw: str) -> int | None:
+    """``raw`` as pydantic v2's lax ``int`` validates a string, or ``None`` where
+    it fails (``int_parsing`` or ``int_parsing_size``).
+
+    So DRF's ``ScrudfulPagination`` accepts exactly the ``page`` and
+    ``page_size`` that django-ninja's query model does, without depending on
+    pydantic. Unlike ``int()``: only ASCII digits, ``"1.0"`` (a fraction of
+    zeros) is 1, and only the Unicode ``White_Space`` characters are stripped.
+    It mirrors pydantic-core's steps, quirks included (``"0-5"`` is -5): a
+    JSON integer as is; else, after dropping a fraction of zeros and a sign,
+    underscores between digits and leading zeros (and underscores again)
+    are removed before the JSON integer is read. Checked against pydantic
+    by ``tests/test_page_parameters.py``.
+    """
+    text = raw.strip(_WHITE_SPACE)
+    run = _DIGIT_RUN.match(text)
+    if run is not None and run.end() > _MAX_INT_LENGTH:
+        prefix = _JSON_INT.match(text)
+        if prefix is not None and prefix.end() == run.end():
+            return None  # int_parsing_size
+    if _JSON_INT.fullmatch(text):
+        return _int(text)
+    point = text.find(".")
+    if point >= 0 and text[point + 1 :] and not text[point + 1 :].strip("0"):
+        text = text[:point]
+    sign = ""
+    if text[:1] in ("+", "-"):
+        sign, text = text[0], text[1:]
+        if text[:1] in ("+", "-"):
+            return None
+    text = _strip_underscores(text) or text
+    unpadded = _strip_leading_zeros(text)
+    if unpadded is not None:
+        text = _strip_underscores(unpadded) or unpadded
+    if sign == "-":
+        text = "-" + text
+    if len(text) > _MAX_INT_LENGTH or not _JSON_INT.fullmatch(text):
+        return None
+    return _int(text)
+
+
+def _int(text: str) -> int | None:
+    """``int(text)``, or ``None`` for more digits than the interpreter's limit
+    (``sys.set_int_max_str_digits``), which may be below pydantic's."""
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _strip_underscores(text: str) -> str | None:
+    """``text`` without its underscores, when each is between other characters
+    and none is doubled; else ``None``."""
+    if "_" not in text or text[0] == "_" or text[-1] == "_" or "__" in text:
+        return None
+    return text.replace("_", "")
+
+
+def _strip_leading_zeros(text: str) -> str | None:
+    """``text`` from the first character after its leading run of zeros and
+    underscores that is a digit or ``-``; its last character when the run is the
+    whole of it; ``None`` when it doesn't start with ``0`` or the run ends on
+    another character."""
+    if not text.startswith("0"):
+        return None
+    for index in range(1, len(text)):
+        char = text[index]
+        if char in "0_":
+            continue
+        if char in "123456789-":
+            return text[index:]
+        return None
+    return text[-1]
+
+
 def is_json(media_type: str) -> bool:
     """Whether ``media_type`` is JSON content: ``application/json`` or ``+json``,
     other than JSON-LD, which carries its context in-band."""
+    return is_json_syntax(media_type) and essence(media_type) != "application/ld+json"
+
+
+def is_json_syntax(media_type: str) -> bool:
+    """Whether ``media_type`` is written as JSON: ``application/json`` or
+    ``+json``, JSON-LD included (unlike :func:`is_json`, which asks whether
+    its context is out of band)."""
     name = essence(media_type)
-    return name != "application/ld+json" and (
-        name == "application/json" or name.endswith("+json")
-    )
+    return name == "application/json" or name.endswith("+json")
+
+
+def with_charset(media_type: str, charset: str) -> str:
+    """``media_type`` with the ``charset`` parameter ``charset`` (the encoding
+    of the bytes it labels), in place of any charset it names."""
+    name, *parameters = split_parameters(media_type)
+    kept = [
+        parameter.strip()
+        for parameter in parameters
+        if parameter.strip()
+        and parameter.partition("=")[0].strip().lower() != "charset"
+    ]
+    return "; ".join([name.strip(), *kept, f"charset={charset}"])
+
+
+def split_parameters(media_type: str) -> list[str]:
+    """``media_type`` split at each ``;`` outside a quoted string (whose text,
+    a ``;`` included, is kept as written)."""
+    parts = []
+    start = 0
+    quoted = escaped = False
+    for index, char in enumerate(media_type):
+        if escaped:
+            escaped = False
+        elif quoted and char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif char == ";" and not quoted:
+            parts.append(media_type[start:index])
+            start = index + 1
+    parts.append(media_type[start:])
+    return parts
 
 
 def is_in_band(media_type: str) -> bool:

@@ -425,8 +425,72 @@ so ninja's validation and OpenAPI describe the real body:
 
 Each entry's ``etag``, ``last_modified`` and ``link`` come from the same item
 callbacks as the detail GET. ``page`` and ``page_size`` (default 100, at most
-1000) are query parameters. The optional list validators are called with the
+1000) are query parameters; bad values are ninja's 422 validation error,
+listing every bad parameter. The optional list validators are called with the
 queryset, and then a list can answer 304.
+
+ninja validates the parameters before the operation runs, so a bad ``page``
+would be a 422 even for a client the list must refuse. ``before=`` runs where
+DRF checks permissions: ``before(request, **path_params)`` is called once per
+request after ninja's authentication and before its throttles and its
+validation of any parameter, with the URL's path parameters as they are (not
+validated yet). They are strings (unless the path uses a converter such as
+``{int:pk}``), not the values the function gets: ``"07"``, ``"+7"`` and
+``" 7"`` are all 7 to an ``int`` parameter, so a ``before`` denying
+``path_params["org"] == "7"`` lets ``/orgs/07/...`` through. Never deny by
+testing a raw string for a value: compare the value the function gets
+(declare the parameter ``str``, as below), or parse it as its type does and
+refuse what doesn't parse. ``before`` returns ``None`` to let the request go
+on; anything else it returns (``False``, a response) raises ``TypeError``,
+as a refusal is raised, never returned. ``request.auth`` is set only when an
+auth callback succeeded (the examples here run under ``NinjaAPI(auth=...)``,
+where it always is): on an operation that may run without ``auth``, fail
+closed before using it, as below. Raise ``HttpError(401, ...)`` or ``HttpError(403, ...)``
+there; the API's exception handler answers it, and the refused request uses
+none of a throttle's quota. When it returns, ninja throttles and validates
+every parameter as without ``before``: one 422 lists every bad one, ``page``
+and ``page_size`` included, and the OpenAPI description is unchanged. Neither
+its error nor that 422 passes through the decorators added with
+``add_decorator(mode="operation")``. scrudful installs ``before`` through
+``Operation.run``: a ``decorate_view`` decorator below ``@scrudful_list``
+must use ``functools.wraps`` (``ConfigError`` otherwise, when the operation is
+built). ``before`` runs in scrudful's own copy of ninja's per-operation checks
+(CSRF flag, authentication, throttles), which relies on ``Operation.run``
+answering their response before it reads any parameter. Both are verified
+against ninja 1.7.0 and 1.7.1; the ``ninja`` extra allows any ninja from 1.7
+below 2, so a later release may be installed before scrudful has verified
+it. When the
+operation is built, scrudful compares ninja's ``_run_checks`` and ``run``
+with those releases': by a digest of their source (comments, docstrings and
+blank lines aside), or, where the source isn't installed (``.pyc`` only),
+only by the names, local variables and arguments they use. On a ninja whose
+code differs, or with an ``Operation`` subclass overriding either method,
+``before=`` raises ``ConfigError`` at startup instead of skipping a check:
+upgrade scrudful, or keep ninja at a verified release (an app using
+``before=`` should lock its ninja version). Without ``before=`` the check is
+never made. Each request is checked too: one that reaches the operation's
+function without ``before`` having allowed it (ninja served a copy of the
+operation without scrudful's checks) fails with ``RuntimeError``, never goes
+on unchecked.
+
+Here the API's auth callback returns the caller's ``rbac_context`` (a
+string, as in the example project), and the path names the context listed.
+The path parameter is declared ``str``, so ``before`` compares the value the
+handler gets:
+
+.. code-block:: python
+
+    def same_context(request, **path_params):
+        context = getattr(request, "auth", None)
+        if context is None:  # no auth callback succeeded: fail closed
+            raise HttpError(401, "Unauthorized")
+        if path_params["context"] != context:
+            raise HttpError(403, "Forbidden")
+
+    @roles.get("/contexts/{context}/roles", response=List[RoleOut])
+    @scrudful_list(href_func=role_href, before=same_context)
+    def list_context_roles(request, context: str):
+        return Role.objects.filter(rbac_context=context).order_by("pk")
 
 The collection response is a list, set or tuple of the item schema
 (``List[RoleOut]``, ``list[RoleOut]``). ``Optional[List[RoleOut]]`` or another
@@ -486,7 +550,10 @@ every POST. It is the same for everyone:
   loaded object, queryset or created item), so they must accept ``None``;
 * the response always has the two fixed HTTP Schema Resource Links, an
   ``Allow`` header listing the body's methods and, for the paths that serve
-  it, a ``head`` entry without content.
+  it, a ``head`` entry without content;
+* the body is written by the API's renderer and served as
+  ``application/json`` with the renderer's charset (see "The API's renderer"
+  under `Error responses`_).
 
 CORS
 ~~~~
@@ -598,9 +665,36 @@ scrudful's own 400, 412 and 428, and the responses the API's exception
 handlers make for the errors raised inside a scrudful operation and for those
 :func:`~scrudful.ninja.add_error_links` covers. ninja renders those
 ``application/json``, and scrudful replaces that ``Content-Type`` with the
-entity's ``media_type`` whatever the handler chose, so every wrapped handler's
-JSON bodies must be content the entity describes. A handler's response with
+entity's ``media_type`` whatever the handler chose, with the ``charset``
+parameter of the bytes (the renderer's; one the entity's ``media_type``
+names is replaced), so every wrapped handler's JSON bodies must be content
+the entity describes. A handler's response with
 other content (e.g. ``text/plain``) keeps its ``Content-Type``.
+
+**The API's renderer.** scrudful's own bodies (the OPTIONS HTTP Schema
+Resource and the 400, 412 and 428) are written by the renderer of the API
+serving the request (``NinjaAPI(renderer=...)``), as every other response, so
+a renderer with other separators or escapes gives them the same bytes (a
+JSON-LD renderer, ``application/ld+json``, too). The renderer writes them as
+it writes the API's other data: one that changes the data's shape (renames
+keys, e.g. to camelCase, or wraps each body, e.g. in ``{"data": ...}``)
+changes them too, as it changes ninja's own 422 bodies, and the HTTP Schema
+Resource then no longer has the shape the semantic-http spec gives it (nor
+names the parameters as the API reads them). Use a renderer that changes
+only how the data is written. Their
+``Content-Type`` is still the media type described here (``application/json``,
+or the ``error`` entity's media type), not the renderer's, with the
+renderer's ``charset`` parameter, as ninja's own responses carry it
+(``application/json; charset=utf-8`` by default). Unless the renderer is
+ninja's ``JSONRenderer`` with a ``DjangoJSONEncoder`` (its default
+``NinjaJSONEncoder`` is one), which writes them its own way, the body is first
+reduced to JSON values as ninja's ``NinjaJSONEncoder`` (a
+``DjangoJSONEncoder``) writes them, so a renderer of plain JSON (ORJSON,
+``json.dumps``) writes a datetime, ``Decimal``, ``UUID`` or lazy string in an
+``error_body_func`` body as ``JsonResponse`` did. A renderer whose
+``media_type`` is not JSON content, or a ``decorate_view`` decorator below
+scrudful that wraps ``Operation.run`` without ``functools.wraps``, gets them
+written as Django's ``JsonResponse`` writes them.
 
 **Error bodies.** ``error_body_func(request, result)`` on ``@scrudful`` and
 ``@scrudful_list`` returns the dict that replaces the default

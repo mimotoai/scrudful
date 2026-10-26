@@ -8,7 +8,9 @@ from items.models import Item
 from ninja import NinjaAPI, Router, Schema
 from rest_framework import serializers, viewsets
 from rest_framework.routers import SimpleRouter
-from rest_framework.test import APIClient
+from rest_framework.exceptions import ValidationError
+from rest_framework.request import Request
+from rest_framework.test import APIClient, APIRequestFactory
 
 from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS
 from scrudful.ninja import scrudful_list
@@ -94,6 +96,47 @@ class SmallViewSet(BareViewSet):
     pagination_class = SmallPagination
 
 
+class ClampingPagination(SmallPagination):
+    """A 0.6.0 subclass clamping page_size, as DRF's PageNumberPagination does."""
+
+    def _integer(self, request, name, default, maximum):
+        if name == self.page_size_query_param:
+            raw = request.query_params.get(name)
+            if raw is not None and raw.isdigit() and int(raw) > maximum:
+                return maximum
+        return super()._integer(request, name, default, maximum)
+
+
+class ClampingViewSet(BareViewSet):
+    pagination_class = ClampingPagination
+
+
+class LastPagePagination(SmallPagination):
+    """A 0.6.0 subclass accepting ``page=last``."""
+
+    def _integer(self, request, name, default, maximum):
+        if name == self.page_query_param and request.query_params.get(name) == "last":
+            return Item.objects.count()
+        return super()._integer(request, name, default, maximum)
+
+
+class LastPageViewSet(BareViewSet):
+    pagination_class = LastPagePagination
+
+
+class LastPageParsePagination(SmallPagination):
+    """``page=last`` through the parsing hook, not ``_integer``."""
+
+    def _parse_parameter(self, request, name, default, maximum):
+        if name == self.page_query_param and request.query_params.get(name) == "last":
+            return Item.objects.count(), None
+        return super()._parse_parameter(request, name, default, maximum)
+
+
+class LastPageParseViewSet(BareViewSet):
+    pagination_class = LastPageParsePagination
+
+
 def none_modified(obj):
     return None
 
@@ -133,6 +176,9 @@ router.register("bare", BareViewSet, basename="bare")
 router.register("nohref", NoHrefViewSet, basename="nohref")
 router.register("unordered", UnorderedViewSet, basename="unordered")
 router.register("small", SmallViewSet, basename="small")
+router.register("clamping", ClampingViewSet, basename="clamping")
+router.register("lastpage", LastPageViewSet, basename="lastpage")
+router.register("lastparse", LastPageParseViewSet, basename="lastparse")
 
 ninja_router = Router()
 
@@ -253,6 +299,125 @@ def test_pagination_bad_page_size_is_400(items, client):
     response = client.get("/drf/small/", {"page_size": 3})
     assert response.status_code == 400
     assert list(response.json()) == ["page_size"]
+
+
+@pytest.mark.parametrize(
+    "params, name, message, code",
+    [
+        ({"page": "x"}, "page", "A valid integer is required.", "invalid"),
+        ({"page": "1.5"}, "page", "A valid integer is required.", "invalid"),
+        ({"page": ""}, "page", "A valid integer is required.", "invalid"),
+        (
+            {"page": "0"},
+            "page",
+            "Ensure this value is greater than or equal to 1.",
+            "min_value",
+        ),
+        ({"page_size": "y"}, "page_size", "A valid integer is required.", "invalid"),
+        (
+            {"page_size": "-1"},
+            "page_size",
+            "Ensure this value is greater than or equal to 1.",
+            "min_value",
+        ),
+        (
+            {"page_size": "3"},
+            "page_size",
+            "Ensure this value is less than or equal to 2.",
+            "max_value",
+        ),
+    ],
+)
+def test_pagination_errors_carry_codes(items, params, name, message, code):
+    request = Request(APIRequestFactory().get("/drf/small/", params))
+    with pytest.raises(ValidationError) as caught:
+        SmallPagination().paginate_queryset(Item.objects.all(), request, SmallViewSet())
+    assert caught.value.detail == {name: [message]}
+    assert caught.value.get_codes() == {name: [code]}
+
+
+def test_pagination_reports_both_bad_parameters(items, client):
+    response = client.get("/drf/small/", {"page": "x", "page_size": "3"})
+    assert response.status_code == 400
+    assert response.json() == {
+        "page": ["A valid integer is required."],
+        "page_size": ["Ensure this value is less than or equal to 2."],
+    }
+
+
+def test_pagination_integer_helper_still_raises_with_code(items):
+    request = Request(APIRequestFactory().get("/drf/small/", {"page_size": "0"}))
+    with pytest.raises(ValidationError) as caught:
+        SmallPagination()._integer(request, "page_size", 1, 2)
+    assert caught.value.get_codes() == {"page_size": ["min_value"]}
+    request = Request(APIRequestFactory().get("/drf/small/", {"page_size": "2"}))
+    assert SmallPagination()._integer(request, "page_size", 1, 2) == 2
+    assert SmallPagination()._integer(request, "page", 7, None) == 7
+
+
+def test_pagination_subclass_integer_override_clamps(items, client):
+    response = client.get("/drf/clamping/", {"page_size": 5000})
+    assert response.status_code == 200
+    assert len(response.json()["content"]) == 2
+    # An overridden _integer: the first error only, as in 0.6.0.
+    first = client.get("/drf/clamping/", {"page": "x", "page_size": "0"})
+    assert first.status_code == 400
+    assert first.json() == {"page": ["A valid integer is required."]}
+
+
+def test_pagination_subclass_integer_override_accepts_last(items, client):
+    response = client.get("/drf/lastpage/", {"page": "last"})
+    assert response.status_code == 200
+    body = response.json()
+    assert [entry["content"]["name"] for entry in body["content"]] == ["c"]
+    bad = client.get("/drf/lastpage/", {"page": "last", "page_size": "3"})
+    assert bad.status_code == 400
+    assert bad.json() == {
+        "page_size": ["Ensure this value is less than or equal to 2."]
+    }
+
+
+@pytest.mark.parametrize("url", ["/drf/lastpage/", "/drf/lastparse/"])
+def test_pagination_page_last_through_either_hook(items, client, url):
+    response = client.get(url, {"page": "last"})
+    assert response.status_code == 200
+    assert [e["content"]["name"] for e in response.json()["content"]] == ["c"]
+    bad = client.get(url, {"page": "x", "page_size": "3"})
+    assert bad.status_code == 400
+    page_error = {"page": ["A valid integer is required."]}
+    if url == "/drf/lastparse/":
+        # The default _integer: both parameters' errors.
+        page_error["page_size"] = ["Ensure this value is less than or equal to 2."]
+    assert bad.json() == page_error
+
+
+def test_pagination_overridden_integer_stops_at_the_first_error(items):
+    """0.6.0's order: an override is not called for page_size once page failed."""
+    calls = []
+
+    class Recording(ClampingPagination):
+        def _integer(self, request, name, default, maximum):
+            calls.append(name)
+            return super()._integer(request, name, default, maximum)
+
+    request = Request(APIRequestFactory().get("/", {"page": "x", "page_size": "y"}))
+    with pytest.raises(ValidationError) as caught:
+        Recording().paginate_queryset(Item.objects.all(), request, SmallViewSet())
+    assert caught.value.get_codes() == {"page": ["invalid"]}
+    assert calls == ["page"]
+
+
+def test_pagination_parse_parameter_returns_value_and_error(items):
+    def parse(params, name, maximum=None):
+        request = Request(APIRequestFactory().get("/drf/small/", params))
+        return SmallPagination()._parse_parameter(request, name, 7, maximum)
+
+    assert parse({}, "page") == (7, None)
+    assert parse({"page": " 2.0 "}, "page") == (2, None)
+    value, error = parse({"page": "٣"}, "page")
+    assert value is None and error.code == "invalid"
+    value, error = parse({"page_size": "3"}, "page_size", 2)
+    assert value is None and error.code == "max_value"
 
 
 def test_pagination_max_page_size(items, client):

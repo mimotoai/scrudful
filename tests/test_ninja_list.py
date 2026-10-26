@@ -365,7 +365,7 @@ def test_list_early_responses_keep_handler_headers(items):
         assert "Cache-Control" not in response.headers
         assert "Vary" not in response.headers
         assert "Content-Language" not in response.headers
-        assert response.headers["Content-Type"] == "application/json"
+        assert response.headers["Content-Type"] == "application/json; charset=utf-8"
         assert response.headers["Link"] == ERROR_LINK
 
 
@@ -559,6 +559,18 @@ def test_list_registered_on_several_paths(items):
 def test_pagination_bad_input(items, query, status):
     response = TestClient(list_router()).get(f"/items?{query}")
     assert response.status_code == status
+
+
+def test_pagination_reports_both_bad_parameters(items):
+    """As DRF's ScrudfulPagination: one error response names both parameters
+    (here ninja's 422, with pydantic's error types)."""
+    response = TestClient(list_router()).get("/items?page=x&page_size=5000")
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert [(e["loc"][-1], e["type"]) for e in errors] == [
+        ("page", "int_parsing"),
+        ("page_size", "less_than_equal"),
+    ]
 
 
 def test_pagination_parameter_not_passed_to_handler(items):

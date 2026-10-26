@@ -2,6 +2,120 @@
 Changelog
 =========
 
+0.7.0 (since 0.6.0)
+===================
+
+Behaviour change (DRF)
+----------------------
+
+* DRF: ``ScrudfulPagination`` parses ``page`` and ``page_size`` as ninja's
+  ``scrudful_list`` does, with pydantic v2's lax ``int`` from a string, not
+  Python's ``int()``, so both front ends accept the same values. ``?page=2.0``
+  (and ``2.00``) is now page 2, where it was a 400; ``?page=٣`` (and other
+  non-ASCII digits, e.g. ``３``) is now a 400 ("A valid integer is
+  required."), where it was page 3. Only Unicode ``White_Space`` is stripped
+  around the value (not U+001C..U+001F, which ``int()`` strips). pydantic is
+  not a dependency of the DRF adapter: the rules are implemented in
+  ``scrudful._adapter.parse_query_int`` and tested against pydantic. A value
+  with more digits than the interpreter allows ``int()``
+  (``sys.set_int_max_str_digits``) is a 400, as in 0.6.0. A
+  subclass overriding ``_integer`` (or ``_parse_parameter``) decides for
+  itself.
+
+Behaviour change (ninja)
+------------------------
+
+* ninja: the automatic OPTIONS body and scrudful's own 400, 412 and 428 bodies
+  are now written by the serving API's renderer (``NinjaAPI(renderer=...)``),
+  as its other responses are, not by Django's ``JsonResponse``. With ninja's
+  default ``JSONRenderer`` the bytes are unchanged; an API with another JSON
+  renderer (compact separators, ORJSON, ``ensure_ascii=False``, JSON-LD ...)
+  gets other bytes on those responses than with 0.6.0. A renderer that
+  changes the data's shape (renames keys, e.g. to camelCase, or wraps each
+  body) now changes these bodies too, as it does ninja's own 422s: the
+  OPTIONS HTTP Schema Resource then no longer has the spec's shape, so use
+  one that changes only how the data is written. Their ``Content-Type`` keeps its
+  media type (``application/json``, or the ``error`` entity's) and now
+  carries the renderer's ``charset`` parameter, as ninja's own responses do
+  (``application/json; charset=utf-8`` by default). The body is first reduced
+  to JSON values as ninja's ``NinjaJSONEncoder`` (a ``DjangoJSONEncoder``)
+  writes them, so a datetime, ``Decimal``, ``UUID`` or lazy string from an
+  ``error_body_func`` is still written as in 0.6.0 by a renderer of plain
+  JSON (ORJSON, ``json.dumps``). Links, ``Allow`` and expose headers are
+  unchanged, a 304 still has no body, and a renderer whose ``media_type`` is
+  not JSON content keeps the ``JsonResponse`` bytes and ``Content-Type``.
+  Written by the renderer, these responses are ``HttpResponse`` objects, no
+  longer ``JsonResponse``. A ``JSONRenderer`` with a ``DjangoJSONEncoder``
+  subclass writes Django's values (datetime, ``Decimal`` ...) its own way in
+  them too; another renderer gets them reduced as ``NinjaJSONEncoder``
+  writes them.
+* ninja: an error the API's exception handler answers for a scrudful
+  operation (or under ``add_error_links``), served as the ``error`` entity's
+  media type, now also carries the charset of its bytes
+  (``application/problem+json; charset=utf-8``), where 0.6.0 dropped it; a
+  charset the entity's ``media_type`` names is replaced by the bytes' one,
+  never repeated.
+
+New
+---
+
+* ninja: ``scrudful_list(before=...)`` (optional):
+  ``before(request, **path_params)`` is called once per request where DRF
+  checks permissions: after ninja's authentication, before its throttles and
+  before it validates any parameter, with the URL's path parameters as they
+  are (strings, not the values the function gets: ``"07"`` is 7 to an
+  ``int`` parameter, so compare the function's value or parse as its type
+  does, never deny by testing a raw string). It returns ``None`` to let the
+  request go on: anything else it returns (``False``, a response, or an
+  awaitable in a sync operation, whose coroutine is closed or future
+  cancelled, never awaited) raises ``TypeError``, as a refusal is raised,
+  never returned. So a list can answer 401 or 403 before the 422 of a bad
+  parameter, and a refused request uses none of a throttle's quota. When it
+  returns, ninja throttles and validates every parameter as without it: one
+  422 lists every bad one, and the OpenAPI description is unchanged. Neither
+  its error nor that 422 reaches the decorators added with
+  ``add_decorator(mode="operation")``. With ``before``, scrudful runs its own
+  copy of ninja's per-operation checks (CSRF flag, authentication,
+  throttles) with ``before`` between the last two, relying on
+  ``Operation.run`` to answer their response before it reads any parameter.
+  Both are verified against ninja 1.7.0 and 1.7.1. The ``ninja`` extra still
+  allows any ninja from 1.7 below 2, so a later release scrudful hasn't
+  verified may be installed: an app using ``before=`` should lock its ninja
+  version. When the operation is built (at startup), ``before=`` raises
+  ``ConfigError`` if the installed ninja's ``_run_checks`` or ``run`` differs
+  from those releases' (upgrade scrudful, or keep ninja at a verified
+  release), if an ``Operation`` subclass overrides either, or if a
+  ``decorate_view`` below ``@scrudful_list`` hides the operation (no
+  ``functools.wraps``). They are compared by a digest of their source,
+  comments, docstrings and blank lines aside; where the source isn't
+  installed (``.pyc`` only), only the names, local variables and arguments
+  they use are compared. A request that reaches the function without
+  ``before`` having allowed it (ninja served a copy of the operation without
+  scrudful's checks) fails with ``RuntimeError`` instead of going on.
+  ``request.auth`` exists only when an auth callback succeeded: where
+  ``before`` may run without one, fail closed (``getattr(request, "auth",
+  None)`` and a 401 when it is ``None``). Without ``before`` nothing changes.
+
+Fixes
+-----
+
+* DRF: a create calling ``self.perform_create(serializer, ...)`` with extra
+  arguments (``owner=request.user``, as DRF documents) no longer raises
+  ``TypeError``: the wrapper ``scrudful_viewset`` puts on ``perform_create``
+  passes them through and returns its result, and the 201 still gets the
+  created object's ``Location`` and validators.
+* DRF: ``ScrudfulPagination``'s bad ``page`` and ``page_size`` errors carry
+  the codes of a DRF ``IntegerField``'s (``invalid``, ``min_value``,
+  ``max_value``), with its messages (translated, as DRF's are), and one 400
+  names both parameters
+  when both are bad, as ninja's ``scrudful_list`` 422 already did. Each
+  parameter still goes through ``_integer``, so a subclass calling or
+  overriding it (to clamp ``page_size``, or accept ``page=last``) keeps its
+  behaviour, and with an overridden ``_integer`` the 400 names the first bad
+  parameter only, as in 0.6.0 (the override is not called for ``page_size``
+  once ``page`` failed). ``_parse_parameter`` (returning the value and the
+  error, parsed once) is the new hook below it, and keeps both errors.
+
 0.6.0 (since 0.5.0)
 ===================
 

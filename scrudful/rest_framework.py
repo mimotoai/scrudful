@@ -107,8 +107,14 @@ from typing import Any
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.http import Http404, HttpRequest, HttpResponseBase
 from django.utils.encoding import iri_to_uri
-from rest_framework.exceptions import APIException, NotFound, ValidationError
+from rest_framework.exceptions import (
+    APIException,
+    ErrorDetail,
+    NotFound,
+    ValidationError,
+)
 from rest_framework.decorators import api_view
+from rest_framework.fields import IntegerField
 from rest_framework.metadata import BaseMetadata, SimpleMetadata
 from rest_framework.mixins import UpdateModelMixin
 from rest_framework.pagination import BasePagination
@@ -141,6 +147,7 @@ from scrudful._adapter import (
     is_json,
     merge_links,
     options_links,
+    parse_query_int,
     reason_phrase,
     set_validator_headers,
     validator_policy,
@@ -325,8 +332,9 @@ class ScrudfulViewFunc:
         context_rel_or_func: Any = None,
         context_type_or_func: Any = None,
         error: Entity | None = None,
-        error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]]
-        | None = None,
+        error_body_func: (
+            Callable[[Any, ConditionalResult], dict[str, Any]] | None
+        ) = None,
         object_validators: bool = False,
         location_func: Callable[..., Any] | None = None,
         creates: bool = False,
@@ -899,15 +907,19 @@ def _memoize_get_object(cls: type) -> None:
 
 
 def _record_created(view: Any) -> None:
-    """Make ``view.perform_create`` record the saved instance on the request."""
+    """Make ``view.perform_create`` record the saved instance on the request.
+
+    The wrapper passes any extra arguments (``perform_create(serializer,
+    owner=...)``) through and returns what ``perform_create`` returns.
+    """
     perform_create = getattr(view, "perform_create", None)
     if not callable(perform_create):
         return
     request = view.request
     setattr(request, _CREATED_ATTR, None)
 
-    def record(serializer: Any) -> Any:
-        result = perform_create(serializer)
+    def record(serializer: Any, *args: Any, **kwargs: Any) -> Any:
+        result = perform_create(serializer, *args, **kwargs)
         # A many=True create saves a list: no single object to describe.
         created = None
         if not getattr(serializer, "many", False):
@@ -1538,8 +1550,11 @@ class ScrudfulPagination(BasePagination):
     as the URL keyword (``pk=...``).
 
     A non-integer or out of range ``page`` or ``page_size`` is a 400 naming
-    the parameter; a ``page`` past the last one is a 404 (page 1 always
-    exists).
+    the parameter (both, when both are bad, unless a subclass overrides
+    ``_integer``), each error with the code of a DRF
+    ``IntegerField``'s: ``invalid`` (not an integer), ``min_value`` (below 1)
+    or ``max_value`` (``page_size`` above ``max_page_size``). A ``page`` past
+    the last one is a 404 (page 1 always exists).
     """
 
     page_size = 100
@@ -1558,10 +1573,29 @@ class ScrudfulPagination(BasePagination):
                 f"{type(view).__name__} uses ScrudfulPagination: it needs "
                 "Meta.href_func(view, request, obj), returning an item's URL"
             )
-        number = self._integer(request, self.page_query_param, 1, None)
-        size = self._integer(
-            request, self.page_size_query_param, self.page_size, self.max_page_size
-        )
+        # Each parameter goes through _integer. With scrudful's own, their
+        # errors are merged, so one 400 names both; an overridden one stops at
+        # the first error, as in 0.6.0 (it is not called for page_size once
+        # page failed).
+        collect = type(self)._integer is ScrudfulPagination._integer
+        values, errors = [], {}
+        for name, default, maximum in (
+            (self.page_query_param, 1, None),
+            (self.page_size_query_param, self.page_size, self.max_page_size),
+        ):
+            try:
+                values.append(self._integer(request, name, default, maximum))
+            except ValidationError as exc:
+                if not collect:
+                    raise
+                detail = exc.detail
+                if isinstance(detail, dict):
+                    errors.update(detail)
+                else:
+                    errors[name] = detail
+        if errors:
+            raise ValidationError(errors)
+        number, size = values
         try:
             # The unordered-queryset warning points at this method's caller.
             self.count, self.objects = slice_page(queryset, number, size)
@@ -1635,23 +1669,57 @@ class ScrudfulPagination(BasePagination):
     def _integer(
         self, request: Request, name: str, default: int, maximum: int | None
     ) -> int:
-        """The query parameter ``name`` as an integer in ``[1, maximum]``."""
+        """The query parameter ``name`` as an integer in ``[1, maximum]``.
+
+        :meth:`paginate_queryset` calls it for ``page`` and ``page_size`` and
+        merges the errors of both into one ``ValidationError``. A subclass may
+        override it (to clamp ``page_size``, say): ``paginate_queryset`` then
+        raises the first error, as in 0.6.0, without calling it for
+        ``page_size`` once ``page`` failed. Or override
+        :meth:`_parse_parameter`, which keeps both errors.
+
+        Raises
+        ------
+        rest_framework.exceptions.ValidationError
+            ``{name: [error]}``, the error of :meth:`_parse_parameter`.
+        """
+        value, error = self._parse_parameter(request, name, default, maximum)
+        if error is not None:
+            raise ValidationError({name: [error]})
+        return value  # type: ignore[return-value]
+
+    def _parse_parameter(
+        self, request: Request, name: str, default: int, maximum: int | None
+    ) -> tuple[int, None] | tuple[None, ErrorDetail]:
+        """The query parameter ``name`` parsed once: ``(value, None)``, or
+        ``(None, error)``.
+
+        ``default`` when it is absent. An integer is what django-ninja's
+        ``scrudful_list`` accepts (pydantic's lax ``int``: ``"2.0"`` is 2,
+        ``"٣"`` is not an integer), see
+        :func:`scrudful._adapter.parse_query_int`. The error's code is
+        ``invalid`` (not an integer), ``min_value`` (below 1) or ``max_value``
+        (above ``maximum``), with the message a DRF ``IntegerField`` gives
+        (translated as DRF's are). A subclass may
+        override it to accept other values (``page=last``, say) by returning
+        their integer.
+        """
         raw = request.query_params.get(name)
         if raw is None:
-            return default
-        try:
-            value = int(raw)
-        except ValueError:
-            raise ValidationError({name: ["A valid integer is required."]}) from None
+            return default, None
+        messages = IntegerField.default_error_messages
+        value = parse_query_int(raw)
+        if value is None:
+            return None, ErrorDetail(str(messages["invalid"]), code="invalid")
         if value < 1:
-            raise ValidationError(
-                {name: ["Ensure this value is greater than or equal to 1."]}
+            return None, ErrorDetail(
+                messages["min_value"].format(min_value=1), code="min_value"
             )
         if maximum is not None and value > maximum:
-            raise ValidationError(
-                {name: [f"Ensure this value is less than or equal to {maximum}."]}
+            return None, ErrorDetail(
+                messages["max_value"].format(max_value=maximum), code="max_value"
             )
-        return value
+        return value, None
 
     def _item_kwargs(self, obj: Any) -> dict[str, Any]:
         """The URL keywords of ``obj``'s detail route, as its callbacks get them.

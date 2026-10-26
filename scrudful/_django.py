@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -16,6 +17,7 @@ from django.core.paginator import UnorderedObjectListWarning
 from django.db.models import QuerySet
 from django.http import (
     HttpRequest,
+    HttpResponse,
     HttpResponseBase,
     HttpResponseNotModified,
     JsonResponse,
@@ -30,6 +32,7 @@ from scrudful.conditional import ConditionalResult
 __all__ = [
     "aware",
     "conditional_response",
+    "json_response",
     "page_url",
     "precondition_headers",
     "slice_page",
@@ -48,26 +51,31 @@ def precondition_headers(request: HttpRequest) -> dict[str, str]:
     return _adapter.precondition_headers(getlist)
 
 
+#: Writes a JSON body: ``render(data, status, content_type)`` returns the
+#: response carrying it, with that status and Content-Type.
+Render = Callable[[Any, int, str], HttpResponse]
+
+
 def conditional_response(
     result: ConditionalResult,
     link: str | None = None,
     content_type: str | None = None,
+    render: Render | None = None,
 ) -> HttpResponseBase:
     """Render a failed precondition: a bare 304, or a JSON body and status.
 
     ``link`` is the Link field value of a response with a body (the adapter's
     error Links) and ``content_type`` its Content-Type (default
     ``application/json``; the media type of the adapter's error entity); a
-    304 gets neither.
+    304 gets neither. The body is written by ``render`` (the ninja adapter
+    passes the API's renderer), else as Django's ``JsonResponse`` writes it.
     """
     response: HttpResponseBase
     if result.body is None:
         response = HttpResponseNotModified()
     else:
-        response = JsonResponse(
-            result.body,
-            status=result.status,
-            content_type=content_type or "application/json",
+        response = json_response(
+            result.body, result.status, content_type or "application/json", render
         )
         if link:
             response["Link"] = link
@@ -75,6 +83,16 @@ def conditional_response(
         response[name] = value
     _adapter.expose_headers(response)
     return response
+
+
+def json_response(
+    data: Any, status: int, content_type: str, render: Render | None = None
+) -> HttpResponse:
+    """A response with the JSON body ``data``, written by ``render`` if given,
+    else by Django's ``JsonResponse``, and this status and Content-Type."""
+    if render is None:
+        return JsonResponse(data, status=status, content_type=content_type)
+    return render(data, status, content_type)
 
 
 def aware(value: Any) -> Any:
