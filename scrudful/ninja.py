@@ -410,7 +410,15 @@ from collections.abc import Callable, Generator, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
-from typing import Any, NamedTuple, TypeVar, Union, get_args, get_origin
+from typing import (
+    Any,
+    NamedTuple,
+    NoReturn,
+    TypeVar,
+    Union,
+    get_args,
+    get_origin,
+)
 
 from asgiref.sync import async_to_sync, sync_to_async
 from django.http import (
@@ -425,6 +433,7 @@ from ninja import errors as ninja_errors
 from ninja.constants import NOT_SET
 from ninja.errors import ConfigError, HttpError
 from ninja.operation import AsyncOperation, Operation
+from ninja.renderers import JSONRenderer
 from ninja.responses import NinjaJSONEncoder
 from ninja.signature.details import is_collection_type
 from ninja.signature.utils import get_path_param_names
@@ -1173,11 +1182,17 @@ def scrudful_list(
         throttles and before it validates any parameter of the operation
         (path, query or body) or calls its function. ``path_params`` are the
         URL's values, not validated yet (strings, unless the path uses a
-        converter such as ``{int:pk}``). ``request.auth`` is set only when an
+        converter such as ``{int:pk}``): ``"07"``, ``"+7"`` and ``" 7"`` are
+        all 7 to an ``int`` parameter. Never deny by testing a raw string for
+        a value: compare the value the function gets (declare the parameter
+        ``str``), or parse it as its type does and refuse what doesn't
+        parse. ``request.auth`` is set only when an
         auth callback succeeded: on an operation that may run without
         ``auth``, fail closed (``user = getattr(request, "auth", None)``, and
         ``raise HttpError(401, ...)`` when it is ``None``) before using it.
-        Its return value is ignored. Raise ninja's ``HttpError`` (or another
+        It returns ``None`` to let the request go on; anything else it
+        returns (``False``, a response) raises ``TypeError``, as a refusal is
+        raised, never returned. Raise ninja's ``HttpError`` (or another
         exception the API handles) to answer first, e.g. with 401 or 403 whatever the
         parameters are; the API's exception handler answers it, as ninja
         answers its own errors, an ``HttpError`` gets the operation's error
@@ -1756,7 +1771,8 @@ class _Raised:
     #: The operation's, once its wrapper raised an ``HttpError`` or
     #: ``Http404``.
     config: _Config | None = None
-    #: The path parameters, as the URL gives them.
+    #: The path parameters, as the URL gives them (strings, unless the path
+    #: uses a converter).
     path_params: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1831,11 +1847,13 @@ def _render(request: HttpRequest) -> Render | None:
     Its ``create_response``, when its renderer writes JSON content (an
     ``application/json`` or ``+json`` ``media_type``), so these bodies have
     the bytes and charset of every other response of the API; their
-    Content-Type is the body's media type with that charset. The body is
-    first reduced to JSON values as ninja's ``NinjaJSONEncoder`` (a
-    ``DjangoJSONEncoder``) writes them, so a renderer of plain JSON
-    (``orjson``, ``json.dumps``) writes a datetime, ``Decimal``, ``UUID`` or
-    lazy string as ``JsonResponse`` did. ``None`` (Django's ``JsonResponse``)
+    Content-Type is the body's media type with that charset. Unless the
+    renderer is ninja's ``JSONRenderer`` with its encoder, which writes them
+    so itself, the body is first reduced to JSON values as ninja's
+    ``NinjaJSONEncoder`` (a ``DjangoJSONEncoder``) writes them, so a renderer
+    of plain JSON (``orjson``, ``json.dumps``) writes a datetime,
+    ``Decimal``, ``UUID`` or lazy string as ``JsonResponse`` did. ``None``
+    (Django's ``JsonResponse``)
     outside a scrudful operation, or for a renderer of other content: the
     bodies are JSON whatever the renderer.
     """
@@ -1847,13 +1865,32 @@ def _render(request: HttpRequest) -> Render | None:
     except ValueError:  # not a media type
         return None
 
+    as_is = _writes_ninja_json(api.renderer)
+
     def render(data: Any, status: int, content_type: str) -> HttpResponse:
-        plain = json.loads(json.dumps(data, cls=NinjaJSONEncoder))
+        plain = data if as_is else _json_values(data)
         response: HttpResponse = api.create_response(request, plain, status=status)
         response["Content-Type"] = f"{content_type}; charset={response.charset}"
         return response
 
     return render
+
+
+def _writes_ninja_json(renderer: Any) -> bool:
+    """Whether ``renderer`` writes values as ``NinjaJSONEncoder`` does: ninja's
+    ``JSONRenderer`` (its ``render``) with that encoder or a subclass. Its
+    bodies need no reduction (:func:`_json_values`) first."""
+    encoder = getattr(renderer, "encoder_class", None)
+    return (
+        type(renderer).render is JSONRenderer.render
+        and isinstance(encoder, type)
+        and issubclass(encoder, NinjaJSONEncoder)
+    )
+
+
+def _json_values(data: Any) -> Any:
+    """``data`` as JSON values, written as ``NinjaJSONEncoder`` writes them."""
+    return json.loads(json.dumps(data, cls=NinjaJSONEncoder))
 
 
 def _note_raised(config: _Config, exc: Exception) -> None:
@@ -2151,10 +2188,14 @@ def _install_before(
     raises is answered by the API's exception handler, as ninja answers its
     own; neither reaches the decorators added with
     ``add_decorator(mode="operation")``, which wrap the operation's function.
-    In a sync operation, a ``before`` returning an awaitable raises
-    ``TypeError``: it can't be awaited there, and the request must not go on
-    as if it were allowed. A coroutine is closed and a future (or task)
-    cancelled, so neither runs on unawaited.
+    ``before`` allows the request by returning ``None`` and refuses it by
+    raising: anything else it returns raises ``TypeError`` (a returned
+    ``HttpResponse`` or ``False`` must not let the request go on as if it
+    were allowed). So does an awaitable in a sync operation, which can't
+    await it; a coroutine is closed and a future (or task) cancelled, so
+    neither runs on unawaited. Without the path parameters (the checks run
+    outside the operation's ``Operation.run``) it raises ``RuntimeError``
+    instead of calling ``before`` without them.
 
     Raises
     ------
@@ -2163,65 +2204,87 @@ def _install_before(
     """
     _check_ninja_checks(operation, asynchronous, label)
 
+    def path_params() -> dict[str, Any]:
+        raised = _RAISED.get()
+        if raised is None:
+            raise RuntimeError(
+                f"{label}: before can't get the path parameters: the "
+                "operation's checks ran outside its Operation.run"
+            )
+        return dict(raised.path_params)
+
     def answer(request: HttpRequest, exc: Exception) -> HttpResponseBase:
         _note_raised(config, exc)
         return operation.api.on_exception(request, exc)  # type: ignore[no-any-return]
 
-    def path_params() -> dict[str, Any]:
-        raised = _RAISED.get()
-        return {} if raised is None else dict(raised.path_params)
+    def mark_csrf_exempt(request: HttpRequest) -> None:
+        if operation.csrf_exempt:
+            request._ninja_csrf_exempt = True  # type: ignore[attr-defined]
+
+    def after_before(request: HttpRequest, result: Any) -> HttpResponseBase | None:
+        """Fail closed unless ``before`` returned ``None``; then throttle."""
+        if result is not None:
+            _refuse_before_result(result, asynchronous)
+        if operation.throttle_objects:
+            error = operation._check_throttles(request)
+            if error:
+                return error  # type: ignore[no-any-return]
+        return None
 
     if asynchronous:
 
         async def run_checks(request: HttpRequest) -> HttpResponseBase | None:
-            if operation.csrf_exempt:
-                request._ninja_csrf_exempt = True  # type: ignore[attr-defined]
+            mark_csrf_exempt(request)
             if operation.auth_callbacks:
                 error = await operation._run_authentication(request)
                 if error:
                     return error  # type: ignore[no-any-return]
+            params = path_params()
             try:
-                await _call_async(config.before, (request,), path_params())
+                result = await _call_async(config.before, (request,), params)
             except Exception as exc:
                 return answer(request, exc)
-            if operation.throttle_objects:
-                error = operation._check_throttles(request)
-                if error:
-                    return error  # type: ignore[no-any-return]
-            return None
+            return after_before(request, result)
 
     else:
 
         def run_checks(  # type: ignore[misc]
             request: HttpRequest,
         ) -> HttpResponseBase | None:
-            if operation.csrf_exempt:
-                request._ninja_csrf_exempt = True  # type: ignore[attr-defined]
+            mark_csrf_exempt(request)
             if operation.auth_callbacks:
                 error = operation._run_authentication(request)
                 if error:
                     return error  # type: ignore[no-any-return]
+            params = path_params()
             try:
-                result = config.before(request, **path_params())  # type: ignore[misc]
+                result = config.before(request, **params)  # type: ignore[misc]
             except Exception as exc:
                 return answer(request, exc)
-            if inspect.isawaitable(result):
-                if inspect.iscoroutine(result):
-                    result.close()
-                elif asyncio.isfuture(result):
-                    result.cancel()
-                raise TypeError(
-                    f"before returned an awaitable ({result!r}) in a sync "
-                    "operation, which can't await it: make the operation async "
-                    "def, or before a plain function"
-                )
-            if operation.throttle_objects:
-                error = operation._check_throttles(request)
-                if error:
-                    return error  # type: ignore[no-any-return]
-            return None
+            return after_before(request, result)
 
     operation._run_checks = run_checks
+
+
+def _refuse_before_result(result: Any, asynchronous: bool) -> NoReturn:
+    """Raise ``TypeError`` for what ``before`` returned instead of ``None``;
+    an awaitable is closed (a coroutine) or cancelled (a future) first."""
+    if inspect.isawaitable(result):
+        if inspect.iscoroutine(result):
+            result.close()
+        elif asyncio.isfuture(result):
+            result.cancel()
+        if not asynchronous:
+            raise TypeError(
+                f"before returned an awaitable ({result!r}) in a sync "
+                "operation, which can't await it: make the operation async "
+                "def, or before a plain function"
+            )
+    raise TypeError(
+        f"before returned {result!r}: it allows the request by returning "
+        "None and refuses it by raising (e.g. HttpError(403, ...)), never by "
+        "returning a response or a value"
+    )
 
 
 def _raised_links(

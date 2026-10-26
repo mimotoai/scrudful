@@ -282,3 +282,46 @@ def test_plain_renderer_writes_what_json_response_did(
     assert response.status_code == status
     expected = json.loads(json.dumps(DJANGO_VALUES, cls=DjangoJSONEncoder))
     assert {key: response.json()[key] for key in DJANGO_VALUES} == expected
+
+
+class OwnRenderJSONRenderer(JSONRenderer):
+    """ninja's renderer class, with a ``render`` of its own."""
+
+    def render(self, request, data, *, response_status):
+        return json.dumps(data)
+
+
+class OtherEncoderRenderer(JSONRenderer):
+    encoder_class = json.JSONEncoder
+
+
+@pytest.mark.parametrize(
+    "renderer, reduced",
+    [
+        (None, False),
+        (CompactRenderer(), False),
+        (PlainRenderer(), True),
+        (OwnRenderJSONRenderer(), True),
+        (OtherEncoderRenderer(), True),
+    ],
+    ids=["default", "compact", "plain", "own-render", "other-encoder"],
+)
+def test_bodies_reduced_only_for_other_renderers(monkeypatch, renderer, reduced):
+    """ninja's JSONRenderer with its encoder writes Django's values itself."""
+    import scrudful.ninja
+
+    calls = []
+    original = scrudful.ninja._json_values
+
+    def counting(data):
+        calls.append(data)
+        return original(data)
+
+    monkeypatch.setattr(scrudful.ninja, "_json_values", counting)
+    client = TestClient(api_for(router(Store()), renderer))
+    for method, headers, status in EARLY:
+        response = client.request(
+            method, "/items/1", json={"name": "x"}, headers=headers
+        )
+        assert response.status_code == status
+    assert len(calls) == (len(EARLY) if reduced else 0)

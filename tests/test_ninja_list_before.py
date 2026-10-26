@@ -19,12 +19,14 @@ from items.models import Item
 from ninja import NinjaAPI, Router
 from ninja.decorators import decorate_view
 from django.core.cache import cache
+from django.http import HttpResponse
 from django.test import RequestFactory
 from ninja import operation as ninja_operation
 from ninja.errors import ConfigError, HttpError
 from ninja.security import APIKeyHeader
 from ninja.testing import TestAsyncClient, TestClient
 from ninja.throttling import AnonRateThrottle as Throttle
+import scrudful.ninja
 from scrudful.ninja import Entity, add_error_links, scrudful_list
 
 from tests.test_ninja_adapter import ItemOut
@@ -122,16 +124,19 @@ def getter(asynchronous: bool, api: NinjaAPI):
 
 
 class Recorder:
-    """A ``before`` hook recording its calls, raising ``error`` if set."""
+    """A ``before`` hook recording its calls, raising ``error`` if set, else
+    returning ``result``."""
 
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(self, error: Exception | None = None, result: Any = None) -> None:
         self.calls: list[tuple[Any, dict[str, Any]]] = []
         self.error = error
+        self.result = result
 
     def __call__(self, request, **params):
         self.calls.append((request, params))
         if self.error is not None:
             raise self.error
+        return self.result
 
 
 class AsyncRecorder(Recorder):
@@ -386,6 +391,31 @@ def test_sync_before_returning_an_awaitable_is_an_error(items):
     client = TestClient(api_for(list_router(before=before)))
     with pytest.raises(TypeError, match="awaitable"):
         client.get("/p/7/items")
+
+
+@ASYNC
+@pytest.mark.parametrize(
+    "refusal",
+    [HttpResponse(status=403), False, True],
+    ids=["response", "False", "True"],
+)
+def test_before_returning_anything_but_none_fails_closed(items, asynchronous, refusal):
+    """A refusal is raised, never returned: a returned one must not be
+    taken for an allowed request."""
+    before = Recorder(result=refusal)
+    get = getter(asynchronous, api_for(list_router(asynchronous, before=before)))
+    with pytest.raises(TypeError, match="never by returning"):
+        get("/p/7/items")
+    assert len(before.calls) == 1
+
+
+def test_async_before_returning_an_awaitable_fails_closed(items):
+    async def before(request, **params):
+        return _deny(request)
+
+    get = getter(True, api_for(list_router(True, before=before)))
+    with pytest.raises(TypeError, match="never by returning"):
+        get("/p/7/items")
 
 
 def test_sync_before_returning_a_future_cancels_it(items):
@@ -755,17 +785,42 @@ def test_checks_copy_sets_the_csrf_flag_as_ninja(asynchronous, csrf_exempt):
     operation.auth_callbacks = []
     operation.throttle_objects = []
     flags = []
-    for checks in (
-        operation._run_checks,
-        functools.partial(type(operation)._run_checks, operation),
-    ):
-        request = RequestFactory().get("/p/7/items")
-        result = checks(request)
-        if asynchronous:
-            result = async_to_sync(_awaited)(result)
-        assert result is None
-        flags.append(getattr(request, "_ninja_csrf_exempt", None))
+    # The path parameters, as scrudful's Operation.run decorator sets them.
+    token = scrudful.ninja._RAISED.set(
+        scrudful.ninja._Raised(path_params={"parent": "7"})
+    )
+    try:
+        for checks in (
+            operation._run_checks,
+            functools.partial(type(operation)._run_checks, operation),
+        ):
+            request = RequestFactory().get("/p/7/items")
+            result = checks(request)
+            if asynchronous:
+                result = async_to_sync(_awaited)(result)
+            assert result is None
+            flags.append(getattr(request, "_ninja_csrf_exempt", None))
+    finally:
+        scrudful.ninja._RAISED.reset(token)
     assert flags[0] == flags[1] == (True if csrf_exempt else None)
+
+
+@ASYNC
+def test_checks_outside_operation_run_never_call_before(asynchronous):
+    """Without the path parameters ``before`` isn't called with none."""
+    before = Recorder()
+    router = list_router(asynchronous, before=before)
+    [operation] = [
+        op
+        for path_view in router.path_operations.values()
+        for op in path_view.operations
+    ]
+    operation.auth_callbacks = []
+    with pytest.raises(RuntimeError, match="can't get the path parameters"):
+        result = operation._run_checks(RequestFactory().get("/p/7/items"))
+        if asynchronous:
+            async_to_sync(_awaited)(result)
+    assert before.calls == []
 
 
 async def _awaited(awaitable):

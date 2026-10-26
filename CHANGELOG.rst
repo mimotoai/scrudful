@@ -48,14 +48,17 @@ New
   ``before(request, **path_params)`` is called once per request where DRF
   checks permissions: after ninja's authentication, before its throttles and
   before it validates any parameter, with the URL's path parameters as they
-  are. So a list can answer 401 or 403 before the 422 of a bad parameter, and
+  are (strings, not the values the function gets: ``"07"`` is 7 to an
+  ``int`` parameter, so compare the function's value or parse as its type
+  does, never deny by testing a raw string). It returns ``None`` to let the
+  request go on: anything else it returns (``False``, a response) raises
+  ``TypeError``, a refusal is raised, never returned. So a list can answer 401 or 403 before the 422 of a bad parameter, and
   a refused request uses none of a throttle's quota. When it returns, ninja
   throttles and validates every parameter as without it: one 422 lists every
   bad one, and the OpenAPI description is unchanged. Neither its error nor
   that 422 reaches the decorators added with ``add_decorator(mode="operation")``.
-  A sync ``before`` returning an awaitable in a sync operation raises
-  ``TypeError`` (a coroutine is closed and a future cancelled, never
-  awaited). With ``before``, scrudful runs its own copy of ninja's
+  So does an awaitable in a sync operation (a coroutine is closed and a
+  future cancelled, never awaited). With ``before``, scrudful runs its own copy of ninja's
   per-operation checks (CSRF flag, authentication, throttles) with ``before``
   between the last two, relying on ``Operation.run`` to answer their
   response before it reads any parameter. Both are verified against ninja

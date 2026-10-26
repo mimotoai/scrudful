@@ -434,10 +434,18 @@ would be a 422 even for a client the list must refuse. ``before=`` runs where
 DRF checks permissions: ``before(request, **path_params)`` is called once per
 request after ninja's authentication and before its throttles and its
 validation of any parameter, with the URL's path parameters as they are (not
-validated yet). ``request.auth`` is set only when an auth callback succeeded
-(the examples here run under ``NinjaAPI(auth=...)``, where it always is): on
-an operation that may run without ``auth``, fail closed before using it, as
-below. Raise ``HttpError(401, ...)`` or ``HttpError(403, ...)``
+validated yet). They are strings (unless the path uses a converter such as
+``{int:pk}``), not the values the function gets: ``"07"``, ``"+7"`` and
+``" 7"`` are all 7 to an ``int`` parameter, so a ``before`` denying
+``path_params["org"] == "7"`` lets ``/orgs/07/...`` through. Never deny by
+testing a raw string for a value: compare the value the function gets
+(declare the parameter ``str``, as below), or parse it as its type does and
+refuse what doesn't parse. ``before`` returns ``None`` to let the request go
+on; anything else it returns (``False``, a response) raises ``TypeError``,
+as a refusal is raised, never returned. ``request.auth`` is set only when an
+auth callback succeeded (the examples here run under ``NinjaAPI(auth=...)``,
+where it always is): on an operation that may run without ``auth``, fail
+closed before using it, as below. Raise ``HttpError(401, ...)`` or ``HttpError(403, ...)``
 there; the API's exception handler answers it, and the refused request uses
 none of a throttle's quota. When it returns, ninja throttles and validates
 every parameter as without ``before``: one 422 lists every bad one, ``page``
@@ -669,8 +677,8 @@ to JSON values as ninja's ``NinjaJSONEncoder`` (a ``DjangoJSONEncoder``)
 writes them, so a renderer of plain JSON (ORJSON, ``json.dumps``) writes a
 datetime, ``Decimal``, ``UUID`` or lazy string in an ``error_body_func``
 body as ``JsonResponse`` did. A renderer whose
-``media_type`` is not JSON content, a ``decorate_view`` decorator below
-scrudful that wraps ``Operation.run`` without ``functools.wraps`` gets them
+``media_type`` is not JSON content, or a ``decorate_view`` decorator below
+scrudful that wraps ``Operation.run`` without ``functools.wraps``, gets them
 written as Django's ``JsonResponse`` writes them.
 
 **Error bodies.** ``error_body_func(request, result)`` on ``@scrudful`` and
