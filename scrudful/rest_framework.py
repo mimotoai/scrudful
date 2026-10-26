@@ -899,15 +899,19 @@ def _memoize_get_object(cls: type) -> None:
 
 
 def _record_created(view: Any) -> None:
-    """Make ``view.perform_create`` record the saved instance on the request."""
+    """Make ``view.perform_create`` record the saved instance on the request.
+
+    The wrapper passes any extra arguments (``perform_create(serializer,
+    owner=...)``) through and returns what ``perform_create`` returns.
+    """
     perform_create = getattr(view, "perform_create", None)
     if not callable(perform_create):
         return
     request = view.request
     setattr(request, _CREATED_ATTR, None)
 
-    def record(serializer: Any) -> Any:
-        result = perform_create(serializer)
+    def record(serializer: Any, *args: Any, **kwargs: Any) -> Any:
+        result = perform_create(serializer, *args, **kwargs)
         # A many=True create saves a list: no single object to describe.
         created = None
         if not getattr(serializer, "many", False):
