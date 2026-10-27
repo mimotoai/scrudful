@@ -1096,7 +1096,7 @@ def test_view_func_error_steers_authorization_away_from_below(store):
         message
     )
     assert "runs after load and the preconditions" in message
-    assert "authorization in load or auth=" in message
+    assert "authorization in before=, load or auth=" in message
     assert "add_decorator(mode='operation')" in message
     assert "Stacking two scrudful decorators is not supported" in message
     assert '"Placement of other decorators"' in message

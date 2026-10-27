@@ -2,6 +2,69 @@
 Changelog
 =========
 
+0.8.0 (since 0.7.0)
+===================
+
+Additive and backwards compatible: an operation without ``after_throttles=``
+(and an item or create operation without ``before=``) behaves as in 0.7.0,
+but for two messages. The ``RuntimeError`` raised when ``before`` can't get
+the path parameters now names the hook as ``before=``. The ``ConfigError``
+of any scrudful operation whose ``view_func`` something replaced now lists
+``before=`` among the places for per-operation authorization ("in before=,
+load or auth=", was "in load or auth=").
+
+New
+---
+
+* ninja: ``scrudful_list(after_throttles=...)`` (optional):
+  ``after_throttles(request, **path_params)`` is called once per request
+  where DRF's ``list()`` starts: after ninja's authentication, after
+  ``before`` (if given) and after ninja's throttles, and before ninja
+  validates any parameter. So DRF's whole order can be reproduced
+  (authentication, ``before``, throttles, ``after_throttles``, then the
+  parameters): a throttled request (429) never calls it, so a client over
+  its quota can't force an expensive check (e.g. a per-row authorization
+  filter that may answer 400) on every request, and its error beats the 422
+  of a bad ``page``, as DRF's ``list()`` filters before it paginates. A
+  request it refuses has used its throttle quota, as in DRF. Its contract is
+  ``before``'s: the URL's path parameters as they are (each hook gets its own
+  copy), ``None`` to let the request go on (anything else, or an awaitable in
+  a sync operation, whose coroutine is closed or future cancelled, raises
+  ``TypeError``), an error raised to answer first (answered by the API's
+  exception handler, with the operation's error Links), neither that error
+  nor the 422 that follows reaching the ``add_decorator(mode="operation")``
+  decorators, ``async def`` in an ``async def`` operation, and the same
+  guards: ``ConfigError`` when the operation is built (an installed ninja's
+  ``_run_checks`` or ``run`` differing from 1.7.0's and 1.7.1's, an
+  ``Operation`` subclass overriding either, or a ``decorate_view`` below
+  ``@scrudful_list`` without ``functools.wraps``), and ``RuntimeError`` for a
+  request that reaches the function without the hooks having allowed it.
+  Use it alone or with ``before``. When it returns, one 422 lists every bad
+  parameter, and the OpenAPI description is unchanged. The ``ConfigError``
+  and ``RuntimeError`` messages name the hooks the operation has
+  (``before=``, ``after_throttles=`` or both).
+* ninja: item and create operations take the same hooks:
+  ``scrudful(before=..., after_throttles=...)`` and
+  ``scrudful_create(before=..., after_throttles=...)`` (optional), with
+  ``scrudful_list``'s contract, machinery and guards (the ``ConfigError``
+  of a ``decorate_view`` hiding the operation names ``@scrudful`` or
+  ``@scrudful_create``). The order is DRF's for these operations too:
+  authentication, ``before`` (where DRF's ``has_permission`` runs, before
+  its throttles), throttles, ``after_throttles``, then the parameters and
+  body, ``load`` and the preconditions. So a client ``before`` refuses gets
+  its 401 or 403 even when throttled, and a client either hook refuses never
+  gets a 422 for a bad body, or a 304, 412 or 428 (nor a validator). A hook
+  gets the raw request and may read the body as the operation's parameters
+  do: ``request.body`` for a JSON body, ``request.POST`` and
+  ``request.FILES`` for a form or an upload, never ``request.body`` of a
+  multipart body (ninja's CSRF check or ``fix_request_files_middleware`` may
+  have parsed it already, and it would hold the uploaded files in memory);
+  the body is still validated after it. The OpenAPI description is
+  unchanged. As for a list with ``before=``, the decorated function of an
+  operation with a hook can't be called directly (e.g. in a unit test): it
+  raises ``RuntimeError``, since the hooks didn't run. Test the operation
+  through ninja's ``TestClient``.
+
 0.7.0 (since 0.6.0)
 ===================
 

@@ -1,6 +1,6 @@
 [project]
 name = "scrudful"
-version = "0.7.0"
+version = "0.8.0"
 description = "HTTP conditional-request and Link-header helpers for SCRUDful REST APIs (Django REST Framework, django-ninja, FastAPI)"
 authors = [{ name = "David Charboneau", email = "david@openteams.com" }]
 requires-python = ">=3.10"

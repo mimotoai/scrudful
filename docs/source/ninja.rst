@@ -135,6 +135,52 @@ Handlers in modules with ``from __future__ import annotations`` work, including
 when the hidden parameter's annotation is imported only under
 ``TYPE_CHECKING``: each annotation is evaluated on its own.
 
+``@scrudful`` and ``@scrudful_create`` take the hooks of ``@scrudful_list``
+too (since 0.8.0), with the same contract and guards (see
+:ref:`before= and after_throttles= <ninja-hooks>`): ``before(request,
+**path_params)`` runs where DRF checks permissions (``has_permission``),
+after ninja's authentication and before its throttles, and
+``after_throttles(request, **path_params)`` after the throttles. Both run
+before ninja validates any parameter or the body, so before ``load`` and the
+preconditions: a client a hook refuses never gets a 304, 412, 428 or 422, or
+a validator, and a throttled client gets 429 only once ``before`` allowed it,
+as on DRF. The path parameters are the URL's values, not validated yet:
+strings, unless the path uses a converter (``pk`` is an ``int`` below). Never
+deny by testing a raw string for a value: ``"07"`` is 7 to an ``int``
+parameter (see :ref:`below <ninja-hooks>`). Called directly (outside ninja,
+e.g. in a unit test), the decorated function of an operation with a hook
+raises ``RuntimeError``, since the hooks didn't run: test it through ninja's
+``TestClient``. A hook gets the raw request, and may read the body as the
+operation's parameters do:
+
+- a JSON body through ``request.body``, which ninja then reads again from
+  memory. A body over Django's ``DATA_UPLOAD_MAX_MEMORY_SIZE`` fails there as
+  when ninja reads it: Django's 400 (with ``DEBUG``, ninja's 500 traceback).
+- a form or an upload (``Form`` and ``File`` parameters) through
+  ``request.POST`` and ``request.FILES``, never ``request.body``. A multipart
+  body may already be parsed when the hook runs: on a POST by ninja's CSRF
+  check (an ``APIKeyCookie`` or ``SessionAuth`` such as ``django_auth``, which
+  check CSRF by default), on a PUT, PATCH or DELETE by
+  ``fix_request_files_middleware``. ``request.body`` then raises Django's
+  ``RawPostDataException`` (a 500). Otherwise it would hold every uploaded
+  file in memory, failing beyond ``DATA_UPLOAD_MAX_MEMORY_SIZE``, a limit
+  Django doesn't apply to uploaded files.
+
+An item operation refusing, before its throttles, a client that can edit
+nowhere:
+
+.. code-block:: python
+
+    def may_edit_somewhere(request, **path_params):
+        if not can_edit_in_some_context(getattr(request, "auth", None)):
+            raise HttpError(403, "Forbidden")
+
+    @roles.put("/{int:pk}", response=RoleOut,
+               openapi_extra={"responses": CONDITIONAL_WRITE_RESPONSES})
+    @scrudful(load=authorized_role, error=ERROR, before=may_edit_somewhere, **ROLE)
+    def replace_role(request, pk: int, payload: RoleIn, obj: Role):
+        return save_role(obj, **payload.dict())
+
 Choosing what ``load`` returns
 ------------------------------
 
@@ -429,6 +475,8 @@ callbacks as the detail GET. ``page`` and ``page_size`` (default 100, at most
 listing every bad parameter. The optional list validators are called with the
 queryset, and then a list can answer 304.
 
+.. _ninja-hooks:
+
 ninja validates the parameters before the operation runs, so a bad ``page``
 would be a 422 even for a client the list must refuse. ``before=`` runs where
 DRF checks permissions: ``before(request, **path_params)`` is called once per
@@ -467,11 +515,11 @@ only by the names, local variables and arguments they use. On a ninja whose
 code differs, or with an ``Operation`` subclass overriding either method,
 ``before=`` raises ``ConfigError`` at startup instead of skipping a check:
 upgrade scrudful, or keep ninja at a verified release (an app using
-``before=`` should lock its ninja version). Without ``before=`` the check is
-never made. Each request is checked too: one that reaches the operation's
-function without ``before`` having allowed it (ninja served a copy of the
-operation without scrudful's checks) fails with ``RuntimeError``, never goes
-on unchecked.
+``before=`` should lock its ninja version). Without ``before=`` or
+``after_throttles=`` the check is never made. Each request is checked too:
+one that reaches the operation's function without the hooks having allowed it
+(ninja served a copy of the operation without scrudful's checks) fails with
+``RuntimeError``, never goes on unchecked.
 
 Here the API's auth callback returns the caller's ``rbac_context`` (a
 string, as in the example project), and the path names the context listed.
@@ -489,6 +537,40 @@ handler gets:
 
     @roles.get("/contexts/{context}/roles", response=List[RoleOut])
     @scrudful_list(href_func=role_href, before=same_context)
+    def list_context_roles(request, context: str):
+        return Role.objects.filter(rbac_context=context).order_by("pk")
+
+``after_throttles=`` (since 0.8.0) runs where DRF's ``list()`` starts:
+``after_throttles(request, **path_params)`` is called once per request after
+ninja's authentication, after ``before`` (if given) and after ninja's
+throttles, and still before its validation of any parameter. A throttled
+request (429) never calls it, so a client can't force an expensive check
+(e.g. a per-row authorization filter that may answer 400) by sending
+requests over its quota, and its error beats the 422 of a bad ``page``, as
+in DRF, where ``list()`` filters before it paginates. A request it refuses
+has used its throttle quota, as in DRF. Its contract is ``before``'s: the
+same raw path parameters (each hook gets its own copy), ``None`` to go on
+(anything else, or an awaitable in a sync operation, raises ``TypeError``),
+an error raised to answer first, answered by the API's exception handler
+with the operation's error Links and never passing through the
+``add_decorator(mode="operation")`` decorators, ``async def`` in an
+``async def`` operation, the same ``ConfigError`` at startup and the same
+``RuntimeError`` for a request that reaches the function without it having
+allowed it. When it returns, one 422 lists every bad parameter, and the
+OpenAPI description is unchanged. Use it alone or with ``before``; with both,
+the order is DRF's: authentication, ``before``, throttles,
+``after_throttles``, then the parameters:
+
+.. code-block:: python
+
+    def not_too_large(request, **path_params):
+        if conditional_rows(request.auth) > LIMIT:
+            raise HttpError(400, "conditional_list_too_large")
+
+    @roles.get("/contexts/{context}/roles", response=List[RoleOut])
+    @scrudful_list(
+        href_func=role_href, before=same_context, after_throttles=not_too_large
+    )
     def list_context_roles(request, context: str):
         return Role.objects.filter(rbac_context=context).order_by("pk")
 
