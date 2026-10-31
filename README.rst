@@ -287,8 +287,7 @@ arrives, as there is no ``get_object()``.
 ``last_modified_func``), ``scrudful_viewset`` sets ``creates=True`` for
 ``create``; without it, ``create`` gets only the links and error entity. Set
 ``creates=True`` on an explicit ``@scrudful`` create (it needs
-``object_validators``). No precondition is
-evaluated and the 201 gets ``ETag`` and ``Last-Modified`` from the saved
+``object_validators``). The 201 gets ``ETag`` and ``Last-Modified`` from the saved
 instance, plus ``Location`` from ``Meta.location_func(view, request, obj)``
 (``location_func=`` on the decorator; it requires ``creates=True`` and
 ``object_validators``). A header
@@ -297,11 +296,27 @@ custom ``create()`` that bypasses it gets no validators, and neither does a
 bulk create (``many=True``) that saves several objects. OPTIONS describes the
 201 without the validator headers, as django-ninja does.
 
+A create's target is the collection, so its preconditions are evaluated
+against the list validators (``Meta.list_etag_func`` and
+``Meta.list_last_modified_func``; ``list_etag_func=`` and
+``list_last_modified_func=`` on an explicit ``@scrudful``), as a GET of the
+list computes them for the same request: ``If-Match`` with an ETag the list
+doesn't have, a past ``If-Unmodified-Since`` or ``If-None-Match: *`` is a 412,
+and nothing is created. The 400 and 412 carry the create's ``Meta.error`` and
+``Meta.error_body_func``, as its serializer 400 does. The callbacks are called
+only for a POST with ``If-Match``, ``If-None-Match`` or ``If-Unmodified-Since``:
+a create without a precondition proceeds (never a 428). The check and the create
+are atomic only if you serialize conditional creates, e.g. lock a row per
+collection (``select_for_update()``) in a list validator callback, with a
+transaction spanning the request (``ATOMIC_REQUESTS``) so the lock is held until
+the create commits.
+
 **Error bodies (``error_body_func``).** ``error_body_func(request, result)``,
 also ``Meta.error_body_func`` and ``Meta.list_error_body_func`` (the list
 response's), returns the dict used as the body of scrudful's own 400, 412 and
-428. It must be a plain function. ``scrudful_viewset`` does not apply it to
-``create``. Status, headers, Links and Content-Type are unchanged and it is not
+428. It must be a plain function. ``scrudful_viewset`` gives ``create`` the
+item's (``Meta.error_body_func``), paired with the ``Meta.error`` its 400 and
+412 carry. Status, headers, Links and Content-Type are unchanged and it is not
 called for a 304.
 
 .. code-block:: python

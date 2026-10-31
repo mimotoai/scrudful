@@ -172,6 +172,15 @@ router = ScrudfulRouter(tags=["roles"])
 # --- The collection: list and create ------------------------------------------------
 
 
+def authorized_roles(request: HttpRequest, **params: Any) -> QuerySet[Role]:
+    """The roles the caller may see: the list, and a create's target.
+
+    scoped-rbac's list filter would go here; the model's Meta.ordering keeps
+    the pages stable.
+    """
+    return Role.objects.filter(rbac_context=request.auth)
+
+
 def roles_etag(roles: QuerySet[Role]) -> str:
     """The collection's ETag: changes when any listed role changes."""
     digest = hashlib.sha256()
@@ -202,13 +211,21 @@ def roles_modified(roles: QuerySet[Role]) -> datetime | None:
     error=ERROR,
 )
 def list_roles(request: HttpRequest) -> QuerySet[Role]:
-    # The authorized queryset (scoped-rbac's list filter would go here); the
-    # model's Meta.ordering keeps the pages stable.
-    return Role.objects.filter(rbac_context=request.auth)
+    return authorized_roles(request)
 
 
 @router.post("", response={201: RoleOut, 403: Message})
-@scrudful_create(location_func=role_url, **ROLE, responses={403: ERROR})
+@scrudful_create(
+    location_func=role_url,
+    **ROLE,
+    # The target is the collection: If-Match takes the list's ETag (412 if
+    # it changed), and a create without a precondition is never a 428.
+    list_load=authorized_roles,
+    list_etag_func=roles_etag,
+    list_last_modified_func=roles_modified,
+    error=ERROR,
+    responses={403: ERROR},
+)
 def create_role(request: HttpRequest, payload: RoleIn) -> Any:
     # No load: authorization is decided from the body.
     denied = forbidden(request, payload.rbac_context)

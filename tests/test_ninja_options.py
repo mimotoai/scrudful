@@ -179,6 +179,9 @@ def list_router(store: Store, router: Router | None = None) -> Router:
         location_func=lambda request, item: f"/items/{item['id']}",
         etag_func=etag,
         last_modified_func=modified,
+        # The list's: a create's preconditions are the collection's.
+        list_load=lambda request, **params: list(store.items.values()),
+        list_etag_func=lambda items: f"n{len(items)}",
         **LINKS,
     )
     def create_item(request, payload: ItemIn):
@@ -801,8 +804,13 @@ def test_options_list_path(store):
                 "required": True,
                 "content": ITEM_CONTENT,
             },
-            # A create is never evaluated: no 400/412, no parameters.
-            "responses": {"201": {"description": "Created", "content": ITEM_CONTENT}},
+            # Evaluated against the list's ETag, never required: no 428 and
+            # no parameters.
+            "responses": {
+                "201": {"description": "Created", "content": ITEM_CONTENT},
+                "400": MALFORMED,
+                "412": FAILED,
+            },
         },
         "options": describe_options(),
     }

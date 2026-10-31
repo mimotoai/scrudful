@@ -59,6 +59,9 @@ PRECONDITION_FIELDS = (
     "if-modified-since",
     "if-unmodified-since",
 )
+#: The preconditions a create (a POST) evaluates: If-Modified-Since applies
+#: only to GET and HEAD (RFC 9110 §13.1.3).
+CREATE_PRECONDITION_FIELDS = ("if-match", "if-none-match", "if-unmodified-since")
 #: Methods whose 2xx responses get freshly computed validators (RFC 9110 §9.3.4).
 FRESH_VALIDATOR_METHODS = frozenset({"PUT", "PATCH"})
 #: Methods that neither select nor modify a representation of the target
@@ -161,6 +164,19 @@ def precondition_headers(getlist: Callable[[str], Sequence[str]]) -> dict[str, s
         if values:
             headers[name] = ", ".join(values)
     return headers
+
+
+def evaluates_create_preconditions(method: str, headers: Mapping[str, str]) -> bool:
+    """Whether a create's request has preconditions to evaluate.
+
+    A POST carrying one of :data:`CREATE_PRECONDITION_FIELDS` (``headers``
+    as :func:`precondition_headers` collects them, empty fields dropped).
+    Without one there is nothing to evaluate, so the collection's validators
+    are not computed.
+    """
+    return method == "POST" and any(
+        name in headers for name in CREATE_PRECONDITION_FIELDS
+    )
 
 
 def evaluates_preconditions(method: str) -> bool:

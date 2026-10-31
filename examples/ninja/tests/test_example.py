@@ -335,6 +335,29 @@ def test_create(client):
     assert response.status_code == 200
 
 
+def test_create_checks_the_preconditions_of_the_collection(client, role):
+    """The target of a create is the collection: If-Match takes the list's
+    ETag, and a stale one creates nothing."""
+    etag = client.get("/api/roles", headers=ACME).headers["ETag"]
+    body = {"name": "viewer", "rbac_context": "acme"}
+    stale = client.post(
+        "/api/roles",
+        body,
+        content_type="application/json",
+        headers={**ACME, "If-Match": '"stale"'},
+    )
+    assert stale.status_code == 412
+    assert stale.headers["Link"] == links("error")
+    assert not Role.objects.filter(name="viewer").exists()
+    current = client.post(
+        "/api/roles",
+        body,
+        content_type="application/json",
+        headers={**ACME, "If-Match": etag},
+    )
+    assert current.status_code == 201
+
+
 def test_create_in_another_context_is_403(client):
     response = client.post(
         "/api/roles",
@@ -529,6 +552,10 @@ def test_options_collection(client):
     assert body["post"]["requestBody"]["content"] == content("role")
     assert body["post"]["responses"]["201"]["content"] == content("role")
     assert body["post"]["responses"]["403"]["content"] == content("error")
+    # The create's preconditions: a 400 and a 412, never a 428.
+    for status in ("400", "412"):
+        assert body["post"]["responses"][status]["content"] == content("error")
+    assert "428" not in body["post"]["responses"]
 
 
 def test_options_search(client):

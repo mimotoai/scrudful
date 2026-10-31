@@ -372,6 +372,14 @@ class ErrorViewSet(ThingViewSetBase):
         )
 
 
+@scrudful_viewset
+class UnconditionalCreateErrorViewSet(ErrorViewSet):
+    """Without list validators: the create checks no precondition."""
+
+    class Meta(ErrorViewSet.Meta):
+        list_etag_func = None
+
+
 IF_MATCH = {"If-Match": '"v1"'}
 PROBLEM = Entity(
     "/schemas/problem",
@@ -929,6 +937,7 @@ for prefix, viewset in [
     ("lm-format", LastModifiedFormatViewSet),
     ("post", PostViewSet),
     ("errors", ErrorViewSet),
+    ("error-creates", UnconditionalCreateErrorViewSet),
     ("problems", ProblemViewSet),
     ("error-only", ErrorOnlyViewSet),
     ("mixed-actions", MixedActionViewSet),
@@ -1497,16 +1506,23 @@ def test_options_error_content(client):
             f"{BASE}/schemas/problem", f"{BASE}/contexts/problem"
         )["application/json"]
     }
-    # The create is not conditional: no early responses to describe, but the
-    # serializer's 400 carries the error entity's Links.
-    assert set(listing["post"]["responses"]) == {"201", "400"}
-    assert listing["post"]["responses"]["400"] == {
+    # The create's preconditions are evaluated against the list validators:
+    # its 400 and 412 carry the create's (the item) error entity's Links.
+    assert set(listing["post"]["responses"]) == {"201", "400", "412"}
+    error = {
+        "application/json": content(f"{BASE}/schemas/error", f"{BASE}/contexts/error")[
+            "application/json"
+        ]
+    }
+    for status in ("400", "412"):
+        assert listing["post"]["responses"][status]["content"] == error
+    # Without them the create is not conditional, but the serializer's 400
+    # carries the error entity's Links.
+    creates = client.options("/error-creates/").json()
+    assert set(creates["post"]["responses"]) == {"201", "400"}
+    assert creates["post"]["responses"]["400"] == {
         "description": "Bad Request",
-        "content": {
-            "application/json": content(
-                f"{BASE}/schemas/error", f"{BASE}/contexts/error"
-            )["application/json"]
-        },
+        "content": error,
     }
 
 
@@ -2313,7 +2329,7 @@ def test_without_the_exception_handler_nothing_is_added_or_described(client):
         )
         assert response.status_code == 400
         assert "Link" not in response
-        listing = client.options("/errors/").json()
+        listing = client.options("/error-creates/").json()
         detail = client.options("/errors/1/").json()
     validate_http_schema_resource(listing)
     assert set(listing["post"]["responses"]) == {"201"}
@@ -2332,7 +2348,7 @@ def test_a_non_conditional_delete_has_no_400_entry(client):
 
 
 def test_a_serializer_400_is_described_with_the_exception_handler(client):
-    listing = client.options("/errors/").json()
+    listing = client.options("/error-creates/").json()
     assert set(listing["post"]["responses"]) == {"201", "400"}
 
 
@@ -2371,7 +2387,7 @@ def test_a_delegating_exception_handler_is_known_by_its_marker(
         response = client.put(
             "/errors/1/", {"raise": True}, format="json", headers=IF_MATCH
         )
-        listing = client.options("/errors/").json()
+        listing = client.options("/error-creates/").json()
     # Each delegates: the serializer's 400 carries the error Links.
     assert response.status_code == 400
     assert response["Link"] == ERROR_LINKS

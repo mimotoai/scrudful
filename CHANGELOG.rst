@@ -2,6 +2,69 @@
 Changelog
 =========
 
+0.9.0 (since 0.8.0)
+===================
+
+A create now evaluates its preconditions against the collection it creates
+in (#9): RFC 9110 §13.1 says an origin server MUST evaluate If-Match,
+If-None-Match and If-Unmodified-Since against the target resource, and a
+POST to a collection targets the collection.
+
+Behaviour change (DRF)
+----------------------
+
+* DRF: ``scrudful_viewset``'s ``create`` (with or without
+  ``object_validators``) evaluates the request's preconditions against the
+  list validators, ``Meta.list_etag_func`` and ``Meta.list_last_modified_func``,
+  called as for ``list`` (``func(view, request, **url_kwargs)``), before the
+  view runs, for a POST carrying If-Match, If-None-Match or
+  If-Unmodified-Since (not otherwise). A viewset with either one now answers
+  **412** to a create with
+  an If-Match the list doesn't have (strong comparison; ``*`` passes), a
+  past If-Unmodified-Since (without If-Match) or ``If-None-Match: *`` (the
+  collection always has a representation; a weak comparison otherwise), and
+  **400** to a malformed If-Match or If-None-Match, where 0.8.0 answered 201;
+  nothing is created. If-Modified-Since is ignored, and a create without a
+  precondition proceeds as before, without calling the list validators:
+  never a 428. A viewset without list validators is unchanged. The 400 and
+  412 carry the create's ``error`` entity (the item ``Meta.error``, as its
+  serializer 400 does) and the body of the paired ``Meta.error_body_func``,
+  which ``create`` now gets (it had no ``error_body_func``). OPTIONS
+  describes the create's 400 and 412 (with the ``error`` content), still
+  without precondition parameters.
+* The check and the create are atomic only if the application serializes
+  conditional creates, e.g. by locking a row per collection
+  (``select_for_update()``) in a list validator callback, with a
+  transaction spanning the request (``ATOMIC_REQUESTS``) so the lock is held
+  until the create commits.
+
+New
+---
+
+* DRF: ``ScrudfulViewFunc`` and ``@scrudful`` take ``list_etag_func`` and
+  ``list_last_modified_func`` (optional): the collection's validators,
+  against which a POST's preconditions are evaluated as above (other
+  methods ignore them), for an explicit create (``creates=True``), or a
+  POST handler without validators of its own. With ``etag_func`` or
+  ``last_modified_func`` they need ``creates=True`` (``TypeError``
+  otherwise).
+* ninja: ``scrudful_create`` takes ``list_load``, ``list_etag_func``,
+  ``list_last_modified_func``, ``error`` and ``error_body_func`` (optional).
+  ``list_load(request, **params)`` returns the collection (what the list
+  operation's handler returns for the same request; ``params`` as for
+  ``load``), and ``list_etag_func(collection)`` /
+  ``list_last_modified_func(collection)`` (the list operation's) its
+  validators. A POST's preconditions are evaluated against them before the
+  handler, with the DRF rules above (412, 400, never a 428; ``list_load``
+  runs only when the POST carries one), the 400 and 412 carrying ``error``'s
+  Links (callables get the collection) and ``error_body_func``'s body, and
+  OPTIONS lists them. ``list_load`` returning ``None`` means no collection:
+  the handler answers, as with ``load``. A list validator without
+  ``list_load``, or ``list_load`` without one, is a ``TypeError``. A
+  ``scrudful_create`` without them is unchanged. In an async operation the
+  check and the create can't share a transaction (Django refuses
+  ``ATOMIC_REQUESTS`` for async views): re-check in the handler.
+
 0.8.0 (since 0.7.0)
 ===================
 

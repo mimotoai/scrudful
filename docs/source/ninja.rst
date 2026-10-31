@@ -313,8 +313,8 @@ Create
 ------
 
 ``@scrudful_create(...)`` decorates a POST on a collection. There is no
-``load`` and no precondition evaluation: the handler authorizes from the
-parsed body. A plain return value gets **201**, with ``Location``
+``load``: the handler authorizes from the parsed body. A plain return value
+gets **201**, with ``Location``
 (``location_func``), the item's Links and the item's ``ETag`` and
 ``Last-Modified``, so the client can edit the new item without a GET. Pass the
 item operations' callbacks:
@@ -351,6 +351,47 @@ usual. Set ``meta.created`` to get them all, or ``meta.location`` for the
     @scrudful_create(location_func=role_url, **ROLE)
     def create_role(request, payload: RoleIn, meta: ScrudfulResponse):
         meta.created = Role.objects.create(**payload.dict())
+
+A create's target is the collection, so its preconditions are the
+collection's. Pass ``list_load(request, **params)``, returning what the list
+operation's handler returns for the same request, and the list operation's
+``list_etag_func`` or ``list_last_modified_func``: for a POST with
+``If-Match``, ``If-None-Match`` or ``If-Unmodified-Since``, the list validators
+are computed from the collection before the handler runs and the
+preconditions are evaluated against them. ``If-Match`` with an ETag the list
+doesn't have (a strong comparison: a weak list ETag never matches), a past
+``If-Unmodified-Since`` or ``If-None-Match: *`` is a **412**, a malformed
+``If-Match`` a **400**, with ``error``'s Links and ``error_body_func``'s body,
+and nothing is created. A ``list_load`` returning ``None`` means there is no
+collection (e.g. its parent is missing): the handler answers, as with
+``load``. A create without a precondition proceeds without calling
+``list_load``: never a 428. OPTIONS lists the 400 and 412.
+
+.. code-block:: python
+
+    def authorized_roles(request, **params):
+        return Role.objects.filter(rbac_context=request.auth)
+
+    @roles.post("", response={201: RoleOut, 403: Message})
+    @scrudful_create(
+        location_func=role_url,
+        **ROLE,
+        list_load=authorized_roles,
+        list_etag_func=roles_etag,
+        list_last_modified_func=roles_modified,
+        error=ERROR,
+    )
+    def create_role(request, payload: RoleIn): ...
+
+The check and the create are atomic only if you serialize conditional creates,
+e.g. by locking a row per collection in ``list_load``
+(``select_for_update()``) with a transaction spanning the whole operation
+(``ATOMIC_REQUESTS = True``, or ``transaction.atomic`` around it), so the lock
+is held until the create commits: otherwise two requests with the same
+``If-Match`` can both create. An async operation can't do this: ``list_load``
+and the handler run in separate threads and Django refuses ``ATOMIC_REQUESTS``
+for async views, so re-check the collection in the handler's own transaction
+and raise ``HttpError(412)`` if it changed.
 
 .. _ninja-placement:
 
