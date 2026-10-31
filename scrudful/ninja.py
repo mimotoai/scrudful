@@ -4,7 +4,8 @@ The HTTP logic lives in :mod:`scrudful.conditional` and :mod:`scrudful.utils`;
 this module only adapts it to django-ninja's operations. Validators and
 precondition results are computed only from the object the operation's
 ``load`` callable returns, i.e. from what authorization already approved (for
-a create, from the object the handler created).
+a create, the preconditions from the collection ``list_load`` returns, the
+response's validators from the object the handler created).
 
 Order of execution
     ``@scrudful`` wraps the operation's function, so everything it does runs
@@ -15,7 +16,8 @@ Order of execution
        in its copy of ninja's checks: authentication, ``before``, throttling,
        ``after_throttles`` (DRF's order; see :func:`scrudful_list`);
     2. ninja's parameter parsing and validation (422 as usual);
-    3. ``load(request, **params)``, with the parameters ninja validated;
+    3. ``load(request, **params)`` (a create's ``list_load``, for a POST
+       carrying a precondition), with the parameters ninja validated;
     4. the validator callbacks, called with the loaded object, and the
        preconditions (304, 400, 412, 428);
     5. the handler, which receives the loaded object;
@@ -175,22 +177,41 @@ Create
     412 and a malformed If-Match or If-None-Match with 400 (``error``'s
     Links, whose callables get the collection, and ``error_body_func``'s
     body), and If-Modified-Since is ignored. When ``list_load`` returns
-    ``None`` there is no collection, as for ``load``: the handler answers
-    (e.g. 404). A create without a precondition proceeds without calling
-    ``list_load``: it is never answered with 428. Without the list
-    validators the If-* headers are ignored.
+    ``None`` there is no collection, as for ``load``: no precondition can
+    fail and the handler answers (e.g. 404), though a malformed header is
+    still a 400 (whose link callables get ``None``). A create without a
+    precondition proceeds without calling ``list_load``: it is never
+    answered with 428. Without the list validators the If-* headers are
+    ignored. The list validators are evaluated for POST only: an operation
+    without POST raises ``ConfigError`` when it is built. ``list_load`` must
+    apply the list operation's authorization; the check runs before the
+    handler, so before any authorization it decides from the body.
 
     The check and the create are atomic only if the application serializes
-    conditional creates, e.g. by locking a row per collection
-    (``select_for_update()``) in ``list_load``, with a transaction spanning
-    the whole operation (``ATOMIC_REQUESTS = True``, or ``transaction.atomic``
-    around it), so that the lock is held until the create commits;
-    otherwise two requests carrying the same If-Match can both create. In an
-    async operation ``list_load`` and the handler run in separate threads
-    and Django refuses ``ATOMIC_REQUESTS``, so no lock taken in ``list_load``
-    outlives it: re-check the collection in the handler's own transaction
-    instead (e.g. lock the row, compare its version with the If-Match the
-    precondition check passed, and raise ``HttpError(412)`` if it moved).
+    every write that changes the collection's validators with conditional
+    creates: lock a row per collection (``select_for_update()``) in
+    ``list_load``, with a transaction spanning the whole operation, so that
+    the lock is held until the create commits, and take the same lock in
+    the other writes (unconditional creates, which don't call
+    ``list_load``, and the item operations). Otherwise two requests carrying
+    the same If-Match can both create. The transaction is
+    ``ATOMIC_REQUESTS = True``, or ``transaction.atomic`` wrapping the
+    operation's ``view_func`` (``router.add_decorator(transaction.atomic,
+    mode="operation")`` on a router whose operations are all sync; see
+    "Placement"). Django refuses ``ATOMIC_REQUESTS`` for an async view, and
+    ninja serves a path asynchronously when any of its operations is async,
+    so a sync create sharing its path with an async operation can use
+    neither (``add_decorator`` would wrap the async one too): wrap only its
+    ``view_func``, with a ``contribute_operation_callback`` callback
+    contributed above the scrudful decorator (ninja runs the sync operation
+    in one thread, so ``list_load`` and the handler share the transaction). If
+    ``list_load`` is shared with the list operation, lock only for a POST
+    (``request.method == "POST"``), or every GET of the list takes the lock
+    too. An async operation can't do this: ``list_load`` and the handler
+    are called separately, so no transaction spans both. Re-check the
+    collection in the handler's own transaction instead (e.g. lock the row,
+    compare its version with the If-Match the precondition check passed,
+    and raise ``HttpError(412)`` if it moved).
 
     A plain return value gets status 201: the
     wrapper returns ``ninja.Status(201, result)``, so the operation must
@@ -742,10 +763,11 @@ class _Config:
 
     @property
     def evaluates_preconditions(self) -> bool:
-        """Whether the If-* headers are evaluated before the handler runs.
+        """Whether the If-* headers may be evaluated before the handler runs.
 
         An item's, against the loaded object's validators; a create's,
-        against the collection's (for a POST carrying a precondition).
+        against the collection's (the flow evaluates them only for a POST
+        carrying a precondition).
         """
         if self.kind == "create":
             return self.has_list_validators
@@ -1113,11 +1135,13 @@ def scrudful_create(
         those of a GET of the list. ``params`` are the parameters ninja
         validated for the operation (path, query, the body ...), as for
         :func:`scrudful`'s ``load``; accept ``**kwargs`` to ignore those you
-        don't need. It runs before the handler, only for a POST carrying
-        If-Match, If-None-Match or If-Unmodified-Since, and returns ``None``
-        when there is no collection (e.g. its parent is missing): the
-        preconditions are then not evaluated and the handler answers.
-        Required with a list validator, and needs one.
+        don't need. It must apply the list operation's authorization. It
+        runs before the handler, only for a POST carrying If-Match,
+        If-None-Match or If-Unmodified-Since, and returns ``None`` when there
+        is no collection (e.g. its parent is missing): no precondition can
+        then fail and the handler answers, though a malformed If-Match or
+        If-None-Match is still a 400. Required with a list validator, and
+        needs one.
     list_etag_func : callable, optional
         ``list_etag_func(collection)``: the entity-tag of the collection
         ``list_load`` returned, as for :func:`scrudful_list`. The request's
@@ -1132,9 +1156,11 @@ def scrudful_create(
         and 412 bodies (there is no 428), and of the response to an
         ``HttpError`` or ``Http404`` the operation raises, unless
         ``responses`` declares its status. Link callables get the collection
-        on the 400 and 412, else ``None``.
+        on the 400 and 412 (``None`` if ``list_load`` returned none), else
+        ``None``.
     error_body_func : callable, optional
-        As for :func:`scrudful`: the body of scrudful's own 400 and 412.
+        As for :func:`scrudful`: the body of scrudful's own 400 and 412. An
+        ``HttpError(412)`` the handler raises gets the API's body, not this.
     before : callable, optional
         ``before(request, **path_params)``, called once per request where DRF
         checks permissions (``has_permission``): after ninja's
@@ -1170,7 +1196,8 @@ def scrudful_create(
     ------
     TypeError
         If ``location_func``, ``list_load``, a hook, a validator callback or
-        ``error_body_func`` isn't callable, if a list validator is set
+        ``error_body_func`` isn't callable, if ``error_body_func`` is
+        ``async def``, if a list validator is set
         without ``list_load`` or ``list_load`` without one, if ``request``,
         ``error`` or a value of ``responses`` isn't an :class:`Entity` or a
         key of ``responses`` isn't an HTTP status code, if the handler is a
@@ -1185,7 +1212,8 @@ def scrudful_create(
         before the decorator bound it: a ``_ninja_contribute_to_operation``
         callback contributed below the decorator, or a decorator between it
         and the operation decorator (see "Placement" in the module
-        docstring). Also with a hook, as for :func:`scrudful_list`.
+        docstring). Also with a hook, as for :func:`scrudful_list`, and with
+        list validators on an operation without POST.
     """
     if not callable(location_func):
         raise TypeError(
@@ -1720,13 +1748,11 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 obj = yield load, (request,), params
                 values[load_as] = obj
 
-            if config.kind == "create":
+            if config.kind == "create" and config.evaluates_preconditions:
                 headers = precondition_headers(request)
                 # Only a POST carrying a precondition: list_load and the list
                 # validators aren't called for one without (never a 428).
-                if config.evaluates_preconditions and evaluates_create_preconditions(
-                    method, headers
-                ):
+                if evaluates_create_preconditions(method, headers):
                     obj = yield config.list_load, (request,), params
                     etag, last_modified = yield from _validators(
                         config.list_etag_func, config.list_last_modified_func, obj
@@ -1916,6 +1942,19 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                     "Stacking two scrudful decorators is not supported. See "
                     '"Placement of other decorators" in the scrudful.ninja '
                     "documentation."
+                )
+            if (
+                config.kind == "create"
+                and config.has_list_validators
+                and "POST" not in operation.methods
+            ):
+                raise ConfigError(
+                    f"{name}: operation {'/'.join(operation.methods)} "
+                    f"{operation.path!r} ({handler.__qualname__}()): the "
+                    "collection's preconditions (list_etag_func, "
+                    "list_last_modified_func) are evaluated for a POST "
+                    "only, and the operation takes none. Register it with "
+                    "router.post, or drop list_load and the list validators."
                 )
             collection = (
                 _envelope_response(operation) if config.kind == "list" else None

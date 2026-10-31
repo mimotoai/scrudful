@@ -1904,6 +1904,13 @@ def test_metadata_for_nested_list_routes(client):
     assert store.calls == [("nested_etag", 5)]
 
 
+def test_nested_create_evaluates_the_preconditions_of_its_collection(client):
+    url = "/parents/5/children/"
+    assert client.post(url, headers={"If-Match": '"list-4"'}).status_code == 412
+    assert client.post(url, headers={"If-Match": '"list-5"'}).status_code == 201
+    assert store.calls == [("nested_etag", 5), ("nested_etag", 5)]
+
+
 def test_metadata_for_action_routes(client):
     metadata = client.options("/actions/1/below/").json()
     validate_http_schema_resource(metadata)

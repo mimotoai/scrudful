@@ -32,22 +32,34 @@ Behaviour change (DRF)
   which ``create`` now gets (it had no ``error_body_func``). OPTIONS
   describes the create's 400 and 412 (with the ``error`` content), still
   without precondition parameters.
+* Unlike for ``list``, list validators returning ``None`` don't make the
+  collection missing (``If-None-Match: *`` is still a 412): raise ``Http404``
+  in the callback to answer a POST to a missing collection with 404.
+* DRF: an explicit ``@scrudful`` on the ``create`` of a ``scrudful_viewset``
+  whose ``Meta`` sets ``list_etag_func`` or ``list_last_modified_func`` now
+  raises ``TypeError`` unless it is given list validators of its own: the
+  explicit decorator replaces the ``Meta`` configuration, so its
+  preconditions would never be evaluated.
 * The check and the create are atomic only if the application serializes
-  conditional creates, e.g. by locking a row per collection
-  (``select_for_update()``) in a list validator callback, with a
-  transaction spanning the request (``ATOMIC_REQUESTS``) so the lock is held
-  until the create commits.
+  every write that changes the collection's validators with conditional
+  creates: lock a row per collection (``select_for_update()``) in a list
+  validator callback, for a POST only (the ``list`` action calls the same
+  callbacks), with a transaction spanning the request (``ATOMIC_REQUESTS``)
+  so the lock is held until the create commits, and take the same lock in
+  the other writes (unconditional creates and item PUT, PATCH and DELETE).
 
 New
 ---
 
 * DRF: ``ScrudfulViewFunc`` and ``@scrudful`` take ``list_etag_func`` and
   ``list_last_modified_func`` (optional): the collection's validators,
-  against which a POST's preconditions are evaluated as above (other
-  methods ignore them), for an explicit create (``creates=True``), or a
-  POST handler without validators of its own. With ``etag_func`` or
-  ``last_modified_func`` they need ``creates=True`` (``TypeError``
-  otherwise).
+  against which a POST's preconditions are evaluated as above, for an
+  explicit create (``creates=True``), or a POST handler without validators
+  of its own. With ``etag_func`` or ``last_modified_func`` they need
+  ``creates=True``, and on a class-body handler named after a standard
+  non-POST handler (``get``, ``put``, ``list``, ``retrieve`` ...) they raise
+  ``TypeError`` when the class is created; other handlers (a function view's
+  other methods, a GET ``@action``) ignore them.
 * ninja: ``scrudful_create`` takes ``list_load``, ``list_etag_func``,
   ``list_last_modified_func``, ``error`` and ``error_body_func`` (optional).
   ``list_load(request, **params)`` returns the collection (what the list
@@ -59,11 +71,18 @@ New
   runs only when the POST carries one), the 400 and 412 carrying ``error``'s
   Links (callables get the collection) and ``error_body_func``'s body, and
   OPTIONS lists them. ``list_load`` returning ``None`` means no collection:
-  the handler answers, as with ``load``. A list validator without
-  ``list_load``, or ``list_load`` without one, is a ``TypeError``. A
-  ``scrudful_create`` without them is unchanged. In an async operation the
-  check and the create can't share a transaction (Django refuses
-  ``ATOMIC_REQUESTS`` for async views): re-check in the handler.
+  no precondition can fail and the handler answers, as with ``load``
+  (a malformed header is still a 400). A list validator without
+  ``list_load``, or ``list_load`` without one, is a ``TypeError``, and list
+  validators on an operation without POST a ``ConfigError`` when it is
+  built. A ``scrudful_create`` without them is unchanged. Serialize the
+  writes as for DRF, in a transaction around the operation
+  (``ATOMIC_REQUESTS``, ``router.add_decorator(transaction.atomic,
+  mode="operation")`` on a router of sync operations, or a per-operation
+  wrapper of ``view_func`` for a sync create on a path with an async
+  operation; see the ``scrudful.ninja`` documentation); in an async
+  operation ``list_load`` and the handler can't share a transaction:
+  re-check in the handler.
 
 0.8.0 (since 0.7.0)
 ===================

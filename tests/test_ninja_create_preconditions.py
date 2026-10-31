@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from asgiref.sync import async_to_sync
 from ninja import Router
+from ninja.errors import ConfigError
 from ninja.testing import TestAsyncClient, TestClient
 
 from scrudful.ninja import Entity, ScrudfulRouter, scrudful_create
@@ -265,3 +266,47 @@ def test_sync_handler_rejects_async_list_load():
 
         @decorate
         def create_item(request): ...
+
+
+@pytest.mark.parametrize("method", ["put", "patch"])
+def test_list_validators_on_an_operation_without_post_are_rejected(method):
+    router = ScrudfulRouter()
+    decorate = scrudful_create(
+        location_func=lambda request, item: "/x",
+        list_load=lambda request, **params: [],
+        list_etag_func=collection_etag,
+    )
+    with pytest.raises(ConfigError, match="POST"):
+
+        @getattr(router, method)("/items", response={201: ItemOut})
+        @decorate
+        def create_item(request, payload: ItemIn): ...
+
+
+def test_list_validators_on_an_operation_with_post_are_accepted():
+    router = ScrudfulRouter()
+
+    @router.api_operation(["POST", "PUT"], "/items", response={201: ItemOut})
+    @scrudful_create(
+        location_func=lambda request, item: "/x",
+        list_load=lambda request, **params: [],
+        list_etag_func=collection_etag,
+    )
+    def create_item(request, payload: ItemIn):
+        return {"id": 3, "name": payload.name, "version": 1}
+
+    client = TestClient(router)
+    response = client.post("/items", json={"name": "c"}, headers={"If-Match": '"n9"'})
+    assert response.status_code == 412
+
+
+def test_list_last_modified_func_alone(store):
+    assert (
+        post(store, {"If-Unmodified-Since": BEFORE}, list_etag_func=None).status_code
+        == 412
+    )
+    assert (
+        post(Store(), {"If-Unmodified-Since": AFTER}, list_etag_func=None).status_code
+        == 201
+    )
+    assert post(Store(), {"If-Match": '"n2"'}, list_etag_func=None).status_code == 412

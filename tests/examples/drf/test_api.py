@@ -407,6 +407,10 @@ def test_create_checks_the_preconditions_of_the_collection(client, item):
     )
     assert stale.status_code == 412
     assert stale.json() == PRECONDITION_FAILED
+    # The create's error entity, though the viewset has no object_validators.
+    assert stale["Content-Type"] == "application/json"
+    assert f'<{BASE}/schemas/error.json>; rel="describedby"' in stale["Link"]
+    assert f"<{BASE}/contexts/error.jsonld>" in stale["Link"]
     assert not Item.objects.filter(name="New").exists()
     current = client.post(
         "/items/", {"name": "New"}, format="json", headers={"If-Match": etag}

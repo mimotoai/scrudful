@@ -360,12 +360,17 @@ operation's handler returns for the same request, and the list operation's
 are computed from the collection before the handler runs and the
 preconditions are evaluated against them. ``If-Match`` with an ETag the list
 doesn't have (a strong comparison: a weak list ETag never matches), a past
-``If-Unmodified-Since`` or ``If-None-Match: *`` is a **412**, a malformed
-``If-Match`` a **400**, with ``error``'s Links and ``error_body_func``'s body,
-and nothing is created. A ``list_load`` returning ``None`` means there is no
-collection (e.g. its parent is missing): the handler answers, as with
-``load``. A create without a precondition proceeds without calling
-``list_load``: never a 428. OPTIONS lists the 400 and 412.
+``If-Unmodified-Since``, ``If-None-Match: *`` or ``If-None-Match`` with the
+list's ETag is a **412**, a malformed ``If-Match`` or ``If-None-Match`` a
+**400**, with ``error``'s Links and ``error_body_func``'s body, and nothing is
+created. A ``list_load`` returning ``None`` means there is no collection (e.g.
+its parent is missing): no precondition can fail and the handler answers, as
+with ``load``, though a malformed header is still a 400. A create without a
+precondition proceeds without calling ``list_load``: never a 428. OPTIONS lists
+the 400 and 412. The list validators are evaluated for a POST only, so an
+operation without POST raises ``ConfigError`` when it is built. ``list_load``
+must apply the list operation's authorization: the check runs before the
+handler, so before any authorization the handler decides from the body.
 
 .. code-block:: python
 
@@ -383,15 +388,31 @@ collection (e.g. its parent is missing): the handler answers, as with
     )
     def create_role(request, payload: RoleIn): ...
 
-The check and the create are atomic only if you serialize conditional creates,
-e.g. by locking a row per collection in ``list_load``
-(``select_for_update()``) with a transaction spanning the whole operation
-(``ATOMIC_REQUESTS = True``, or ``transaction.atomic`` around it), so the lock
-is held until the create commits: otherwise two requests with the same
-``If-Match`` can both create. An async operation can't do this: ``list_load``
-and the handler run in separate threads and Django refuses ``ATOMIC_REQUESTS``
-for async views, so re-check the collection in the handler's own transaction
-and raise ``HttpError(412)`` if it changed.
+The check and the create are atomic only if you serialize every write that
+changes the collection's validators with conditional creates: lock a row per
+collection in ``list_load`` (``select_for_update()``) with a transaction
+spanning the whole operation, so the lock is held until the create commits, and
+take the same lock in the other writes (unconditional creates, which don't call
+``list_load``, and the item operations). Otherwise two requests with the same
+``If-Match`` can both create.
+
+* The transaction is ``ATOMIC_REQUESTS = True``, or
+  ``router.add_decorator(transaction.atomic, mode="operation")`` on a router
+  whose operations are all sync (see :ref:`ninja-placement`). ninja serves a
+  path asynchronously when any of its operations is async, and Django refuses
+  ``ATOMIC_REQUESTS`` for async views, so a sync create sharing its path with
+  an async operation can use neither (``add_decorator`` would wrap the async
+  one too). Wrap only the create's ``view_func`` in ``transaction.atomic``,
+  with a ``contribute_operation_callback`` callback contributed above the
+  scrudful decorator, as in :ref:`ninja-placement`: ninja runs the sync
+  operation in one thread, so ``list_load`` and the handler share the
+  transaction.
+* When the list operation's handler calls the same function as ``list_load``
+  (e.g. it returns ``authorized_roles(request)``), lock only when
+  ``request.method == "POST"``, or every GET of the list takes the lock too.
+* An async operation can't hold the lock: ``list_load`` and the handler are
+  called separately, so no transaction spans both. Re-check the collection in
+  the handler's own transaction and raise ``HttpError(412)`` if it changed.
 
 .. _ninja-placement:
 

@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 
 import pytest
+from django.http import Http404
 from django.urls import include, path
 from rest_framework import generics, serializers, viewsets
 from rest_framework.decorators import api_view
@@ -13,6 +14,7 @@ from rest_framework.test import APIClient
 from items.models import Item
 from scrudful.problem import PROBLEM_JSON, problem_details
 from scrudful.rest_framework import (
+    _NEVER_CREATES,
     Entity,
     ScrudfulViewFunc,
     scrudful,
@@ -82,6 +84,15 @@ class PlainViewSet(viewsets.ModelViewSet):
 
 
 @scrudful_viewset
+class ModifiedViewSet(viewsets.ModelViewSet):
+    queryset = Item.objects.all()
+    serializer_class = ItemSerializer
+
+    class Meta:
+        list_last_modified_func = list_modified
+
+
+@scrudful_viewset
 class NoListValidatorsViewSet(viewsets.ModelViewSet):
     queryset = Item.objects.all()
     serializer_class = ItemSerializer
@@ -111,14 +122,35 @@ def collection_view(request):
     return Response([], status=201 if request.method == "POST" else 200)
 
 
+def parent_etag(request, parent_pk):
+    if parent_pk != 1:
+        raise Http404
+    return f"n{parent_pk}"
+
+
+@api_view(["POST"])
+@scrudful(list_etag_func=parent_etag)
+def children_view(request, parent_pk):
+    return Response({}, status=201)
+
+
+@api_view(["POST"])
+@scrudful(list_etag_func=lambda request: None)
+def no_validators_view(request):
+    return Response({}, status=201)
+
+
 router = SimpleRouter()
 router.register("objects", ObjectViewSet, basename="object")
 router.register("plains", PlainViewSet, basename="plain")
+router.register("modifieds", ModifiedViewSet, basename="modified")
 router.register("nolists", NoListValidatorsViewSet, basename="nolist")
 urlpatterns = [
     path("", include(router.urls)),
     path("explicit/", ExplicitCreateView.as_view()),
     path("function/", collection_view),
+    path("parents/<int:parent_pk>/children/", children_view),
+    path("none/", no_validators_view),
 ]
 
 
@@ -260,3 +292,102 @@ def test_list_validators_with_target_validators_need_creates():
             etag_func=lambda view, request: "v1",
             list_etag_func=list_etag,
         )
+
+
+def class_body_error(build):
+    """The exception ``build`` raises from a class body's ``__set_name__``
+    (wrapped in a ``RuntimeError`` before Python 3.12)."""
+    with pytest.raises((TypeError, RuntimeError)) as info:
+        build()
+    error = info.value
+    return error.__cause__ if isinstance(error, RuntimeError) else error
+
+
+@pytest.mark.parametrize("name", sorted(_NEVER_CREATES))
+def test_list_validators_on_a_handler_that_never_creates_are_rejected(name):
+    handler = scrudful(list_etag_func=list_etag)(lambda self, request: None)
+    error = class_body_error(
+        lambda: type("V", (generics.GenericAPIView,), {name: handler})
+    )
+    assert isinstance(error, TypeError)
+    assert f"V.{name}" in str(error)
+    assert "POST" in str(error)
+
+
+@pytest.mark.parametrize(
+    "name, func",
+    [("list_etag_func", list_etag), ("list_last_modified_func", list_modified)],
+)
+def test_explicit_create_without_the_list_validators_of_meta_is_rejected(name, func):
+    meta = type("Meta", (), {name: staticmethod(func)})
+    with pytest.raises(TypeError, match=f"Meta.{name}"):
+
+        @scrudful_viewset
+        class V(viewsets.ModelViewSet):
+            queryset = Item.objects.all()
+            serializer_class = ItemSerializer
+            Meta = meta
+
+            @scrudful()
+            def create(self, request, *args, **kwargs):
+                return super().create(request, *args, **kwargs)
+
+
+def test_explicit_create_with_its_own_list_validators_is_kept():
+    @scrudful_viewset
+    class V(viewsets.ModelViewSet):
+        queryset = Item.objects.all()
+        serializer_class = ItemSerializer
+
+        class Meta:
+            list_etag_func = list_etag
+
+        @scrudful(list_last_modified_func=list_modified)
+        def create(self, request, *args, **kwargs):
+            return super().create(request, *args, **kwargs)
+
+    assert V.create.list_etag_func is None
+    assert V.create.list_last_modified_func is list_modified
+
+
+def test_list_last_modified_func_alone(client):
+    assert (
+        post(client, "/modifieds/", **{"If-Unmodified-Since": BEFORE}).status_code
+        == 412
+    )
+    assert (
+        post(client, "/modifieds/", **{"If-Unmodified-Since": AFTER}).status_code == 201
+    )
+    # No ETag: no If-Match but * can match it.
+    assert post(client, "/modifieds/", **{"If-Match": '"n1"'}).status_code == 412
+    assert post(client, "/modifieds/", **{"If-Match": "*"}).status_code == 201
+
+
+def test_list_validators_get_the_url_kwargs(client):
+    url = "/parents/1/children/"
+    assert post(client, url, **{"If-Match": '"n1"'}).status_code == 201
+    assert post(client, url, **{"If-Match": '"n2"'}).status_code == 412
+
+
+def test_a_list_validator_raising_http404_is_a_404(client):
+    """The way to answer a POST to a missing collection (e.g. its parent)."""
+    response = post(client, "/parents/2/children/", **{"If-Match": "*"})
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "headers, status",
+    [
+        ({"If-None-Match": "*"}, 412),
+        ({"If-Match": "*"}, 201),
+        ({"If-Match": '"n0"'}, 412),
+        ({"If-Unmodified-Since": BEFORE}, 201),
+    ],
+)
+def test_list_validators_returning_none_still_mean_a_collection(
+    client, headers, status
+):
+    """Unlike a GET of the list: the collection always has a representation
+    (a missing one is the callback's Http404), so If-None-Match: * fails and
+    If-Match: * passes."""
+    assert post(client, "/none/", **headers).status_code == status

@@ -74,8 +74,9 @@ view. ``error_body_func(request, result)`` replaces the body of the 400, 412 and
 Rules worth knowing:
 
 * **Validators are opt-in.** Preconditions, and the 428 requirement, apply only
-  when ``etag_func`` or ``last_modified_func`` is configured. Without them a
-  decorated view behaves like an undecorated one, apart from the ``Link`` and
+  when ``etag_func`` or ``last_modified_func`` is configured (for a create, the
+  collection's ``list_etag_func`` or ``list_last_modified_func``). Without them
+  a decorated view behaves like an undecorated one, apart from the ``Link`` and
   expose headers.
 * **TRACE, OPTIONS and CONNECT ignore preconditions.** Their response is not
   a representation of the target resource (a TRACE echoes the request), so
@@ -88,9 +89,13 @@ Rules worth knowing:
 * **Callbacks returning ``None``** mean "no current representation": the
   preconditions are skipped and your view produces its own 404. The exception
   is PUT, which may create the resource: ``If-None-Match: *`` passes and
-  ``If-Match`` gives 412. POST is not an exception: when both callbacks
-  return ``None`` its preconditions are skipped too, so even a failing
-  ``If-Match`` reaches your view.
+  ``If-Match`` gives 412. A general POST is not an exception: when both
+  callbacks return ``None`` its preconditions are skipped too, so even a
+  failing ``If-Match`` reaches your view. A DRF create's list validators are:
+  the collection always has a representation, so ``If-None-Match: *`` gives
+  412 even when they return ``None``; raise ``Http404`` in the callback for a
+  missing collection. A django-ninja ``list_load`` returning ``None`` is a
+  missing collection, as for ``load``.
 * **Callbacks run first**, before your view's own lookup and permission
   checks, so they must apply the same scoping (for example
   ``view.get_queryset()`` with DRF, or the current user from a dependency with
@@ -285,7 +290,7 @@ arrives, as there is no ``get_object()``.
 
 **Creates.** With ``object_validators`` (which needs ``etag_func`` or
 ``last_modified_func``), ``scrudful_viewset`` sets ``creates=True`` for
-``create``; without it, ``create`` gets only the links and error entity. Set
+``create``; without it, the 201 gets only the links. Set
 ``creates=True`` on an explicit ``@scrudful`` create (it needs
 ``object_validators``). The 201 gets ``ETag`` and ``Last-Modified`` from the saved
 instance, plus ``Location`` from ``Meta.location_func(view, request, obj)``
@@ -301,15 +306,28 @@ against the list validators (``Meta.list_etag_func`` and
 ``Meta.list_last_modified_func``; ``list_etag_func=`` and
 ``list_last_modified_func=`` on an explicit ``@scrudful``), as a GET of the
 list computes them for the same request: ``If-Match`` with an ETag the list
-doesn't have, a past ``If-Unmodified-Since`` or ``If-None-Match: *`` is a 412,
-and nothing is created. The 400 and 412 carry the create's ``Meta.error`` and
-``Meta.error_body_func``, as its serializer 400 does. The callbacks are called
-only for a POST with ``If-Match``, ``If-None-Match`` or ``If-Unmodified-Since``:
-a create without a precondition proceeds (never a 428). The check and the create
-are atomic only if you serialize conditional creates, e.g. lock a row per
+doesn't have, a past ``If-Unmodified-Since``, ``If-None-Match: *`` or
+``If-None-Match`` with the list's ETag is a 412, a malformed ``If-Match`` or
+``If-None-Match`` a 400, and nothing is created. The 400 and 412 carry the
+create's ``Meta.error`` and ``Meta.error_body_func``, as its serializer 400
+does. The callbacks are called only for a POST with ``If-Match``,
+``If-None-Match`` or ``If-Unmodified-Since``: a create without a precondition
+proceeds (never a 428). They run before the view, so before any permission it
+decides from the body. Two misplacements raise ``TypeError``: list validators on
+a class-body handler named after a standard non-POST handler (``get``,
+``list``, ``retrieve`` ...), and an explicit ``@scrudful`` create without list
+validators of its own when ``Meta`` sets them (an explicit decorator replaces
+the ``Meta`` configuration). On any other handler that doesn't answer a POST
+(e.g. a GET ``@action``) they are ignored.
+
+The check and the create are atomic only if you serialize every write that
+changes the collection's validators with conditional creates: lock a row per
 collection (``select_for_update()``) in a list validator callback, with a
 transaction spanning the request (``ATOMIC_REQUESTS``) so the lock is held until
-the create commits.
+the create commits, and take the same lock in the other writes (unconditional
+creates, which call no list callback, and item PUT, PATCH and DELETE). The list
+callbacks also serve the ``list`` action: lock only when
+``request.method == "POST"``, or every GET of the list takes the lock too.
 
 **Error bodies (``error_body_func``).** ``error_body_func(request, result)``,
 also ``Meta.error_body_func`` and ``Meta.list_error_body_func`` (the list
