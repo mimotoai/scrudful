@@ -71,7 +71,7 @@ def test_get_user(client):
     assert response.headers["etag"] == '"user-1-v1"'
     assert response.headers["last-modified"] == SEED_MODIFIED
     assert response.headers["link"] == LINKS
-    assert response.headers["access-control-expose-headers"] == "ETag, Link"
+    assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
 
 
 def test_links_resolve(client):
@@ -139,7 +139,7 @@ def test_create_user(client):
     assert body["created_at"] == body["updated_at"]
     assert response.headers["location"] == f"{BASE}/users/4"
     assert response.headers["link"] == LINKS
-    assert response.headers["access-control-expose-headers"] == "Link, Location"
+    assert response.headers["access-control-expose-headers"] == "Link, Location, Allow"
     assert "etag" not in response.headers
     assert "last-modified" not in response.headers
 
@@ -242,7 +242,7 @@ def test_put_replaces_user_and_returns_fresh_validators(client):
     assert (body["id"], body["name"], body["age"]) == (2, "Alicia", 25)
     assert response.headers["etag"] == '"user-2-v2"'
     assert response.headers["link"] == LINKS
-    assert response.headers["access-control-expose-headers"] == "ETag, Link"
+    assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
     last_modified = parsedate_to_datetime(response.headers["last-modified"])
     assert before <= last_modified <= after
     assert client.get("/users/1").json() == JOHN

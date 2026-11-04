@@ -104,7 +104,7 @@ def test_raised_http_error_uses_declared_entity(asynchronous):
     assert response.status_code == 404
     assert response.json() == {"detail": "x"}
     assert response.headers["Link"] == ERR404_LINK
-    assert expose(response) == {"Link"}
+    assert expose(response) == {"Link", "Allow"}
 
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
@@ -285,7 +285,7 @@ def test_add_error_links_validation_and_auth(store):
     )
     assert response.status_code == 422
     assert response.headers["Link"] == ERR_LINK
-    assert expose(response) == {"Link"}
+    assert expose(response) == {"Link", "Allow"}
 
     response = client.get("/items/1")
     assert response.status_code == 401

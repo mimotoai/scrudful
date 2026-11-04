@@ -82,7 +82,7 @@ def test_retrieve_sends_validators_links_and_expose_headers(client, item):
     assert response["ETag"] == '"v1"'
     assert response["Last-Modified"] == MODIFIED_HTTP
     assert response["Link"] == LINKS
-    assert response["Access-Control-Expose-Headers"] == "ETag, Link"
+    assert response["Access-Control-Expose-Headers"] == "ETag, Link, Allow"
 
 
 def test_echoed_etag_gives_304_with_validators(client, item):
@@ -92,7 +92,7 @@ def test_echoed_etag_gives_304_with_validators(client, item):
     assert response.content == b""
     assert response["ETag"] == '"v1"'
     assert response["Last-Modified"] == MODIFIED_HTTP
-    assert response["Access-Control-Expose-Headers"] == "ETag"
+    assert response["Access-Control-Expose-Headers"] == "ETag, Link, Allow"
 
 
 def test_echoed_last_modified_gives_304(client, item):
@@ -231,7 +231,7 @@ def test_write_response_carries_the_new_validators(client, item, method):
     assert response["Last-Modified"] == after["Last-Modified"]
     assert response["Last-Modified"] != MODIFIED_HTTP
     assert response["Link"] == LINKS
-    assert response["Access-Control-Expose-Headers"] == "ETag, Link"
+    assert response["Access-Control-Expose-Headers"] == "ETag, Link, Allow"
 
 
 def test_edit_loop_reuses_the_write_response_etag(client, item):
@@ -397,7 +397,7 @@ def test_create_exposes_location_and_sends_no_validators(client):
     assert "ETag" not in response
     assert "Last-Modified" not in response
     assert response["Link"] == LINKS
-    assert response["Access-Control-Expose-Headers"] == "Link, Location"
+    assert response["Access-Control-Expose-Headers"] == "Link, Location, Allow"
 
 
 def test_create_checks_the_preconditions_of_the_collection(client, item):
@@ -430,7 +430,7 @@ def test_list_has_a_collection_etag(client, item):
         f'<{BASE}/contexts/item.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; '
         'type="application/ld+json"'
     )
-    assert response["Access-Control-Expose-Headers"] == "ETag, Link"
+    assert response["Access-Control-Expose-Headers"] == "ETag, Link, Allow"
     assert client.get("/items/", headers={"If-None-Match": etag}).status_code == 304
 
     client.post("/items/", {"name": "Two"}, format="json")

@@ -4,6 +4,7 @@ from starlette.datastructures import URL
 
 from scrudful.utils import (
     EXPOSABLE_HEADERS,
+    EXPOSE_HEADERS,
     join_links,
     link_content,
     link_relations,
@@ -180,8 +181,9 @@ def test_join_links(values, expected):
 # --- merge_expose_headers ---------------------------------------------------
 
 
-def test_exposable_headers():
-    assert EXPOSABLE_HEADERS == ("ETag", "Link", "Location")
+def test_expose_headers_constant():
+    assert EXPOSE_HEADERS == ("ETag", "Link", "Location", "Allow")
+    assert EXPOSABLE_HEADERS is EXPOSE_HEADERS
 
 
 @pytest.mark.parametrize(

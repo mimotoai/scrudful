@@ -738,7 +738,9 @@ def test_handler_headers_kept_and_link_joined(store):
     assert response.headers["Link"] == (
         f'</items/2>; rel="next", {SCHEMA_LINK}, {CONTEXT_LINK}'
     )
-    assert response.headers["Access-Control-Expose-Headers"] == "X-Total, ETag, Link"
+    assert response.headers["Access-Control-Expose-Headers"] == (
+        "X-Total, ETag, Link, Allow"
+    )
     assert response.cookies["seen"].value == "1"
 
 

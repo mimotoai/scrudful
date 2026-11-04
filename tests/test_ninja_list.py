@@ -228,7 +228,7 @@ def test_list_headers(items):
     assert response.headers["Link"] == LIST_LINK
     assert "ETag" not in response.headers
     assert "Last-Modified" not in response.headers
-    assert expose(response) == {"Link"}
+    assert expose(response) == {"Link", "Allow"}
 
     response = TestClient(
         list_router(
@@ -240,7 +240,7 @@ def test_list_headers(items):
     assert response.headers["Link"] == LIST_LINK
     assert response.headers["ETag"] == '"n3"'
     assert "Last-Modified" in response.headers
-    assert expose(response) == {"ETag", "Link"}
+    assert expose(response) == {"ETag", "Link", "Allow"}
 
 
 def test_list_link_callables_get_queryset_and_item(items):
@@ -356,7 +356,7 @@ def test_list_early_responses_keep_handler_headers(items):
     assert response.headers["ETag"] == '"n3"'
     assert "Content-Type" not in response.headers
     assert "Content-Language" not in response.headers
-    assert expose(response) == {"ETag"}
+    assert expose(response) == {"ETag", "Link", "Allow"}
 
     for headers, status in (({"If-Match": '"n2"'}, 412), ({"If-Match": "bad"}, 400)):
         response = client.get("/items", headers=headers)

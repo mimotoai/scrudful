@@ -989,7 +989,7 @@ def test_get_sends_validators_and_links(client):
     assert response.status_code == 200
     assert response["ETag"] == '"v1"'
     assert response["Last-Modified"] == MODIFIED_HTTP
-    assert response["Access-Control-Expose-Headers"] == "ETag, Link"
+    assert response["Access-Control-Expose-Headers"] == "ETag, Link, Allow"
 
 
 def test_context_rel_and_type_are_honoured(client):
@@ -1168,7 +1168,7 @@ def test_handler_headers_are_kept_and_merged(client):
     response = client.get("/headers/1/")
     assert response["ETag"] == '"handler"'
     assert response["Link"] == f'<http://example.com/other>; rel="other", {SCHEMA_LINK}'
-    assert response["Access-Control-Expose-Headers"] == "X-Custom, link, ETag"
+    assert response["Access-Control-Expose-Headers"] == "X-Custom, link, ETag, Allow"
 
 
 def test_create_gets_links_but_no_validators(client):
@@ -1178,7 +1178,7 @@ def test_create_gets_links_but_no_validators(client):
     assert response["Link"] == f"{SCHEMA_LINK}, " + (
         f'<{CONTEXT}>; rel="my-context-rel"; type="application/x-context"'
     )
-    assert response["Access-Control-Expose-Headers"] == "Link, Location"
+    assert response["Access-Control-Expose-Headers"] == "Link, Location, Allow"
     assert store.calls == []
 
 
@@ -1288,7 +1288,7 @@ def test_error_links_on_412_428_400(client):
     for status, response in responses.items():
         assert response.status_code == status
         assert response["Link"] == ERROR_LINKS
-        assert response["Access-Control-Expose-Headers"] == "Link"
+        assert response["Access-Control-Expose-Headers"] == "Link, Allow"
     get_412 = client.get("/errors/1/", headers={"If-Match": '"v0"'})
     assert get_412.status_code == 412
     assert get_412["Link"] == ERROR_LINKS
@@ -1389,7 +1389,7 @@ def test_error_links_on_a_plain_django_view(client):
     assert response["Link"] == (
         f'<{BASE}/schemas/error>; rel="describedby"; type="application/schema+json"'
     )
-    assert response["Access-Control-Expose-Headers"] == "Link"
+    assert response["Access-Control-Expose-Headers"] == "Link, Allow"
     response = client.get("/django-error/", headers={"If-None-Match": '"v1"'})
     assert response.status_code == 304
     assert "Link" not in response
@@ -1462,7 +1462,7 @@ def test_options_json_for_browsable_accept(client):
         body = response.json()
         validate_http_schema_resource(body)
         assert response["Allow"] == allow_header(body)
-        assert response["Access-Control-Expose-Headers"] == "Link"
+        assert response["Access-Control-Expose-Headers"] == "Link, Allow"
 
 
 def test_options_headers_and_method_order(client):
@@ -2173,7 +2173,7 @@ def test_exception_handler_adds_error_links(client):
         assert response.status_code == status
         assert response["Link"] == ERROR_LINKS
         assert response["Content-Type"] == "application/json"
-        assert response["Access-Control-Expose-Headers"] == "Link"
+        assert response["Access-Control-Expose-Headers"] == "Link, Allow"
         assert "detail" in response.json() or status == 400
     assert responses[400].json() == {"name": ["This field is required."]}
     assert responses[405]["Allow"] == "GET, PUT, PATCH, DELETE, HEAD, OPTIONS"
@@ -2237,7 +2237,7 @@ def test_an_error_answering_options_gets_the_view_wide_error_links(client, url):
     assert response.status_code == 403
     assert response["Link"] == ERROR_LINKS
     assert response["Content-Type"] == "application/json"
-    assert response["Access-Control-Expose-Headers"] == "Link"
+    assert response["Access-Control-Expose-Headers"] == "Link, Allow"
     # The request's own handler's entity, as before.
     response = client.get(url)
     assert response.status_code == 403

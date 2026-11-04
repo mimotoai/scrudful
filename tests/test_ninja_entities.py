@@ -116,7 +116,7 @@ def test_general_post_200_result_links(store):
     assert "ETag" not in response.headers
     assert "Last-Modified" not in response.headers
     assert "Location" not in response.headers
-    assert expose(response) == {"Link"}
+    assert expose(response) == {"Link", "Allow"}
     config = search._scrudful
     assert config.request == QUERY
     assert dict(config.responses) == {200: RESULTS}
@@ -134,7 +134,7 @@ def test_request_entity_puts_no_header(store):
     response = TestClient(router).post("/items/search", json={"q": "a"})
     assert response.status_code == 200
     assert "Link" not in response.headers
-    assert "Access-Control-Expose-Headers" not in response.headers
+    assert expose(response) == {"Link", "Allow"}
 
 
 def test_per_status_entity(store):
@@ -165,7 +165,7 @@ def test_default_entity_only_on_2xx(store):
     response = TestClient(router).get("/items/1")
     assert response.status_code == 404
     assert "Link" not in response.headers
-    assert "Access-Control-Expose-Headers" not in response.headers
+    assert expose(response) == {"Link", "Allow"}
 
 
 def test_per_status_entity_overrides_default_on_2xx(store):
@@ -453,7 +453,7 @@ def test_error_links_on_412_428_400(store, method, headers, status):
     response = client.request(method, "/items/1", headers=headers)
     assert response.status_code == status
     assert "Link" not in response.headers
-    assert "Link" not in expose(response)
+    assert expose(response) == {"Link", "Allow"}
 
 
 def test_no_error_links_on_304(store):
@@ -675,7 +675,7 @@ def test_no_default_entity_links_on_204(store):
         assert response.status_code == 204
         if path == "/items/1":
             assert "Link" not in response.headers
-            assert "Link" not in expose(response)
+            assert expose(response) == {"Link", "Allow"}
         else:
             assert response.headers["Link"] == ERROR_LINK
     response = client.post("/items/1/touch")

@@ -517,7 +517,7 @@ def test_returned_response_gets_the_headers(make_client, store):
     assert response.headers["etag"] == '"v1"'
     assert response.headers["last-modified"] == MODIFIED_HTTP
     assert response.headers["link"] == SCHEMA_LINK
-    assert response.headers["access-control-expose-headers"] == "ETag, Link"
+    assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
 
 
 @pytest.mark.parametrize("returned", [True, False])
@@ -557,7 +557,7 @@ def test_route_status_code_decides_whether_validators_are_sent(make_client, stor
     response = client.get("/redirect", follow_redirects=False)
     assert response.status_code == 307
     assert "etag" not in response.headers
-    assert response.headers["access-control-expose-headers"] == "Location"
+    assert response.headers["access-control-expose-headers"] == "Link, Location, Allow"
 
 
 def test_http_exception_propagates_unchanged(make_client, store):
@@ -639,7 +639,9 @@ def test_headers_set_by_the_endpoint_are_kept_and_merged(make_client, store):
         '<http://example.com/1>; rel="prev", <http://example.com/3>; rel="next", '
         f"{SCHEMA_LINK}, {CONTEXT_LINK}"
     ]
-    assert response.headers["access-control-expose-headers"] == "X-Total, ETag, Link"
+    assert response.headers["access-control-expose-headers"] == (
+        "X-Total, ETag, Link, Allow"
+    )
 
 
 def test_cors_middleware_replaces_expose_headers_on_cross_origin_requests(
@@ -659,7 +661,9 @@ def test_cors_middleware_replaces_expose_headers_on_cross_origin_requests(
         return {}
 
     client = make_client(app)
-    assert client.get("/items").headers["access-control-expose-headers"] == "ETag"
+    assert client.get("/items").headers["access-control-expose-headers"] == (
+        "ETag, Link, Allow"
+    )
     cross_origin = client.get("/items", headers={"Origin": "http://other.example"})
     assert cross_origin.headers["access-control-expose-headers"] == (
         "ETag, Link, Location"
@@ -756,13 +760,13 @@ def test_link_defaults_and_custom_values(make_client):
     client = make_client(app)
     response = client.get("/defaults")
     assert response.headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
-    assert response.headers["access-control-expose-headers"] == "Link"
+    assert response.headers["access-control-expose-headers"] == "Link, Allow"
     assert client.get("/custom").headers["link"] == (
         f'<{SCHEMA}>; rel="schema"; type="application/schema+json"'
     )
     response = client.get("/none")
     assert "link" not in response.headers
-    assert "access-control-expose-headers" not in response.headers
+    assert response.headers["access-control-expose-headers"] == "Link, Allow"
     assert client.get("/callable-defaults").headers["link"] == SCHEMA_LINK
 
 
@@ -855,7 +859,7 @@ def test_get_returns_validators(client):
     assert response.headers["etag"] == '"v1"'
     assert response.headers["last-modified"] == MODIFIED_HTTP
     assert response.headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
-    assert response.headers["access-control-expose-headers"] == "ETag, Link"
+    assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
 
 
 @pytest.mark.parametrize(
@@ -868,7 +872,7 @@ def test_if_none_match_gives_304_with_validators(client, store, if_none_match):
     assert response.content == b""
     assert response.headers["etag"] == '"v1"'
     assert response.headers["last-modified"] == MODIFIED_HTTP
-    assert response.headers["access-control-expose-headers"] == "ETag"
+    assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
     assert "endpoint" not in store.calls
 
 
@@ -1003,7 +1007,7 @@ def test_conditional_write_gets_fresh_validators(client, store, method, headers)
     assert response.json() == {"version": 2, "method": method}
     assert response.headers["etag"] == '"v2"'
     assert response.headers["last-modified"] == "Tue, 02 Jan 2024 04:04:05 GMT"
-    assert response.headers["access-control-expose-headers"] == "ETag"
+    assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
     assert store.calls == ["etag", "last_modified", "endpoint"] + [
         "etag",
         "last_modified",
@@ -1218,7 +1222,9 @@ def test_304_carries_dependency_headers(make_client, store):
         "session=abc; Path=/; SameSite=lax",
         "raw=1",
     ]
-    assert response.headers["access-control-expose-headers"] == "X-Custom, ETag"
+    assert response.headers["access-control-expose-headers"] == (
+        "X-Custom, ETag, Link, Allow"
+    )
     assert "content-type" not in response.headers
     assert "content-encoding" not in response.headers
     assert response.content == b""
@@ -1237,7 +1243,7 @@ def test_412_carries_only_dependency_cookies(make_client, store):
     assert "cache-control" not in response.headers
     assert "vary" not in response.headers
     assert "etag" not in response.headers
-    assert response.headers["access-control-expose-headers"] == "X-Custom"
+    assert response.headers["access-control-expose-headers"] == "X-Custom, Link, Allow"
 
 
 # --- default status of the response class --------------------------------------
@@ -1495,10 +1501,10 @@ def test_empty_dependency_expose_header_on_early_responses(make_client, store):
     client = make_client(app)
     response = client.put("/item", headers={"If-Match": '"other"'})
     assert response.status_code == 412
-    assert "access-control-expose-headers" not in response.headers
+    assert response.headers["access-control-expose-headers"] == "Link, Allow"
     response = client.put("/item")
     assert response.status_code == 428
-    assert "access-control-expose-headers" not in response.headers
+    assert response.headers["access-control-expose-headers"] == "Link, Allow"
 
 
 def test_empty_if_match_is_absent(make_client, store):
@@ -1549,7 +1555,7 @@ def test_repeated_expose_header_lines_are_all_kept(make_client, store):
 
     response = make_client(app).get("/item")
     assert response.headers.get_list("access-control-expose-headers") == [
-        "X-One, X-Two, ETag"
+        "X-One, X-Two, ETag, Link, Allow"
     ]
 
 

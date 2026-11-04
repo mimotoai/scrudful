@@ -17,7 +17,7 @@ from typing import Any, Protocol
 
 from scrudful.conditional import SAFE_METHODS, ConditionalResult, validator_headers
 from scrudful.utils import (
-    EXPOSABLE_HEADERS,
+    EXPOSE_HEADERS,
     join_links,
     link_content,
     link_relations,
@@ -230,13 +230,21 @@ def set_validator_headers(
             headers[name] = value
 
 
+_ALWAYS_EXPOSED = frozenset({"Link", "Allow"})
+
+
 def expose_headers(headers: Headers) -> None:
-    """Add the exposable headers present to Access-Control-Expose-Headers."""
-    names = [name for name in EXPOSABLE_HEADERS if name in headers]
-    if names:
-        headers["Access-Control-Expose-Headers"] = merge_expose_headers(
-            headers.get("Access-Control-Expose-Headers"), names
-        )
+    """Merge the exposed headers into Access-Control-Expose-Headers.
+
+    ``Link`` and ``Allow`` are always exposed; ``ETag`` and ``Location`` only
+    when present.
+    """
+    names = [
+        name for name in EXPOSE_HEADERS if name in _ALWAYS_EXPOSED or name in headers
+    ]
+    headers["Access-Control-Expose-Headers"] = merge_expose_headers(
+        headers.get("Access-Control-Expose-Headers"), names
+    )
 
 
 def evaluated_signature(func: Callable[..., Any]) -> inspect.Signature:

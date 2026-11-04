@@ -168,22 +168,22 @@ def test_set_validator_headers_without_validators():
 def test_expose_headers_lists_present_headers():
     headers = {"ETag": '"v1"', "Location": "/x", "Content-Type": "text/plain"}
     expose_headers(headers)
-    assert headers["Access-Control-Expose-Headers"] == "ETag, Location"
+    assert headers["Access-Control-Expose-Headers"] == "ETag, Link, Location, Allow"
 
 
 def test_expose_headers_merges_existing_value():
     headers = {"Link": "<x>", "Access-Control-Expose-Headers": "X-Custom, etag"}
     expose_headers(headers)
-    assert headers["Access-Control-Expose-Headers"] == "X-Custom, etag, Link"
+    assert headers["Access-Control-Expose-Headers"] == "X-Custom, etag, Link, Allow"
 
 
-def test_expose_headers_nothing_to_expose():
-    headers = {"Access-Control-Expose-Headers": "X-Custom"}
-    expose_headers(headers)
-    assert headers == {"Access-Control-Expose-Headers": "X-Custom"}
+def test_expose_headers_always_link_and_allow():
     headers = {}
     expose_headers(headers)
-    assert headers == {}
+    assert headers["Access-Control-Expose-Headers"] == "Link, Allow"
+    headers = {"ETag": '"1"', "Access-Control-Expose-Headers": "X-Total"}
+    expose_headers(headers)
+    assert headers["Access-Control-Expose-Headers"] == "X-Total, ETag, Link, Allow"
 
 
 # --- response descriptions ---------------------------------------------------

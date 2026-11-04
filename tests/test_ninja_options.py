@@ -330,7 +330,7 @@ def test_options_headers(store):
         body = response.json()
         assert response.headers["Allow"] == allow_header(body)
         assert link_problems("OPTIONS", 200, response.headers, True, body) == []
-        assert expose(response) == {"Link"}
+        assert expose(response) == {"Link", "Allow"}
 
 
 def test_options_lists_options_and_head(store):

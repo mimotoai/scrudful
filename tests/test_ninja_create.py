@@ -109,7 +109,7 @@ def test_create_201_location_links_validators(store, counted):
     assert response.headers["Link"] == ITEM_LINK
     assert response.headers["ETag"] == '"v1"'
     assert response.headers["Last-Modified"] == MODIFIED_HTTP
-    assert expose(response) == {"ETag", "Link", "Location"}
+    assert expose(response) == {"ETag", "Link", "Location", "Allow"}
     assert counted.calls == {"location": 1, "etag": 1, "modified": 1}
     assert counted.objects == [store.items[3]]
 
@@ -193,7 +193,7 @@ def test_create_non_201_no_location(store, counted):
     assert response.json() == {"detail": "bad name"}
     for name in ("Location", "ETag", "Last-Modified", "Link"):
         assert name not in response.headers
-    assert "Access-Control-Expose-Headers" not in response.headers
+    assert expose(response) == {"Link", "Allow"}
     assert counted.calls == {}
 
 
@@ -334,7 +334,7 @@ def test_create_http_response_body_gets_static_item_links(store, counted, body):
     response = TestClient(router).post("/items", json={"name": "c"})
     assert response.status_code == 201
     assert response.headers["Link"] == ITEM_LINK
-    assert expose(response) == {"Link"}
+    assert expose(response) == {"Link", "Allow"}
     for name in ("Location", "ETag", "Last-Modified"):
         assert name not in response.headers
     assert counted.calls == {}
