@@ -1,5 +1,6 @@
 """The HTTP Schema Resource of a ``ScrudfulRouter`` path, built without a request."""
 
+import functools
 import json
 import re
 import types
@@ -14,7 +15,7 @@ import pytest
 from asgiref.sync import async_to_sync
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
-from django.http import Http404
+from django.http import Http404, HttpResponseForbidden
 from django.test import Client
 from ninja import NinjaAPI, Router
 from ninja.errors import AuthenticationError, ConfigError, HttpError
@@ -1452,13 +1453,127 @@ def test_non_preflight_options_runs_the_checks():
 
 
 def test_options_consumes_no_throttle_for_allow(clear_cache):
+    """OPTIONS itself is throttled once, as ninja would; computing Allow (a
+    check per method) consumes nothing more."""
     api, _ = make_api(throttle=[AnonRateThrottle("2/day")])
     client = TestClient(api)
-    options(client, "/1")
-    assert client.get("/1").status_code == 200  # the per-method checks ran no throttle
+    assert options(client, "/1").status_code == 204  # one of the two
+    assert client.get("/1").status_code == 200  # the per-method checks ran none
+    throttled = client.get("/1")
+    assert throttled.status_code == 429
+
+
+def test_options_is_throttled_as_ninja_would(clear_cache):
+    api, _ = make_api(throttle=[AnonRateThrottle("1/day")])
+    client = TestClient(api)
+    assert options(client, "/1").status_code == 204
+    throttled = options(client, "/1")
+    get = client.get("/1")
+    # ninja's own 429, for OPTIONS as for the GET.
+    assert throttled.status_code == get.status_code == 429
+    assert throttled.content == get.content
+    assert throttled.headers["Retry-After"] == get.headers["Retry-After"]
+
+
+def test_options_is_throttled_with_the_mounts_throttles(clear_cache):
+    router_options, _, item = split_options({})
+    router = ScrudfulRouter(**router_options)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    api = NinjaAPI(
+        urls_namespace=f"api-{uuid.uuid4().hex}", throttle=[AnonRateThrottle("9/day")]
+    )
+    api.add_router("/open", router, url_name_prefix="open")
+    api.add_router(
+        "/tight", router, throttle=[AnonRateThrottle("1/day")], url_name_prefix="tight"
+    )
+    client = TestClient(api)
+    assert [options(client, "/tight/1").status_code for _ in range(2)] == [204, 429]
+    assert [options(client, "/open/1").status_code for _ in range(2)] == [204, 204]
+
+
+def test_preflight_never_consumes_quota(clear_cache):
+    api, _ = make_api(throttle=[AnonRateThrottle("1/day")])
+    client = TestClient(api)
+    preflight = {
+        "Origin": "https://app.example",
+        "Access-Control-Request-Method": "PUT",
+    }
+    for _ in range(3):
+        assert options(client, "/1", headers=preflight).status_code == 204
     assert client.get("/1").status_code == 200
-    assert client.get("/1").status_code == 429
-    assert options(client, "/1").status_code == 204  # nor is OPTIONS throttled
+
+
+def deny(view_func):
+    @functools.wraps(view_func)
+    def denying(request, *args, **kwargs):
+        raise HttpError(403, "Forbidden")
+
+    return denying
+
+
+def test_operation_mode_decorators_never_gate_options():
+    """``add_decorator(mode="operation")`` wraps each operation's function,
+    which OPTIONS never calls: neither a preflight nor OPTIONS is refused."""
+    api, router = make_api()
+    router.add_decorator(deny)
+    client = TestClient(api)
+    assert client.get("/1").status_code == 403
+    preflight = options(
+        client,
+        "/1",
+        headers={
+            "Origin": "https://app.example",
+            "Access-Control-Request-Method": "PUT",
+        },
+    )
+    assert preflight.status_code == 204 and preflight.content == b""
+    assert "Link" not in preflight.headers
+    r = options(client, "/1")
+    expected = {"GET", "PUT", "OPTIONS"}
+    assert (
+        options_204_problems(r.status_code, dict(r.headers), r.content, expected) == []
+    )
+
+
+def test_view_mode_decorators_run_first():
+    """``add_decorator(mode="view")`` wraps ``Operation.run`` itself: it runs
+    before OPTIONS is answered, a preflight too (documented)."""
+
+    def deny_view(run):
+        @functools.wraps(run)
+        def denying(request, *args, **kwargs):
+            return HttpResponseForbidden()
+
+        return denying
+
+    api, router = make_api()
+    router.add_decorator(deny_view, mode="view")
+    client = TestClient(api)
+    preflight = options(
+        client,
+        "/1",
+        headers={
+            "Origin": "https://app.example",
+            "Access-Control-Request-Method": "PUT",
+        },
+    )
+    assert preflight.status_code == options(client, "/1").status_code == 403
+
+
+def test_options_view_refuses_without_the_run_decorator():
+    _, router = make_api()
+    [operation] = [
+        op
+        for op in router.path_operations["/{pk}"].operations
+        if "OPTIONS" in op.methods
+    ]
+    with pytest.raises(RuntimeError, match="Operation.run decorator"):
+        operation.view_func(None, pk="1")
 
 
 def test_automatic_options_is_csrf_exempt_unthrottled_and_unauthenticated():
@@ -1699,6 +1814,7 @@ def test_hooks_get_the_urls_parameters():
         ("NinjaAPI", "_get_bound_routers"),
         ("ParamModel", "resolve"),
         ("PathModel", "get_request_data"),
+        ("Operation", "_check_throttles"),
     ],
 )
 def test_options_needs_ninjas_internals(monkeypatch, fresh_ninja_code, owner, method):
@@ -1749,6 +1865,25 @@ def test_options_needs_the_path_models(monkeypatch):
     monkeypatch.setattr(get, "models", None)
     with pytest.raises(ConfigError, match=r"Operation\.models"):
         options(TestClient(api), "/1")
+
+
+def test_options_needs_ninjas_operation_clone(monkeypatch, fresh_ninja_code):
+    """The run decorator answering OPTIONS reaches each mount's clone only
+    through ``Operation.clone``: checked when the operation is added."""
+    cls = ninja.operation.Operation
+    monkeypatch.setattr(cls, "clone", wrapping(cls.clone))
+    with pytest.raises(ConfigError, match=r"rely on ninja's Operation\.clone: "):
+        make_api()
+
+
+def test_options_needs_the_bound_routers_throttle(monkeypatch, clear_cache):
+    api, _ = make_api(throttle=[AnonRateThrottle("1/day")])
+    client = TestClient(api)
+    assert client.urls  # the URL patterns are built, and kept
+    for bound in api._get_bound_routers():
+        monkeypatch.delattr(bound, "throttle")
+    with pytest.raises(ConfigError, match=r"BoundRouter\.throttle"):
+        options(client, "/1")
 
 
 def test_options_needs_the_auth_callbacks(monkeypatch):
