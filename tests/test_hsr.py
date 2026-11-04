@@ -28,10 +28,13 @@ def test_options_operation_is_204_without_content():
 @pytest.mark.parametrize(
     "given, expected",
     [
-        ({"get"}, "GET, OPTIONS, HEAD"),
+        # HEAD only when given: never inferred from GET.
+        ({"get"}, "GET, OPTIONS"),
+        ({"get", "head"}, "GET, OPTIONS, HEAD"),
+        ({"head"}, "OPTIONS, HEAD"),
         ({"PUT", "patch"}, "PUT, OPTIONS, PATCH"),
         (set(), "OPTIONS"),
-        ({"GET", "QUERY"}, "GET, OPTIONS, HEAD, QUERY"),
+        ({"GET", "QUERY"}, "GET, OPTIONS, QUERY"),
     ],
 )
 def test_allow_value(given, expected):

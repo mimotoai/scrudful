@@ -371,8 +371,11 @@ OPTIONS
        ``Allow`` uses no throttle quota, and the CSRF check of a cookie
        ``auth`` is skipped: ``Allow`` is about authorization, and the
        request using the method is checked.
-    4. ``Allow`` lists those methods, ``OPTIONS`` always, and ``HEAD`` when
-       ``GET`` is (:func:`scrudful._hsr.allow_value`).
+    4. ``Allow`` lists those methods and ``OPTIONS`` always
+       (:func:`scrudful._hsr.allow_value`). ``HEAD`` is a method like the
+       others: listed only when an operation of the path lists it (e.g.
+       ``@router.api_operation(["GET", "HEAD"], ...)``), checked with that
+       operation's checks, since ninja answers an unrouted HEAD with 405.
 
     So OPTIONS isn't gated itself: an anonymous requester on a locked path
     gets a 204 with ``Allow: OPTIONS``, not a 401. The ``auth=`` callbacks
@@ -1770,8 +1773,12 @@ class ScrudfulRouter(Router):
         ``method`` on ``obj`` (the object OPTIONS loaded, or ``None``), for
         the ``Allow`` of OPTIONS on the router's paths; an operation's own
         ``allowed=`` wins over it. It returns a ``bool`` and may be ``async
-        def``. Without either, the operations' ``auth=`` callbacks and
-        ``before`` decide (see "OPTIONS" in the module docstring).
+        def``. ``request`` is a copy with ``method``, authenticated by the
+        operation's ``auth=`` callbacks when they authenticate the requester
+        (``request.auth``), else as it came. ``obj`` was loaded only once the
+        loading operation's ``auth=`` and ``before`` allowed the requester.
+        Without a hook, the operations' ``auth=`` callbacks and ``before``
+        decide (see "OPTIONS" in the module docstring).
 
     Raises
     ------

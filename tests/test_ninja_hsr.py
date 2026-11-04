@@ -167,7 +167,7 @@ def test_hsr_is_identical_across_hosts_and_requesters(client, settings, db):
     # OPTIONS: the Allow is the requester's; the HSR link isn't the host's.
     a = client.options("/a/1", HTTP_HOST="a.example")
     b = client.options("/b/1", HTTP_HOST="b.example", HTTP_X_API_KEY=ALICE)
-    everything = {"GET", "HEAD", "PUT", "OPTIONS"}
+    everything = {"GET", "PUT", "OPTIONS"}
     assert (
         options_204_problems(a.status_code, dict(a.items()), a.content, {"OPTIONS"})
         == []
@@ -1173,12 +1173,12 @@ def test_options_is_204_with_hsr_link():
     r = options(TestClient(api), "/1", headers={"X-API-Key": ALICE})
     assert (
         options_204_problems(
-            r.status_code, dict(r.headers), r.content, {"GET", "HEAD", "PUT", "OPTIONS"}
+            r.status_code, dict(r.headers), r.content, {"GET", "PUT", "OPTIONS"}
         )
         == []
     )
     assert hsr_link_problems(dict(r.headers), PK_TARGET) == []
-    assert r.headers["Allow"] == "GET, PUT, OPTIONS, HEAD"
+    assert r.headers["Allow"] == "GET, PUT, OPTIONS"
     assert {"Link", "Allow"} <= exposed(r.headers)
 
 
@@ -1188,11 +1188,11 @@ def test_allow_reflects_requester():
     assert options(client, "/1").headers["Allow"] == "OPTIONS"
     assert (
         options(client, "/1", headers={"X-API-Key": BOB}).headers["Allow"]
-        == "GET, OPTIONS, HEAD"
+        == "GET, OPTIONS"
     )
     assert (
         options(client, "/1", headers={"X-API-Key": ALICE}).headers["Allow"]
-        == "GET, PUT, OPTIONS, HEAD"
+        == "GET, PUT, OPTIONS"
     )
     # OPTIONS itself isn't gated: an anonymous requester gets a 204, not a 401.
     anonymous = options(client, "/1")
@@ -1215,7 +1215,7 @@ def test_allow_hook_overrides_and_gets_object():
         return method == "GET"
 
     api, _ = make_api(allowed=allowed)
-    assert options(TestClient(api), "/1").headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert options(TestClient(api), "/1").headers["Allow"] == "GET, OPTIONS"
     assert {m for m, _ in seen} == {"GET", "PUT"}
     assert all(o is not None for _, o in seen)
     assert all(o["id"] == 1 for _, o in seen)  # the loaded object
@@ -1259,7 +1259,7 @@ def test_allow_hook_gets_the_authenticated_requester():
     assert sorted(seen) == [("GET", "GET", BOB), ("PUT", "PUT", BOB)]
     seen.clear()
     # The hook alone decides: it is asked about an anonymous requester too.
-    assert options(client, "/1").headers["Allow"] == "GET, PUT, OPTIONS, HEAD"
+    assert options(client, "/1").headers["Allow"] == "GET, PUT, OPTIONS"
     assert sorted(seen) == [("GET", "GET", None), ("PUT", "PUT", None)]
 
 
@@ -1268,7 +1268,7 @@ def test_async_before_is_honoured():
     r = async_options(api, "/1")
     assert options_204_problems(r.status_code, dict(r.headers), r.content) == []
     assert "PUT" not in r.headers["Allow"]
-    assert r.headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert r.headers["Allow"] == "GET, OPTIONS"
 
 
 async def deny_all(request, method, obj):
@@ -1413,7 +1413,7 @@ def test_denials_of_a_check(error, where):
         api, _ = make_api(before=lambda request, **params: check(request) and None)
     else:
         api, _ = make_api(auth=check)
-    assert options(TestClient(api), "/1").headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert options(TestClient(api), "/1").headers["Allow"] == "GET, OPTIONS"
 
 
 @pytest.mark.parametrize(
@@ -1492,7 +1492,7 @@ def collection_router(**router_options: Any) -> ScrudfulRouter:
 def test_collection_path_allow_without_object():
     client = TestClient(mount(collection_router()))
     r = options(client, "/items")
-    expected = {"GET", "HEAD", "POST", "OPTIONS"}
+    expected = {"GET", "POST", "OPTIONS"}
     assert (
         options_204_problems(r.status_code, dict(r.headers), r.content, expected) == []
     )
@@ -1504,7 +1504,7 @@ def test_collection_path_allow_without_object():
         return method == "GET"
 
     client = TestClient(mount(collection_router(allowed=allowed)))
-    assert options(client, "/items").headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert options(client, "/items").headers["Allow"] == "GET, OPTIONS"
     assert sorted(seen) == [("GET", None), ("POST", None)]
 
 
@@ -1546,6 +1546,42 @@ def test_allowed_must_be_callable(factory, required):
         factory(allowed="GET", **required)
 
 
+def test_head_is_listed_only_when_routed_and_checked_per_requester():
+    """ninja answers an unrouted HEAD with 405: Allow lists HEAD only for a
+    path whose operation lists it, checked with that operation's checks."""
+    api, _ = make_api()
+    client = TestClient(api)
+    assert client.request("HEAD", "/1").status_code == 405
+    assert options(client, "/1").headers["Allow"] == "GET, PUT, OPTIONS"
+
+    def no_head_for_bob(request, **params):
+        if request.method == "HEAD" and request.auth == BOB:
+            raise HttpError(403, "Forbidden")
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.api_operation(["GET", "HEAD"], "/{pk}", response=ItemOut)
+    @scrudful(load=Store().load, before=no_head_for_bob, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    client = TestClient(mount(router, auth=KeyAuth()))
+    assert client.request("HEAD", "/1", headers={"X-API-Key": ALICE}).status_code == 200
+    alice = options(client, "/1", headers={"X-API-Key": ALICE})
+    assert (
+        options_204_problems(
+            alice.status_code,
+            dict(alice.headers),
+            alice.content,
+            {"GET", "HEAD", "OPTIONS"},
+        )
+        == []
+    )
+    assert alice.headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert options(client, "/1", headers=BOB_KEY).headers["Allow"] == "GET, OPTIONS"
+    assert options(client, "/1").headers["Allow"] == "OPTIONS"
+
+
 def test_described_operation_uses_its_auth():
     router = ScrudfulRouter(base_url=BASE_URL)
 
@@ -1560,10 +1596,10 @@ def test_described_operation_uses_its_auth():
         return 204, None
 
     client = TestClient(mount(router))
-    assert options(client, "/1").headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert options(client, "/1").headers["Allow"] == "GET, OPTIONS"
     assert (
         options(client, "/1", headers={"X-API-Key": ALICE}).headers["Allow"]
-        == "GET, DELETE, OPTIONS, HEAD"
+        == "GET, DELETE, OPTIONS"
     )
 
 
@@ -1580,10 +1616,10 @@ def test_router_mounted_twice_uses_each_mounts_auth():
     api.add_router("/open", router, url_name_prefix="open")
     api.add_router("/locked", router, auth=KeyAuth(), url_name_prefix="locked")
     client = TestClient(api)
-    assert options(client, "/open/1").headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert options(client, "/open/1").headers["Allow"] == "GET, OPTIONS"
     assert options(client, "/locked/1").headers["Allow"] == "OPTIONS"
     alice = options(client, "/locked/1", headers={"X-API-Key": ALICE})
-    assert alice.headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert alice.headers["Allow"] == "GET, OPTIONS"
 
 
 SESSION_API, _ = make_api(auth=django_auth)
@@ -1603,7 +1639,7 @@ def test_cookie_auth_checks_skip_csrf_for_allow(django_user_model, settings, db)
     r = client.options("/session/1")
     assert (
         options_204_problems(
-            r.status_code, dict(r.items()), r.content, {"GET", "HEAD", "PUT", "OPTIONS"}
+            r.status_code, dict(r.items()), r.content, {"GET", "PUT", "OPTIONS"}
         )
         == []
     )
@@ -1618,7 +1654,7 @@ def test_options_under_parameterized_prefixes(client, settings, db):
     the loader, and the HSR link reverses with the prefixes'."""
     settings.ALLOWED_HOSTS = ["a.example"]
     r = client.options("/t/acme/orgs/7/items/1", HTTP_HOST="a.example")
-    expected = {"GET", "HEAD", "OPTIONS"}
+    expected = {"GET", "OPTIONS"}
     assert (
         options_204_problems(r.status_code, dict(r.items()), r.content, expected) == []
     )
@@ -1647,7 +1683,7 @@ def test_hooks_get_the_urls_parameters():
     api.add_router("/orgs/{org}", router)
     client = TestClient(api)
     assert client.get("/orgs/7/1").status_code == 200
-    assert options(client, "/orgs/7/1").headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert options(client, "/orgs/7/1").headers["Allow"] == "GET, OPTIONS"
     # The GET's, then the OPTIONS' (loading, then checking GET): the same.
     assert seen == [{"org": "7", "pk": "1"}] * 3
 
@@ -1739,7 +1775,7 @@ def test_without_source_the_options_fingerprints_are_checked(
         r = async_options(make_async_api(auth=KeyAuth())[0], "/1", headers=BOB_KEY)
     else:
         r = options(TestClient(make_api(auth=KeyAuth())[0]), "/1", headers=BOB_KEY)
-    assert r.status_code == 204 and r.headers["Allow"] == "GET, PUT, OPTIONS, HEAD"
+    assert r.status_code == 204 and r.headers["Allow"] == "GET, PUT, OPTIONS"
     cls = ninja.params.models.ParamModel
     monkeypatch.setattr(cls, "resolve", classmethod(wrapping(cls.resolve.__func__)))
     with pytest.raises(ConfigError, match=r"ninja's ParamModel\.resolve"):

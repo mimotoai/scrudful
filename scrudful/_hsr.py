@@ -68,14 +68,15 @@ def options_operation() -> dict[str, Any]:
 def allow_value(methods: Iterable[str]) -> str:
     """The ``Allow`` value for ``methods``.
 
-    ``OPTIONS`` is always allowed, and ``HEAD`` when ``GET`` is. The methods
-    of :data:`~scrudful._adapter.METHOD_KEYS` come first, in that order, then
-    any others sorted.
+    ``OPTIONS`` is always allowed. ``HEAD`` is listed only when it is in
+    ``methods``, never inferred from ``GET``: ``Allow`` lists exactly the
+    methods available, and a resource may answer HEAD with 405 (ninja does,
+    unless an operation lists HEAD). The methods of
+    :data:`~scrudful._adapter.METHOD_KEYS` come first, in that order, then any
+    others sorted.
     """
     allowed = {method.upper() for method in methods}
     allowed.add("OPTIONS")
-    if "GET" in allowed:
-        allowed.add("HEAD")
     known = [key.upper() for key in METHOD_KEYS]
     ordered = [method for method in known if method in allowed]
     ordered += sorted(allowed - set(known))

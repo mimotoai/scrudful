@@ -169,7 +169,7 @@ def test_options_has_no_body_whatever_the_renderer(asynchronous, renderer):
     assert response.status_code == 204
     assert response.content == b""
     assert "Content-Type" not in response.headers
-    assert response.headers["Allow"] == "GET, PUT, OPTIONS, HEAD"
+    assert response.headers["Allow"] == "GET, PUT, OPTIONS"
 
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])

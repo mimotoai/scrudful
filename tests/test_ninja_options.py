@@ -293,11 +293,11 @@ def described_router(store: Store) -> Router:
 #: A URL of each path of ``described_router``: its template, and the
 #: ``Allow`` of its OPTIONS (no auth, no hook: every method).
 DESCRIBED_PATHS = {
-    "/items/1": ("/items/{pk}", "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"),
-    "/items": ("/items", "GET, POST, OPTIONS, HEAD"),
+    "/items/1": ("/items/{pk}", "GET, PUT, DELETE, OPTIONS, PATCH"),
+    "/items": ("/items", "GET, POST, OPTIONS"),
     "/items/search": ("/items/search", "POST, OPTIONS"),
     "/jobs/1": ("/jobs/{pk}", "PUT, OPTIONS"),
-    "/bare/1": ("/bare/{pk}", "GET, OPTIONS, HEAD"),
+    "/bare/1": ("/bare/{pk}", "GET, OPTIONS"),
 }
 
 
@@ -442,7 +442,7 @@ def test_mixed_path_agrees(store):
 
     client = TestClient(router)
     target = hsr_target("/items/{pk}")
-    options_204(client, "/items/1", "GET, PUT, OPTIONS, HEAD", target)
+    options_204(client, "/items/1", "GET, PUT, OPTIONS", target)
     body = hsr_get(client, "/items/{pk}")
     assert list(body) == ["get", "put", "options"]
     assert "requestBody" not in body["put"]
@@ -607,7 +607,7 @@ def test_options_trace_when_routed(store):
 
     client = TestClient(router)
     target = hsr_target("/items/{pk}")
-    options_204(client, "/items/1", "GET, OPTIONS, HEAD, TRACE", target)
+    options_204(client, "/items/1", "GET, OPTIONS, TRACE", target)
     body = hsr_get(client, "/items/{pk}")
     assert list(body) == ["get", "options", "trace"]
     assert body["trace"] == {
@@ -697,7 +697,7 @@ def test_router_rejects_options_links():
 def test_options_auto_added(store):
     client = TestClient(item_router(store))
     target = hsr_target("/items/{pk}")
-    options_204(client, "/items/1", "GET, PUT, DELETE, OPTIONS, HEAD", target)
+    options_204(client, "/items/1", "GET, PUT, DELETE, OPTIONS", target)
     # The object is loaded (for an exact Allow); no handler runs.
     assert store.calls == {"load": 1}
     body = hsr_get(client, "/items/{pk}")
@@ -777,7 +777,7 @@ def test_options_needs_no_credentials(store):
     assert client.get("/items/1", headers=ALICE).status_code == 200
     assert store.calls["load"] == 1
     # With them, OPTIONS offers every method, on the object loaded.
-    allow = "GET, PUT, DELETE, OPTIONS, HEAD"
+    allow = "GET, PUT, DELETE, OPTIONS"
     options_204(client, "/items/1", allow, target, headers=ALICE)
     assert store.calls["load"] == 2
 
@@ -788,7 +788,7 @@ def test_options_same_for_missing_and_hidden(store):
     Resource is the same for every URL of the path."""
     client = TestClient(api_with_auth(store, item_router(store)))
     target = hsr_target("/items/{pk}")
-    allow = "GET, PUT, DELETE, OPTIONS, HEAD"
+    allow = "GET, PUT, DELETE, OPTIONS"
     options_204(client, "/items/1", allow, target, headers=ALICE)
     missing = options(client, "/items/999", headers=ALICE)
     hidden = options(client, f"/items/{HIDDEN}", headers=ALICE)
@@ -847,7 +847,7 @@ def test_options_with_path_converters(store):
         (f"/uuids/{uuid.uuid4()}", "/uuids/{uuid:key}"),
         ("/files/a/b.txt", "/files/{path:name}"),
     ):
-        options_204(client, url, "GET, OPTIONS, HEAD", hsr_target(template))
+        options_204(client, url, "GET, OPTIONS", hsr_target(template))
         body = hsr_get(client, template)
         assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
 
@@ -864,7 +864,7 @@ def test_options_default_router(store):
         return {"pk": pk}
 
     client = TestClient(api)
-    options_204(client, "/things/1", "GET, OPTIONS, HEAD", hsr_target("/things/{pk}"))
+    options_204(client, "/things/1", "GET, OPTIONS", hsr_target("/things/{pk}"))
     assert list(hsr_get(client, "/things/{pk}")) == ["get", "options"]
 
 
@@ -894,7 +894,7 @@ def test_options_head_when_routed(store):
 def test_options_list_path(store):
     client = TestClient(list_router(store))
     # A collection: nothing to load.
-    options_204(client, "/items", "GET, POST, OPTIONS, HEAD", hsr_target("/items"))
+    options_204(client, "/items", "GET, POST, OPTIONS", hsr_target("/items"))
     assert store.calls == {}
     body = hsr_get(client, "/items")
     assert body == {
@@ -1117,7 +1117,7 @@ def test_options_link_callables_are_called_in_describe_mode():
     hsr_get(TestClient(router), "/items/{pk}")
     assert calls == [(None, None)]
     # OPTIONS calls none: it has no content to describe.
-    options_204(client, "/items/6", "GET, OPTIONS, HEAD", hsr_target("/items/{pk}"))
+    options_204(client, "/items/6", "GET, OPTIONS", hsr_target("/items/{pk}"))
     assert calls == [(None, None)]
 
 
@@ -1171,7 +1171,7 @@ def test_options_async_operation_with_async_request_entity(store):
     assert store.calls == {}
     # OPTIONS of the async path: the GET's (sync) load, run off the loop.
     response = async_to_sync(client.request)("OPTIONS", "/items/1")
-    allow = {"GET", "HEAD", "PUT", "OPTIONS"}
+    allow = {"GET", "PUT", "OPTIONS"}
     assert (
         options_204_problems(
             response.status_code, dict(response.headers), response.content, allow
@@ -1250,7 +1250,7 @@ def test_options_mixed_operations(store):
     validate_http_schema_resource(body)
     assert list(body) == ["get", "put", "delete", "options", "patch"]
     assert store.calls == {}
-    allow = "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
+    allow = "GET, PUT, DELETE, OPTIONS, PATCH"
     options_204(client, "/items/1", allow, hsr_target("/items/{pk}"))
     # The GET's load (an exact Allow); no handler.
     assert store.calls == {"load": 1}
@@ -1297,7 +1297,7 @@ def test_options_nested_router_api_auth(store):
     assert client.put("/shop/v1/items/1", json={"name": "x"}).status_code == 401
     assert store.calls["load"] == 0
     assert client.get("/shop/v1/items/1", headers=ALICE).status_code == 200
-    allow = "GET, PUT, DELETE, OPTIONS, HEAD"
+    allow = "GET, PUT, DELETE, OPTIONS"
     options_204(client, "/shop/v1/items/1", allow, target, headers=ALICE)
 
 
@@ -1316,7 +1316,7 @@ def test_options_is_not_gated_by_router_and_operation_auth(store):
     options_204(client, "/items/1", "OPTIONS", target)
     assert client.get("/items/1").status_code == 401
     assert store.calls["load"] == 0
-    options_204(client, "/items/1", "GET, OPTIONS, HEAD", target, headers=ALICE)
+    options_204(client, "/items/1", "GET, OPTIONS", target, headers=ALICE)
 
 
 def test_options_router_mounted_twice(store):
@@ -1331,7 +1331,7 @@ def test_options_router_mounted_twice(store):
     # (one URL name for both, see _hsr_target), which serves that document.
     targets = {hsr_target("/items/{pk}", prefix) for prefix in ("/a", "/b")}
     for url, allow in (
-        ("/a/items/1", "GET, PUT, DELETE, OPTIONS, HEAD"),
+        ("/a/items/1", "GET, PUT, DELETE, OPTIONS"),
         ("/b/items/1", "OPTIONS"),
     ):
         response = options_204(client, url, allow, None)
