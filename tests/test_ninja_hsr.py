@@ -4,20 +4,25 @@ import json
 import re
 import types
 import uuid
-from typing import Any
+from typing import Any, List
 
+import ninja.operation
+import ninja.params.models
 import ninja.router
 import ninja.testing.client
 import pytest
+from asgiref.sync import async_to_sync
 from django.core.cache import cache
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+from django.http import Http404
+from django.test import Client
 from ninja import NinjaAPI, Router
-from ninja.errors import ConfigError
+from ninja.errors import AuthenticationError, ConfigError, HttpError
 from ninja.renderers import JSONRenderer
-from ninja.security import APIKeyHeader
+from ninja.security import APIKeyHeader, django_auth
 from ninja.throttling import AnonRateThrottle
 from django.urls import path
-from ninja.testing import TestClient
+from ninja.testing import TestAsyncClient, TestClient
 
 from scrudful._django import scrudful_setting
 from scrudful._hsr import hsr_etag, serialize_hsr
@@ -30,12 +35,22 @@ from scrudful.ninja import (
     http_schema_resource,
     http_schema_resource_view,
     scrudful,
+    scrudful_create,
+    scrudful_list,
 )
-from tests.semantic_http import hsr_get_problems, validate_http_schema_resource
+from tests.semantic_http import (
+    hsr_get_problems,
+    hsr_link_problems,
+    link_problems,
+    options_204_problems,
+    validate_http_schema_resource,
+)
 from tests.test_ninja_adapter import ItemIn, ItemOut, Store, etag, modified, update
 
 BASE_URL = "https://api.example/"
 ALICE = "alice"
+BOB = "bob"
+BOB_KEY = {"X-API-Key": BOB}
 LINKS = dict(schema_link_or_func="/schemas/item", context_link_or_func="/contexts/item")
 OP_ERROR = Entity(
     schema_link_or_func="https://api.example/schemas/op-error",
@@ -118,7 +133,7 @@ class KeyAuth(APIKeyHeader):
     param_name = "X-API-Key"
 
     def authenticate(self, request, key):
-        return key if key == ALICE else None
+        return key if key in (ALICE, BOB) else None
 
 
 # --- requester independence ----------------------------------------------------
@@ -142,11 +157,27 @@ def test_hsr_is_identical_across_hosts_and_requesters(client, settings, db):
         client.get("/b/1", HTTP_HOST="b.example", HTTP_X_API_KEY=ALICE).status_code
         == 200
     )
-    a = client.options("/a/1", HTTP_HOST="a.example")
-    b = client.options("/b/1", HTTP_HOST="b.example", HTTP_X_API_KEY=ALICE)
+    # Each request builds its router's document (the first to need it).
+    a = client.get("/a/_hsr/pk", HTTP_HOST="a.example")
+    b = client.get("/b/_hsr/pk", HTTP_HOST="b.example", HTTP_X_API_KEY=ALICE)
     assert a.status_code == b.status_code == 200
     assert a.content == b.content
+    assert a["ETag"] == b["ETag"]
     assert json.loads(a.content) == http_schema_resource(HOST_A_ROUTER, "/{pk}")
+    # OPTIONS: the Allow is the requester's; the HSR link isn't the host's.
+    a = client.options("/a/1", HTTP_HOST="a.example")
+    b = client.options("/b/1", HTTP_HOST="b.example", HTTP_X_API_KEY=ALICE)
+    everything = {"GET", "HEAD", "PUT", "OPTIONS"}
+    assert (
+        options_204_problems(a.status_code, dict(a.items()), a.content, {"OPTIONS"})
+        == []
+    )
+    assert (
+        options_204_problems(b.status_code, dict(b.items()), b.content, everything)
+        == []
+    )
+    assert hsr_link_problems(dict(a.items()), "https://api.example/a/_hsr/pk") == []
+    assert hsr_link_problems(dict(b.items()), "https://api.example/b/_hsr/pk") == []
     assert (
         http_schema_resource(HOST_A_ROUTER, "/{pk}")["get"]["responses"]["200"][
             "content"
@@ -155,9 +186,11 @@ def test_hsr_is_identical_across_hosts_and_requesters(client, settings, db):
     )
 
 
-def test_options_body_is_the_built_hsr():
+def test_options_has_no_body_and_the_route_serves_the_built_hsr():
     api, router = make_api()
-    response = options(TestClient(api), "/1")
+    client = TestClient(api)
+    assert options(client, "/1").content == b""
+    response = client.get("/_hsr/pk")
     assert json.loads(response.content) == http_schema_resource(router, "/{pk}")
 
 
@@ -232,7 +265,8 @@ def test_hsr_is_built_once_per_path():
     first = http_schema_resource(router, "/{pk}")
     built = len(calls)
     client = TestClient(api)
-    options(client, "/1")
+    client.get("/_hsr/pk")
+    client.get("/_hsr/pk")
     options(client, "/1")
     assert http_schema_resource(router, "/{pk}") == first
     assert len(calls) == built
@@ -1068,3 +1102,645 @@ def test_target_needs_the_operations_api():
         _operation_api(types.SimpleNamespace(api=None))
     with pytest.raises(ConfigError, match="functools.wraps"):
         _operation_api(None)
+
+
+# --- OPTIONS: a 204 with a per-requester Allow ---------------------------------
+
+#: The HSR link target of ``make_api``'s ``"/{pk}"`` (Ruling R6).
+PK_TARGET = "https://api.example/_hsr/pk"
+
+
+def make_async_api(**config: Any) -> tuple[NinjaAPI, ScrudfulRouter]:
+    """``make_api`` with ``async def`` operations."""
+    router_options, api_options, item = split_options(config)
+    router = ScrudfulRouter(**router_options)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(**item)
+    async def get_item(request, pk: int, obj):
+        return obj
+
+    @router.put("/{pk}", response=ItemOut)
+    @scrudful(**item)
+    async def put_item(request, pk: int, payload: ItemIn, obj):
+        update(obj, payload.name)
+        return obj
+
+    return mount(router, **api_options), router
+
+
+def async_options(api: NinjaAPI, path: str, **kwargs: Any) -> Any:
+    return async_to_sync(TestAsyncClient(api).request)("OPTIONS", path, **kwargs)
+
+
+def deny_put_unless_alice(request, **params):
+    if request.method == "PUT" and request.auth != ALICE:
+        raise HttpError(403, "Forbidden")
+
+
+async def async_deny_put(request, **params):
+    if request.method == "PUT":
+        raise HttpError(403, "Forbidden")
+
+
+def raise_http_404(request, **params):
+    raise HttpError(404, "Not Found")
+
+
+class CountingAuth:
+    """An ``auth=`` callable noting each call in ``calls``."""
+
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+
+    def __call__(self, request):
+        self.calls.append("auth")
+        return "someone"
+
+
+def counting_load(calls: list[str]) -> Any:
+    store = Store()
+
+    def load(request, pk, **params):
+        calls.append("load")
+        return store.load(request, pk, **params)
+
+    return load
+
+
+def test_options_is_204_with_hsr_link():
+    api, router = make_api()
+    r = options(TestClient(api), "/1", headers={"X-API-Key": ALICE})
+    assert (
+        options_204_problems(
+            r.status_code, dict(r.headers), r.content, {"GET", "HEAD", "PUT", "OPTIONS"}
+        )
+        == []
+    )
+    assert hsr_link_problems(dict(r.headers), PK_TARGET) == []
+    assert r.headers["Allow"] == "GET, PUT, OPTIONS, HEAD"
+    assert {"Link", "Allow"} <= exposed(r.headers)
+
+
+def test_allow_reflects_requester():
+    api, _ = make_api(auth=KeyAuth(), before=deny_put_unless_alice)
+    client = TestClient(api)
+    assert options(client, "/1").headers["Allow"] == "OPTIONS"
+    assert (
+        options(client, "/1", headers={"X-API-Key": BOB}).headers["Allow"]
+        == "GET, OPTIONS, HEAD"
+    )
+    assert (
+        options(client, "/1", headers={"X-API-Key": ALICE}).headers["Allow"]
+        == "GET, PUT, OPTIONS, HEAD"
+    )
+    # OPTIONS itself isn't gated: an anonymous requester gets a 204, not a 401.
+    anonymous = options(client, "/1")
+    assert (
+        options_204_problems(
+            anonymous.status_code,
+            dict(anonymous.headers),
+            anonymous.content,
+            {"OPTIONS"},
+        )
+        == []
+    )
+
+
+def test_allow_hook_overrides_and_gets_object():
+    seen = []
+
+    def allowed(request, method, obj):
+        seen.append((method, obj))
+        return method == "GET"
+
+    api, _ = make_api(allowed=allowed)
+    assert options(TestClient(api), "/1").headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert {m for m, _ in seen} == {"GET", "PUT"}
+    assert all(o is not None for _, o in seen)
+    assert all(o["id"] == 1 for _, o in seen)  # the loaded object
+
+
+def test_operations_allow_hook_wins_over_the_routers():
+    router_options, _, item = split_options(
+        {"allowed": lambda request, method, obj: False}
+    )
+    router = ScrudfulRouter(**router_options)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    @router.put("/{pk}", response=ItemOut)
+    @scrudful(allowed=lambda request, method, obj: method == "PUT", **item)
+    def put_item(request, pk: int, payload: ItemIn, obj):
+        return obj
+
+    assert options(TestClient(mount(router)), "/1").headers["Allow"] == "PUT, OPTIONS"
+
+
+def test_allow_hook_must_return_a_bool():
+    api, _ = make_api(allowed=lambda request, method, obj: "yes")
+    with pytest.raises(TypeError, match="allowed.*bool"):
+        options(TestClient(api), "/1")
+
+
+def test_allow_hook_gets_the_authenticated_requester():
+    seen = []
+
+    def allowed(request, method, obj):
+        seen.append((method, request.method, request.auth))
+        return True
+
+    api, _ = make_api(auth=KeyAuth(), allowed=allowed)
+    client = TestClient(api)
+    assert options(client, "/1", headers={"X-API-Key": BOB}).status_code == 204
+    assert sorted(seen) == [("GET", "GET", BOB), ("PUT", "PUT", BOB)]
+    seen.clear()
+    # The hook alone decides: it is asked about an anonymous requester too.
+    assert options(client, "/1").headers["Allow"] == "GET, PUT, OPTIONS, HEAD"
+    assert sorted(seen) == [("GET", "GET", None), ("PUT", "PUT", None)]
+
+
+def test_async_before_is_honoured():
+    api, _ = make_async_api(before=async_deny_put)
+    r = async_options(api, "/1")
+    assert options_204_problems(r.status_code, dict(r.headers), r.content) == []
+    assert "PUT" not in r.headers["Allow"]
+    assert r.headers["Allow"] == "GET, OPTIONS, HEAD"
+
+
+async def deny_all(request, method, obj):
+    return False
+
+
+async def no_one(request):
+    return None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("config", [{"allowed": deny_all}, {"auth": no_one}])
+def test_async_checks_are_awaited_never_taken_as_allowed(asynchronous, config):
+    """An async ``allowed`` hook or ``auth`` callback returns a coroutine,
+    which is truthy: it must be awaited, never taken for its truth."""
+    if asynchronous:
+        r = async_options(make_async_api(**config)[0], "/1")
+    else:
+        r = options(TestClient(make_api(**config)[0]), "/1")
+    assert r.status_code == 204
+    assert r.headers["Allow"] == "OPTIONS"
+
+
+def test_sync_before_returning_an_awaitable_is_not_allowed():
+    async def later(request):
+        return None
+
+    def before(request, **params):
+        return later(request)
+
+    api, _ = make_api(before=before)
+    assert options(TestClient(api), "/1").headers["Allow"] == "OPTIONS"
+
+
+def test_missing_object_still_204_without_object_checks():
+    api, _ = make_api(load=lambda request, pk: None)
+    r = options(TestClient(api), "/404")
+    assert r.status_code == 204
+    assert options_204_problems(r.status_code, dict(r.headers), r.content) == []
+    seen = []
+
+    def allowed(request, method, obj):
+        seen.append(obj)
+        return True
+
+    api, _ = make_api(load=lambda request, pk: None, allowed=allowed)
+    assert options(TestClient(api), "/404").status_code == 204
+    assert seen == [None, None]
+
+
+def test_loader_gets_the_validated_path_parameters():
+    seen = []
+
+    def load(request, pk, **params):
+        seen.append((pk, params, request.auth))
+        return None
+
+    api, _ = make_api(auth=KeyAuth(), load=load)
+    client = TestClient(api)
+    assert options(client, "/7", headers={"X-API-Key": BOB}).status_code == 204
+    assert seen == [(7, {}, BOB)]  # an int, as the GET gets it
+    seen.clear()
+    # Not authenticated for the loading operation: nothing is loaded.
+    assert options(client, "/7").headers["Allow"] == "OPTIONS"
+    assert seen == []
+    # A path parameter the GET would refuse (422): no object.
+    r = options(client, "/x", headers={"X-API-Key": BOB})
+    assert r.status_code == 204 and seen == []
+
+
+def test_loader_404_is_answered_with_error_links():
+    api, _ = make_api(load=raise_http_404)
+    add_error_links(api, API_ERROR)
+    r = options(TestClient(api), "/1")
+    assert r.status_code == 404
+    assert link_problems("OPTIONS", 404, dict(r.headers), True) == []
+    assert hsr_link_problems(dict(r.headers)) == []
+    assert hsr_link_problems(dict(r.headers), PK_TARGET) == []
+    assert "<https://api.example/schemas/api-error>" in r.headers["Link"]
+    assert "Allow" not in r.headers
+    assert {"Link", "Allow"} <= exposed(r.headers)
+
+
+def test_loader_http404_is_answered_too():
+    def load(request, pk):
+        raise Http404("gone")
+
+    api, _ = make_api(load=load)
+    r = options(TestClient(api), "/1")
+    assert r.status_code == 404
+    assert hsr_link_problems(dict(r.headers), PK_TARGET) == []
+
+
+def test_other_loader_errors_propagate():
+    def load(request, pk):
+        raise LookupError("broken")
+
+    api, _ = make_api(load=load)
+    with pytest.raises(LookupError, match="broken"):
+        options(TestClient(api), "/1")
+
+
+def test_other_check_errors_propagate():
+    def before(request, **params):
+        raise LookupError("broken")
+
+    api, _ = make_api(before=before)
+    with pytest.raises(LookupError, match="broken"):
+        options(TestClient(api), "/1")
+
+
+def test_an_http_error_of_another_status_propagates():
+    def before(request, **params):
+        raise HttpError(409, "conflict")
+
+    api, _ = make_api(before=before)
+    # ninja answers it, as it answers what an operation raises.
+    r = options(TestClient(api), "/1")
+    assert r.status_code == 409 and r.json() == {"detail": "conflict"}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        HttpError(401, "no"),
+        HttpError(403, "no"),
+        HttpError(404, "no"),
+        Http404("no"),
+        PermissionDenied("no"),
+        AuthenticationError(),
+    ],
+    ids=["401", "403", "404", "Http404", "PermissionDenied", "AuthenticationError"],
+)
+@pytest.mark.parametrize("where", ["before", "auth"])
+def test_denials_of_a_check(error, where):
+    def check(request, **params):
+        if request.method == "PUT":
+            raise error
+        return "someone"
+
+    if where == "before":
+        api, _ = make_api(before=lambda request, **params: check(request) and None)
+    else:
+        api, _ = make_api(auth=check)
+    assert options(TestClient(api), "/1").headers["Allow"] == "GET, OPTIONS, HEAD"
+
+
+@pytest.mark.parametrize(
+    "extra", [{}, {"Cookie": "sessionid=x"}, {"X-API-Key": "wrong"}]
+)
+def test_preflight_runs_nothing(extra, clear_cache):
+    calls = []
+    api, _ = make_api(
+        auth=CountingAuth(calls),
+        throttle=[AnonRateThrottle("1/day")],
+        load=counting_load(calls),
+        before=lambda request, **params: calls.append("before"),
+        allowed=lambda request, method, obj: calls.append("allowed") or True,
+    )
+    client = TestClient(api)
+    for _ in range(3):
+        r = options(
+            client,
+            "/1",
+            headers={
+                "Origin": "https://app.example",
+                "Access-Control-Request-Method": "PUT",
+                **extra,
+            },
+        )
+        assert r.status_code == 204 and r.content == b"" and "Link" not in r.headers
+        assert "Content-Type" not in r.headers
+    assert calls == []
+
+
+def test_non_preflight_options_runs_the_checks():
+    calls = []
+    api, _ = make_api(auth=CountingAuth(calls), load=counting_load(calls))
+    assert options(TestClient(api), "/1").status_code == 204
+    assert calls.count("load") == 1 and "auth" in calls
+
+
+def test_options_consumes_no_throttle_for_allow(clear_cache):
+    api, _ = make_api(throttle=[AnonRateThrottle("2/day")])
+    client = TestClient(api)
+    options(client, "/1")
+    assert client.get("/1").status_code == 200  # the per-method checks ran no throttle
+    assert client.get("/1").status_code == 200
+    assert client.get("/1").status_code == 429
+    assert options(client, "/1").status_code == 204  # nor is OPTIONS throttled
+
+
+def test_automatic_options_is_csrf_exempt_unthrottled_and_unauthenticated():
+    _, router = make_api()
+    [operation] = [
+        op
+        for op in router.path_operations["/{pk}"].operations
+        if "OPTIONS" in op.methods
+    ]
+    assert operation.csrf_exempt
+    assert operation.auth_param is None
+    assert operation.throttle_param == []
+
+
+def collection_router(**router_options: Any) -> ScrudfulRouter:
+    router = ScrudfulRouter(base_url=BASE_URL, **router_options)
+
+    @router.get("/items", response=List[ItemOut])
+    @scrudful_list(href_func=lambda request, item: f"/items/{item['id']}", **LINKS)
+    def list_items(request):
+        return []
+
+    @router.post("/items", response={201: ItemOut})
+    @scrudful_create(location_func=lambda request, obj: "/items/1", **LINKS)
+    def create_item(request, payload: ItemIn):
+        return {"id": 1, "name": payload.name, "version": 1}
+
+    return router
+
+
+def test_collection_path_allow_without_object():
+    client = TestClient(mount(collection_router()))
+    r = options(client, "/items")
+    expected = {"GET", "HEAD", "POST", "OPTIONS"}
+    assert (
+        options_204_problems(r.status_code, dict(r.headers), r.content, expected) == []
+    )
+    assert hsr_link_problems(dict(r.headers), "https://api.example/_hsr/items") == []
+    seen = []
+
+    def allowed(request, method, obj):
+        seen.append((method, obj))
+        return method == "GET"
+
+    client = TestClient(mount(collection_router(allowed=allowed)))
+    assert options(client, "/items").headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert sorted(seen) == [("GET", None), ("POST", None)]
+
+
+def test_create_and_list_take_their_own_allow_hook():
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/items", response=List[ItemOut])
+    @scrudful_list(
+        href_func=lambda request, item: f"/items/{item['id']}",
+        allowed=lambda request, method, obj: False,
+        **LINKS,
+    )
+    def list_items(request):
+        return []
+
+    @router.post("/items", response={201: ItemOut})
+    @scrudful_create(
+        location_func=lambda request, obj: "/items/1",
+        allowed=lambda request, method, obj: True,
+        **LINKS,
+    )
+    def create_item(request, payload: ItemIn):
+        return {"id": 1, "name": payload.name, "version": 1}
+
+    allow = options(TestClient(mount(router)), "/items").headers["Allow"]
+    assert allow == "POST, OPTIONS"
+
+
+@pytest.mark.parametrize(
+    "factory, required",
+    [
+        (scrudful, {}),
+        (scrudful_create, {"location_func": lambda request, obj: "/"}),
+        (scrudful_list, {"href_func": lambda request, item: "/"}),
+    ],
+)
+def test_allowed_must_be_callable(factory, required):
+    with pytest.raises(TypeError, match="allowed must be callable"):
+        factory(allowed="GET", **required)
+
+
+def test_described_operation_uses_its_auth():
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(load=Store().load, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    @router.delete("/{pk}", auth=KeyAuth(), response={204: None})
+    @described(Entity())
+    def delete_item(request, pk: int):
+        return 204, None
+
+    client = TestClient(mount(router))
+    assert options(client, "/1").headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert (
+        options(client, "/1", headers={"X-API-Key": ALICE}).headers["Allow"]
+        == "GET, DELETE, OPTIONS, HEAD"
+    )
+
+
+def test_router_mounted_twice_uses_each_mounts_auth():
+    router_options, _, item = split_options({})
+    router = ScrudfulRouter(**router_options)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    api.add_router("/open", router, url_name_prefix="open")
+    api.add_router("/locked", router, auth=KeyAuth(), url_name_prefix="locked")
+    client = TestClient(api)
+    assert options(client, "/open/1").headers["Allow"] == "GET, OPTIONS, HEAD"
+    assert options(client, "/locked/1").headers["Allow"] == "OPTIONS"
+    alice = options(client, "/locked/1", headers={"X-API-Key": ALICE})
+    assert alice.headers["Allow"] == "GET, OPTIONS, HEAD"
+
+
+SESSION_API, _ = make_api(auth=django_auth)
+urlpatterns += [path("session/", SESSION_API.urls)]
+
+
+@pytest.mark.urls(__name__)
+def test_cookie_auth_checks_skip_csrf_for_allow(django_user_model, settings, db):
+    """The per-method checks of a cookie ``auth=``, CSRF-checked on the PUT
+    itself, don't fail CSRF for the OPTIONS: ``Allow`` is about authorization.
+    And under Django's URL resolver the HSR link reverses in the namespace."""
+    settings.ALLOWED_HOSTS = ["a.example"]
+    client = Client(enforce_csrf_checks=True, HTTP_HOST="a.example")
+    assert client.options("/session/1").headers["Allow"] == "OPTIONS"
+    client.force_login(django_user_model.objects.create_user("carol"))
+    assert client.put("/session/1", "{}", "application/json").status_code == 403
+    r = client.options("/session/1")
+    assert (
+        options_204_problems(
+            r.status_code, dict(r.items()), r.content, {"GET", "HEAD", "PUT", "OPTIONS"}
+        )
+        == []
+    )
+    assert (
+        hsr_link_problems(dict(r.items()), "https://api.example/session/_hsr/pk") == []
+    )
+
+
+@pytest.mark.urls(__name__)
+def test_options_under_parameterized_prefixes(client, settings, db):
+    """The prefixes' parameters reach the hooks, the path's are validated for
+    the loader, and the HSR link reverses with the prefixes'."""
+    settings.ALLOWED_HOSTS = ["a.example"]
+    r = client.options("/t/acme/orgs/7/items/1", HTTP_HOST="a.example")
+    expected = {"GET", "HEAD", "OPTIONS"}
+    assert (
+        options_204_problems(r.status_code, dict(r.items()), r.content, expected) == []
+    )
+    target = "http://a.example/t/acme/orgs/7/items/_hsr/pk"
+    assert hsr_link_problems(dict(r.items()), target) == []
+    # Store().load raises a 404 for a missing item: the pk reached it as an int.
+    missing = client.options("/t/acme/orgs/7/items/3", HTTP_HOST="a.example")
+    assert missing.status_code == 404
+    assert hsr_link_problems(dict(missing.items()), target) == []
+
+
+def test_hooks_get_the_urls_parameters():
+    seen = []
+
+    def before(request, **params):
+        seen.append(params)
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(load=Store().load, before=before, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    api.add_router("/orgs/{org}", router)
+    client = TestClient(api)
+    assert client.get("/orgs/7/1").status_code == 200
+    assert options(client, "/orgs/7/1").headers["Allow"] == "GET, OPTIONS, HEAD"
+    # The GET's, then the OPTIONS' (loading, then checking GET): the same.
+    assert seen == [{"org": "7", "pk": "1"}] * 3
+
+
+# --- the ninja internals OPTIONS relies on --------------------------------------
+
+
+@pytest.mark.parametrize(
+    "owner, method",
+    [
+        ("Operation", "_run_authentication"),
+        ("AsyncOperation", "_run_authentication"),
+        ("NinjaAPI", "_get_bound_routers"),
+        ("ParamModel", "resolve"),
+        ("PathModel", "get_request_data"),
+    ],
+)
+def test_options_needs_ninjas_internals(monkeypatch, fresh_ninja_code, owner, method):
+    cls = {
+        "Operation": ninja.operation.Operation,
+        "AsyncOperation": ninja.operation.AsyncOperation,
+        "NinjaAPI": NinjaAPI,
+        "ParamModel": ninja.params.models.ParamModel,
+        "PathModel": ninja.params.models.PathModel,
+    }[owner]
+    if owner == "AsyncOperation":
+        api = make_async_api()[0]
+        send = async_options
+    else:
+        api = make_api()[0]
+        client = TestClient(api)
+
+        def send(api, path):
+            return options(client, path)
+
+    assert send(api, "/1").status_code == 204
+    original = vars(cls)[method]
+    if isinstance(original, classmethod):
+        replaced = classmethod(wrapping(original.__func__))
+    else:
+        replaced = wrapping(original)
+    monkeypatch.setattr(cls, method, replaced)
+    with pytest.raises(ConfigError, match=rf"rely on ninja's {owner}\.{method}: "):
+        send(api, "/1")
+
+
+@pytest.mark.parametrize("shape", [[], {}])
+def test_options_needs_the_bound_path_operations(monkeypatch, shape):
+    api, _ = make_api()
+    client = TestClient(api)
+    assert client.urls  # the URL patterns are built, and kept
+    for bound in api._get_bound_routers():
+        monkeypatch.setattr(bound, "path_operations", shape)
+    with pytest.raises(ConfigError, match=r"BoundRouter\.path_operations"):
+        options(client, "/1")
+
+
+def test_options_needs_the_path_models(monkeypatch):
+    api, router = make_api()
+    [get] = [
+        op for op in router.path_operations["/{pk}"].operations if "GET" in op.methods
+    ]
+    monkeypatch.setattr(get, "models", None)
+    with pytest.raises(ConfigError, match=r"Operation\.models"):
+        options(TestClient(api), "/1")
+
+
+def test_options_needs_the_auth_callbacks(monkeypatch):
+    api, _ = make_api()
+    client = TestClient(api)
+    assert client.urls  # the URL patterns are built, and kept
+    for bound in api._get_bound_routers():
+        for path_view in bound.path_operations.values():
+            for operation in path_view.operations:
+                if "GET" in operation.methods:
+                    monkeypatch.setattr(operation, "auth_callbacks", object())
+    with pytest.raises(ConfigError, match=r"Operation\.auth_callbacks"):
+        options(client, "/1")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_without_source_the_options_fingerprints_are_checked(
+    monkeypatch, fresh_ninja_code, asynchronous
+):
+    import scrudful.ninja
+
+    monkeypatch.setattr(scrudful.ninja, "_source_digest", lambda func: None)
+    if asynchronous:
+        r = async_options(make_async_api(auth=KeyAuth())[0], "/1", headers=BOB_KEY)
+    else:
+        r = options(TestClient(make_api(auth=KeyAuth())[0]), "/1", headers=BOB_KEY)
+    assert r.status_code == 204 and r.headers["Allow"] == "GET, PUT, OPTIONS, HEAD"
+    cls = ninja.params.models.ParamModel
+    monkeypatch.setattr(cls, "resolve", classmethod(wrapping(cls.resolve.__func__)))
+    with pytest.raises(ConfigError, match=r"ninja's ParamModel\.resolve"):
+        options(TestClient(make_api()[0]), "/1")

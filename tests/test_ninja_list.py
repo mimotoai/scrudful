@@ -329,7 +329,7 @@ def test_list_trace_ignores_preconditions(items):
         assert "Last-Modified" not in response.headers
     assert calls == []
     assert client.get("/items", headers={"If-Match": '"nope"'}).status_code == 412
-    body = client.request("OPTIONS", "/items").json()
+    body = client.get("/_hsr/items").json()
     assert set(body["trace"]["responses"]) == {"200", "default"}
     assert "412" in body["get"]["responses"]
 

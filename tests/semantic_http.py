@@ -167,7 +167,8 @@ def link_problems(
             problems.append("content without a Content-Type")
         else:
             problems += _context_problems(content_type, contexts)
-    if method == "OPTIONS":
+    # An error answering OPTIONS is an error response, not the description.
+    if method == "OPTIONS" and status < 400:
         problems += _options_problems(
             status, headers, content_type, schemas, contexts, hsr
         )

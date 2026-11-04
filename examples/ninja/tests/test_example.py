@@ -21,11 +21,16 @@ from referencing.jsonschema import DRAFT202012
 from roles.api import save_role
 from roles.models import Role
 
-from scrudful._adapter import allow_header, describe_options, options_links
 from scrudful._hsr import options_operation
 from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS
 from scrudful_ninja.api import api
-from tests.semantic_http import link_problems, validate_http_schema_resource
+from tests.semantic_http import (
+    hsr_get_problems,
+    hsr_link_problems,
+    link_problems,
+    options_204_problems,
+    validate_http_schema_resource,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -61,7 +66,7 @@ def links(name):
 
 
 def content(name):
-    """The OPTIONS ``content`` of the documents ``name``."""
+    """The HTTP Schema Resource ``content`` of the documents ``name``."""
     return {
         "application/json": {
             "schema": {"$ref": f"{API}/schemas/{name}"},
@@ -506,16 +511,45 @@ def options(client, path, **headers):
     return client.options(path, headers=headers)
 
 
+#: The HTTP Schema Resource route of each path of the role router.
+HSR_ROUTES = {
+    "item": "/api/roles/_hsr/pk",
+    "collection": "/api/roles/_hsr/_root",
+    "search": "/api/roles/_hsr/search",
+}
+#: Every method of the item and of the collection.
+ITEM_ALLOW = "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
+COLLECTION_ALLOW = "GET, POST, OPTIONS, HEAD"
+
+
+def hsr(client, kind):
+    """The HTTP Schema Resource of the ``kind`` path, by a GET of its route
+    (no credentials: it is the same for every requester)."""
+    response = client.get(HSR_ROUTES[kind])
+    assert (
+        hsr_get_problems(response.status_code, response.headers, response.content) == []
+    )
+    return response.json()
+
+
+def assert_options_204(response, allow, kind):
+    """A 204 with this ``Allow`` (in its order) and the ``kind`` path's HSR link."""
+    expected = {method.strip() for method in allow.split(",")}
+    assert (
+        options_204_problems(
+            response.status_code, response.headers, response.content, expected
+        )
+        == []
+    )
+    assert response.headers["Allow"] == allow
+    assert hsr_link_problems(response.headers, BASE + HSR_ROUTES[kind]) == []
+
+
 def test_options_item(client, role):
-    response = options(client, detail(role.pk))
-    assert response.status_code == 200
-    assert response.headers["Content-Type"] == "application/json; charset=utf-8"
-    assert response.headers["Link"] == options_links()
-    body = response.json()
+    assert_options_204(options(client, detail(role.pk), **ACME), ITEM_ALLOW, "item")
+    body = hsr(client, "item")
     validate_http_schema_resource(body)
     assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
-    assert response.headers["Allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
-    assert response.headers["Allow"] == allow_header(body)
     assert body["options"] == options_operation()
     assert body["get"]["responses"]["200"]["content"] == content("role")
     assert set(body["get"]["responses"]) == {"200", "304", "400", "412", "default"}
@@ -543,20 +577,32 @@ def test_options_item(client, role):
         ]
 
 
-def test_options_is_the_same_for_everyone(client, role, hidden):
-    """No auth, no load: a missing role and a hidden one are described alike."""
-    expected = options(client, detail(role.pk)).json()
-    assert options(client, detail(role.pk), **ACME).json() == expected
-    assert options(client, detail(hidden.pk)).json() == expected
-    assert options(client, detail(MISSING)).json() == expected
+def test_the_description_is_the_same_for_everyone(client, role, hidden):
+    """The HTTP Schema Resource doesn't depend on the requester; the Allow of
+    OPTIONS does, and a missing role and a hidden one are answered alike."""
+    expected = hsr(client, "item")
+    response = client.get(HSR_ROUTES["item"], headers=ACME)
+    assert response.json() == expected
+    # Without credentials, only OPTIONS; with them, every method on the role.
+    assert_options_204(options(client, detail(role.pk)), "OPTIONS", "item")
+    assert_options_204(options(client, detail(role.pk), **ACME), ITEM_ALLOW, "item")
+    # The loader (authorized_role) answers both 404, through the API's handler.
+    hidden_response = options(client, detail(hidden.pk), **ACME)
+    missing = options(client, detail(MISSING), **ACME)
+    assert hidden_response.status_code == missing.status_code == 404
+    assert hidden_response.content == missing.content
+    assert dict(hidden_response.headers) == dict(missing.headers)
+    assert link_problems("OPTIONS", 404, missing.headers, True) == []
+    assert hsr_link_problems(missing.headers, BASE + HSR_ROUTES["item"]) == []
 
 
 def test_options_collection(client):
-    response = options(client, "/api/roles")
-    body = response.json()
+    response = options(client, "/api/roles", **ACME)
+    assert_options_204(response, COLLECTION_ALLOW, "collection")
+    assert_options_204(options(client, "/api/roles"), "OPTIONS", "collection")
+    body = hsr(client, "collection")
     validate_http_schema_resource(body)
     assert list(body) == ["get", "post", "options", "head"]
-    assert response.headers["Allow"] == "GET, POST, OPTIONS, HEAD"
     assert body["get"]["responses"]["200"]["content"] == content("roles")
     assert "304" in body["get"]["responses"]
     assert body["post"]["requestBody"]["content"] == content("role")
@@ -569,7 +615,9 @@ def test_options_collection(client):
 
 
 def test_options_search(client):
-    body = options(client, "/api/roles/search").json()
+    response = options(client, "/api/roles/search", **ACME)
+    assert_options_204(response, "POST, OPTIONS", "search")
+    body = hsr(client, "search")
     validate_http_schema_resource(body)
     assert list(body) == ["post", "options"]
     assert body["post"]["requestBody"]["content"] == content("role-search")
@@ -578,10 +626,10 @@ def test_options_search(client):
     assert set(body["post"]["responses"]) == {"200", "default"}
 
 
-def test_responses_agree_with_options(client, role):
+def test_responses_agree_with_the_hsr(client, role):
     """Every response's Links are the entry of the HTTP Schema Resource."""
-    item = options(client, detail(role.pk)).json()
-    collection = options(client, "/api/roles").json()
+    item = hsr(client, "item")
+    collection = hsr(client, "collection")
     data = {"name": "owner", "rbac_context": "acme"}
     current = {"If-Match": f'"{role.etag}"'}
     stale = {"If-Match": '"stale"'}
@@ -612,11 +660,11 @@ def test_responses_agree_with_options(client, role):
     ]
     statuses = [response.status_code for _, response, _ in responses]
     assert statuses == [200, 200, 200, 412, 428, 400, 403, 200, 200, 201]
-    for method, response, hsr in responses:
+    for method, response, description in responses:
         has_content = bool(response.content)
         assert has_content == (method != "HEAD")
         problems = link_problems(
-            method, response.status_code, response.headers, has_content, hsr=hsr
+            method, response.status_code, response.headers, has_content, hsr=description
         )
         assert problems == [], (method, response.status_code)
 
@@ -661,7 +709,9 @@ CONFORMANCE = [
     ("delete", ITEM, {"headers": STALE}, 412),
     ("delete", ITEM, {"headers": MALFORMED}, 400),
     ("delete", ITEM, {"headers": {}}, 401),
-    ("options", ITEM, {}, 200),
+    ("options", ITEM, {"headers": ACME}, 204),
+    ("options", ITEM, {"headers": {}}, 204),
+    ("options", "/api/roles/999999", {"headers": ACME}, 404),
     ("get", LIST, {"headers": ACME}, 200),
     ("get", LIST, {"headers": {}}, 401),
     ("get", LIST, {"headers": {"If-None-Match": "nope", **ACME}}, 400),
@@ -671,13 +721,20 @@ CONFORMANCE = [
     ("post", LIST, {"data": FOREIGN_BODY, "headers": ACME}, 403),
     ("post", LIST, {"data": {"name": 1}, "headers": ACME}, 422),
     ("post", LIST, {"data": ROLE_BODY, "headers": {}}, 401),
-    ("options", LIST, {}, 200),
+    ("options", LIST, {"headers": ACME}, 204),
     ("post", SEARCH, {"data": {"name": "adm"}, "headers": ACME}, 200),
     ("post", SEARCH, {"data": {"name": 1}, "headers": ACME}, 422),
     ("post", SEARCH, {"data": {"name": "adm"}, "headers": {}}, 401),
-    ("options", SEARCH, {}, 200),
+    ("options", SEARCH, {"headers": ACME}, 204),
 ]
-# Statuses the OPTIONS bodies don't list, so there is no entry to agree with:
+#: The HTTP Schema Resource route of each path of CONFORMANCE.
+CONFORMANCE_HSR = {
+    ITEM: "item",
+    "/api/roles/999999": "item",
+    LIST: "collection",
+    SEARCH: "search",
+}
+# Statuses the HTTP Schema Resources don't list, so there is no entry to agree with:
 # a 304 (a HEAD's too) has no content, and ninja's 404, 422 and 401 are not
 # described. Their Links are still checked by the rules that don't need the
 # body (and are those of the error entity: see below).
@@ -691,8 +748,9 @@ NO_ENTRY = {304, 404, 422, 401}
 )
 def test_example_links_everywhere(client, role, method, path, arguments, status):
     """Every response with content, and every HEAD, follows the Semantic HTTP
-    0.1 Link rules and agrees with the OPTIONS body of its path."""
-    path = path.format(pk=role.pk)
+    0.1 Link rules and agrees with the HTTP Schema Resource of its path; every
+    OPTIONS is a 204 with the HSR link (or, for a missing role, the loader's
+    error)."""
     etag = f'"{role.etag}"'
     arguments = {
         **arguments,
@@ -704,12 +762,29 @@ def test_example_links_everywhere(client, role, method, path, arguments, status)
     if "data" in arguments:
         arguments["content_type"] = "application/json"
         arguments["data"] = json.dumps(arguments["data"])
-    hsr = client.options(path).json()
-    if method == "options":
-        # Until OPTIONS answers 204, its 200 agrees with the entry it had.
-        hsr = {**hsr, "options": describe_options()}
+    kind = CONFORMANCE_HSR[path]
+    description = hsr(client, kind)
+    path = path.format(pk=role.pk)
     response = getattr(client, method)(path, **arguments)
     assert response.status_code == status
+    if method == "options" and status == 204:
+        # Every method with credentials (the role is acme's), else OPTIONS.
+        allow = (
+            {"item": ITEM_ALLOW, "collection": COLLECTION_ALLOW}.get(
+                kind, "POST, OPTIONS"
+            )
+            if arguments["headers"]
+            else "OPTIONS"
+        )
+        assert_options_204(response, allow, kind)
+        return
+    if method == "options":
+        # The loader's error, with the HSR link too (Task 9 adds it to every
+        # error answered on a path scrudful describes).
+        assert hsr_link_problems(response.headers, BASE + HSR_ROUTES[kind]) == []
+        assert response.headers["Link"].startswith(links("error"))
+        assert link_problems("OPTIONS", status, response.headers, True) == []
+        return
     has_content = (
         method != "head" and status not in (204, 304) and bool(response.content)
     )
@@ -719,7 +794,7 @@ def test_example_links_everywhere(client, role, method, path, arguments, status)
         status,
         response.headers,
         has_content,
-        None if status in NO_ENTRY else hsr,
+        None if status in NO_ENTRY else description,
     )
     assert problems == []
     if status in NO_ENTRY - {304}:
@@ -727,16 +802,19 @@ def test_example_links_everywhere(client, role, method, path, arguments, status)
 
 
 def test_cors_preflight_is_not_broken(client, role):
-    """A preflight that reaches the view (no CORS middleware here) gets the
-    description; django-cors-headers would answer it before the view."""
+    """A preflight that reaches the view (no CORS middleware here) is a 204
+    without content or Links, answered before authentication and loading;
+    django-cors-headers would answer it before the view."""
     response = options(
         client,
         detail(role.pk),
         Origin="https://app.example.com",
         **{"Access-Control-Request-Method": "PUT"},
     )
-    assert response.status_code == 200
-    assert response.json() == options(client, detail(role.pk)).json()
+    assert response.status_code == 204
+    assert response.content == b""
+    assert "Link" not in response.headers
+    assert "Content-Type" not in response.headers
 
 
 # --- The documents the Links point to --------------------------------------------

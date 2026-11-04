@@ -1,5 +1,7 @@
-"""The bodies scrudful's ninja adapter writes itself (OPTIONS and the early 400,
-412 and 428) go through the serving API's renderer, as every other response."""
+"""The bodies scrudful's ninja adapter writes itself (the early 400, 412 and
+428) go through the serving API's renderer, as every other response. OPTIONS
+has none: it is a 204, whatever the renderer (the HTTP Schema Resource it links
+to is served by its route as compact JSON, see ``test_ninja_hsr``)."""
 
 import functools
 import json
@@ -131,7 +133,6 @@ def requests(asynchronous: bool, api: NinjaAPI):
 
 #: (method, headers, status) of each response scrudful writes itself.
 EARLY = [
-    ("OPTIONS", {}, 200),
     ("PUT", {"If-Match": '"v0"'}, 412),
     ("PUT", {}, 428),
     ("PUT", {"If-Match": "v1"}, 400),
@@ -153,13 +154,26 @@ def test_custom_renderer_writes_scrudful_bodies(asynchronous, method, headers, s
     assert response.json() == default.json()
     assert dict(response.headers) == dict(default.headers)
     assert response.headers["Content-Type"] == "application/json; charset=utf-8"
-    if method == "OPTIONS":
-        assert response.headers["Allow"]
-        assert 'rel="describedby"' in response.headers["Link"]
 
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("method, headers, status", EARLY[1:])
+@pytest.mark.parametrize(
+    "renderer",
+    [None, CompactRenderer(), TextRenderer(), Latin1Renderer(), PlainRenderer()],
+    ids=["default", "compact", "text", "latin-1", "plain"],
+)
+def test_options_has_no_body_whatever_the_renderer(asynchronous, renderer):
+    """OPTIONS was the renderer's: now a 204 without content or Content-Type."""
+    request = requests(asynchronous, api_for(router(Store(), asynchronous), renderer))
+    response = request("OPTIONS", "/items/1")
+    assert response.status_code == 204
+    assert response.content == b""
+    assert "Content-Type" not in response.headers
+    assert response.headers["Allow"] == "GET, PUT, OPTIONS, HEAD"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("method, headers, status", EARLY)
 def test_custom_renderer_error_entity_media_type(asynchronous, method, headers, status):
     items = router(
         Store(), asynchronous, error=PROBLEM, error_body_func=accented_problem
@@ -253,12 +267,10 @@ def test_renderer_charset_encodes_and_labels_scrudful_bodies(method, headers, st
     client = TestClient(api_for(items, Latin1Renderer()))
     response = client.request(method, "/items/1", json={"name": "x"}, headers=headers)
     assert response.status_code == status
-    media_type = "application/json" if method == "OPTIONS" else PROBLEM_JSON
-    assert response.headers["Content-Type"] == f"{media_type}; charset=latin-1"
+    assert response.headers["Content-Type"] == f"{PROBLEM_JSON}; charset=latin-1"
     body = json.loads(response.content.decode("latin-1"))
-    if method != "OPTIONS":
-        assert body["title"] == "Précondition échouée"
-        assert "é".encode("latin-1") in response.content
+    assert body["title"] == "Précondition échouée"
+    assert "é".encode("latin-1") in response.content
 
 
 #: Values ``JsonResponse`` (``DjangoJSONEncoder``) writes, plain JSON doesn't.
@@ -275,7 +287,7 @@ def django_values_problem(request, result):
 
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("method, headers, status", EARLY[1:])
+@pytest.mark.parametrize("method, headers, status", EARLY)
 def test_plain_renderer_writes_what_json_response_did(
     asynchronous, method, headers, status
 ):
@@ -344,7 +356,7 @@ def test_bodies_reduced_only_for_other_renderers(monkeypatch, renderer, reduced)
     assert len(calls) == (len(EARLY) if reduced else 0)
 
 
-@pytest.mark.parametrize("method, headers, status", EARLY[1:])
+@pytest.mark.parametrize("method, headers, status", EARLY)
 def test_error_media_type_charset_names_the_renderer_s(method, headers, status):
     """An entity's own charset is replaced by the one the bytes are in."""
     entity = Entity(
@@ -431,7 +443,7 @@ class CachingAPI(NinjaAPI):
         return response
 
 
-@pytest.mark.parametrize("method, headers, status", EARLY[1:])
+@pytest.mark.parametrize("method, headers, status", EARLY)
 def test_overridden_create_response_never_adds_headers_to_early_errors(
     method, headers, status
 ):

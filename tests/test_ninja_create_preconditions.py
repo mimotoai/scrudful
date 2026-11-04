@@ -13,7 +13,7 @@ from scrudful.ninja import Entity, ScrudfulRouter, scrudful_create
 from scrudful.problem import PROBLEM_JSON, problem_details
 from tests.test_ninja_adapter import TEST_BASE_URL, ItemIn, ItemOut, Store, etag
 from tests.test_ninja_entities import ERROR, ERROR_LINK
-from tests.test_ninja_options import options
+from tests.test_ninja_options import hsr_get
 
 LIST_MODIFIED = datetime(2026, 1, 1, tzinfo=timezone.utc)
 BEFORE = "Wed, 31 Dec 2025 00:00:00 GMT"
@@ -198,7 +198,7 @@ def test_without_list_validators_preconditions_are_ignored(store):
 
 def test_options_describes_the_412(store):
     client = TestClient(create_router(store, error=ERROR))
-    described = options(client, "/items").json()["post"]
+    described = hsr_get(client, "/items")["post"]
     assert {"201", "400", "412"} <= set(described["responses"])
     assert "428" not in described["responses"]
     assert "parameters" not in described

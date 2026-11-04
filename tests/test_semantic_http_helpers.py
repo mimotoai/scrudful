@@ -215,6 +215,14 @@ def test_link_problems_options_wrong_targets_and_status():
     assert link_problems("OPTIONS", 204, _options_headers("OPTIONS"), False, body)
 
 
+def test_link_problems_options_error_is_an_error_response():
+    """An error answering OPTIONS (a loader's 404) is checked as any error
+    response, not as the OPTIONS description."""
+    headers = {"Content-Type": "application/json", "Link": f"{SCHEMA}, {CONTEXT}"}
+    assert link_problems("OPTIONS", 404, headers, True) == []
+    assert link_problems("OPTIONS", 404, {"Content-Type": "application/json"}, True)
+
+
 def test_link_problems_options_head_with_content():
     body = {
         "head": {

@@ -167,7 +167,9 @@ def forbidden(request: HttpRequest, rbac_context: str) -> Status | None:
     return None
 
 
-#: Answers OPTIONS on every path with the path's HTTP Schema Resource.
+#: Answers OPTIONS on every path with a 204 whose Allow lists the methods
+#: this requester may use, and links to the path's HTTP Schema Resource,
+#: which it serves by GET under ``_hsr/``.
 router = ScrudfulRouter(tags=["roles"])
 
 

@@ -240,14 +240,15 @@ def test_raised_error_on_every_mount(store):
 def test_agreement_for_declared_404(store):
     router = raising_router(False, responses={404: ERR404}, error=ERR)
     client = TestClient(router)
-    options_body = client.request("OPTIONS", "/items/1").json()
+    options_body = client.get("/_hsr/items.pk").json()
     response = get(client, "/items/1")
     assert response.status_code == 404
     assert link_problems("GET", 404, response.headers, True, hsr=options_body) == []
 
 
 def test_agreement_for_conditional_400(store):
-    """A raised 400 on a conditional GET: ``error``, as OPTIONS describes it."""
+    """A raised 400 on a conditional GET: ``error``, as the HTTP Schema
+    Resource describes it."""
     router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     def load(request, pk: int):
@@ -259,7 +260,7 @@ def test_agreement_for_conditional_400(store):
         return obj
 
     client = TestClient(router)
-    options_body = client.request("OPTIONS", "/items/1").json()
+    options_body = client.get("/_hsr/items.pk").json()
     response = get(client, "/items/1")
     assert response.status_code == 400
     assert response.headers["Link"] == ERR_LINK
@@ -538,7 +539,7 @@ def test_early_errors_are_served_as_the_error_media_type(store):
         return obj
 
     client = TestClient(router)
-    hsr = client.request("OPTIONS", "/items/1").json()
+    hsr = client.get("/_hsr/items.pk").json()
     validate_http_schema_resource(hsr)
     payload = {"name": "x"}
     early = [
@@ -602,7 +603,8 @@ def test_error_media_type_must_be_json(media_type):
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
 def test_raised_error_is_served_as_the_error_media_type(store, asynchronous):
-    """A handler-raised 400 agrees with OPTIONS, which lists it as problem+json."""
+    """A handler-raised 400 agrees with the HTTP Schema Resource, which lists
+    it as problem+json."""
     router = ScrudfulRouter(base_url=TEST_BASE_URL)
     if asynchronous:
 
@@ -619,10 +621,8 @@ def test_raised_error_is_served_as_the_error_media_type(store, asynchronous):
             raise HttpError(400, "bad")
 
     client = client_for(router, asynchronous)
-    options = client.request
-    if asynchronous:
-        options = async_to_sync(options)
-    hsr = options("OPTIONS", "/items/1").json()
+    # The HSR route is a sync view: ninja's async test client can't call it.
+    hsr = TestClient(router).get("/_hsr/items.pk").json()
     validate_http_schema_resource(hsr)
     assert list(hsr["get"]["responses"]["400"]["content"]) == [
         "application/problem+json"
