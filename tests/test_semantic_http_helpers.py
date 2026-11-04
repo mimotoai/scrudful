@@ -9,6 +9,10 @@ from jsonschema import ValidationError
 
 from scrudful._adapter import CONTEXT_TYPE, describe_options, options_links
 from tests.semantic_http import (
+    hsr_get_problems,
+    hsr_link_problems,
+    options_204_problems,
+    undescribed_problems,
     link_problems,
     parse_links,
     validate_http_schema_resource,
@@ -272,3 +276,62 @@ def test_link_problems_agreement_selects_status_then_class_then_default():
 def test_link_problems_agreement_without_entry():
     body = {"get": {"responses": {"200": {"description": "OK"}}}}
     assert link_problems("GET", 200, PERSON_GET_HEADERS, True, body)
+
+
+# --- 37ec1ce rules ----------------------------------------------------------
+
+HSR_LINK = (
+    "<https://h.example/_hsr/item>;"
+    ' rel="https://w3id.org/semantic-http/ns#http-schema-resource-document";'
+    ' type="application/json"'
+)
+HSR_RESPONSE_LINKS = (
+    "<https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json>;"
+    ' rel="describedby"; type="application/schema+json", '
+    "<https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld>;"
+    ' rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
+)
+
+
+def test_options_204_conformant():
+    h = {"Allow": "GET, HEAD, OPTIONS", "Link": HSR_LINK}
+    assert options_204_problems(204, h, b"", {"GET", "HEAD", "OPTIONS"}) == []
+
+
+def test_options_204_rejects_body_and_200():
+    h = {"Allow": "GET, OPTIONS", "Link": HSR_LINK, "Content-Type": "application/json"}
+    problems = options_204_problems(200, h, b"{}")
+    assert any("content" in p for p in problems) and any("200" in p for p in problems)
+
+
+def test_options_204_allow_must_equal_expected():
+    h = {"Allow": "GET, PUT, OPTIONS", "Link": HSR_LINK}
+    assert options_204_problems(204, h, b"", {"GET", "HEAD", "OPTIONS"})
+
+
+def test_hsr_link_problems_anchor_type_count():
+    assert hsr_link_problems({"Link": HSR_LINK}) == []
+    assert hsr_link_problems({"Link": HSR_LINK + '; anchor="#x"'})
+    assert hsr_link_problems({"Link": HSR_LINK.replace("application/json", "text/plain")})
+    assert hsr_link_problems({"Link": f"{HSR_LINK}, {HSR_LINK}"})
+    assert hsr_link_problems({"Link": HSR_LINK}, "https://h.example/other")
+
+
+def test_hsr_get_problems_person_fixture():
+    body = (FIXTURES / "person.http-schema-resource.json").read_bytes()
+    h = {
+        "Content-Type": "application/json",
+        "Link": HSR_RESPONSE_LINKS,
+        "ETag": '"x"',
+        "Cache-Control": "public, max-age=300",
+    }
+    assert hsr_get_problems(200, h, body) == []
+
+
+def test_undescribed_problems():
+    hsr = json.loads((FIXTURES / "person.http-schema-resource.json").read_text())
+    html = {"Content-Type": "text/html; charset=utf-8"}
+    assert undescribed_problems(None, html, hsr)
+    assert undescribed_problems("application/json", html, hsr)
+    assert undescribed_problems("text/html,*/*;q=0.8", html, hsr) == []
+    assert undescribed_problems(None, {"Content-Type": "application/json"}, hsr) == []

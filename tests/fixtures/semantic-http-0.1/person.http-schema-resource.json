@@ -53,9 +53,9 @@
         "description": "BAD REQUEST: The request was malformed or missing required content.",
         "content": {
           "application/problem+json": {
-            "schema": { "$ref": "https://example.com/schemas/problem.schema.json" },
+            "schema": { "$ref": "https://w3id.org/semantic-http/0.1/problem-details.schema.json" },
             "x-rdf-context": {
-              "href": "https://example.com/contexts/problem.context.jsonld",
+              "href": "https://w3id.org/semantic-http/0.1/problem-details.context.jsonld",
               "type": "application/ld+json"
             }
           }
@@ -78,17 +78,8 @@
   },
   "options": {
     "responses": {
-      "200": {
-        "description": "OK",
-        "content": {
-          "application/json": {
-            "schema": { "$ref": "https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json" },
-            "x-rdf-context": {
-              "href": "https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld",
-              "type": "application/ld+json"
-            }
-          }
-        }
+      "204": {
+        "description": "No Content"
       }
     }
   }

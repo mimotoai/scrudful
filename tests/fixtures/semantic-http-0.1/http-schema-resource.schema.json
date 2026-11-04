@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json",
   "title": "HTTP Schema Resource",
-  "description": "An HTTP Schema Resource describes the HTTP methods of a Semantic HTTP Resource that are available to the requester. It is an OpenAPI 3.1 Path Item Object with extra constraints: every request and response media type links to a schema and, unless the media type carries RDF in-band, to an RDF context.",
+  "description": "An HTTP Schema Resource describes the HTTP methods of a Semantic HTTP Resource that the resource supports, and may describe more. It is an OpenAPI 3.1 Path Item Object with extra constraints: every request and response media type links to a schema and, unless the media type carries RDF in-band, to an RDF context.",
   "$ref": "#/$defs/PathItem",
   "$defs": {
     "AbsoluteUri": {
@@ -12,7 +12,7 @@
     },
     "PathItem": {
       "type": "object",
-      "description": "The methods of a Semantic HTTP Resource that are available to the requester. Only the OpenAPI Path Item fields listed here are allowed, plus x- extensions. A $ref Path Item is not allowed. An x- extension key MUST NOT contain a colon, because JSON-LD reads such a key as an IRI.",
+      "description": "The methods of a Semantic HTTP Resource that the resource supports, and possibly more. Only the OpenAPI Path Item fields listed here are allowed, plus x- extensions. A $ref Path Item is not allowed. An x- extension key MUST NOT contain a colon, because JSON-LD reads such a key as an IRI.",
       "propertyNames": { "not": { "pattern": "^x-[^:]*:" } },
       "properties": {
         "get": { "$ref": "#/$defs/Operation" },
@@ -34,7 +34,7 @@
     },
     "Operation": {
       "type": "object",
-      "description": "An HTTP method available to the requester. It MUST list its responses. Only the OpenAPI 3.1 Operation fields listed here are allowed, plus x- extensions, as in Request Body, Response and Media Type: JSON-LD would lift some other keys, such as @context, an IRI or a context term. Neither an Operation-level servers field nor a $ref member is allowed, so it cannot be a Reference Object. An x- extension key MUST NOT contain a colon, because JSON-LD reads such a key as an IRI.",
+      "description": "An HTTP method that the resource supports. It MUST list its responses. Only the OpenAPI 3.1 Operation fields listed here are allowed, plus x- extensions, as in Request Body, Response and Media Type: JSON-LD would lift some other keys, such as @context, an IRI or a context term. Neither an Operation-level servers field nor a $ref member is allowed, so it cannot be a Reference Object. An x- extension key MUST NOT contain a colon, because JSON-LD reads such a key as an IRI.",
       "propertyNames": { "not": { "pattern": "^x-[^:]*:" } },
       "properties": {
         "tags": {},

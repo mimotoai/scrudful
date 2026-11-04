@@ -32,6 +32,11 @@ from scrudful.utils import _split_top_level, _unquote
 
 FIXTURES = Path(__file__).parent / "fixtures" / "semantic-http-0.1"
 HSR_SCHEMA = json.loads((FIXTURES / "http-schema-resource.schema.json").read_text())
+PROBLEM_DETAILS_SCHEMA = json.loads(
+    (FIXTURES / "problem-details.schema.json").read_text()
+)
+HSR_DOCUMENT_REL = "https://w3id.org/semantic-http/ns#http-schema-resource-document"
+HSR_OPTIONS_ENTRY = {"responses": {"204": {"description": "No Content"}}}
 _ABSOLUTE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _CONTEXT_RELS = {JSON_LD_CONTEXT_REL, RDF_CONTEXT_REL}
 
@@ -265,3 +270,142 @@ def _agreement_problems(
     if links != ([schema], [context] * (context is not None)):
         return [f"the Links {links} don't agree with the entry's {schema}, {context}"]
     return []
+
+
+# --- Rules of the 37ec1ce revision -------------------------------------------
+
+
+def hsr_link_problems(
+    headers: Mapping[str, str], expected_target: str | None = None
+) -> list[str]:
+    """How the HTTP Schema Resource link of ``headers`` breaks the rules.
+
+    There must be exactly one, with ``type="application/json"`` and no
+    ``anchor``; with ``expected_target`` its target must equal it.
+    """
+    links = [
+        link
+        for link in parse_links(_header(headers, "link"))
+        if HSR_DOCUMENT_REL in _relations(link[1])
+    ]
+    if len(links) != 1:
+        return [f"{len(links)} HTTP Schema Resource links, need exactly 1"]
+    target, params = links[0]
+    problems = []
+    if params.get("type") != "application/json":
+        problems.append(f"the HTTP Schema Resource link has type {params.get('type')!r}")
+    if "anchor" in params:
+        problems.append("the HTTP Schema Resource link has an anchor")
+    if expected_target is not None and target != expected_target:
+        problems.append(f"the HTTP Schema Resource link targets {target!r}")
+    return problems
+
+
+def options_204_problems(
+    status: int,
+    headers: Mapping[str, str],
+    body: bytes,
+    expected_allow: set[str] | None = None,
+) -> list[str]:
+    """How a non-preflight OPTIONS response breaks the rules.
+
+    It must be a 204 without content, with ``Allow`` (equal to
+    ``expected_allow`` when given) and one HTTP Schema Resource link.
+    """
+    problems = []
+    if status != 204:
+        problems.append(f"OPTIONS answered {status}, need 204")
+    if body:
+        problems.append("OPTIONS 204 has content")
+    if _header(headers, "content-type") is not None:
+        problems.append("OPTIONS 204 has a Content-Type")
+    allow = _header(headers, "allow")
+    if allow is None:
+        problems.append("OPTIONS without Allow")
+    elif expected_allow is not None:
+        methods = {m.strip() for m in allow.split(",") if m.strip()}
+        if methods != expected_allow:
+            problems.append(f"Allow {sorted(methods)} is not {sorted(expected_allow)}")
+    return problems + hsr_link_problems(headers)
+
+
+def hsr_get_problems(
+    status: int, headers: Mapping[str, str], body: bytes
+) -> list[str]:
+    """How a GET of the HTTP Schema Resource breaks the rules."""
+    problems = []
+    if status != 200:
+        problems.append(f"HSR GET answered {status}, need 200")
+    content_type = _header(headers, "content-type")
+    if content_type is None or essence(content_type) != "application/json":
+        problems.append(f"HSR Content-Type {content_type!r}, need application/json")
+    links = parse_links(_header(headers, "link"))
+    if [t for t, _ in _schema_links(links)] != [HSR_SCHEMA_URL]:
+        problems.append("the HSR describedby link is not the HTTP Schema Resource's")
+    if [t for t, _ in _context_links(links)] != [HSR_CONTEXT_URL]:
+        problems.append("the HSR context link is not the HTTP Schema Resource's")
+    if _header(headers, "etag") is None:
+        problems.append("HSR without ETag")
+    cache_control = _header(headers, "cache-control") or ""
+    if "public" not in [d.strip().lower() for d in cache_control.split(",")]:
+        problems.append(f"HSR Cache-Control {cache_control!r} lacks public")
+    try:
+        document = json.loads(body)
+        validate_http_schema_resource(document)
+    except Exception as exc:  # JSON, schema or AssertionError: all are problems
+        problems.append(f"the HSR body is invalid: {exc}")
+    else:
+        if document.get("options") != HSR_OPTIONS_ENTRY:
+            problems.append(f"the HSR options entry is {document.get('options')!r}")
+    return problems
+
+
+def _accepts(accept: str, media_type: str) -> bool:
+    """Whether ``accept`` accepts ``media_type`` (RFC 9110 section 12.5.1).
+
+    The most specific matching range decides; its ``q=0`` means not acceptable.
+    """
+    type_, _, subtype = media_type.partition("/")
+    best: tuple[int, float] | None = None
+    for part in _split_top_level(accept, ","):
+        range_, *params = [p.strip(" \t") for p in _split_top_level(part, ";")]
+        range_ = range_.lower()
+        if range_ == "*/*":
+            rank = 0
+        elif range_ == f"{type_}/*":
+            rank = 1
+        elif range_ == media_type:
+            rank = 2
+        else:
+            continue
+        q = 1.0
+        for param in params:
+            name, _, value = param.partition("=")
+            if name.strip().lower() == "q":
+                try:
+                    q = float(value)
+                except ValueError:
+                    q = 0.0
+        if best is None or rank > best[0]:
+            best = (rank, q)
+    return best is not None and best[1] > 0
+
+
+def undescribed_problems(
+    accept: str | None, headers: Mapping[str, str], hsr: dict
+) -> list[str]:
+    """How a response of a media type the HSR doesn't describe breaks the rules.
+
+    Content whose media type is no ``content`` key of ``hsr`` is allowed only
+    when the request's ``accept`` accepts it.
+    """
+    content_type = _header(headers, "content-type")
+    if content_type is None:
+        return []
+    media_type = essence(content_type)
+    described = {essence(key) for content in _content_maps(hsr) for key in content}
+    if media_type in described:
+        return []
+    if accept is not None and _accepts(accept, media_type):
+        return []
+    return [f"{media_type} is undescribed and not accepted by {accept!r}"]
