@@ -394,6 +394,11 @@ OPTIONS
     (``https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld``),
     and an ``Allow`` listing the body's methods in its order.
 
+    The router also serves the document by GET, the same for every
+    requester and cacheable, at the path's HSR route ``/_hsr/<name>`` (see
+    :class:`ScrudfulRouter`), or :func:`http_schema_resource_view` serves it
+    wherever it is mounted.
+
 The runtime response
     A handler parameter annotated :class:`ScrudfulResponse` receives a fresh
     instance on every request; like the ``load_as`` parameter, it is hidden
@@ -467,6 +472,7 @@ import functools
 import hashlib
 import inspect
 import io
+import itertools
 import json
 import re
 import textwrap
@@ -495,7 +501,10 @@ from django.http import (
     HttpRequest,
     HttpResponse,
     HttpResponseBase,
+    HttpResponseNotAllowed,
 )
+from django.urls import NoReverseMatch, URLResolver, reverse
+from django.urls.resolvers import RegexPattern
 from django.utils.encoding import iri_to_uri
 from ninja import NinjaAPI, Query, Router, Schema, Status
 from ninja import errors as ninja_errors
@@ -551,7 +560,16 @@ from scrudful._django import (
     scrudful_setting,
     slice_page,
 )
-from scrudful._hsr import absolute_for_hsr, options_operation
+from scrudful._hsr import (
+    DEFAULT_HSR_CACHE_CONTROL,
+    HSR_ROUTE_SEGMENT,
+    absolute_for_hsr,
+    hsr_etag,
+    hsr_response_links,
+    hsr_route_name,
+    options_operation,
+    serialize_hsr,
+)
 from scrudful.collection import (
     ENVELOPE_FIELDS,
     PAGE_FIELDS,
@@ -585,6 +603,7 @@ __all__ = [
     "handler404",
     "handler500",
     "http_schema_resource",
+    "http_schema_resource_view",
     "scrudful",
     "scrudful_create",
     "scrudful_list",
@@ -1598,6 +1617,25 @@ class ScrudfulRouter(Router):
     decorators and throttles apply to it as to any operation. Its URL name
     is ``scrudful_options`` on every path.
 
+    The first scrudful or :func:`described` operation of a path also adds
+    the path's HTTP Schema Resource route: GET and HEAD of
+    ``/_hsr/<name>`` under the router's prefix, ``<name>`` being the path's
+    segments joined with ``.`` (``"/{pk}"`` gives ``/_hsr/pk``,
+    ``"/{kind}/{pk}"`` gives ``/_hsr/kind.pk``, ``""`` gives
+    ``/_hsr/_root``). It answers with the document of
+    :func:`http_schema_resource` as compact JSON (``application/json``,
+    whatever the API's renderer), the HSR's own schema and context Links, a
+    strong ``ETag`` (304 for a matching ``If-None-Match``) and the router's
+    ``Cache-Control``. It is the same for every requester: it has
+    ``auth=None`` and no throttles, is CSRF-exempt and is not in the OpenAPI
+    document; the ``add_decorator`` decorators still apply. The routes come
+    before the router's other paths, so ``"/{kind}/{pk}"`` doesn't match
+    them, and ``/_hsr/`` is reserved: an operation under it, or two paths
+    with one name (``"/a/{x}"`` and ``"/a/{x}/"``), is a ``ConfigError``.
+    Their URL names are private (unique per router), so don't ``reverse()``
+    them. With ``hsr_route=False``, serve the document elsewhere with
+    :func:`http_schema_resource_view` and say where with ``hsr_url``.
+
     Every operation on a ``ScrudfulRouter`` is described in its path's HTTP
     Schema Resource, so each needs an entity: a scrudful decorator's, or,
     for a plain operation, the one :func:`described` (or ``scrudful_entity=``
@@ -1637,10 +1675,12 @@ class ScrudfulRouter(Router):
         headers resolve it against the request.
     hsr_route : bool, optional
         Whether the router serves each path's HTTP Schema Resource by GET
-        (``SCRUDFUL["HSR_ROUTE"]``, default ``True``).
+        (``SCRUDFUL["HSR_ROUTE"]``, default ``True``). Turning it off needs
+        an ``hsr_url``.
     hsr_url : callable, optional
         ``hsr_url(path)``: the URL of the HTTP Schema Resource of ``path``
-        (``SCRUDFUL["HSR_URL"]``), for one served elsewhere.
+        (``SCRUDFUL["HSR_URL"]``), for one served elsewhere; the responses
+        link to it, even when the router serves the route too.
     hsr_cache_control : str, optional
         The ``Cache-Control`` of the HTTP Schema Resource
         (``SCRUDFUL["HSR_CACHE_CONTROL"]``, default ``public, max-age=300``).
@@ -1653,7 +1693,9 @@ class ScrudfulRouter(Router):
     TypeError
         If one of these has the wrong type.
     ConfigError
-        If ``base_url`` is not an absolute URL.
+        If ``base_url`` is not an absolute URL; ``SCRUDFUL["HSR_ROUTE"]`` or
+        ``SCRUDFUL["HSR_URL"]`` has the wrong type; or the HSR route is off
+        without an ``hsr_url``.
     """
 
     def __init__(
@@ -1688,10 +1730,20 @@ class ScrudfulRouter(Router):
         self.hsr_url = hsr_url
         self.hsr_cache_control = hsr_cache_control
         self.allowed = allowed
+        # Both read now, so that a wrong setting fails here.
+        route_on, url = self._hsr_route_on(), self._hsr_url()
+        if not route_on and url is None:
+            raise ConfigError("hsr_route=False needs hsr_url=")
         #: The ``PathView`` of each path, as given to the operation decorator.
         self._scrudful_paths: dict[str, Any] = {}
         #: The HTTP Schema Resource of each path, once built.
         self._scrudful_hsrs: dict[str, dict[str, Any]] = {}
+        #: The URL name of the HSR route of each path that has one.
+        self._scrudful_hsr_url_names: dict[str, str] = {}
+        #: The path of each HSR route name, to refuse two paths one name.
+        self._scrudful_hsr_names: dict[str, str] = {}
+        #: Unique for the process, so the HSR routes' URL names are too.
+        self._scrudful_serial = next(_ROUTER_SERIALS)
         _SCRUDFUL_ROUTERS.add(self)
 
     def add_api_operation(
@@ -1710,14 +1762,40 @@ class ScrudfulRouter(Router):
         ``router.get(...)`` and the other operation decorators, which don't
         pass it on).
 
+        The first scrudful or :func:`described` operation of a path also adds
+        the path's HTTP Schema Resource route (see :class:`ScrudfulRouter`).
+
         Raises
         ------
         ConfigError
             If the operation is plain (not scrudful) and has no entity, unless
             it routes only OPTIONS, or if it is given an entity twice or is
-            scrudful and given one.
+            scrudful and given one; if ``path`` is under ``/_hsr/``; or if
+            ``path`` would have the HTTP Schema Resource route of another
+            path of the router.
         """
+        if ("/" + path.lstrip("/")).startswith(f"/{HSR_ROUTE_SEGMENT}/"):
+            raise ConfigError(
+                f"'/{HSR_ROUTE_SEGMENT}/' is reserved for scrudful's HTTP "
+                "Schema Resources"
+            )
         entity = _operation_entity(path, methods, view_func, scrudful_entity)
+        is_scrudful = isinstance(getattr(view_func, "_scrudful", None), _Config)
+        hsr_name = None
+        if (
+            (is_scrudful or entity is not None)
+            and path not in self._scrudful_hsr_url_names
+            and self._hsr_route_on()
+        ):
+            hsr_name = hsr_route_name(path)
+            other = self._scrudful_hsr_names.get(hsr_name)
+            if other is not None:
+                raise ConfigError(
+                    f"{path!r} and {other!r} of this ScrudfulRouter have the "
+                    f"same HTTP Schema Resource route name {hsr_name!r} "
+                    f"('/{HSR_ROUTE_SEGMENT}/{hsr_name}'): use one path "
+                    "template, or put them on different routers"
+                )
         super().add_api_operation(path, methods, view_func, **kwargs)
         path_view = _path_view(self, view_func)
         operation = view_func._ninja_operation
@@ -1734,7 +1812,7 @@ class ScrudfulRouter(Router):
                 for operation in path_view.operations
                 if not _is_automatic_options(operation)
             ]
-        elif isinstance(getattr(view_func, "_scrudful", None), _Config) and not any(
+        elif is_scrudful and not any(
             "OPTIONS" in operation.methods for operation in path_view.operations
         ):
             super().add_api_operation(
@@ -1745,6 +1823,72 @@ class ScrudfulRouter(Router):
                 response=NOT_SET,
                 include_in_schema=False,
             )
+        if hsr_name is not None:
+            self._add_hsr_route(path, hsr_name)
+
+    def _add_hsr_route(self, path: str, name: str) -> None:
+        """Serve ``path``'s HTTP Schema Resource by GET and HEAD at
+        ``/_hsr/<name>``, ahead of every other path of the router.
+
+        Django tries a router's paths in the order of ninja's
+        ``Router.path_operations``, so the HSR routes are moved to its start:
+        a path such as ``"/{kind}/{pk}"``, added before or after, would
+        otherwise match ``/_hsr/<name>``.
+        """
+        url_name = f"scrudful_hsr_{self._scrudful_serial}_{name}"
+        route = f"/{HSR_ROUTE_SEGMENT}/{name}"
+        super().add_api_operation(
+            route,
+            ["GET", "HEAD"],
+            _hsr_route_view(self, path),
+            auth=None,
+            throttle=[],
+            response=NOT_SET,
+            include_in_schema=False,
+            url_name=url_name,
+        )
+        self._scrudful_hsr_url_names[path] = url_name
+        self._scrudful_hsr_names[name] = path
+        hsr_routes = {f"/{HSR_ROUTE_SEGMENT}/{n}" for n in self._scrudful_hsr_names}
+        for key in list(self.path_operations):
+            if key not in hsr_routes:
+                self.path_operations[key] = self.path_operations.pop(key)
+
+    def _hsr_route_on(self) -> bool:
+        """``hsr_route``, else ``SCRUDFUL["HSR_ROUTE"]``, else ``True``."""
+        if self.hsr_route is not None:
+            return self.hsr_route
+        value = scrudful_setting("HSR_ROUTE", True)
+        if not isinstance(value, bool):
+            raise ConfigError(
+                f'SCRUDFUL["HSR_ROUTE"] must be a bool, not {type(value).__name__}'
+            )
+        return value
+
+    def _hsr_url(self) -> Callable[[str], str] | None:
+        """``hsr_url``, else ``SCRUDFUL["HSR_URL"]``, else ``None``."""
+        if self.hsr_url is not None:
+            return self.hsr_url
+        value = scrudful_setting("HSR_URL", None)
+        if value is not None and not callable(value):
+            raise ConfigError(
+                'SCRUDFUL["HSR_URL"] must be a callable, '
+                f"hsr_url(path), not {type(value).__name__}"
+            )
+        return value
+
+    def _hsr_cache_control(self) -> str:
+        """``hsr_cache_control``, else ``SCRUDFUL["HSR_CACHE_CONTROL"]``, else
+        ``public, max-age=300``."""
+        if self.hsr_cache_control is not None:
+            return self.hsr_cache_control
+        value = scrudful_setting("HSR_CACHE_CONTROL", DEFAULT_HSR_CACHE_CONTROL)
+        if not isinstance(value, str):
+            raise ConfigError(
+                'SCRUDFUL["HSR_CACHE_CONTROL"] must be a str, not '
+                f"{type(value).__name__}"
+            )
+        return value
 
     def _hsr(self, path: str) -> dict[str, Any]:
         """The HTTP Schema Resource of ``path``, built once (not a copy)."""
@@ -1771,6 +1915,9 @@ class ScrudfulRouter(Router):
 #: :func:`add_error_links` discards.
 _SCRUDFUL_ROUTERS: weakref.WeakSet[ScrudfulRouter] = weakref.WeakSet()
 
+#: The serial number of each ``ScrudfulRouter``, in its HSR routes' URL names.
+_ROUTER_SERIALS = itertools.count(1)
+
 #: The entity :func:`add_error_links` gave each API, for the HTTP Schema
 #: Resources of the paths of the routers it mounts.
 _API_ERRORS: weakref.WeakKeyDictionary[NinjaAPI, Entity] = weakref.WeakKeyDictionary()
@@ -1779,6 +1926,16 @@ _API_ERRORS: weakref.WeakKeyDictionary[NinjaAPI, Entity] = weakref.WeakKeyDictio
 #: :func:`_serving_router_run`); ``None`` outside one.
 _SERVING_ROUTER: ContextVar[ScrudfulRouter | None] = ContextVar(
     "scrudful_serving_router", default=None
+)
+
+#: The API of that operation (see :func:`_hsr_target`); ``None`` outside one.
+_SERVING_ROUTER_API: ContextVar[NinjaAPI | None] = ContextVar(
+    "scrudful_serving_router_api", default=None
+)
+
+#: A resolver of each API's own URL patterns (see :func:`_hsr_route_path`).
+_API_RESOLVERS: weakref.WeakKeyDictionary[NinjaAPI, URLResolver] = (
+    weakref.WeakKeyDictionary()
 )
 
 
@@ -1913,6 +2070,189 @@ def http_schema_resource(router: ScrudfulRouter, path: str) -> dict[str, Any]:
     if not isinstance(router, ScrudfulRouter):
         raise TypeError(f"router must be a ScrudfulRouter, not {type(router).__name__}")
     return copy.deepcopy(router._hsr(path))
+
+
+def http_schema_resource_view(
+    router: ScrudfulRouter, path: str
+) -> Callable[[HttpRequest], HttpResponseBase]:
+    """A plain Django view serving the HTTP Schema Resource of ``path``.
+
+    It answers GET and HEAD as the router's own HSR route does (see
+    :class:`ScrudfulRouter`), and any other method with 405. It is for
+    serving the document elsewhere, e.g. with ``hsr_route=False`` and an
+    ``hsr_url`` naming where it is mounted::
+
+        path("schemas/items/item", http_schema_resource_view(items, "/{pk}"))
+
+    Like the route, it runs no authentication, permission check or throttle,
+    and is CSRF-exempt. ``path`` is checked on the first request, as
+    :func:`http_schema_resource` checks it.
+
+    Raises
+    ------
+    TypeError
+        If ``router`` isn't a :class:`ScrudfulRouter`.
+    """
+    if not isinstance(router, ScrudfulRouter):
+        raise TypeError(f"router must be a ScrudfulRouter, not {type(router).__name__}")
+
+    def scrudful_hsr_view(
+        request: HttpRequest, *args: Any, **kwargs: Any
+    ) -> HttpResponseBase:
+        if request.method not in ("GET", "HEAD"):
+            response = HttpResponseNotAllowed(["GET", "HEAD"])
+            expose_headers(response)
+            return response
+        return _hsr_response(request, router, path)
+
+    scrudful_hsr_view.csrf_exempt = True  # type: ignore[attr-defined]
+    return scrudful_hsr_view
+
+
+def _hsr_route_view(
+    router: ScrudfulRouter, path: str
+) -> Callable[..., HttpResponseBase]:
+    """The view of ``path``'s HSR route (see :meth:`ScrudfulRouter._add_hsr_route`).
+
+    It declares no parameters, so ninja passes and validates none (a prefix
+    such as ``"/orgs/{org}/items"`` has some), and is CSRF-exempt.
+    """
+
+    def scrudful_hsr(request: HttpRequest, **params: Any) -> HttpResponseBase:
+        return _hsr_response(request, router, path)
+
+    scrudful_hsr.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        [inspect.Parameter("request", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+    )
+    scrudful_hsr.csrf_exempt = True  # type: ignore[attr-defined]
+    return scrudful_hsr
+
+
+def _hsr_response(
+    request: HttpRequest, router: ScrudfulRouter, path: str
+) -> HttpResponseBase:
+    """The answer to a GET or HEAD of ``path``'s HTTP Schema Resource.
+
+    A 200 whose body is :func:`~scrudful._hsr.serialize_hsr` of the document
+    (the bytes the ``ETag`` hashes, not the API renderer's), with the HSR's
+    own Links and the router's ``Cache-Control``; or, for an
+    ``If-None-Match`` matching the ``ETag`` (weak comparison), a 304 with the
+    ``ETag`` and ``Cache-Control``.
+    """
+    body = serialize_hsr(router._hsr(path))
+    etag = hsr_etag(body)
+    cache_control = router._hsr_cache_control()
+    result = evaluate_preconditions(
+        request.method or "GET",
+        precondition_headers(request),
+        etag=etag,
+        last_modified=None,
+        require_precondition=False,
+    )
+    if result is not None:
+        early = conditional_response(result)
+        if result.status == 304:
+            early["Cache-Control"] = cache_control
+        return early
+    response = HttpResponse(body, content_type="application/json")
+    response["Link"] = hsr_response_links()
+    response["ETag"] = etag
+    response["Cache-Control"] = cache_control
+    expose_headers(response)
+    return response
+
+
+def _hsr_target(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
+    """The URL of the HTTP Schema Resource of ``router``'s ``path``: the target
+    of the HSR link of the responses (and OPTIONS) of ``path``.
+
+    Resolved in this order:
+
+    1. ``hsr_url(path)``, with the router's ``hsr_url``, else
+       ``SCRUDFUL["HSR_URL"]``, as it returns it;
+    2. else, with the HSR route turned off (``hsr_route=False`` or
+       ``SCRUDFUL["HSR_ROUTE"] = False``), a ``ConfigError``;
+    3. else the path of ``path``'s HSR route, reversed by its URL name (unique
+       per router), with the URL parameters the request matched outside
+       ``path`` (an API's or router's prefix, such as ``"/orgs/{org}/items"``):
+
+       a. in the URL namespace the request was resolved in (Django's URL
+          resolver, so the route of the API and mount the request came
+          through);
+       b. when the request has no namespace (ninja's ``TestClient`` resolves
+          it among the API's patterns alone), among the URL patterns of the
+          API of the ``ScrudfulRouter`` operation running, relative to the
+          API's root;
+
+    4. made absolute against the router's base URL (``base_url``, else
+       ``SCRUDFUL["BASE_URL"]``) when it has one, else with
+       ``request.build_absolute_uri()``.
+
+    A router mounted twice in one API (``url_name_prefix``) has one URL name
+    per route for both mounts: 3a gives one of them, which serves the same
+    document.
+
+    Raises
+    ------
+    ConfigError
+        If the route is off and there is no ``hsr_url``; ``path`` has no HSR
+        route on ``router``; or the route can't be reversed (3b outside a
+        ``ScrudfulRouter`` operation, or a request not routed to ``router``).
+    """
+    hsr_url = router._hsr_url()
+    if hsr_url is not None:
+        return hsr_url(path)
+    if not router._hsr_route_on():
+        raise ConfigError("hsr_route=False needs hsr_url=")
+    route = _hsr_route_path(request, router, path)
+    base_url = router._base_url()
+    if base_url is not None:
+        return resolve_uri(route, base_url)
+    return request.build_absolute_uri(route)
+
+
+def _hsr_route_path(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
+    """The absolute path of ``path``'s HSR route (steps 3a and 3b of
+    :func:`_hsr_target`)."""
+    url_name = router._scrudful_hsr_url_names.get(path)
+    if url_name is None:
+        raise ConfigError(
+            f"{path!r} has no HTTP Schema Resource route on this ScrudfulRouter "
+            f"(the paths with one are {sorted(router._scrudful_hsr_url_names)}): "
+            "give the path as given to the operation decorator, of a scrudful "
+            "or @described operation added while the route was on"
+        )
+    match = getattr(request, "resolver_match", None)
+    kwargs: dict[str, Any] = {}
+    if match is not None:
+        own = get_path_param_names(path)
+        kwargs = {k: v for k, v in match.kwargs.items() if k not in own}
+        if match.namespace:
+            try:
+                return reverse(f"{match.namespace}:{url_name}", kwargs=kwargs)
+            except NoReverseMatch as exc:
+                raise _unreversed(path, exc) from exc
+    api = _SERVING_ROUTER_API.get()
+    if api is None:
+        raise ConfigError(
+            f"can't find the HTTP Schema Resource route of {path!r}: the request "
+            "was resolved without a URL namespace, outside an operation of a "
+            "ScrudfulRouter, so scrudful doesn't know its API"
+        )
+    resolver = _API_RESOLVERS.get(api)
+    if resolver is None:
+        resolver = _API_RESOLVERS[api] = URLResolver(RegexPattern(r"^/"), api.urls[0])
+    try:
+        return "/" + resolver.reverse(url_name, **kwargs)
+    except NoReverseMatch as exc:
+        raise _unreversed(path, exc) from exc
+
+
+def _unreversed(path: str, exc: NoReverseMatch) -> ConfigError:
+    return ConfigError(
+        f"can't reverse the HTTP Schema Resource route of {path!r} (is the "
+        f"request routed to its ScrudfulRouter?): {exc}"
+    )
 
 
 def add_error_links(api: NinjaAPI, error: Entity) -> None:
@@ -2451,33 +2791,41 @@ def _serving_router_run(
     router: ScrudfulRouter,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """The ``Operation.run`` decorator of each operation of ``router``,
-    setting :data:`_SERVING_ROUTER` while it runs (see :func:`_live_base`).
+    setting :data:`_SERVING_ROUTER` (see :func:`_live_base`) and
+    :data:`_SERVING_ROUTER_API`, the operation's API (see :func:`_hsr_target`),
+    while it runs.
 
     Outermost of scrudful's, so the API's exception handlers ninja calls in
-    ``run`` see it too.
+    ``run`` see them too.
     """
 
     def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
         operation = _operation_of(run)
+
+        @contextlib.contextmanager
+        def serving() -> Iterator[None]:
+            # The API is bound to the clone after its run is decorated.
+            router_token = _SERVING_ROUTER.set(router)
+            api_token = _SERVING_ROUTER_API.set(getattr(operation, "api", None))
+            try:
+                yield
+            finally:
+                _SERVING_ROUTER_API.reset(api_token)
+                _SERVING_ROUTER.reset(router_token)
+
         if getattr(operation, "is_async", inspect.iscoroutinefunction(run)):
 
             @functools.wraps(run)
             async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                token = _SERVING_ROUTER.set(router)
-                try:
+                with serving():
                     return await run(request, *args, **kw)
-                finally:
-                    _SERVING_ROUTER.reset(token)
 
         else:
 
             @functools.wraps(run)
             def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                token = _SERVING_ROUTER.set(router)
-                try:
+                with serving():
                     return run(request, *args, **kw)
-                finally:
-                    _SERVING_ROUTER.reset(token)
 
         return scrudful_run
 

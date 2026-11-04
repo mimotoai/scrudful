@@ -6,23 +6,29 @@ import uuid
 from typing import Any
 
 import pytest
+from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from ninja import NinjaAPI, Router
 from ninja.errors import ConfigError
+from ninja.renderers import JSONRenderer
 from ninja.security import APIKeyHeader
+from ninja.throttling import AnonRateThrottle
 from django.urls import path
 from ninja.testing import TestClient
 
 from scrudful._django import scrudful_setting
+from scrudful._hsr import hsr_etag, serialize_hsr
 from scrudful.ninja import (
     Entity,
     ScrudfulRouter,
+    _hsr_target,
     add_error_links,
     described,
     http_schema_resource,
+    http_schema_resource_view,
     scrudful,
 )
-from tests.semantic_http import validate_http_schema_resource
+from tests.semantic_http import hsr_get_problems, validate_http_schema_resource
 from tests.test_ninja_adapter import ItemIn, ItemOut, Store, etag, modified, update
 
 BASE_URL = "https://api.example/"
@@ -608,3 +614,374 @@ def test_scrudful_setting(settings):
     settings.SCRUDFUL = ["BASE_URL"]
     with pytest.raises(ImproperlyConfigured, match="dict"):
         scrudful_setting("BASE_URL", None)
+
+
+# --- the HSR GET route ---------------------------------------------------------
+
+
+def head(client: TestClient, path: str, **kwargs: Any) -> Any:
+    # ninja's TestClient has no head().
+    return client.request("HEAD", path, **kwargs)
+
+
+def exposed(headers: Any) -> set[str]:
+    return {n.strip() for n in headers["Access-Control-Expose-Headers"].split(",")}
+
+
+def test_hsr_route_serves_the_document():
+    api, router = make_api()
+    client = TestClient(api)
+    r = client.get("/_hsr/pk")
+    assert hsr_get_problems(r.status_code, dict(r.headers), r.content) == []
+    assert json.loads(r.content) == http_schema_resource(router, "/{pk}")
+    assert r.headers["Content-Type"] == "application/json"
+    assert r.headers["Cache-Control"] == "public, max-age=300"
+    assert {"Link", "Allow", "ETag"} <= exposed(r.headers)
+    etag_ = r.headers["ETag"]
+    not_modified = client.get("/_hsr/pk", headers={"If-None-Match": etag_})
+    assert not_modified.status_code == 304
+    assert not_modified.headers["ETag"] == etag_
+    assert not_modified.headers["Cache-Control"] == "public, max-age=300"
+    weak = client.get("/_hsr/pk", headers={"If-None-Match": "W/" + etag_})
+    assert weak.status_code == 304
+    other = client.get("/_hsr/pk", headers={"If-None-Match": '"other"'})
+    assert other.status_code == 200
+    assert head(client, "/_hsr/pk").status_code == 200
+    assert head(client, "/_hsr/pk").headers["ETag"] == etag_
+
+
+def test_hsr_body_is_the_bytes_the_etag_hashes():
+    class IndentedRenderer(JSONRenderer):
+        json_dumps_params = {"indent": 4}
+
+    router_options, _, item = split_options({})
+    router = ScrudfulRouter(**router_options)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    api = NinjaAPI(
+        urls_namespace=f"api-{uuid.uuid4().hex}", renderer=IndentedRenderer()
+    )
+    api.add_router("", router)
+    r = TestClient(api).get("/_hsr/pk")
+    assert r.content == serialize_hsr(http_schema_resource(router, "/{pk}"))
+    assert r.headers["ETag"] == hsr_etag(r.content)
+
+
+@pytest.fixture
+def clear_cache():
+    cache.clear()
+    yield
+    cache.clear()
+
+
+def test_hsr_route_needs_no_auth_and_ignores_throttles(clear_cache):
+    api, _ = make_api(auth=KeyAuth(), throttle=[AnonRateThrottle("1/day")])
+    client = TestClient(api)
+    assert [client.get("/_hsr/pk").status_code for _ in range(3)] == [200, 200, 200]
+    assert client.get("/1").status_code == 401
+
+
+def test_hsr_route_ignores_router_auth_and_throttles(clear_cache):
+    router_options, _, item = split_options({})
+    router = ScrudfulRouter(
+        auth=KeyAuth(), throttle=[AnonRateThrottle("1/day")], **router_options
+    )
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    client = TestClient(mount(router))
+    assert [client.get("/_hsr/pk").status_code for _ in range(3)] == [200, 200, 200]
+
+
+def test_hsr_route_is_csrf_exempt_and_not_in_openapi():
+    api, router = make_api()
+    [operation] = router.path_operations["/_hsr/pk"].operations
+    assert operation.csrf_exempt
+    assert operation.methods == ["GET", "HEAD"]
+    paths = api.get_openapi_schema(path_prefix="")["paths"]
+    assert "/{pk}" in paths
+    assert not any("_hsr" in p for p in paths)
+
+
+def test_hsr_route_resolves_before_item_path():
+    api, _ = make_api()
+    response = TestClient(api).get("/_hsr/pk")
+    assert response.headers["Content-Type"] == "application/json"
+
+
+def wildcard_router() -> ScrudfulRouter:
+    """Paths that would swallow ``/_hsr/<name>`` if they came first: a
+    ``@described`` ``"/{x}/{y}"`` and a scrudful ``"/{kind}/{pk}"``, then a
+    ``"/{pk}"`` added after them."""
+    router = ScrudfulRouter(base_url=BASE_URL)
+    _, _, item = split_options({})
+
+    @router.get("/{x}/{y}")
+    @described(Entity(**LINKS))
+    def pair(request, x: str, y: str):
+        return {"pair": [x, y]}
+
+    @router.get("/{kind}/{pk}/{rest}", response=ItemOut)
+    @scrudful(**item)
+    def kind_item(request, kind: str, pk: int, rest: str, obj):
+        return obj
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    return router
+
+
+@pytest.mark.parametrize(
+    "hsr_path, path",
+    [
+        ("/_hsr/pk", "/{pk}"),
+        ("/_hsr/x.y", "/{x}/{y}"),
+        ("/_hsr/kind.pk.rest", "/{kind}/{pk}/{rest}"),
+    ],
+)
+def test_hsr_routes_resolve_before_every_path_of_the_router(hsr_path, path):
+    router = wildcard_router()
+    r = TestClient(mount(router)).get(hsr_path)
+    assert hsr_get_problems(r.status_code, dict(r.headers), r.content) == []
+    assert json.loads(r.content) == http_schema_resource(router, path)
+
+
+def test_described_only_path_gets_an_hsr_route():
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/health")
+    @described(Entity(**LINKS))
+    def health(request):
+        return {}
+
+    @router.api_operation(["OPTIONS"], "/bare")
+    def bare(request):
+        return {}
+
+    client = TestClient(mount(router))
+    r = client.get("/_hsr/health")
+    assert hsr_get_problems(r.status_code, dict(r.headers), r.content) == []
+    assert json.loads(r.content) == http_schema_resource(router, "/health")
+    assert "/_hsr/bare" not in router.path_operations
+
+
+def handler(request, obj):
+    return obj
+
+
+def pk_handler(request, pk: int, obj):
+    return obj
+
+
+def id_handler(request, id: int, obj):
+    return obj
+
+
+def x_handler(request, x: str, obj):
+    return obj
+
+
+def plain(request):
+    return {}
+
+
+def test_reserved_segment_and_name_clash():
+    router = ScrudfulRouter(base_url=BASE_URL)
+    _, _, item = split_options({})
+    with pytest.raises(ConfigError, match="reserved"):
+        router.get("/_hsr/x")(scrudful(**item)(handler))
+    with pytest.raises(ConfigError, match="reserved"):
+        router.get("_hsr/x")(described(Entity(**LINKS))(plain))
+    assert router.path_operations == {}
+    router.get("/{pk}")(scrudful(**item)(pk_handler))
+    router.get("/{id}")(scrudful(**item)(id_handler))  # "pk" vs "id": no clash
+    assert {"/_hsr/pk", "/_hsr/id"} <= router.path_operations.keys()
+    router.get("/a/{x}")(scrudful(**item)(x_handler))
+    with pytest.raises(ConfigError, match=r"'/a/\{x\}/'.*'/a/\{x\}'.*'a\.x'"):
+        router.get("/a/{x}/")(scrudful(**item)(x_handler))
+    with pytest.raises(ConfigError, match="'pk'"):
+        router.get("/{int:pk}")(scrudful(**item)(pk_handler))
+    router.put("/{pk}")(scrudful(**item)(pk_handler))  # the same path: no clash
+    assert "/{int:pk}" not in router.path_operations
+
+
+def test_hsr_route_false_needs_hsr_url():
+    with pytest.raises(ConfigError, match=re.escape("hsr_route=False needs hsr_url=")):
+        make_api(hsr_route=False)
+
+
+def test_hsr_route_setting(settings):
+    settings.SCRUDFUL = {"HSR_ROUTE": False}
+    with pytest.raises(ConfigError, match="hsr_url"):
+        ScrudfulRouter(base_url=BASE_URL)
+    settings.SCRUDFUL = {"HSR_ROUTE": False, "HSR_URL": lambda p: f"/docs{p}"}
+    api, router = make_api()
+    assert router.path_operations.keys() == {"/{pk}"}
+    with pytest.raises(Exception, match="Cannot resolve"):
+        TestClient(api).get("/_hsr/pk")
+    _, router = make_api(hsr_route=True)  # the router's argument wins
+    assert "/_hsr/pk" in router.path_operations
+    settings.SCRUDFUL = {"HSR_ROUTE": "no"}
+    with pytest.raises(ConfigError, match="HSR_ROUTE"):
+        ScrudfulRouter()
+    settings.SCRUDFUL = {"HSR_URL": "https://docs.example/"}
+    with pytest.raises(ConfigError, match="HSR_URL"):
+        ScrudfulRouter()
+
+
+def test_hsr_cache_control(settings):
+    def cache_control(api: NinjaAPI) -> str:
+        return TestClient(api).get("/_hsr/pk").headers["Cache-Control"]
+
+    api, _ = make_api(hsr_cache_control="public, max-age=60")
+    assert cache_control(api) == "public, max-age=60"
+    settings.SCRUDFUL = {"HSR_CACHE_CONTROL": "public, max-age=10"}
+    assert cache_control(make_api()[0]) == "public, max-age=10"
+    assert cache_control(api) == "public, max-age=60"  # the router's wins
+    settings.SCRUDFUL = {"HSR_CACHE_CONTROL": 10}
+    with pytest.raises(ConfigError, match="HSR_CACHE_CONTROL"):
+        cache_control(make_api()[0])
+
+
+def test_http_schema_resource_view_for_mounting(rf):
+    _, router = make_api(
+        hsr_route=False, hsr_url=lambda p: f"https://docs.example/hsr{p}"
+    )
+    view = http_schema_resource_view(router, "/{pk}")
+    r = view(rf.get("/anywhere"))
+    assert hsr_get_problems(r.status_code, dict(r.items()), r.content) == []
+    assert r.content == serialize_hsr(http_schema_resource(router, "/{pk}"))
+    assert view(rf.get("/anywhere", HTTP_IF_NONE_MATCH=r["ETag"])).status_code == 304
+    assert view(rf.head("/anywhere")).status_code == 200
+    not_allowed = view(rf.post("/anywhere"))
+    assert not_allowed.status_code == 405
+    assert not_allowed["Allow"] == "GET, HEAD"
+    assert view.csrf_exempt
+    with pytest.raises(TypeError, match="ScrudfulRouter"):
+        http_schema_resource_view(Router(), "/{pk}")
+
+
+# --- the HSR link target -------------------------------------------------------
+
+
+def target_router(name: str, **router_options: Any) -> ScrudfulRouter:
+    """A ``"/{pk}"`` with its own entity, and ``"/{pk}/target"`` answering
+    ``_hsr_target(request, router, "/{pk}")``."""
+    router = ScrudfulRouter(**router_options)
+    links = dict(
+        schema_link_or_func=f"https://api.example/schemas/{name}",
+        context_link_or_func=f"https://api.example/contexts/{name}",
+    )
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(load=Store().load, etag_func=etag, **links)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    @router.get("/{pk}/target")
+    @described(Entity(**links))
+    def target(request, pk: int):
+        return {"target": _hsr_target(request, router, "/{pk}")}
+
+    return router
+
+
+def two_routers(
+    **router_options: Any,
+) -> tuple[NinjaAPI, ScrudfulRouter, ScrudfulRouter]:
+    """Two routers each with ``"/{pk}"``, under one API at ``/a`` and ``/b``."""
+    a = target_router("a", **router_options)
+    b = target_router("b", **router_options)
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    api.add_router("/a", a)
+    api.add_router("/b", b)
+    return api, a, b
+
+
+def test_two_routers_with_one_path_have_their_own_route_and_target():
+    api, a, b = two_routers()
+    client = TestClient(api)
+    assert http_schema_resource(a, "/{pk}") != http_schema_resource(b, "/{pk}")
+    for prefix, router in (("a", a), ("b", b)):
+        r = client.get(f"/{prefix}/_hsr/pk")
+        assert hsr_get_problems(r.status_code, dict(r.headers), r.content) == []
+        assert json.loads(r.content) == http_schema_resource(router, "/{pk}")
+        target = client.get(f"/{prefix}/1/target").json()["target"]
+        assert target == f"http://testlocation/{prefix}/_hsr/pk"
+    names = [p.name for p in api.urls[0] if "_hsr" in str(p.pattern)]
+    assert len(names) == len(set(names)) == 4  # pk and pk.target, per router
+
+
+def test_target_resolves_against_the_base_url():
+    api, _, _ = two_routers(base_url="https://api.example/v1/")
+    target = TestClient(api).get("/b/1/target").json()["target"]
+    assert target == "https://api.example/b/_hsr/pk"
+
+
+def test_target_is_hsr_url_when_given():
+    router = target_router(
+        "a", hsr_route=False, hsr_url=lambda p: f"https://docs.example/hsr{p}"
+    )
+    target = TestClient(mount(router)).get("/1/target").json()["target"]
+    assert target == "https://docs.example/hsr/{pk}"
+
+
+def test_target_from_the_hsr_url_setting(settings):
+    settings.SCRUDFUL = {"HSR_URL": lambda p: f"https://docs.example/s{p}"}
+    router = target_router("a")
+    target = TestClient(mount(router)).get("/1/target").json()["target"]
+    assert target == "https://docs.example/s/{pk}"
+
+
+def test_target_with_the_route_turned_off_later_is_config_error(settings):
+    router = target_router("a")
+    client = TestClient(mount(router))
+    settings.SCRUDFUL = {"HSR_ROUTE": False}
+    with pytest.raises(ConfigError, match="hsr_url"):
+        client.get("/1/target")
+
+
+def test_target_outside_an_operation_is_config_error(rf):
+    router = target_router("a")
+    with pytest.raises(ConfigError, match=re.escape("'/{pk}'")):
+        _hsr_target(rf.get("/1/target"), router, "/{pk}")
+
+
+TWO_API, TWO_A, TWO_B = two_routers()
+ORG_ROUTER = target_router("org")
+ORG_API = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+ORG_API.add_router("/orgs/{org}/items", ORG_ROUTER)
+urlpatterns += [path("two/", TWO_API.urls), path("t/<str:tenant>/", ORG_API.urls)]
+
+
+@pytest.mark.urls(__name__)
+def test_targets_reverse_through_django_url_resolver(client, settings, db):
+    settings.ALLOWED_HOSTS = ["a.example"]
+    for prefix, router in (("a", TWO_A), ("b", TWO_B)):
+        target = client.get(f"/two/{prefix}/1/target", HTTP_HOST="a.example").json()
+        assert target == {"target": f"http://a.example/two/{prefix}/_hsr/pk"}
+        r = client.get(f"/two/{prefix}/_hsr/pk", HTTP_HOST="a.example")
+        assert hsr_get_problems(r.status_code, dict(r.items()), r.content) == []
+        assert json.loads(r.content) == http_schema_resource(router, "/{pk}")
+    r = client.head("/two/a/_hsr/pk", HTTP_HOST="a.example")
+    assert r.status_code == 200 and r.content == b""
+
+
+@pytest.mark.urls(__name__)
+def test_target_under_parameterized_prefixes(client, settings, db):
+    settings.ALLOWED_HOSTS = ["a.example"]
+    url = "/t/acme/orgs/7/items/1/target"
+    target = client.get(url, HTTP_HOST="a.example").json()["target"]
+    assert target == "http://a.example/t/acme/orgs/7/items/_hsr/pk"
+    r = client.get("/t/acme/orgs/7/items/_hsr/pk", HTTP_HOST="a.example")
+    assert hsr_get_problems(r.status_code, dict(r.items()), r.content) == []
