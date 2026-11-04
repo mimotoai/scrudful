@@ -16,7 +16,7 @@ from typing import Any
 from scrudful._adapter import reason_phrase
 from scrudful.conditional import ConditionalResult
 
-__all__ = ["PROBLEM_JSON", "problem_details"]
+__all__ = ["PROBLEM_JSON", "problem_details", "problem_from_errors"]
 
 #: The media type of an RFC 9457 problem details object.
 PROBLEM_JSON = "application/problem+json"
@@ -40,4 +40,24 @@ def problem_details(request: Any, result: ConditionalResult) -> dict[str, Any]:
     if detail is not None:
         problem["detail"] = detail
     problem.update(body)
+    return problem
+
+
+def problem_from_errors(
+    status: int, errors: Any, detail: str | None = None
+) -> dict[str, Any]:
+    """RFC 9457 problem details for a framework validation error.
+
+    ``type`` is ``about:blank``, ``title`` the reason phrase of ``status`` and
+    ``detail`` the given ``detail`` or that phrase. ``errors`` (the framework's
+    own error list) is an extension member, omitted when ``None``.
+    """
+    problem: dict[str, Any] = {
+        "type": "about:blank",
+        "title": reason_phrase(status),
+        "status": status,
+        "detail": detail or reason_phrase(status),
+    }
+    if errors is not None:
+        problem["errors"] = errors
     return problem
