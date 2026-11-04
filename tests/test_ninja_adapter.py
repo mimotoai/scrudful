@@ -869,7 +869,12 @@ def test_callback_errors_use_ninja_handlers(store, failing):
     def fail(*args):
         raise HttpError(403, "Forbidden")
 
-    options = {"etag_func": etag, "schema_link_or_func": "/schemas/item", failing: fail}
+    options = {
+        "etag_func": etag,
+        "schema_link_or_func": "/schemas/item",
+        "context_link_or_func": "/contexts/item",
+        failing: fail,
+    }
     router = Router()
 
     @router.get("/items/{pk}")

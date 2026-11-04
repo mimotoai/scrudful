@@ -30,7 +30,11 @@ from tests.test_ninja_adapter import (
     update,
 )
 
-PROBLEM = Entity(schema_link_or_func="/schemas/problem", media_type=PROBLEM_JSON)
+PROBLEM = Entity(
+    schema_link_or_func="/schemas/problem",
+    context_link_or_func="/contexts/problem",
+    media_type=PROBLEM_JSON,
+)
 
 
 class CompactRenderer(JSONRenderer):
@@ -344,6 +348,7 @@ def test_error_media_type_charset_names_the_renderer_s(method, headers, status):
     """An entity's own charset is replaced by the one the bytes are in."""
     entity = Entity(
         schema_link_or_func="/schemas/problem",
+        context_link_or_func="/contexts/problem",
         media_type="application/problem+json; charset=UTF-16; profile=x",
     )
     client = TestClient(api_for(router(Store(), error=entity), Latin1Renderer()))
@@ -377,6 +382,7 @@ def test_raised_and_early_errors_share_the_content_type(asynchronous, renderer):
 def test_quoted_media_type_parameters_kept_as_written():
     entity = Entity(
         schema_link_or_func="/schemas/problem",
+        context_link_or_func="/contexts/problem",
         media_type='application/problem+json; profile="https://ex.com/a;b"',
     )
     client = TestClient(api_for(router(Store(), error=entity)))

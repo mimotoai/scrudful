@@ -8,7 +8,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from scrudful._adapter import is_in_band, is_json, media_type_key
+from scrudful._adapter import (
+    SCHEMA_WITHOUT_CONTEXT,
+    HsrConfigError,
+    is_in_band,
+    is_json,
+    media_type_key,
+)
 
 __all__ = ["Entity"]
 
@@ -68,7 +74,11 @@ class Entity:
         If ``media_type`` is not a media type; if it is in-band and
         ``context_link_or_func`` is set; or if it is neither JSON nor
         in-band, ``context_link_or_func`` is set and ``context_type_or_func``
-        is not.
+        is not; or if it is not in-band and ``schema_link_or_func`` is a
+        value but ``context_link_or_func`` is not set (the HTTP Schema
+        Resource would lack its ``x-rdf-context``; ``HsrConfigError``, a
+        ``ValueError``). A callable schema link is checked when the HTTP
+        Schema Resource is built.
     """
 
     schema_link_or_func: Any = None
@@ -83,6 +93,11 @@ class Entity:
         media_type = media_type_key(self.media_type)
         object.__setattr__(self, "media_type", media_type)
         if not self.context_link_or_func:
+            schema = self.schema_link_or_func
+            if schema and not callable(schema) and not is_in_band(media_type):
+                raise HsrConfigError(
+                    SCHEMA_WITHOUT_CONTEXT.format(media_type=media_type)
+                )
             return
         if is_in_band(media_type):
             raise ValueError(

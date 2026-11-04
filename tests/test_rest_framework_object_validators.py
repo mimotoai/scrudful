@@ -90,7 +90,9 @@ class ExplicitView(generics.RetrieveUpdateDestroyAPIView):
         return super().put(request, *args, **kwargs)
 
 
-ERROR = Entity(schema_link_or_func="/schemas/error")
+ERROR = Entity(
+    schema_link_or_func="/schemas/error", context_link_or_func="/contexts/error"
+)
 
 
 @scrudful_viewset
@@ -197,7 +199,11 @@ class ProblemViewSet(viewsets.ModelViewSet):
     class Meta:
         object_validators = True
         etag_func = object_etag
-        error = Entity(schema_link_or_func="/schemas/error", media_type=PROBLEM_JSON)
+        error = Entity(
+            schema_link_or_func="/schemas/error",
+            context_link_or_func="/contexts/error",
+            media_type=PROBLEM_JSON,
+        )
         error_body_func = problem_details
 
 

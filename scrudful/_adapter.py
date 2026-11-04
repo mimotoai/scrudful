@@ -34,6 +34,9 @@ HSR_SCHEMA_URL = "https://w3id.org/semantic-http/0.1/http-schema-resource.schema
 HSR_CONTEXT_URL = (
     "https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld"
 )
+#: The relation and media type of the Link to an HTTP Schema Resource.
+HSR_LINK_REL = "https://w3id.org/semantic-http/ns#http-schema-resource-document"
+HSR_LINK_TYPE = "application/json"
 #: Media types that carry their RDF in-band, so need no context link.
 IN_BAND_MEDIA_TYPES = frozenset(
     {
@@ -47,6 +50,21 @@ IN_BAND_MEDIA_TYPES = frozenset(
 )
 #: The keys of an HTTP Schema Resource that are methods (the others are ``x-``).
 METHOD_KEYS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
+
+
+class HsrConfigError(ValueError):
+    """A configuration the HTTP Schema Resource cannot be built from.
+
+    The adapters re-raise it as their framework's configuration error.
+    """
+
+
+#: The message of the schema-without-context error (:class:`HsrConfigError`).
+SCHEMA_WITHOUT_CONTEXT = (
+    "{media_type} content has a schema link but no RDF context link; the HTTP "
+    "Schema Resource's x-rdf-context would be missing. Give the context link "
+    "(context_link_or_func)"
+)
 
 DEFAULT_SCHEMA_REL = SCHEMA_REL
 DEFAULT_SCHEMA_TYPE = SCHEMA_TYPE
@@ -532,9 +550,13 @@ _CONTEXT_RELS = frozenset({JSON_LD_CONTEXT_REL, RDF_CONTEXT_REL})
 
 
 def merge_links(
-    existing: str | None, schema: str | None, context: str | None
+    existing: str | None,
+    schema: str | None,
+    context: str | None,
+    hsr: str | None = None,
 ) -> str | None:
-    """Join the view's Link ``existing`` with the ``schema`` and ``context`` links.
+    """Join the view's Link ``existing`` with the ``schema``, ``context`` and
+    ``hsr`` links.
 
     A link of ``existing`` with a relation that scrudful's ``schema``
     (``context``) link-value has replaces that link: with the defaults, a
@@ -546,9 +568,12 @@ def merge_links(
     replaces it. An overridden context relation is matched exactly.
     Relation types are compared case-insensitively, every one of a ``rel``
     holding several (RFC 8288 §2.1.1, §3.3). A link of another relation
-    replaces nothing.
+    replaces nothing. A link of ``existing`` with the HTTP Schema Resource
+    relation replaces scrudful's ``hsr`` link.
     """
     relations = link_relations(existing)
+    if HSR_LINK_REL.lower() in relations:
+        hsr = None
     if relations & link_relations(schema):
         schema = None
     context_rels = link_relations(context)
@@ -556,7 +581,7 @@ def merge_links(
         context_rels |= _CONTEXT_RELS
     if relations & context_rels:
         context = None
-    return join_links(existing, schema, context)
+    return join_links(existing, schema, context, hsr)
 
 
 def options_links() -> str:
@@ -594,10 +619,15 @@ def describe_content(
     ValueError
         If ``media_type`` is malformed, or a context is given for non-JSON
         content without ``context_type``.
+    HsrConfigError
+        If ``media_type`` is not in-band and a ``schema`` is given without a
+        ``context``.
     """
     key = media_type_key(media_type)
     if not schema:
         return None
+    if not context and not is_in_band(media_type):
+        raise HsrConfigError(SCHEMA_WITHOUT_CONTEXT.format(media_type=key))
     if essence(schema_type) == SCHEMA_TYPE:
         entry: dict[str, Any] = {"schema": {"$ref": schema}}
     else:

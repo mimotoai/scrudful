@@ -515,10 +515,17 @@ def test_describe_content_x_schema():
 
 def test_describe_content_keeps_parameters():
     content = describe_content(
-        "Application/JSON; charset=UTF-8", "https://h/s", SCHEMA_TYPE, None, None
+        "Application/JSON; charset=UTF-8",
+        "https://h/s",
+        SCHEMA_TYPE,
+        "https://h/c",
+        None,
     )
     assert content == {
-        "application/json; charset=UTF-8": {"schema": {"$ref": "https://h/s"}}
+        "application/json; charset=UTF-8": {
+            "schema": {"$ref": "https://h/s"},
+            "x-rdf-context": {"href": "https://h/c", "type": "application/ld+json"},
+        }
     }
 
 

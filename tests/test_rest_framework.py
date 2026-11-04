@@ -765,7 +765,8 @@ class UsedErrorAPIView(drf_views.APIView):
     @scrudful(
         etag_func=etag_func,
         schema_link_or_func=SCHEMA,
-        error=Entity(used_error_schema),
+        context_link_or_func=CONTEXT,
+        error=Entity(used_error_schema, context_link_or_func=CONTEXT),
     )
     def get(self, request, pk):
         return Response({"id": pk})
@@ -777,7 +778,7 @@ class SerializerErrorAPIView(drf_views.APIView):
     @scrudful(
         schema_link_or_func=SCHEMA,
         context_link_or_func=CONTEXT,
-        error=Entity(used_error_schema),
+        error=Entity(used_error_schema, context_link_or_func=CONTEXT),
     )
     def put(self, request, pk):
         return Response({"id": pk})
@@ -1335,7 +1336,15 @@ def test_error_bodies_are_served_as_the_error_media_type(client):
 
 @pytest.mark.parametrize("media_type", ["text/turtle", "text/csv", "application/xml"])
 def test_error_media_type_must_be_json(media_type):
-    error = Entity("/schemas/error", media_type=media_type)
+    context = (
+        {}
+        if media_type == "text/turtle"
+        else {
+            "context_link_or_func": "/contexts/error",
+            "context_type_or_func": "text/x",
+        }
+    )
+    error = Entity("/schemas/error", media_type=media_type, **context)
     with pytest.raises(ValueError, match="scrudful's JSON error bodies"):
         scrudful(error=error)
     with pytest.raises(ValueError, match=media_type):
@@ -1541,7 +1550,7 @@ def test_options_calls_the_error_callables_only_when_described(client):
     assert response.status_code == 200
     body = response.json()
     assert error_calls == ["used"]
-    error = content(f"{BASE}/schemas/error?pk=1")
+    error = content(f"{BASE}/schemas/error?pk=1", CONTEXT)
     for status in ("400", "412"):
         assert body["get"]["responses"][status]["content"] == error
 

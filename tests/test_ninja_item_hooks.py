@@ -40,7 +40,9 @@ from tests.test_ninja_list_before import (
     opaque,
 )
 
-ERROR = Entity(schema_link_or_func="/schemas/error")
+ERROR = Entity(
+    schema_link_or_func="/schemas/error", context_link_or_func="/contexts/error"
+)
 ALICE = {"X-API-Key": "alice"}
 METHODS = ["GET", "PUT", "PATCH", "DELETE"]
 WRITES = ["PUT", "PATCH", "DELETE"]

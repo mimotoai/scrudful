@@ -41,3 +41,8 @@ def test_reexported():
     for module in (ninja, rest_framework, fastapi):
         assert module.Entity is Entity
         assert "Entity" in module.__all__
+
+
+def test_entity_rejects_schema_without_context():
+    with pytest.raises(ValueError, match="x-rdf-context"):
+        Entity(schema_link_or_func="https://x/s")

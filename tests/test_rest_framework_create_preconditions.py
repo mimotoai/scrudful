@@ -67,7 +67,11 @@ class ObjectViewSet(viewsets.ModelViewSet):
     class Meta:
         object_validators = True
         etag_func = staticmethod(lambda obj: f"v{obj.version}")
-        error = Entity(schema_link_or_func="/schemas/problem", media_type=PROBLEM_JSON)
+        error = Entity(
+            schema_link_or_func="/schemas/problem",
+            context_link_or_func="/contexts/problem",
+            media_type=PROBLEM_JSON,
+        )
         error_body_func = item_error_body
         list_etag_func = list_etag
         list_last_modified_func = list_modified

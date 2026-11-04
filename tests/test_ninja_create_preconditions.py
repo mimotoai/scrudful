@@ -155,7 +155,11 @@ def test_the_412_has_the_error_links_and_body(store):
     response = post(
         store,
         {"If-Match": '"nope"'},
-        error=Entity("/schemas/error", media_type=PROBLEM_JSON),
+        error=Entity(
+            "/schemas/error",
+            context_link_or_func="/contexts/error",
+            media_type=PROBLEM_JSON,
+        ),
         error_body_func=problem_details,
     )
     assert response.status_code == 412
@@ -174,7 +178,7 @@ def test_error_link_callables_get_the_collection(store):
     response = post(
         store,
         {"If-Match": '"nope"'},
-        error=Entity(schema),
+        error=Entity(schema, context_link_or_func="/contexts/error"),
     )
     assert response.status_code == 412
     assert seen == [list(store.items.values())]
@@ -199,7 +203,13 @@ def test_options_describes_the_412(store):
     assert "428" not in described["responses"]
     assert "parameters" not in described
     assert described["responses"]["412"]["content"] == {
-        "application/json": {"schema": {"$ref": "http://testlocation/schemas/error"}}
+        "application/json": {
+            "schema": {"$ref": "http://testlocation/schemas/error"},
+            "x-rdf-context": {
+                "href": "http://testlocation/contexts/error",
+                "type": "application/ld+json",
+            },
+        }
     }
     assert store.calls == {}
 

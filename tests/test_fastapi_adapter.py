@@ -1669,7 +1669,9 @@ def test_dependency_link_is_not_copied_onto_early_errors(make_client, store):
     """A dependency's Link describes the success representation."""
     app = FastAPI()
     dependency_link = (
-        '<http://example.com/other>; rel="describedby"; type="application/schema+json"'
+        '<http://example.com/other>; rel="describedby"; '
+        'type="application/schema+json", <http://example.com/other.jsonld>; '
+        'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
     )
 
     def set_headers(response: Response):
@@ -1890,10 +1892,18 @@ def test_add_error_links_twice_does_not_double(make_client):
     # The latest call's entity replaces the earlier one.
     app = _links_app()
     add_error_links(app, ERROR)
-    add_error_links(app, Entity(schema_link_or_func="http://example.com/other"))
+    add_error_links(
+        app,
+        Entity(
+            schema_link_or_func="http://example.com/other",
+            context_link_or_func="http://example.com/other.jsonld",
+        ),
+    )
     response = make_client(app).get("/items/3")
     assert response.headers["link"] == (
-        '<http://example.com/other>; rel="describedby"; type="application/schema+json"'
+        '<http://example.com/other>; rel="describedby"; '
+        'type="application/schema+json", <http://example.com/other.jsonld>; '
+        'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
     )
     assert response.headers["content-type"] == "application/json"
     handler = app.exception_handlers[StarletteHTTPException]

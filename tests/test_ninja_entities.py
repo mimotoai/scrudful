@@ -35,10 +35,13 @@ RESULTS_LINK = (
     'type="application/ld+json"'
 )
 QUERY = Entity("/schemas/query", context_link_or_func="/contexts/query")
-ERROR = Entity("/schemas/error")
+ERROR = Entity("/schemas/error", context_link_or_func="/contexts/error")
 ERROR_LINK = (
     '<http://testlocation/schemas/error>; rel="describedby"; '
-    'type="application/schema+json"'
+    'type="application/schema+json", '
+    "<http://testlocation/contexts/error>; "
+    'rel="http://www.w3.org/ns/json-ld#context"; '
+    'type="application/ld+json"'
 )
 PROBLEM = Entity("/schemas/problem", context_link_or_func="/contexts/problem")
 PROBLEM_LINK = (
@@ -50,7 +53,10 @@ PROBLEM_LINK = (
 )
 JOB_LINK = (
     '<http://testlocation/schemas/job>; rel="describedby"; '
-    'type="application/schema+json"'
+    'type="application/schema+json", '
+    "<http://testlocation/contexts/job>; "
+    'rel="http://www.w3.org/ns/json-ld#context"; '
+    'type="application/ld+json"'
 )
 
 
@@ -184,7 +190,7 @@ def test_runtime_overrides(store):
         meta.status = 202
         meta.location = "/jobs/1"
         meta.etag = "j1"
-        meta.entity = Entity("/schemas/job")
+        meta.entity = Entity("/schemas/job", context_link_or_func="/contexts/job")
         return {"id": 1}
 
     response = TestClient(router).post("/jobs")
@@ -591,14 +597,18 @@ def test_async_operation_entities_and_runtime_values(store):
     router = Router()
 
     @router.post("/jobs", response={202: Job, 409: Message})
-    @scrudful(responses={409: Entity(schema)}, **LINKS)
+    @scrudful(
+        responses={409: Entity(schema, context_link_or_func="/contexts/job")}, **LINKS
+    )
     async def start_job(request, meta: ScrudfulResponse):
         if request.GET.get("conflict"):
             return Status(409, {"detail": "busy"})
         meta.status = 202
         meta.location = "/jobs/1"
         meta.etag = "j1"
-        meta.entity = Entity(lambda request, obj: "/schemas/job")
+        meta.entity = Entity(
+            lambda request, obj: "/schemas/job", context_link_or_func="/contexts/job"
+        )
         return {"id": 1}
 
     client = TestAsyncClient(router)

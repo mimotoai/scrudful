@@ -139,6 +139,7 @@ def test_list_invalid_page_has_error_links(store, asynchronous):
     options = dict(
         href_func=lambda request, item: f"/items/{item['id']}",
         list_schema_link_or_func="/schemas/items",
+        list_context_link_or_func="/contexts/items",
         error=ERR,
     )
     if asynchronous:
@@ -583,7 +584,15 @@ def test_early_errors_without_error_are_json(store):
 
 @pytest.mark.parametrize("media_type", ["text/turtle", "text/csv", "application/xml"])
 def test_error_media_type_must_be_json(media_type):
-    error = Entity("/schemas/error", media_type=media_type)
+    context = (
+        {}
+        if media_type == "text/turtle"
+        else {
+            "context_link_or_func": "/contexts/error",
+            "context_type_or_func": "text/x",
+        }
+    )
+    error = Entity("/schemas/error", media_type=media_type, **context)
     with pytest.raises(ValueError, match="scrudful's JSON error bodies"):
         scrudful(error=error)
     with pytest.raises(ValueError, match=media_type):
@@ -665,6 +674,14 @@ def test_add_error_links_leaves_non_json_content_alone(store):
 
 @pytest.mark.parametrize("media_type", ["text/csv", "text/turtle", "application/xml"])
 def test_add_error_links_media_type_must_be_json(store, media_type):
-    error = Entity("/schemas/error", media_type=media_type)
+    context = (
+        {}
+        if media_type == "text/turtle"
+        else {
+            "context_link_or_func": "/contexts/error",
+            "context_type_or_func": "text/x",
+        }
+    )
+    error = Entity("/schemas/error", media_type=media_type, **context)
     with pytest.raises(ValueError, match="scrudful's JSON error bodies"):
         add_error_links(error_api(store), error)

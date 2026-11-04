@@ -562,7 +562,10 @@ def test_trace_gets_no_default_entity():
 
     # An entity declared for the status still applies to TRACE.
     @router.api_operation(["GET", "TRACE"], "/echo/{pk}", response={200: Message})
-    @scrudful(**LINKS, responses={200: Entity("/schemas/echo")})
+    @scrudful(
+        **LINKS,
+        responses={200: Entity("/schemas/echo", context_link_or_func="/contexts/echo")},
+    )
     def echo(request, pk: int):
         return {"detail": "echo"}
 
@@ -576,12 +579,15 @@ def test_trace_gets_no_default_entity():
     assert "Link" not in response.headers
 
     body = options(client, "/echo/1").json()
-    echo_content = content("/schemas/echo")
+    echo_content = content("/schemas/echo", "/contexts/echo")
     assert body["trace"]["responses"]["200"]["content"] == echo_content
     response = client.request("TRACE", "/echo/1")
     assert response.headers["Link"] == (
         '<http://testlocation/schemas/echo>; rel="describedby"; '
-        'type="application/schema+json"'
+        'type="application/schema+json", '
+        "<http://testlocation/contexts/echo>; "
+        'rel="http://www.w3.org/ns/json-ld#context"; '
+        'type="application/ld+json"'
     )
 
 
@@ -820,8 +826,13 @@ def test_options_list_path(store):
 
 def test_options_entities():
     router = ScrudfulRouter()
-    error = Entity(schema_link_or_func="/schemas/error")
-    conflict = Entity(schema_link_or_func="/schemas/conflict")
+    error = Entity(
+        schema_link_or_func="/schemas/error", context_link_or_func="/contexts/error"
+    )
+    conflict = Entity(
+        schema_link_or_func="/schemas/conflict",
+        context_link_or_func="/contexts/conflict",
+    )
 
     @router.put(
         "/jobs/{pk}",
@@ -837,7 +848,10 @@ def test_options_entities():
         ),
         responses={
             200: Entity(),  # no entity: no content
-            202: Entity(schema_link_or_func="/schemas/job"),
+            202: Entity(
+                schema_link_or_func="/schemas/job",
+                context_link_or_func="/contexts/job",
+            ),
             404: Entity(context_link_or_func="/contexts/missing"),
             412: conflict,
         },
@@ -859,17 +873,20 @@ def test_options_entities():
         location_func=lambda request, job: f"/jobs/{job['id']}",
         **LINKS,
         request=Entity(),  # no request entity
-        responses={409: Entity(schema_link_or_func="/schemas/conflict")},
+        responses={
+            409: Entity(
+                schema_link_or_func="/schemas/conflict",
+                context_link_or_func="/contexts/conflict",
+            )
+        },
     )
     def create_job(request, payload: ItemIn):
         return {"id": 1}
 
     client = TestClient(router)
-    # Entities with a schema only are described as they are (not valid 0.1:
-    # JSON content needs a context too).
     body = options(client, "/jobs/1").json()
-    error_content = content("/schemas/error")
-    conflict_content = content("/schemas/conflict")
+    error_content = content("/schemas/error", "/contexts/error")
+    conflict_content = content("/schemas/conflict", "/contexts/conflict")
     assert body["put"]["requestBody"]["content"] == content(
         "/schemas/job-in", "/contexts/job-in"
     )
@@ -879,7 +896,10 @@ def test_options_entities():
         "400": {**MALFORMED, "content": error_content},
         "412": {**FAILED, "content": error_content},
         "428": {**REQUIRED, "content": error_content},
-        "202": {"description": "Accepted", "content": content("/schemas/job")},
+        "202": {
+            "description": "Accepted",
+            "content": content("/schemas/job", "/contexts/job"),
+        },
         # A Media Type Object needs a schema: a context alone is not described.
         "404": {"description": "Not Found"},
     }
@@ -964,12 +984,14 @@ def test_options_link_callables_get_the_request_and_none():
         return f"/schemas/{request.method.lower()}"
 
     @router.get("/items/{pk}")
-    @scrudful(schema_link_or_func=schema)
+    @scrudful(schema_link_or_func=schema, context_link_or_func="/contexts/get")
     def get_item(request, pk: int):
         return {}
 
     body = options(TestClient(router), "/items/5").json()
-    assert body["get"]["responses"]["200"]["content"] == content("/schemas/options")
+    assert body["get"]["responses"]["200"]["content"] == content(
+        "/schemas/options", "/contexts/get"
+    )
     assert calls == [("OPTIONS", "/items/5", None)]
 
 
@@ -993,7 +1015,11 @@ def test_options_async_operation_with_async_request_entity(store):
         load=load,
         etag_func=etag,
         schema_link_or_func=response_schema,
-        request=Entity(schema_link_or_func=request_schema),
+        context_link_or_func="/contexts/item",
+        request=Entity(
+            schema_link_or_func=request_schema,
+            context_link_or_func="/contexts/item-in",
+        ),
     )
     async def put_item(request, pk: int, payload: ItemIn, obj):
         return obj
@@ -1006,8 +1032,12 @@ def test_options_async_operation_with_async_request_entity(store):
     response = async_to_sync(TestAsyncClient(router).request)("OPTIONS", "/items/1")
     assert response.status_code == 200
     body = response.json()
-    assert body["put"]["requestBody"]["content"] == content("/schemas/item-in")
-    assert body["put"]["responses"]["200"]["content"] == content("/schemas/item")
+    assert body["put"]["requestBody"]["content"] == content(
+        "/schemas/item-in", "/contexts/item-in"
+    )
+    assert body["put"]["responses"]["200"]["content"] == content(
+        "/schemas/item", "/contexts/item"
+    )
     assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
     assert sorted(calls) == [("async", None), ("sync", None)]
     assert store.calls == {}

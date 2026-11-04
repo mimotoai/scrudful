@@ -33,7 +33,9 @@ from scrudful.ninja import Entity, add_error_links, scrudful_list
 from tests.test_ninja_adapter import ItemOut
 from tests.test_ninja_list import href
 
-ERROR = Entity(schema_link_or_func="/schemas/error")
+ERROR = Entity(
+    schema_link_or_func="/schemas/error", context_link_or_func="/contexts/error"
+)
 
 #: Queries with a parameter ninja rejects (422): page parameters, the
 #: operation's own ``n``, and both.
