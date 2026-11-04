@@ -508,6 +508,7 @@ from django.urls.resolvers import RegexPattern
 from django.utils.encoding import iri_to_uri
 from ninja import NinjaAPI, Query, Router, Schema, Status
 from ninja import errors as ninja_errors
+from ninja import router as ninja_router
 from ninja.constants import NOT_SET
 from ninja.errors import ConfigError, HttpError
 from ninja.operation import AsyncOperation, Operation
@@ -1833,8 +1834,25 @@ class ScrudfulRouter(Router):
         Django tries a router's paths in the order of ninja's
         ``Router.path_operations``, so the HSR routes are moved to its start:
         a path such as ``"/{kind}/{pk}"``, added before or after, would
-        otherwise match ``/_hsr/<name>``.
+        otherwise match ``/_hsr/<name>``. That order is kept by ninja's
+        ``BoundRouter._bind_operations`` (which clones the paths for each
+        mount) and ``BoundRouter.urls_paths`` (which yields their URL
+        patterns, naming them by an explicit ``url_name`` as is), checked to
+        be ninja 1.7.0's and 1.7.1's.
+
+        Raises
+        ------
+        ConfigError
+            If the installed ninja's ``BoundRouter`` or either method differs.
         """
+        bound_router = getattr(ninja_router, "BoundRouter", None)
+        for method in ("_bind_operations", "urls_paths"):
+            _check_ninja_internal(
+                bound_router,
+                "BoundRouter",
+                method,
+                "scrudful's HTTP Schema Resource routes",
+            )
         url_name = f"scrudful_hsr_{self._scrudful_serial}_{name}"
         route = f"/{HSR_ROUTE_SEGMENT}/{name}"
         super().add_api_operation(
@@ -1928,9 +1946,11 @@ _SERVING_ROUTER: ContextVar[ScrudfulRouter | None] = ContextVar(
     "scrudful_serving_router", default=None
 )
 
-#: The API of that operation (see :func:`_hsr_target`); ``None`` outside one.
-_SERVING_ROUTER_API: ContextVar[NinjaAPI | None] = ContextVar(
-    "scrudful_serving_router_api", default=None
+#: That operation (ninja's ``Operation``, whose ``api`` :func:`_hsr_target`
+#: reads); ``None`` outside one, or when it can't be found (see
+#: :func:`_operation_of`).
+_SERVING_ROUTER_OPERATION: ContextVar[Any] = ContextVar(
+    "scrudful_serving_router_operation", default=None
 )
 
 #: A resolver of each API's own URL patterns (see :func:`_hsr_route_path`).
@@ -2196,8 +2216,10 @@ def _hsr_target(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
     ------
     ConfigError
         If the route is off and there is no ``hsr_url``; ``path`` has no HSR
-        route on ``router``; or the route can't be reversed (3b outside a
-        ``ScrudfulRouter`` operation, or a request not routed to ``router``).
+        route on ``router``; the route can't be reversed (3b outside a
+        ``ScrudfulRouter`` operation, or a request not routed to ``router``);
+        or, for 3b, the installed ninja's ``Operation.api``,
+        ``NinjaClientBase._resolve`` or ``NinjaAPI.urls`` isn't ninja 1.7's.
     """
     hsr_url = router._hsr_url()
     if hsr_url is not None:
@@ -2232,20 +2254,82 @@ def _hsr_route_path(request: HttpRequest, router: ScrudfulRouter, path: str) -> 
                 return reverse(f"{match.namespace}:{url_name}", kwargs=kwargs)
             except NoReverseMatch as exc:
                 raise _unreversed(path, exc) from exc
-    api = _SERVING_ROUTER_API.get()
-    if api is None:
+    if _SERVING_ROUTER.get() is None:
         raise ConfigError(
             f"can't find the HTTP Schema Resource route of {path!r}: the request "
             "was resolved without a URL namespace, outside an operation of a "
             "ScrudfulRouter, so scrudful doesn't know its API"
         )
+    api = _operation_api(_SERVING_ROUTER_OPERATION.get())
     resolver = _API_RESOLVERS.get(api)
     if resolver is None:
-        resolver = _API_RESOLVERS[api] = URLResolver(RegexPattern(r"^/"), api.urls[0])
+        # ninja's TestClient routes a request among ``api.urls[0]`` alone and
+        # sets the namespace-less ``resolver_match`` of the pattern matched.
+        try:
+            from ninja.testing import client as ninja_client
+        except ImportError:  # pragma: no cover - ninja 1.7 has it
+            ninja_client = None
+        _check_ninja_internal(
+            getattr(ninja_client, "NinjaClientBase", None),
+            "NinjaClientBase",
+            "_resolve",
+            "scrudful's HTTP Schema Resource links under ninja's TestClient",
+        )
+        resolver = _API_RESOLVERS[api] = URLResolver(
+            RegexPattern(r"^/"), _api_patterns(api)
+        )
     try:
         return "/" + resolver.reverse(url_name, **kwargs)
     except NoReverseMatch as exc:
         raise _unreversed(path, exc) from exc
+
+
+def _operation_api(operation: Any) -> NinjaAPI:
+    """The API of ninja's ``operation`` (ninja 1.7's ``Operation.api``).
+
+    Raises
+    ------
+    ConfigError
+        If ``operation`` is ``None`` (it can't be found) or has no API.
+    """
+    if operation is None:
+        raise ConfigError(
+            "scrudful can't find the ninja operation through Operation.run, "
+            "because a decorate_view decorator wraps it without "
+            "functools.wraps, so it doesn't know the API serving the request "
+            "for its HTTP Schema Resource link. Use functools.wraps in that "
+            "decorator, or apply decorate_view above the operation decorator."
+        )
+    api = getattr(operation, "api", None)
+    if not isinstance(api, NinjaAPI):
+        raise ConfigError(
+            "scrudful reads the API serving the request from ninja's "
+            "Operation.api, which the installed ninja's "
+            f"{type(operation).__qualname__} doesn't have as ninja 1.7.0 and "
+            "1.7.1 do: upgrade scrudful, or keep ninja at one of those releases"
+        )
+    return api
+
+
+def _api_patterns(api: NinjaAPI) -> list[Any]:
+    """``api``'s URL patterns: the first item of ``NinjaAPI.urls`` (ninja 1.7's
+    ``(patterns, app_name, namespace)``).
+
+    Raises
+    ------
+    ConfigError
+        If the installed ninja's ``NinjaAPI.urls`` has another shape.
+    """
+    urls = api.urls
+    if not (isinstance(urls, tuple) and len(urls) == 3 and isinstance(urls[0], list)):
+        raise ConfigError(
+            "scrudful reverses the HTTP Schema Resource routes of an API among "
+            "its patterns, the first item of ninja's NinjaAPI.urls, which the "
+            "installed ninja doesn't give as ninja 1.7.0 and 1.7.1 do, a "
+            "(patterns, app_name, namespace) tuple: upgrade scrudful, or keep "
+            "ninja at one of those releases"
+        )
+    return urls[0]
 
 
 def _unreversed(path: str, exc: NoReverseMatch) -> ConfigError:
@@ -2792,8 +2876,8 @@ def _serving_router_run(
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """The ``Operation.run`` decorator of each operation of ``router``,
     setting :data:`_SERVING_ROUTER` (see :func:`_live_base`) and
-    :data:`_SERVING_ROUTER_API`, the operation's API (see :func:`_hsr_target`),
-    while it runs.
+    :data:`_SERVING_ROUTER_OPERATION`, the operation (see
+    :func:`_hsr_target`), while it runs.
 
     Outermost of scrudful's, so the API's exception handlers ninja calls in
     ``run`` see them too.
@@ -2804,13 +2888,12 @@ def _serving_router_run(
 
         @contextlib.contextmanager
         def serving() -> Iterator[None]:
-            # The API is bound to the clone after its run is decorated.
             router_token = _SERVING_ROUTER.set(router)
-            api_token = _SERVING_ROUTER_API.set(getattr(operation, "api", None))
+            operation_token = _SERVING_ROUTER_OPERATION.set(operation)
             try:
                 yield
             finally:
-                _SERVING_ROUTER_API.reset(api_token)
+                _SERVING_ROUTER_OPERATION.reset(operation_token)
                 _SERVING_ROUTER.reset(router_token)
 
         if getattr(operation, "is_async", inspect.iscoroutinefunction(run)):
@@ -2982,8 +3065,31 @@ def _raised_links_run(
 #: (:func:`_install_hooks`) was written from: ``_run_checks``, which it
 #: copies, and ``run``, which answers the response it returns before reading
 #: any parameter. ninja 1.7.0 and 1.7.1 on Python 3.10 to 3.14 (``run``'s
-#: f-string is tokenized differently from Python 3.12 on).
+#: f-string is tokenized differently from Python 3.12 on). Also those the HTTP
+#: Schema Resource routes and links rely on (:meth:`ScrudfulRouter._add_hsr_route`,
+#: :func:`_hsr_route_path`): ``BoundRouter._bind_operations`` and
+#: ``BoundRouter.urls_paths`` (the routes' order and URL names) and ninja's
+#: ``TestClient`` resolving a request (``NinjaClientBase._resolve``), each
+#: with its digest before Python 3.12 and from it on.
 _NINJA_SOURCES = {
+    "BoundRouter._bind_operations": frozenset(
+        {
+            "873e51ad8cace9e07c15f2819ec99ac3cf53d0659705b15bcc8621edfb052fed",
+            "27088996948fe2a5fadbec87c86f96c701f33752d4d594b94eb4ef06134d5af2",
+        }
+    ),
+    "BoundRouter.urls_paths": frozenset(
+        {
+            "85c4f63c7cd88350cc2ac5af93f0b024c66487ee4f1b5188ec6bc8c5f5f41f3b",
+            "9cacc722ce0ab6834f0c20a5de1363293c9a3d0c13050431d1ae8cdade7d24b0",
+        }
+    ),
+    "NinjaClientBase._resolve": frozenset(
+        {
+            "45f93bff824798198140d0b3311bb4bb0b2d58c6544fcd1d0860814dcbfce7bf",
+            "1067efbf84d27a64f0017013877ea6abd94bd812c36b91c68f40f770ec545901",
+        }
+    ),
     "Operation._run_checks": frozenset(
         {"1f879fdc88dd517f7ff2f3961c324160638e3de021cf294b6e4e9f9ecccfc2d4"}
     ),
@@ -3013,10 +3119,28 @@ _CHECKS_CODE = (
     ("self", "request", "error"),
     2,
 )
+#: The names of ``BoundRouter.urls_paths`` (see :data:`_NINJA_CODE`).
+_URLS_PATHS_NAMES = (
+    "replace_path_param_notation",
+    "path_operations",
+    "items",
+    "join",
+    "normalize_path",
+    "lstrip",
+    "operations",
+    "getattr",
+    "api",
+    "get_operation_url_name",
+    "template",
+    "url_name_prefix",
+    "django_path",
+    "get_view",
+)
 #: Where the source isn't available: the names, local variables and argument
-#: count of each (the same in ninja 1.7.0 and 1.7.1 on Python 3.10 to 3.14).
-#: Weaker: a body using the same names in another order passes.
-_NINJA_CODE = {
+#: count of each (the same in ninja 1.7.0 and 1.7.1 on Python 3.10 to 3.14),
+#: or a set of them. Weaker: a body using the same names in another order
+#: passes.
+_NINJA_CODE: dict[str, Any] = {
     "Operation._run_checks": _CHECKS_CODE,
     "Operation.run": (
         (
@@ -3074,6 +3198,80 @@ _NINJA_CODE = {
         ),
         2,
     ),
+    "BoundRouter._bind_operations": (
+        (
+            "mount",
+            "inherited_decorators",
+            "template",
+            "_decorators",
+            "path_operations",
+            "items",
+            "clone",
+            "operations",
+            "api",
+            "auth_param",
+            "NOT_SET",
+            "auth",
+            "_set_auth",
+            "throttle_param",
+            "throttle",
+            "isinstance",
+            "BaseThrottle",
+            "throttle_objects",
+            "tags",
+            "run",
+            "view_func",
+            "ValueError",
+        ),
+        (
+            "self",
+            "effective_decorators",
+            "path",
+            "path_view",
+            "cloned_view",
+            "operation",
+            "throttle",
+            "decorator",
+            "mode",
+        ),
+        1,
+    ),
+    # Several fingerprints: from Python 3.12 on, the comprehension's ``i`` is
+    # a local variable of the function (PEP 709).
+    "BoundRouter.urls_paths": frozenset(
+        (
+            _URLS_PATHS_NAMES,
+            ("self", "prefix", "path", "path_view", *comprehension, "route")
+            + ("operation", "url_name"),
+            2,
+        )
+        for comprehension in ((), ("i",))
+    ),
+    "NinjaClientBase._resolve": (
+        (
+            "split",
+            "lstrip",
+            "urls",
+            "resolve",
+            "_build_request",
+            "resolver_match",
+            "func",
+            "kwargs",
+            "Exception",
+        ),
+        (
+            "self",
+            "method",
+            "path",
+            "data",
+            "request_params",
+            "url_path",
+            "url",
+            "match",
+            "request",
+        ),
+        5,
+    ),
 }
 #: Tokens that don't change the code: comments and blank lines.
 _IGNORED_TOKENS = frozenset({tokenize.COMMENT, tokenize.NL})
@@ -3129,18 +3327,33 @@ def _without_docstring(tokens: list[tokenize.TokenInfo]) -> list[tokenize.TokenI
 @functools.cache
 def _is_ninja_code(func: Any, name: str) -> bool:
     """Whether ``func`` is the code of ninja's method ``name`` (e.g.
-    ``"Operation.run"``) scrudful's copy of the checks was written from: by
-    the digest of its source, else (no source) by its names, locals and
-    arguments. Memoized: each function is read once, whatever the number of
-    operations and mounts."""
+    ``"Operation.run"``) scrudful was written against: by the digest of its
+    source, else (no source) by its names, locals and arguments. Memoized:
+    each function is read once, whatever the number of operations and
+    mounts."""
     digest = _source_digest(func)
     if digest is not None:
         return digest in _NINJA_SOURCES[name]
     code = getattr(func, "__code__", None)
-    return (
-        code is not None
-        and (code.co_names, code.co_varnames, code.co_argcount) == _NINJA_CODE[name]
-    )
+    if code is None:
+        return False
+    expected = _NINJA_CODE[name]
+    fingerprints = expected if isinstance(expected, frozenset) else {expected}
+    return (code.co_names, code.co_varnames, code.co_argcount) in fingerprints
+
+
+def _check_ninja_internal(owner: Any, owner_name: str, method: str, use: str) -> None:
+    """Raise ``ConfigError`` unless ``owner`` (ninja's class ``owner_name``,
+    ``None`` when the installed ninja has none) has ninja 1.7.0's and
+    1.7.1's ``method``, which ``use`` relies on."""
+    name = f"{owner_name}.{method}"
+    func = getattr(owner, method, None) if owner is not None else None
+    if func is None or not _is_ninja_code(func, name):
+        raise ConfigError(
+            f"{use} rely on ninja's {name}: the installed ninja's differs from "
+            "ninja 1.7.0's and 1.7.1's, which they are verified against: "
+            "upgrade scrudful, or keep ninja at one of those releases"
+        )
 
 
 def _check_ninja_checks(

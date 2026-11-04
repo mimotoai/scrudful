@@ -2,9 +2,12 @@
 
 import json
 import re
+import types
 import uuid
 from typing import Any
 
+import ninja.router
+import ninja.testing.client
 import pytest
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
@@ -985,3 +988,83 @@ def test_target_under_parameterized_prefixes(client, settings, db):
     assert target == "http://a.example/t/acme/orgs/7/items/_hsr/pk"
     r = client.get("/t/acme/orgs/7/items/_hsr/pk", HTTP_HOST="a.example")
     assert hsr_get_problems(r.status_code, dict(r.items()), r.content) == []
+
+
+# --- the ninja internals the HSR routes and links rely on ----------------------
+
+
+@pytest.fixture
+def fresh_ninja_code():
+    """The check of ninja's code is memoized per function: start afresh."""
+    import scrudful.ninja
+
+    scrudful.ninja._is_ninja_code.cache_clear()
+    yield
+    scrudful.ninja._is_ninja_code.cache_clear()
+
+
+def wrapping(func):
+    """A function behaving as ``func`` whose code is not ninja's."""
+
+    def changed(*args, **kwargs):
+        return func(*args, **kwargs)
+
+    return changed
+
+
+@pytest.mark.parametrize("method", ["_bind_operations", "urls_paths"])
+def test_hsr_routes_need_ninjas_bound_router(monkeypatch, fresh_ninja_code, method):
+    """The routes' order and URL names are kept by these two methods."""
+    cls = ninja.router.BoundRouter
+    monkeypatch.setattr(cls, method, wrapping(getattr(cls, method)))
+    with pytest.raises(
+        ConfigError, match=rf"rely on ninja's BoundRouter\.{method}: .*upgrade"
+    ):
+        make_api()
+
+
+def test_hsr_routes_need_a_bound_router(monkeypatch, fresh_ninja_code):
+    monkeypatch.delattr(ninja.router, "BoundRouter")
+    with pytest.raises(ConfigError, match=r"ninja's BoundRouter\._bind_operations"):
+        make_api()
+
+
+def test_without_source_the_bound_router_fingerprint_is_checked(
+    monkeypatch, fresh_ninja_code
+):
+    import scrudful.ninja
+
+    monkeypatch.setattr(scrudful.ninja, "_source_digest", lambda func: None)
+    api, _ = make_api()
+    assert TestClient(api).get("/_hsr/pk").status_code == 200
+    cls = ninja.router.BoundRouter
+    monkeypatch.setattr(cls, "urls_paths", wrapping(cls.urls_paths))
+    with pytest.raises(ConfigError, match=r"ninja's BoundRouter\.urls_paths"):
+        make_api()
+
+
+def test_target_under_test_client_needs_ninjas_resolve(monkeypatch, fresh_ninja_code):
+    cls = ninja.testing.client.NinjaClientBase
+    monkeypatch.setattr(cls, "_resolve", wrapping(cls._resolve))
+    client = TestClient(mount(target_router("a")))
+    with pytest.raises(ConfigError, match=r"ninja's NinjaClientBase\._resolve"):
+        client.get("/1/target")
+
+
+def test_target_under_test_client_needs_ninjas_urls(monkeypatch):
+    client = TestClient(mount(target_router("a")))
+    assert client.get("/1").status_code == 200  # the client keeps the patterns
+    monkeypatch.setattr(NinjaAPI, "urls", property(lambda self: {"patterns": []}))
+    with pytest.raises(ConfigError, match=r"NinjaAPI\.urls.*upgrade"):
+        client.get("/1/target")
+
+
+def test_target_needs_the_operations_api():
+    from scrudful.ninja import _operation_api
+
+    with pytest.raises(ConfigError, match=r"ninja's Operation\.api.*upgrade"):
+        _operation_api(types.SimpleNamespace())
+    with pytest.raises(ConfigError, match=r"Operation\.api"):
+        _operation_api(types.SimpleNamespace(api=None))
+    with pytest.raises(ConfigError, match="functools.wraps"):
+        _operation_api(None)
