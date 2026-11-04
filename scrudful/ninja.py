@@ -572,6 +572,7 @@ __all__ = [
     "scrudful_list",
 ]
 
+
 def handler404(error: Entity) -> Callable[..., HttpResponse]:
     """A Django ``handler404`` that answers JSON unless the client prefers HTML.
 
@@ -587,7 +588,6 @@ def handler500(error: Entity) -> Callable[..., HttpResponse]:
     In ``urls.py``: ``handler500 = scrudful.ninja.handler500(ERROR)``.
     """
     return error_handler(500, error)
-
 
 
 #: OpenAPI descriptions of the responses ``@scrudful`` can produce for GET/HEAD
