@@ -530,6 +530,7 @@ from scrudful._django import (
     Render,
     aware,
     conditional_response,
+    error_handler,
     json_response,
     page_url,
     precondition_headers,
@@ -564,10 +565,30 @@ __all__ = [
     "ScrudfulResponse",
     "ScrudfulRouter",
     "add_error_links",
+    "handler404",
+    "handler500",
     "scrudful",
     "scrudful_create",
     "scrudful_list",
 ]
+
+def handler404(error: Entity) -> Callable[..., HttpResponse]:
+    """A Django ``handler404`` that answers JSON unless the client prefers HTML.
+
+    In ``urls.py``: ``handler404 = scrudful.ninja.handler404(ERROR)``, with
+    ``ERROR`` an :class:`Entity` of plain (non-callable) link values.
+    """
+    return error_handler(404, error)
+
+
+def handler500(error: Entity) -> Callable[..., HttpResponse]:
+    """A Django ``handler500`` that answers JSON unless the client prefers HTML.
+
+    In ``urls.py``: ``handler500 = scrudful.ninja.handler500(ERROR)``.
+    """
+    return error_handler(500, error)
+
+
 
 #: OpenAPI descriptions of the responses ``@scrudful`` can produce for GET/HEAD
 #: without calling the handler. Pass it to the operation decorator, e.g.

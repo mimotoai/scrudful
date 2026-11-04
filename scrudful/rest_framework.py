@@ -162,7 +162,7 @@ from scrudful._adapter import (
     validator_policy,
     with_error_body,
 )
-from scrudful._django import aware, page_url, slice_page
+from scrudful._django import aware, error_handler, page_url, slice_page
 from scrudful._django import conditional_response as django_conditional_response
 from scrudful._django import precondition_headers as django_precondition_headers
 from scrudful.conditional import (
@@ -188,10 +188,30 @@ __all__ = [
     "ScrudfulPagination",
     "ScrudfulViewFunc",
     "exception_handler",
+    "handler404",
+    "handler500",
     "scrudful",
     "scrudful_api_view",
     "scrudful_viewset",
 ]
+
+
+def handler404(error: Entity) -> Callable[..., HttpResponseBase]:
+    """A Django ``handler404`` that answers JSON unless the client prefers HTML.
+
+    In ``urls.py``: ``handler404 = scrudful.rest_framework.handler404(ERROR)``,
+    with ``ERROR`` an :class:`Entity` of plain (non-callable) link values.
+    """
+    return error_handler(404, error)
+
+
+def handler500(error: Entity) -> Callable[..., HttpResponseBase]:
+    """A Django ``handler500`` that answers JSON unless the client prefers HTML.
+
+    In ``urls.py``: ``handler500 = scrudful.rest_framework.handler500(ERROR)``.
+    """
+    return error_handler(500, error)
+
 
 # Set on the request while a ScrudfulViewFunc handles it, so that a wrapped
 # method calling another one (partial_update -> update) is handled once.

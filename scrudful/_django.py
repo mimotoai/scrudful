@@ -10,7 +10,7 @@ import math
 import warnings
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from django.core.paginator import UnorderedObjectListWarning
@@ -24,14 +24,20 @@ from django.http import (
     QueryDict,
 )
 from django.utils import timezone
+from django.utils.cache import patch_vary_headers
+from django.views import defaults
 
 from scrudful import _adapter
 from scrudful.collection import InvalidPage
 from scrudful.conditional import ConditionalResult
+from scrudful.entity import Entity
+from scrudful.problem import PROBLEM_JSON, problem_from_errors
+from scrudful.utils import join_links, link_content, resolve_uri
 
 __all__ = [
     "aware",
     "conditional_response",
+    "error_handler",
     "json_response",
     "page_url",
     "precondition_headers",
@@ -93,6 +99,102 @@ def json_response(
     if render is None:
         return JsonResponse(data, status=status, content_type=content_type)
     return render(data, status, content_type)
+
+
+def _plain_links(entity: Entity, request: HttpRequest) -> str | None:
+    """The Link field value of ``entity``'s plain schema and context links.
+
+    The same rels, types and defaults as the adapters' error Links; a
+    relative URL resolves against the request.
+    """
+    base = request.build_absolute_uri()
+    candidates = [
+        (
+            entity.schema_link_or_func,
+            entity.schema_rel_or_func,
+            entity.schema_type_or_func,
+            (_adapter.DEFAULT_SCHEMA_REL, _adapter.DEFAULT_SCHEMA_TYPE),
+            None,
+        )
+    ]
+    context_defaults = _adapter.context_defaults(entity.media_type)
+    if context_defaults != (None, None):
+        candidates.append(
+            (
+                entity.context_link_or_func,
+                entity.context_rel_or_func,
+                entity.context_type_or_func,
+                context_defaults,
+                entity.media_type,
+            )
+        )
+    parts = []
+    for url, rel, content_type, defaults_, context_of in candidates:
+        if not url:
+            continue
+        if context_of is not None:
+            content_type = _adapter.context_link_type(context_of, content_type)
+        parts.append(
+            link_content(
+                resolve_uri(url, base),
+                rel or defaults_[0],
+                content_type or defaults_[1],
+            )
+        )
+    return join_links(*parts) if parts else None
+
+
+def error_handler(
+    status: Literal[404, 500], error: Entity
+) -> Callable[..., HttpResponse]:
+    """A Django ``handler404`` / ``handler500`` that honours ``Accept``.
+
+    The view answers with Django's HTML page when the client prefers
+    ``text/html`` to the entity's media type, else with a JSON body (RFC 9457
+    problem details for ``application/problem+json``, else
+    ``{"detail": <reason phrase>}``) served as ``error.media_type`` with the
+    entity's Links. It always sends ``Vary: Accept``.
+
+    Raises
+    ------
+    TypeError
+        If a link of ``error`` is a callable.
+    """
+    if any(
+        callable(value)
+        for value in (
+            error.schema_link_or_func,
+            error.schema_rel_or_func,
+            error.schema_type_or_func,
+            error.context_link_or_func,
+            error.context_rel_or_func,
+            error.context_type_or_func,
+        )
+    ):
+        raise TypeError("handler404/handler500 need an Entity with plain link values")
+
+    def view(request: HttpRequest, exception: Exception | None = None) -> HttpResponse:
+        if _adapter.prefers_html(request.headers.get("Accept"), error.media_type):
+            if status == 404:
+                response = defaults.page_not_found(
+                    request, exception  # type: ignore[arg-type]
+                )
+            else:
+                response = defaults.server_error(request)
+        else:
+            if _adapter.essence(error.media_type) == PROBLEM_JSON:
+                body = problem_from_errors(status, None)
+            else:
+                body = {"detail": _adapter.reason_phrase(status)}
+            response = json_response(body, status, error.media_type)
+            link = _plain_links(error, request)
+            if link:
+                response["Link"] = link
+        patch_vary_headers(response, ["Accept"])
+        _adapter.expose_headers(response)
+        return response
+
+    return view
 
 
 def aware(value: Any) -> Any:

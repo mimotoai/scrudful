@@ -699,6 +699,68 @@ def with_error_body(
     return dataclasses.replace(result, body=body)
 
 
+def _accept_ranges(accept: str) -> list[tuple[str, float]]:
+    """The ``(type/subtype range, q)`` pairs of an Accept field value."""
+    ranges = []
+    for item in accept.split(","):
+        pieces = [piece.strip() for piece in item.split(";")]
+        media_range = pieces[0].lower()
+        if "/" not in media_range:
+            continue
+        weight = 1.0
+        for parameter in pieces[1:]:
+            name, _, value = parameter.partition("=")
+            if name.strip().lower() == "q":
+                try:
+                    weight = min(max(float(value.strip()), 0.0), 1.0)
+                except ValueError:
+                    weight = 0.0
+                break
+        ranges.append((media_range, weight))
+    return ranges
+
+
+def _accept_rank(
+    ranges: list[tuple[str, float]], media_type: str
+) -> tuple[float, int]:
+    """``(q, specificity)`` of ``media_type`` for the Accept ``ranges``.
+
+    The most specific matching range decides (RFC 9110 section 12.5.1);
+    ``(0.0, -1)`` when none matches.
+    """
+    kind = media_type.partition("/")[0]
+    best = -1
+    weight = 0.0
+    for media_range, q in ranges:
+        if media_range == media_type:
+            specificity = 2
+        elif media_range == f"{kind}/*":
+            specificity = 1
+        elif media_range == "*/*":
+            specificity = 0
+        else:
+            continue
+        if specificity > best:
+            best, weight = specificity, q
+    return weight, best
+
+
+def prefers_html(accept: str | None, media_type: str) -> bool:
+    """Whether an Accept field value prefers ``text/html`` to ``media_type``.
+
+    True iff the quality of ``text/html`` is strictly greater than that of
+    ``media_type``'s essence; at equal quality the more specific range wins
+    (RFC 9110 section 12.5.1), so ``text/html,*/*;q=0.8`` prefers HTML and
+    ``*/*`` does not. An absent or empty ``accept`` prefers nothing.
+    """
+    if not accept or not accept.strip():
+        return False
+    ranges = _accept_ranges(accept)
+    html = _accept_rank(ranges, "text/html")
+    other = _accept_rank(ranges, essence(media_type))
+    return html[0] > 0 and html > other
+
+
 def reason_phrase(status: int) -> str:
     """The reason phrase of ``status`` (django-ninja's OpenAPI text when unknown)."""
     try:
