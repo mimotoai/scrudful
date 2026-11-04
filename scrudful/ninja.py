@@ -1846,8 +1846,11 @@ def described(entity: Entity) -> Callable[[Handler], Handler]:
 
     The HTTP Schema Resource then describes the operation's request body
     (POST, PUT, PATCH) and its 2xx responses but 204 with ``entity``'s
-    ``content``; scrudful adds nothing to the operation's responses. ninja's
-    operation decorators don't pass unknown arguments on, so it is a
+    ``content``. From scrudful 0.10.0, those responses get ``entity``'s
+    schema and context Links and the HTTP Schema Resource link, as a
+    scrudful operation's do, so that they agree with the description; until
+    then, an operation used on its own must send these Links itself.
+    ninja's operation decorators don't pass unknown arguments on, so it is a
     decorator, below the operation decorator::
 
         @router.get("/health")

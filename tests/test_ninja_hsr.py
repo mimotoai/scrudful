@@ -10,6 +10,7 @@ from django.core.exceptions import ImproperlyConfigured
 from ninja import NinjaAPI, Router
 from ninja.errors import ConfigError
 from ninja.security import APIKeyHeader
+from django.urls import path
 from ninja.testing import TestClient
 
 from scrudful._django import scrudful_setting
@@ -113,19 +114,34 @@ class KeyAuth(APIKeyHeader):
 
 # --- requester independence ----------------------------------------------------
 
+#: Two APIs of identical routers, so that each request builds its router's
+#: HTTP Schema Resource (it is built once, by the first request): one
+#: answers an anonymous requester on one host, the other an authenticated
+#: one on another.
+HOST_A_API, HOST_A_ROUTER = make_api(auth=KeyAuth())
+HOST_B_API, HOST_B_ROUTER = make_api(auth=KeyAuth())
 
-def test_hsr_is_identical_across_hosts_and_requesters():
-    api, router = make_api(base_url="https://api.example/")
-    a = options(TestClient(router), "/1", headers={"Host": "a.example"})
-    b = options(
-        TestClient(router), "/1", headers={"Host": "b.example", "X-API-Key": ALICE}
+# For Django's test client: real hosts, which ninja's TestClient ignores.
+urlpatterns = [path("a/", HOST_A_API.urls), path("b/", HOST_B_API.urls)]
+
+
+@pytest.mark.urls(__name__)
+def test_hsr_is_identical_across_hosts_and_requesters(client, settings, db):
+    settings.ALLOWED_HOSTS = ["a.example", "b.example"]
+    assert client.get("/a/1", HTTP_HOST="a.example").status_code == 401
+    assert (
+        client.get("/b/1", HTTP_HOST="b.example", HTTP_X_API_KEY=ALICE).status_code
+        == 200
     )
+    a = client.options("/a/1", HTTP_HOST="a.example")
+    b = client.options("/b/1", HTTP_HOST="b.example", HTTP_X_API_KEY=ALICE)
     assert a.status_code == b.status_code == 200
     assert a.content == b.content
+    assert json.loads(a.content) == http_schema_resource(HOST_A_ROUTER, "/{pk}")
     assert (
-        http_schema_resource(router, "/{pk}")["get"]["responses"]["200"]["content"][
-            "application/json"
-        ]["schema"]["$ref"]
+        http_schema_resource(HOST_A_ROUTER, "/{pk}")["get"]["responses"]["200"][
+            "content"
+        ]["application/json"]["schema"]["$ref"]
         == "https://api.example/schemas/item"
     )
 
