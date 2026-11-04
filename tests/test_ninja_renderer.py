@@ -22,6 +22,7 @@ from scrudful.problem import PROBLEM_JSON, problem_details
 
 from tests.test_ninja_adapter import (
     LINKS,
+    TEST_BASE_URL,
     ItemIn,
     ItemOut,
     Store,
@@ -82,7 +83,7 @@ def router(store: Store, asynchronous: bool = False, **extra: Any) -> Router:
     options = dict(
         load=store.load, etag_func=etag, last_modified_func=modified, **LINKS, **extra
     )
-    items = ScrudfulRouter()
+    items = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     if asynchronous:
 

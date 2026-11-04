@@ -22,11 +22,19 @@ from roles.api import save_role
 from roles.models import Role
 
 from scrudful._adapter import allow_header, describe_options, options_links
+from scrudful._hsr import options_operation
 from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS
 from scrudful_ninja.api import api
 from tests.semantic_http import link_problems, validate_http_schema_resource
 
 pytestmark = pytest.mark.django_db
+
+
+@pytest.fixture(autouse=True)
+def base_url(settings):
+    """The links' base URL: Django's test client serves testserver."""
+    settings.SCRUDFUL = {"BASE_URL": "http://testserver/"}
+
 
 BASE = "http://testserver"
 API = f"{BASE}/api"
@@ -508,9 +516,11 @@ def test_options_item(client, role):
     assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
     assert response.headers["Allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
     assert response.headers["Allow"] == allow_header(body)
-    assert body["options"] == describe_options()
+    assert body["options"] == options_operation()
     assert body["get"]["responses"]["200"]["content"] == content("role")
-    assert set(body["get"]["responses"]) == {"200", "304", "400", "412"}
+    assert set(body["get"]["responses"]) == {"200", "304", "400", "412", "default"}
+    # The errors get the error entity (add_error_links' and the operations').
+    assert body["get"]["responses"]["default"]["content"] == content("error")
     # HEAD is described like GET, without content: its responses have none.
     assert set(body["head"]["responses"]) == set(body["get"]["responses"])
     for response_ in body["head"]["responses"].values():
@@ -565,7 +575,7 @@ def test_options_search(client):
     assert body["post"]["requestBody"]["content"] == content("role-search")
     assert body["post"]["responses"]["200"]["content"] == content("role-search-result")
     # A search answers 200, not a create's 201.
-    assert set(body["post"]["responses"]) == {"200"}
+    assert set(body["post"]["responses"]) == {"200", "default"}
 
 
 def test_responses_agree_with_options(client, role):
@@ -695,6 +705,9 @@ def test_example_links_everywhere(client, role, method, path, arguments, status)
         arguments["content_type"] = "application/json"
         arguments["data"] = json.dumps(arguments["data"])
     hsr = client.options(path).json()
+    if method == "options":
+        # Until OPTIONS answers 204, its 200 agrees with the entry it had.
+        hsr = {**hsr, "options": describe_options()}
     response = getattr(client, method)(path, **arguments)
     assert response.status_code == status
     has_content = (

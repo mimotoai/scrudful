@@ -45,6 +45,11 @@ LINKS = dict(schema_link_or_func="/schemas/item", context_link_or_func="/context
 METHODS = ["GET", "PUT", "PATCH", "DELETE"]
 IF_HEADERS = [{}, {"If-Match": "*"}, {"If-None-Match": "*"}, {"If-Match": '"stale"'}]
 
+#: The base URL of the test routers (``ScrudfulRouter(base_url=...)``):
+#: ninja's TestClient builds absolute URIs against it, so relative links
+#: resolve the same in the HTTP Schema Resource and on the responses.
+TEST_BASE_URL = "http://testlocation/"
+
 ALICE = {"X-API-Key": "alice"}
 MISSING = 3  # no such row
 HIDDEN = 2  # a row alice may not see
@@ -1203,7 +1208,7 @@ def test_router_add_decorator_wraps_the_bound_operations(store, mode):
     def get_item(request, pk: int, obj):
         return obj
 
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     router.get("/x/{pk}", response=ItemOut)(get_item)
     router.get("/y/{pk}", response={202: ItemOut})(get_item)
     router.add_decorator(recording(seen, mode), mode=mode)

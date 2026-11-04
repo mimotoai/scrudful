@@ -11,7 +11,7 @@ from ninja.testing import TestAsyncClient, TestClient
 
 from scrudful.ninja import Entity, ScrudfulRouter, scrudful_create
 from scrudful.problem import PROBLEM_JSON, problem_details
-from tests.test_ninja_adapter import ItemIn, ItemOut, Store, etag
+from tests.test_ninja_adapter import TEST_BASE_URL, ItemIn, ItemOut, Store, etag
 from tests.test_ninja_entities import ERROR, ERROR_LINK
 from tests.test_ninja_options import options
 
@@ -35,7 +35,7 @@ def collection_modified(items: list[Any]) -> datetime:
 
 def create_router(store: Store, router: Router | None = None, **options: Any) -> Router:
     """``POST /items`` whose collection is ``store.items`` (two rows: ``"n2"``)."""
-    router = router or ScrudfulRouter()
+    router = router or ScrudfulRouter(base_url=TEST_BASE_URL)
 
     def items(request: Any, **params: Any) -> list[Any]:
         store.calls["list_load"] += 1
@@ -215,7 +215,7 @@ def test_options_describes_the_412(store):
 
 
 def test_async_create_with_async_list_load(store):
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     async def items(request: Any, **params: Any) -> list[Any]:
         return list(store.items.values())
@@ -280,7 +280,7 @@ def test_sync_handler_rejects_async_list_load():
 
 @pytest.mark.parametrize("method", ["put", "patch"])
 def test_list_validators_on_an_operation_without_post_are_rejected(method):
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     decorate = scrudful_create(
         location_func=lambda request, item: "/x",
         list_load=lambda request, **params: [],
@@ -294,7 +294,7 @@ def test_list_validators_on_an_operation_without_post_are_rejected(method):
 
 
 def test_list_validators_on_an_operation_with_post_are_accepted():
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.api_operation(["POST", "PUT"], "/items", response={201: ItemOut})
     @scrudful_create(

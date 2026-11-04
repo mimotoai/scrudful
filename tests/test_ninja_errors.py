@@ -28,6 +28,7 @@ from tests.test_ninja_adapter import (
     LINKS,
     MISSING,
     SCHEMA_LINK,
+    TEST_BASE_URL,
     Deny,
     ItemIn,
     ItemOut,
@@ -77,7 +78,7 @@ def get(client: Any, path: str, headers: dict[str, str] | None = None) -> Any:
 
 def raising_router(asynchronous: bool, **options: Any) -> Router:
     """``GET /items/{pk}`` whose handler raises ``HttpError(404, "x")``."""
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     decorate = router.get("/items/{pk}", response={200: ItemOut, 404: Message})
     if asynchronous:
 
@@ -247,7 +248,7 @@ def test_agreement_for_declared_404(store):
 
 def test_agreement_for_conditional_400(store):
     """A raised 400 on a conditional GET: ``error``, as OPTIONS describes it."""
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     def load(request, pk: int):
         raise HttpError(400, "bad")
@@ -524,7 +525,7 @@ PROBLEM_LINK = (
 
 
 def test_early_errors_are_served_as_the_error_media_type(store):
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.get("/items/{pk}", response=ItemOut)
     @scrudful(load=store.load, etag_func=etag, error=PROBLEM, **LINKS)
@@ -569,7 +570,7 @@ def test_early_errors_are_served_as_the_error_media_type(store):
 
 
 def test_early_errors_without_error_are_json(store):
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.get("/items/{pk}", response=ItemOut)
     @scrudful(load=store.load, etag_func=etag, **LINKS)
@@ -602,7 +603,7 @@ def test_error_media_type_must_be_json(media_type):
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
 def test_raised_error_is_served_as_the_error_media_type(store, asynchronous):
     """A handler-raised 400 agrees with OPTIONS, which lists it as problem+json."""
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     if asynchronous:
 
         @router.get("/items/{pk}", response=ItemOut)

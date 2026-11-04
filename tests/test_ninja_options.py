@@ -23,11 +23,13 @@ from scrudful._adapter import (
     describe_options,
     options_links,
 )
+from scrudful._hsr import options_operation
 from scrudful.ninja import (
     CONDITIONAL_READ_RESPONSES,
     CONDITIONAL_WRITE_RESPONSES,
     Entity,
     ScrudfulRouter,
+    described,
     scrudful,
     scrudful_create,
     scrudful_list,
@@ -37,6 +39,7 @@ from tests.test_ninja_adapter import (
     ALICE,
     HIDDEN,
     LINKS,
+    TEST_BASE_URL,
     ItemIn,
     ItemOut,
     KeyAuth,
@@ -84,6 +87,21 @@ REQUIRED = {
     "(send If-Match or If-Unmodified-Since)."
 }
 EITHER = " Either If-Match or If-Unmodified-Since is required."
+#: The ``default`` entry of an operation without an error entity.
+DEFAULT_ERROR = {"description": "Error."}
+#: ninja's own errors, described for an operation whose ``error`` differs
+#: from the API-wide entity (none here: no content).
+FRAMEWORK_ERRORS = {
+    "401": {
+        "description": "Unauthorized: the request lacks valid authentication "
+        "credentials."
+    },
+    "422": {
+        "description": "Unprocessable Content: the request's parameters or "
+        "body are invalid."
+    },
+    "429": {"description": "Too Many Requests: the request was throttled."},
+}
 BOTH_PARAMETERS = [
     {
         "in": "header",
@@ -106,13 +124,20 @@ def options(client: TestClient, path: str, **kwargs: Any) -> Any:
     return client.request("OPTIONS", path, **kwargs)
 
 
+def answered_hsr(body: dict[str, Any]) -> dict[str, Any]:
+    """``body`` with the ``options`` entry of the 200 OPTIONS response that
+    returned it, for agreement checks of that response: until OPTIONS answers
+    204, the HTTP Schema Resource's own entry (a 204) doesn't describe it."""
+    return {**body, "options": describe_options()}
+
+
 def item_router(
     store: Store,
     router: Router | None = None,
     methods: tuple[str, ...] = ("GET", "PUT", "DELETE"),
 ) -> Router:
     """Scrudful ``methods`` on ``/items/{pk}``, with both validators."""
-    router = ScrudfulRouter() if router is None else router
+    router = ScrudfulRouter(base_url=TEST_BASE_URL) if router is None else router
     item = dict(load=store.load, etag_func=etag, last_modified_func=modified, **LINKS)
     if "GET" in methods:
 
@@ -159,7 +184,7 @@ def item_router(
 
 def list_router(store: Store, router: Router | None = None) -> Router:
     """A scrudful list GET and a create POST on ``/items``."""
-    router = ScrudfulRouter() if router is None else router
+    router = ScrudfulRouter(base_url=TEST_BASE_URL) if router is None else router
 
     @router.get("/items", response=List[ItemOut])
     @scrudful_list(
@@ -212,7 +237,7 @@ ERROR = Entity(
 
 def described_router(store: Store) -> Router:
     """One path of each kind: item, list and create, search, ``error``, no links."""
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     # Before ``/items/{pk}``, which would match it too.
     @router.post("/items/search", response=List[ItemOut])
@@ -248,7 +273,8 @@ DESCRIBED_PATHS = ("/items/1", "/items", "/items/search", "/jobs/1", "/bare/1")
 def conformance_router(store: Store) -> Router:
     """The shape of the example project: an item GET/HEAD, PUT and PATCH with
     ``error``, a collection create and an item with a relative schema URL."""
-    router = ScrudfulRouter()
+    # Django's test client serves it: its absolute URIs are testserver's.
+    router = ScrudfulRouter(base_url="http://testserver/")
     item = dict(
         load=store.load,
         etag_func=etag,
@@ -329,12 +355,16 @@ def test_options_headers(store):
         assert response.headers["Link"] == options_links()
         body = response.json()
         assert response.headers["Allow"] == allow_header(body)
-        assert link_problems("OPTIONS", 200, response.headers, True, body) == []
+        assert (
+            link_problems("OPTIONS", 200, response.headers, True, answered_hsr(body))
+            == []
+        )
+        assert body["options"] == options_operation()
         assert expose(response) == {"Link", "Allow"}
 
 
 def test_options_lists_options_and_head(store):
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.api_operation(["GET", "HEAD"], "/items/{pk}", response=ItemOut)
     @scrudful(load=store.load, etag_func=etag, error=ERROR, **LINKS)
@@ -345,7 +375,7 @@ def test_options_lists_options_and_head(store):
     body = response.json()
     assert list(body) == ["get", "options", "head"]
     assert response.headers["Allow"] == "GET, OPTIONS, HEAD"
-    assert body["options"] == describe_options()
+    assert body["options"] == options_operation()
     assert body["get"]["responses"]["200"]["content"]
     assert set(body["head"]["responses"]) == set(body["get"]["responses"])
     for response_ in body["head"]["responses"].values():
@@ -374,10 +404,11 @@ def test_relative_links_resolved(client, db):
 
 def test_mixed_path_agrees(store):
     """Review Focus 5: a scrudful GET and a plain ninja PUT on one path."""
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     item_router(store, router, methods=("GET",))
 
     @router.put("/items/{pk}", response={200: ItemOut, 404: Message})
+    @described(Entity())
     def plain_put(request, pk: int, payload: ItemIn):
         raise HttpError(404, "Not Found")
 
@@ -448,7 +479,7 @@ def test_view_link_not_duplicated(store):
 def test_options_media_type_objects():
     """Non-JSON entities: an ``x-schema``, and an ``x-rdf-context`` unless the
     media type is in-band RDF; the Links agree with them."""
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     csv = Entity(
         "/schemas/rows",
         schema_type_or_func="application/csvm+json",
@@ -507,7 +538,7 @@ def test_a_context_type_callable_of_non_json_content(context_type):
         context_type_or_func=lambda request, obj: context_type,
         media_type="text/csv",
     )
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.get("/rows/{pk}")
     @scrudful(responses={200: csv})
@@ -536,10 +567,11 @@ def test_a_context_type_callable_of_non_json_content(context_type):
 
 
 def test_options_trace_when_routed(store):
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     item_router(store, router, methods=("GET",))
 
     @router.api_operation(["TRACE"], "/items/{pk}", response={200: Message})
+    @described(Entity())
     def trace(request, pk: int):
         return {"detail": "trace"}
 
@@ -547,13 +579,15 @@ def test_options_trace_when_routed(store):
     body = response.json()
     assert list(body) == ["get", "options", "trace"]
     assert response.headers["Allow"] == "GET, OPTIONS, TRACE"
-    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    assert body["trace"] == {
+        "responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}
+    }
     validate_http_schema_resource(body)
 
 
 def test_trace_gets_no_default_entity():
     """A TRACE's content is the echoed request, not the item."""
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.api_operation(["GET", "TRACE"], "/items/{pk}", response={200: Message})
     @scrudful(**LINKS)
@@ -573,7 +607,9 @@ def test_trace_gets_no_default_entity():
     body = options(client, "/items/1").json()
     validate_http_schema_resource(body)
     assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
-    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    assert body["trace"] == {
+        "responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}
+    }
     response = client.request("TRACE", "/items/1")
     assert response.status_code == 200
     assert "Link" not in response.headers
@@ -593,7 +629,7 @@ def test_trace_gets_no_default_entity():
 
 def test_trace_ignores_preconditions(store):
     """A TRACE's content is no representation: no If-*, no validators."""
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.api_operation(["GET", "TRACE"], "/items/{pk}", response={200: Message})
     @scrudful(load=store.load, etag_func=etag, last_modified_func=modified)
@@ -610,7 +646,9 @@ def test_trace_ignores_preconditions(store):
     assert client.get("/items/1", headers={"If-Match": '"nope"'}).status_code == 412
     body = options(client, "/items/1").json()
     validate_http_schema_resource(body)
-    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    assert body["trace"] == {
+        "responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}
+    }
     assert "412" in body["get"]["responses"]
 
 
@@ -619,7 +657,7 @@ def test_router_rejects_options_links():
         ScrudfulRouter(options_schema_link="x")
     with pytest.raises(TypeError):
         ScrudfulRouter(options_context_link="x")
-    assert not hasattr(ScrudfulRouter(), "options_schema_link")
+    assert not hasattr(ScrudfulRouter(base_url=TEST_BASE_URL), "options_schema_link")
 
 
 # --- the automatic operation -----------------------------------------------
@@ -648,6 +686,7 @@ def test_options_body(store):
                 "304": NOT_MODIFIED,
                 "400": MALFORMED,
                 "412": FAILED,
+                "default": DEFAULT_ERROR,
             }
         },
         "put": {
@@ -665,6 +704,7 @@ def test_options_body(store):
                 # entity), the 409 has no entity.
                 "201": {"description": "Created", "content": ITEM_CONTENT},
                 "409": {"description": "Conflict"},
+                "default": DEFAULT_ERROR,
             },
             "parameters": BOTH_PARAMETERS,
         },
@@ -674,10 +714,11 @@ def test_options_body(store):
                 "400": MALFORMED,
                 "412": FAILED,
                 "428": REQUIRED,
+                "default": DEFAULT_ERROR,
             },
             "parameters": BOTH_PARAMETERS,
         },
-        "options": describe_options(),
+        "options": options_operation(),
     }
 
 
@@ -730,7 +771,7 @@ def test_cors_preflight_not_broken(store):
 
 
 def test_options_with_path_converters(store):
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.get("/ints/{int:pk}", response=ItemOut)
     @scrudful(**LINKS)
@@ -756,7 +797,7 @@ def test_options_with_path_converters(store):
 
 def test_options_default_router(store):
     api = NinjaAPI(
-        default_router=ScrudfulRouter(),
+        default_router=ScrudfulRouter(base_url=TEST_BASE_URL),
         urls_namespace=f"api-{uuid.uuid4().hex}",
     )
 
@@ -772,7 +813,7 @@ def test_options_default_router(store):
 
 
 def test_options_head_when_routed(store):
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.api_operation(["GET", "HEAD"], "/items/{pk}", response=ItemOut)
     @scrudful(load=store.load, etag_func=etag, **LINKS)
@@ -788,6 +829,7 @@ def test_options_head_when_routed(store):
             "304": NOT_MODIFIED,
             "400": MALFORMED,
             "412": FAILED,
+            "default": DEFAULT_ERROR,
         }
     }
     assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
@@ -802,6 +844,7 @@ def test_options_list_path(store):
                 "304": NOT_MODIFIED,
                 "400": MALFORMED,
                 "412": FAILED,
+                "default": DEFAULT_ERROR,
             }
         },
         "post": {
@@ -816,16 +859,17 @@ def test_options_list_path(store):
                 "201": {"description": "Created", "content": ITEM_CONTENT},
                 "400": MALFORMED,
                 "412": FAILED,
+                "default": DEFAULT_ERROR,
             },
         },
-        "options": describe_options(),
+        "options": options_operation(),
     }
     validate_http_schema_resource(body)
     assert store.calls == {}
 
 
 def test_options_entities():
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     error = Entity(
         schema_link_or_func="/schemas/error", context_link_or_func="/contexts/error"
     )
@@ -902,12 +946,16 @@ def test_options_entities():
         },
         # A Media Type Object needs a schema: a context alone is not described.
         "404": {"description": "Not Found"},
+        # ninja's own errors don't get the operation's error entity.
+        **FRAMEWORK_ERRORS,
+        "default": {**DEFAULT_ERROR, "content": error_content},
     }
     assert body["delete"]["responses"] == {
         "204": {"description": "No Content"},
         "400": MALFORMED,
         "412": {**FAILED, "content": conflict_content},
         "428": REQUIRED,
+        "default": DEFAULT_ERROR,
     }
     post = options(client, "/jobs").json()["post"]
     assert "requestBody" not in post
@@ -915,12 +963,13 @@ def test_options_entities():
         "201": {"description": "Created", "content": ITEM_CONTENT},
         "400": {"description": "Bad Request"},
         "409": {"description": "Conflict", "content": conflict_content},
+        "default": DEFAULT_ERROR,
     }
 
 
 def test_options_statuses_are_those_the_operation_answers(store):
     """A create answers 201, other operations their declared codes, else 200."""
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.post("/items/search", response=List[ItemOut])
     @scrudful(**LINKS)
@@ -943,18 +992,23 @@ def test_options_statuses_are_those_the_operation_answers(store):
         return {}
 
     @router.post("/items/{pk}", response={200: ItemOut, 400: Message})
+    @described(Entity())
     def plain_post(request, pk: int, payload: ItemIn):
         return {}
 
     client = TestClient(router)
     search_responses = options(client, "/items/search").json()["post"]["responses"]
-    assert search_responses == {"200": {"description": "OK", "content": ITEM_CONTENT}}
+    assert search_responses == {
+        "200": {"description": "OK", "content": ITEM_CONTENT},
+        "default": DEFAULT_ERROR,
+    }
     archive_responses = options(client, "/items/1/archive").json()["post"]["responses"]
     assert archive_responses == {
         "202": {"description": "Accepted"},
         "404": {"description": "Not Found"},
         "400": MALFORMED,
         "412": FAILED,
+        "default": DEFAULT_ERROR,
     }
     body = options(client, "/items/1").json()
     # The DELETE declares a 200 (with a body: the default entity), not a 204.
@@ -963,25 +1017,29 @@ def test_options_statuses_are_those_the_operation_answers(store):
         "400": MALFORMED,
         "412": FAILED,
         "428": REQUIRED,
+        "default": DEFAULT_ERROR,
     }
     # No ``response=``: ninja answers 200.
     assert body["get"]["responses"] == {
-        "200": {"description": "OK", "content": ITEM_CONTENT}
+        "200": {"description": "OK", "content": ITEM_CONTENT},
+        "default": DEFAULT_ERROR,
     }
-    # Not scrudful: the declared statuses, without content.
+    # Not scrudful: the declared statuses, without content (an entity
+    # without links).
     assert body["post"]["responses"] == {
         "200": {"description": "OK"},
         "400": {"description": "Bad Request"},
+        "default": DEFAULT_ERROR,
     }
 
 
-def test_options_link_callables_get_the_request_and_none():
-    router = ScrudfulRouter()
+def test_options_link_callables_are_called_in_describe_mode():
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     calls = []
 
     def schema(request, obj):
-        calls.append((request.method, request.path, obj))
-        return f"/schemas/{request.method.lower()}"
+        calls.append((request, obj))
+        return "/schemas/options"
 
     @router.get("/items/{pk}")
     @scrudful(schema_link_or_func=schema, context_link_or_func="/contexts/get")
@@ -992,11 +1050,15 @@ def test_options_link_callables_get_the_request_and_none():
     assert body["get"]["responses"]["200"]["content"] == content(
         "/schemas/options", "/contexts/get"
     )
-    assert calls == [("OPTIONS", "/items/5", None)]
+    # Without a request or an object (func(None, None)), once: the HTTP
+    # Schema Resource is the same for every request.
+    assert calls == [(None, None)]
+    options(TestClient(router), "/items/6")
+    assert calls == [(None, None)]
 
 
 def test_options_async_operation_with_async_request_entity(store):
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     calls = []
 
     async def request_schema(request, obj):
@@ -1061,9 +1123,10 @@ def test_user_options_wins(store):
 
 
 def test_user_options_declared_first_is_kept(store):
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.api_operation(["GET", "OPTIONS"], "/items/{pk}")
+    @described(Entity())
     def own(request, pk: int):
         return {"own": request.method}
 
@@ -1075,9 +1138,10 @@ def test_user_options_declared_first_is_kept(store):
 
 
 def test_no_options_without_a_scrudful_operation():
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.get("/plain/{pk}")
+    @described(Entity())
     def plain(request, pk: int):
         return {}
 
@@ -1086,15 +1150,17 @@ def test_no_options_without_a_scrudful_operation():
 
 def test_options_mixed_operations(store):
     """Review Focus 5: only some operations of the path are scrudful."""
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.put("/items/{pk}", response={200: ItemOut, 404: Message})
+    @described(Entity())
     def plain_put(request, pk: int, payload: ItemIn):
         raise HttpError(404, "Not Found")
 
     item_router(store, router, methods=("GET",))
 
     @router.delete("/items/{pk}")
+    @described(Entity())
     def plain_delete(request, pk: int):
         return None
 
@@ -1109,16 +1175,19 @@ def test_options_mixed_operations(store):
     assert list(body) == ["get", "put", "delete", "options", "patch"]
     assert response.headers["Allow"] == "GET, PUT, DELETE, OPTIONS, PATCH"
     assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
-    # Not scrudful: no links and no precondition parameters, as in DRF, but
-    # the declared statuses.
+    # Not scrudful (an entity without links): no links and no precondition
+    # parameters, as in DRF, but the declared statuses.
     assert body["put"] == {
         "responses": {
             "200": {"description": "OK"},
             "404": {"description": "Not Found"},
+            "default": DEFAULT_ERROR,
         },
     }
     # No ``response=``: ninja answers 200 (with the handler's ``None``).
-    assert body["delete"] == {"responses": {"200": {"description": "OK"}}}
+    assert body["delete"] == {
+        "responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}
+    }
     # Scrudful without validators: links, no preconditions.
     assert body["patch"] == {
         "requestBody": {
@@ -1126,7 +1195,10 @@ def test_options_mixed_operations(store):
             "required": True,
             "content": ITEM_CONTENT,
         },
-        "responses": {"200": {"description": "OK", "content": ITEM_CONTENT}},
+        "responses": {
+            "200": {"description": "OK", "content": ITEM_CONTENT},
+            "default": DEFAULT_ERROR,
+        },
     }
     assert store.calls == {}
 
@@ -1148,7 +1220,7 @@ def test_options_nested_router_api_auth(store):
 
 
 def test_options_ignores_router_and_operation_auth(store):
-    router = ScrudfulRouter(auth=KeyAuth(store))
+    router = ScrudfulRouter(auth=KeyAuth(store), base_url=TEST_BASE_URL)
 
     @router.get("/items/{pk}", response=ItemOut, auth=KeyAuth(store))
     @scrudful(load=store.load, etag_func=etag, **LINKS)
@@ -1245,6 +1317,12 @@ def without_head(drf: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in drf.items() if key != "head"}
 
 
+def without_options(drf: dict[str, Any]) -> dict[str, Any]:
+    """``drf`` with ninja's ``options`` entry (the 204), which DRF's 200
+    OPTIONS doesn't have yet (it answers with the HSR as its body)."""
+    return {**drf, "options": options_operation()}
+
+
 def test_options_superset_of_drf(store):
     router = item_router(store, methods=("GET", "PUT", "PATCH", "DELETE"))
     list_router(store, router)
@@ -1260,9 +1338,10 @@ def test_options_superset_of_drf(store):
         pk="1",
     )
     ninja_detail = options(client, "/items/1").json()
-    detail = without_head(detail)
+    detail = without_options(without_head(detail))
     assert list(ninja_detail) == list(detail)
     assert_superset(detail, ninja_detail)
+    assert ninja_detail["options"] == options_operation()
     assert detail["put"]["responses"]["200"]["content"] == ITEM_CONTENT
     # The superset: the statuses ninja's operations declare.
     assert "409" in ninja_detail["put"]["responses"]
@@ -1270,7 +1349,7 @@ def test_options_superset_of_drf(store):
 
     listing = drf_options({"get": "list", "post": "create"})
     ninja_listing = options(client, "/items").json()
-    listing = without_head(listing)
+    listing = without_options(without_head(listing))
     assert list(ninja_listing) == list(listing)
     assert_superset(listing, ninja_listing)
     assert listing["get"]["responses"]["200"]["content"] == LIST_CONTENT

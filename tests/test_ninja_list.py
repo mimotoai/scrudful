@@ -23,6 +23,7 @@ from tests.test_ninja_adapter import (
     CONTEXT_LINK,
     LINKS,
     SCHEMA_LINK,
+    TEST_BASE_URL,
     ItemOut,
     Message,
     Store,
@@ -308,7 +309,7 @@ def test_list_validators_304(items):
 
 def test_list_trace_ignores_preconditions(items):
     """A TRACE's content is no representation of the collection."""
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     calls = []
 
     def list_etag(qs):
@@ -329,7 +330,7 @@ def test_list_trace_ignores_preconditions(items):
     assert calls == []
     assert client.get("/items", headers={"If-Match": '"nope"'}).status_code == 412
     body = client.request("OPTIONS", "/items").json()
-    assert set(body["trace"]["responses"]) == {"200"}
+    assert set(body["trace"]["responses"]) == {"200", "default"}
     assert "412" in body["get"]["responses"]
 
 

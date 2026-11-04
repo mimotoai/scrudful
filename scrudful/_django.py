@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import math
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
+from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.core.paginator import UnorderedObjectListWarning
 from django.db.models import QuerySet
 from django.http import (
@@ -41,8 +43,42 @@ __all__ = [
     "json_response",
     "page_url",
     "precondition_headers",
+    "scrudful_setting",
     "slice_page",
 ]
+
+#: The keys of the ``SCRUDFUL`` setting.
+SETTING_KEYS = frozenset(
+    {"BASE_URL", "ERROR", "HSR_CACHE_CONTROL", "HSR_ROUTE", "HSR_URL"}
+)
+
+
+def scrudful_setting(name: str, default: Any) -> Any:
+    """``settings.SCRUDFUL[name]``, or ``default`` when unset.
+
+    ``SCRUDFUL`` is an optional dict of the keys :data:`SETTING_KEYS`; the
+    per-router and per-viewset arguments override it. It is read on every
+    call, so ``override_settings`` applies.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If ``SCRUDFUL`` is not a dict, or has a key scrudful doesn't know.
+    """
+    values = getattr(settings, "SCRUDFUL", None)
+    if values is None:
+        return default
+    if not isinstance(values, Mapping):
+        raise ImproperlyConfigured(
+            f"SCRUDFUL must be a dict, not {type(values).__name__}"
+        )
+    unknown = sorted(str(key) for key in values.keys() - SETTING_KEYS)
+    if unknown:
+        raise ImproperlyConfigured(
+            f"SCRUDFUL has unknown keys {unknown}; its keys are "
+            f"{sorted(SETTING_KEYS)}"
+        )
+    return values.get(name, default)
 
 
 def precondition_headers(request: HttpRequest) -> dict[str, str]:
