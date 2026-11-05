@@ -1888,11 +1888,10 @@ def _loads_object(view: APIView, action: str | None) -> bool:
 #: ``APIException`` of a :data:`_DENIAL_STATUSES` status
 #: (:func:`_is_denial`).
 #:
-#: ``Http404`` is deliberately absent (ruling R16), unlike ninja's denials:
-#: a check that raises it, as DRF's ``DjangoObjectPermissions`` does for an
-#: object the requester may not read, hides the object, so the OPTIONS
-#: answers that 404 (as a GET would) rather than an ``Allow`` that reveals
-#: the object exists.
+#: ``Http404`` is deliberately absent, unlike ninja's denials: a check that
+#: raises it, as DRF's ``DjangoObjectPermissions`` does for an object the
+#: requester may not read, hides the object, so the OPTIONS answers that 404
+#: (as a GET would) rather than an ``Allow`` that reveals the object exists.
 _DENIALS = (DRFPermissionDenied, NotAuthenticated, PermissionDenied)
 #: The statuses of an ``APIException`` that refuses the method checked
 #: (``AuthenticationFailed``, or a 401 or 403 of the project's own), as
@@ -1918,8 +1917,7 @@ def _allowed_methods(view: APIView, request: Request) -> list[str]:
     ``scrudful_api_view(["GET"])`` doesn't).
 
     In two passes (:func:`_may_use`), so that a requester whom the view-level
-    permissions refuse every method can't tell which objects exist (ruling
-    R17):
+    permissions refuse every method can't tell which objects exist:
 
     1. each method's view-level check: ``check_permissions``, or ``True``
        for a method with an ``allowed_func``, which needs the object;
@@ -1931,11 +1929,11 @@ def _allowed_methods(view: APIView, request: Request) -> list[str]:
        loaded: a missing and an existing object both give ``Allow:
        OPTIONS``, as a GET of either is refused alike.
 
-    A method with an ``allowed_func`` always passes pass 1 (ruling R17a), so
-    a view with one loads the object for every requester: OPTIONS of a
-    missing object is then its 404 whoever asks, an existence oracle unless
-    ``get_object()`` (its queryset) hides the objects the requester may not
-    see.
+    A method with an ``allowed_func`` always passes pass 1 (the hook needs
+    the object to decide), so a view with one loads the object for every
+    requester: OPTIONS of a missing object is then its 404 whoever asks, an
+    existence oracle unless ``get_object()`` (its queryset) hides the objects
+    the requester may not see.
     """
     served = [method.upper() for method in view.allowed_methods]
     checked = [
@@ -2469,10 +2467,10 @@ def _scrudful_views() -> _Scan:
 
 def _scan_scrudful_views(resolver: URLResolver) -> _Scan:
     """The scrudful view function of each URL name under ``resolver``, and the
-    errors of the routes it can't serve, each kept apart (R28): an unnamed
-    route (which no name reaches) and a name given to the routes of two
-    different scrudful views (whose name is left out of ``views``, and whose
-    request raises), so that one bad route breaks only its own requests."""
+    errors of the routes it can't serve, each kept apart: an unnamed route
+    (which no name reaches) and a name given to the routes of two different
+    scrudful views (whose name is left out of ``views``, and whose request
+    raises), so that one bad route breaks only its own requests."""
     found: dict[str, tuple[Callable[..., Any], str]] = {}
     clashes: dict[str, str] = {}
     unnamed: list[tuple[Callable[..., Any], str]] = []
@@ -2663,15 +2661,16 @@ def _hsr_build_messages(
 
     A failure that may depend on the data (:class:`_DataDependentError`:
     a link callable raising a ``django.db.DatabaseError``, or returning
-    nothing for a context link or its type) is the warning ``scrudful.W001``: it may
-    not happen later (a callable reading the database fails before
-    ``migrate`` has created its tables, and ``migrate`` runs this check
-    first; one returning a row's URL returns nothing while the table is
-    empty), and the document is built again when it is first served. Any
-    other failure (whatever else a callable raises, such as a
-    ``NoReverseMatch`` or a ``TypeError`` of its signature; scrudful's
-    configuration errors; whatever else the build raises) is the error
-    ``scrudful.E005``, so that one view never stops the check of the others.
+    nothing for a context link or its type) is the warning
+    ``scrudful.W001``: it may not happen later (a callable reading the
+    database fails before ``migrate`` has created its tables, and
+    ``migrate`` runs this check first; one returning a row's URL returns
+    nothing while the table is empty), and the document is built again when
+    it is first served. Any other failure (whatever else a callable raises,
+    such as a ``NoReverseMatch`` or a ``TypeError`` of its signature;
+    scrudful's configuration errors; whatever else the build raises) is the
+    error ``scrudful.E005``, so that one view never stops the check of the
+    others.
     """
     where = f"the HTTP Schema Resource of the route {view_name!r} can't be built"
     try:
@@ -3030,9 +3029,9 @@ class _DataDependentError(ImproperlyConfigured):
     happen later: a link callable called as ``func(view, None)`` raised a
     database error (``django.db.DatabaseError``, its ``__cause__``), or
     returned nothing for a context link (beside a schema link) or for its
-    type, as one reading a row may while the table is empty. The system check reports
-    it as a warning (see :func:`_hsr_build_messages`); any other error of a
-    callable is a plain ``ImproperlyConfigured``."""
+    type, as one reading a row may while the table is empty. The system
+    check reports it as a warning (see :func:`_hsr_build_messages`); any
+    other error of a callable is a plain ``ImproperlyConfigured``."""
 
 
 class _Describing:
