@@ -1048,10 +1048,10 @@ this release, also need the 0.9.0 changes in the changelog):
    * django-ninja: every plain (not scrudful) operation on a
      ``ScrudfulRouter`` needs ``@described(Entity(...))`` (or
      ``scrudful_entity=``), or adding it raises ``ConfigError``;
-   * django-ninja: the API's and routers' ``add_decorator`` decorators now
-     also wrap the public HSR route, so a gate added that way makes it
-     non-public; and ``add_decorator(mode="operation")`` gates no longer gate
-     OPTIONS, nor show in its ``Allow`` (give ``allowed=``);
+   * django-ninja: the API's and routers' ``add_decorator`` decorators wrap
+     the public HSR route too, so a gate added that way makes it non-public;
+     and ``add_decorator(mode="operation")`` gates no longer gate OPTIONS,
+     nor show in its ``Allow`` (give ``allowed=``);
    * django-ninja: a ``ScrudfulRouter``'s options are checked when set as
      attributes too, and ``hsr_route`` can only be set before its first
      operation (``ConfigError``). The ninja internals OPTIONS relies on are
@@ -1071,10 +1071,11 @@ this release, also need the 0.9.0 changes in the changelog):
 
 10. **Check what now behaves differently:**
 
-    * DRF and django-ninja resolve the HSR link before the handler runs, as
-      FastAPI does: a link that can't be resolved (the ``hsr_urls()``
-      include missing, an ``hsr_url`` that raises or returns a relative URL)
-      fails the request before anything is written;
+    * every routed response of a described path carries the HSR link, so a
+      request whose link can't be resolved (the ``hsr_urls()`` include
+      missing, an ``hsr_url`` that raises or returns a relative URL) fails;
+      the link is resolved before the handler runs, so before anything is
+      written;
     * DRF: OPTIONS loads the object as the first method that passed its
       view-level checks loads it (GET, when it did): with a request of that
       method and, on a viewset, its action (``retrieve``), so a
@@ -1086,12 +1087,13 @@ this release, also need the 0.9.0 changes in the changelog):
       only when the URL kwargs have its ``lookup_url_kwarg``;
     * DRF: an undecorated action of a ``scrudful_viewset`` (``E007``) still
       answers, but no HSR describes it, and its responses get no HSR link;
-    * django-ninja: ``SCRUDFUL["HSR_URL"]`` is called with the route Django
-      resolved the request to (``request.resolver_match.route``, the full
-      path template with every prefix: ``"api/items/<pk>"``), the same under
-      ninja's ``TestClient`` for an API the root URLconf includes; a router's
-      own ``hsr_url`` gets the router's path (``"/{pk}"``). ``http_schema_resource`` and
-      ``http_schema_resource_view`` take ``api=``: pass it for a router
+    * django-ninja, serving the HSRs elsewhere: a ``SCRUDFUL["HSR_URL"]``
+      callable gets the route Django resolved the request to
+      (``request.resolver_match.route``, the full path template with every
+      prefix: ``"api/items/<pk>"``), the same under ninja's ``TestClient``
+      for an API the root URLconf includes; a router's own ``hsr_url`` gets
+      the router's path (``"/{pk}"``). Pass ``api=`` to
+      ``http_schema_resource`` and ``http_schema_resource_view`` for a router
       mounted on several APIs;
     * django-ninja, with ``add_error_links``: a 401 or 403 of a scrudful
       operation (ninja's authentication's, ``before=``'s,

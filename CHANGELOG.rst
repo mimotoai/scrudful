@@ -46,14 +46,13 @@ Behaviour change (all adapters)
   ``PermissionDenied`` from ``allowed_func`` (or a permission check);
   ninja's ``HttpError`` 401 or 403 (``AuthenticationError``,
   ``AuthorizationError``) or ``PermissionDenied`` from ``allowed``; FastAPI's
-  ``HTTPException`` 401 or 403 from
-  ``add_options(allowed=)`` (ninja and FastAPI failed the whole OPTIONS). A
-  404 a hook raises is the OPTIONS's answer; anything else propagates.
+  ``HTTPException`` 401 or 403 from ``add_options(allowed=)``. A 404 a hook
+  raises is the OPTIONS's answer; anything else propagates.
 * The HSR route and views are public under Django's
   ``LoginRequiredMiddleware`` (Django 5.1+): DRF's ``hsr_urls()`` view and
   ``http_schema_resource_view``, ninja's HSR routes and
   ``http_schema_resource_view``, and the ``handler404`` / ``handler500`` views
-  are ``login_required = False`` (they redirected to the login page).
+  are ``login_required = False``.
 * A CORS preflight (an OPTIONS with ``Origin`` and
   ``Access-Control-Request-Method``) that reaches scrudful is answered 204
   without content or Links, before any authentication, throttle, hook,
@@ -109,12 +108,11 @@ Behaviour change (all adapters)
   do the DRF decorators given one (``scrudful``, ``scrudful_api_view``,
   ``ScrudfulViewFunc``, and ``scrudful_viewset`` for ``Meta``'s item and
   ``list_`` links, whatever methods the class has) and FastAPI's
-  ``scrudful`` for its link options (it accepted one, whose HSR route then
-  answered 500); the ninja decorators (``scrudful``, ``scrudful_create``,
-  ``scrudful_list``, for the item's and the collection's links) raise
-  ``ConfigError`` chained to it (``scrudful`` and the item links of
-  ``scrudful_list`` accepted one); a callable one raises the adapter's
-  configuration error when the HSR is built (was accepted).
+  ``scrudful`` for its link options; the ninja decorators (``scrudful``,
+  ``scrudful_create``, ``scrudful_list``, for the item's and the
+  collection's links) raise ``ConfigError`` chained to it; a callable one
+  raises the adapter's configuration error when the HSR is built (0.9
+  accepted both).
   ``ScrudfulPagination`` names the view's ``Meta`` in an
   ``ImproperlyConfigured`` for an undecorated view's.
 * Problem details: with an ``application/problem+json`` error entity, the
@@ -129,20 +127,19 @@ Behaviour change (all adapters)
   entry, raised as ``ninja.errors.ConfigError``, Django's
   ``ImproperlyConfigured`` (DRF) and, for FastAPI, ``ValueError``: the
   shared ``scrudful.entity.HsrConfigError`` for a relative URL or a schema
-  without a context (FastAPI re-raised it as a plain ``ValueError``).
+  without a context.
 * ``SCRUDFUL`` (Django) must be a dict of the keys ``BASE_URL``,
   ``HSR_ROUTE``, ``HSR_URL``, ``HSR_CACHE_CONTROL`` and ``ERROR``: another
   value, or an unknown key, raises ``ImproperlyConfigured``. A base URL that
   isn't absolute is a configuration error (``ConfigError`` for ninja,
   ``ImproperlyConfigured`` for DRF and the 404 and 500 handlers,
   ``ValueError`` for FastAPI). A ``base_url`` that isn't a ``str`` is refused
-  the same way (ninja and FastAPI raised ``TypeError``).
+  the same way.
 * A ``hsr_url`` callable must return an absolute URL (a non-empty ``str`` with
   a scheme): ``None``, an empty string or a relative URL is a configuration
-  error, raised when the link is built (it was sent as a broken link).
-  ``hsr_cache_control`` (and ``SCRUDFUL["HSR_CACHE_CONTROL"]``) must not be
-  empty (an empty ``Cache-Control`` field was sent). A base URL that doesn't
-  make a relative link absolute is refused too.
+  error, raised when the link is built. ``hsr_cache_control`` (and
+  ``SCRUDFUL["HSR_CACHE_CONTROL"]``) must not be empty. A base URL that
+  doesn't make a relative link absolute is refused too.
 * ``scrudful.entity.HsrConfigError`` is the public name of the error the
   shared HSR code raises.
 
@@ -188,60 +185,52 @@ Behaviour change (ninja)
   This applies only to the statuses the operation doesn't declare in
   ``responses=``. Without an API-wide entity, nothing changes.
 * An error status declared in ``responses=`` has an HSR entry of its own,
-  with that entity's content (it fell under ``default``, the ``error``'s, or
-  the API-wide 401 and 403 entries, while the response carried the declared
-  entity's Links), and that entity wins on the wire too: the errors ninja
-  answers before the operation (its authentication's 401 and 403, its
-  validation's 422, problem details for a problem-details entity, a 429)
-  carry it, with or without ``add_error_links`` (they carried the API-wide
-  entity, or none).
+  with that entity's content, and that entity wins on the wire too: the
+  errors ninja answers before the operation (its authentication's 401 and
+  403, its validation's 422, problem details for a problem-details entity, a
+  429) carry it, with or without ``add_error_links`` (in 0.9 they carried the
+  API-wide entity, or none).
 * A path whose HSR link can't be computed (an ``hsr_url`` raising or
   returning a relative URL, a route that can't be reversed) raises on every
   request of the path. The link is resolved before the operation runs, so
-  such a request fails before the handler writes anything (it was resolved
-  once the response was made, after the write).
+  such a request fails before the handler writes anything.
 * ``add_error_links``'s entity is also the HSR's API-wide error entity, and
   calling it discards the built HSRs; its link callables are called as
   ``(None, None)`` there.
 * A router mounted on several APIs serves, on each API's HSR route, the HSR
-  of that API's ``add_error_links`` entity, or of none (was one document for
-  all, whose ``default`` entry described the entity of the APIs that called
-  ``add_error_links``, even on an API that didn't). ``http_schema_resource``
-  and ``http_schema_resource_view`` take ``api=`` to say which (pass it for
-  a router mounted on several APIs); without it, APIs that differ (one with
-  an entity and one without included) are a ``ConfigError``, an API without
-  ``add_error_links`` counting once its ``api.urls`` is built. An API
-  mounting the router after its HSR was built is taken into account
-  (``add_router`` discarded nothing).
+  of that API's ``add_error_links`` entity, or of none.
+  ``http_schema_resource`` and ``http_schema_resource_view`` take ``api=`` to
+  say which (pass it for a router mounted on several APIs); without it, APIs
+  that differ (one with an entity and one without included) are a
+  ``ConfigError``, an API without ``add_error_links`` counting once its
+  ``api.urls`` is built, and an API mounting the router after its HSR was
+  built counting too.
 * ``SCRUDFUL["HSR_URL"]`` is called with the route Django resolved the
   request to (``request.resolver_match.route``: the full path template, with
   the URLconf's, the API's and the routers' prefixes, e.g.
-  ``"api/items/<pk>"``), so that it gives each resource its own HSR (it got
-  the path relative to its router, ``"/{pk}"``, the same for every item
-  router). Under ninja's ``TestClient``, which resolves among the API's
+  ``"api/items/<pk>"``), so that it gives each resource its own HSR. Under
+  ninja's ``TestClient``, which resolves among the API's
   patterns, the route is prefixed with the API's route in the root URLconf,
   so tests get the same argument (the route below the API's root for an API
   the root URLconf doesn't include). A router's own ``hsr_url`` still gets
   its path.
 * A router mounted twice in one API links each response to the HSR route of
-  the request's mount (it linked one of them, whichever Django reversed).
-  Each mount's HSR routes have URL names of their own; they stay private.
+  the request's mount. Each mount's HSR routes have URL names of their own;
+  they stay private.
 * The ninja internals OPTIONS relies on are checked when a path gets its
-  OPTIONS operation, at startup (were checked by the first OPTIONS request
-  only, which then failed with ``ConfigError``). Where ninja's source isn't
-  installed, the weaker check by names is announced by a ``RuntimeWarning``,
-  once.
-* A change of ``SCRUDFUL`` (``override_settings``) discards the built HSRs
-  (they kept the base URL they were built with), and so does setting
-  ``router.base_url``.
+  OPTIONS operation, at startup (``ConfigError`` for a ninja whose internals
+  differ). Where ninja's source isn't installed, the weaker check by names is
+  announced by a ``RuntimeWarning``, once.
+* A change of ``SCRUDFUL`` (``override_settings``) discards the built HSRs,
+  and so does setting ``router.base_url``.
 * ``ScrudfulRouter``'s ``base_url``, ``hsr_route``, ``hsr_url``,
   ``hsr_cache_control`` and ``allowed`` attributes are checked when set, as
-  the arguments are (any value was accepted); ``hsr_route`` can only be set
-  before the router's first operation.
+  the arguments are; ``hsr_route`` can only be set before the router's first
+  operation.
 * Whether a path has an HSR route is decided once, when its first described
-  operation is added: a ``SCRUDFUL["HSR_ROUTE"]`` turned off later no longer
-  makes each response of a path with a route raise ``ConfigError`` (the
-  responses link to the route, which still serves the HSR).
+  operation is added: a ``SCRUDFUL["HSR_ROUTE"]`` changed later doesn't
+  change it (the responses keep linking to the route, which still serves the
+  HSR).
 
 Behaviour change (DRF)
 ----------------------
@@ -285,16 +274,16 @@ Behaviour change (DRF)
 * An action of a ``scrudful_viewset`` class without ``@scrudful`` (an
   ``@action``, or a method its ``mapping`` adds) gets no HSR link on its
   responses, which no HSR describes, and a route of such actions alone has no
-  HSR route and no HSR link on its OPTIONS (they were linked to an HSR
-  describing them without content). ``scrudful.E007`` reports them.
+  HSR route and no HSR link on its OPTIONS. ``scrudful.E007`` reports
+  them.
 * OPTIONS loads the object as the first method that passed its view-level
   checks loads it (GET, when it did): a request of that method and, on a
-  viewset, its action (``retrieve``), not OPTIONS's ``metadata``, so a
-  ``get_queryset`` scoped by ``self.action`` scopes it as a GET does. A
-  ``get_object`` of the view's own is called whatever the URL kwarg is named
-  (on a viewset's item action, or on a route with a URL kwarg of a generic
-  view overriding ``get_object``), so its object checks run; only the lookup
-  kwarg did. **Migration:** OPTIONS on such an item route now calls your
+  viewset, its action (``retrieve``), so a ``get_queryset`` scoped by
+  ``self.action`` scopes it as a GET does. A ``get_object`` of the view's own
+  is called whatever the URL kwarg is named (on a viewset's item action, or
+  on a route with a URL kwarg of a generic view overriding ``get_object``),
+  so its object checks run. **Migration:** OPTIONS on such an item route now
+  calls your
   ``get_object``; it must handle each route it serves (raise ``Http404`` for
   a missing object), since anything else it raises is the OPTIONS's answer.
   A plain ``APIView`` is loaded only on its lookup kwarg
@@ -330,23 +319,21 @@ Behaviour change (DRF)
 * ``Meta.hsr_route = False`` without ``Meta.hsr_url`` or
   ``SCRUDFUL["HSR_URL"]`` raises ``ImproperlyConfigured`` when the class is
   decorated, as ninja's and FastAPI's ``hsr_route=False`` without ``hsr_url``
-  do (it was reported by the system check and raised on each request, which
-  still catch a route turned off by ``SCRUDFUL["HSR_ROUTE"]``).
+  do (the system check, and each request, catch a route turned off by
+  ``SCRUDFUL["HSR_ROUTE"]``).
 
 Behaviour change (FastAPI)
 --------------------------
 
 * ``add_options`` takes keyword-only ``base_url``, ``hsr_route``, ``hsr_url``,
   ``hsr_cache_control``, ``allowed`` and ``load``; calling it again replaces
-  them all. It serves the HSRs from one ``/_hsr/{name}`` route put before every
-  other route (an ``APIRouter`` gets one route per resource), named after the
-  template with each convertor but ``str`` joined by ``-`` (``users.id``,
-  ``users.id-int``).
-* ``add_options(hsr_route=None)`` is accepted, and is the default (``True``),
-  as ninja's and DRF's ``hsr_route`` take ``None`` (it was a ``TypeError``).
+  them all. ``hsr_route`` takes ``True``, ``False`` or ``None`` (the default,
+  ``True``), as ninja's and DRF's take ``None``. It serves the HSRs from one
+  ``/_hsr/{name}`` route put before every other route (an ``APIRouter`` gets
+  one route per resource), named after the template with each convertor but
+  ``str`` joined by ``-`` (``users.id``, ``users.id-int``).
 * ``add_options(router)`` adds an OPTIONS route to the resources of the
-  routers included in the router too, at any depth (they advertised and
-  served an HSR, but answered OPTIONS with FastAPI's 405).
+  routers included in the router too, at any depth.
 * ``add_options`` raises **ValueError** (was ``TypeError``) for a link callable
   of a scrudful endpoint, or of its ``error``, that can't be called as
   ``func()``, checked up front for all of them; and for a base URL that isn't
@@ -354,8 +341,8 @@ Behaviour change (FastAPI)
   and two resources with one route name.
 * Resources are keyed by template shape: parameter names are ignored and
   convertors kept, so ``/items/{id}`` and ``/items/{item_id}``, even on
-  different routers, are one resource with one HSR and one ``Allow`` (were
-  separate path strings). Literal and convertor overlaps (``/items/new``
+  different routers, are one resource with one HSR and one ``Allow``.
+  Literal and convertor overlaps (``/items/new``
   beside ``/items/{id}``, ``{id:int}`` beside ``{name}``) stay separate.
 * ``Allow`` runs only the routes' security dependencies (``Security(...)``,
   and a ``Depends`` with a security scheme below it), resolved without the
@@ -364,15 +351,13 @@ Behaviour change (FastAPI)
   parameters, with all of them.
 * A security dependency that needs the request's body (a body, form or file
   parameter, at any depth) refuses its method in ``Allow``, for every
-  requester, unless ``add_options(allowed=)`` decides (it was skipped, and the
-  method listed for everyone); a ``RuntimeWarning`` names each such route,
-  once, when the routes are indexed.
+  requester, unless ``add_options(allowed=)`` decides; a ``RuntimeWarning``
+  names each such route, once, when the routes are indexed.
 * The FastAPI internals the ``Allow`` checks rely on (``solve_dependencies``,
   and how a route's ``dependencies=`` map onto its dependant) are checked by
   ``add_options``, at startup, when a route has security dependencies to
-  check: its ``RuntimeError`` was raised by the first authenticated OPTIONS
-  only. OPTIONS still checks the routes added later; its own check of
-  ``solve_dependencies`` is done once per function.
+  check (``RuntimeError`` for a FastAPI whose internals differ); OPTIONS
+  checks those of the routes added later.
 * The HSR describes the route's ``status_code=`` and the statuses of its
   ``responses=`` (was the status code only), the endpoint's ``entity=`` media
   type (was always ``application/json``); a declared success media type
@@ -384,43 +369,34 @@ Behaviour change (FastAPI)
   raised again once the response is sent). Its handlers' responses on a
   described path also get the HSR link. A Link of that 500 failing to build
   (a link callable or ``hsr_url`` raising, as the endpoint did) is logged on
-  the ``scrudful.fastapi`` logger and the 500 sent without it (the link's
-  exception replaced the endpoint's, and the server sent its bare 500).
+  the ``scrudful.fastapi`` logger and the 500 sent without it, so the
+  exception raised again stays the endpoint's.
 * scrudful's early 400, 412 and 428 keep the Links a dependency set on the
   injected ``Response``, merged by relation, except those with the
   ``describedby`` or an RDF context relation (0.9 dropped them all).
 * scrudful's early 400, 412 and 428 of an endpoint without ``error=`` carry
   the Links of the app's ``add_error_links`` entity, and its media type as
   their ``Content-Type``, and the HSR's 400, 412 and 428 entries have its
-  content (they had no schema or context Link, nor content, while the
-  ``application/json`` they were served as was described). Its link callables
-  are called with ``request=`` there, as in the app's handlers.
+  content (0.9 sent them as ``application/json`` without schema or context
+  Links). Its link callables are called with ``request=`` there, as in the
+  app's handlers.
 * The callables ``add_options`` calls outside the endpoint are called as
   ``func()`` (were given the URL's path parameters and the request);
   ``add_error_links``' calls are unchanged.
 * A router's resource added after its ``add_options`` call, with the router's
   route decorators, ``add_api_route`` or ``include_router`` (its own or those
   of a router included in it), gets its OPTIONS and HSR routes as it is added,
-  its callables checked then (it had none, and its responses no HSR link,
-  silently, until ``add_options`` was called again): ``add_options(router)``
-  wraps those methods on the routers. A route appended to the router's
-  ``routes`` (or by ``APIRouter.add_api_route(router, ...)``) still gets none
-  until the next route is added with the router's methods or ``add_options``
-  is called again, and a ``RuntimeWarning`` now names it, at the latest when
-  the route first responds. An HSR route replaced in (or removed from) the
-  routes makes OPTIONS answer without the HSR link until then (it raised
-  ``NoMatchFound``). A copy of such a router
-  (``copy.copy``) shares the wrapped methods, and ``copy.deepcopy`` fails.
-* ``add_options`` called again on a router already included and serving
-  serves the HSR routes it adds at once, where FastAPI includes routers
-  lazily (it kept serving the routes it had).
-* A route replaced in place in a ``routes`` list, or routes reordered in
-  it, are seen: the HSR and ``Allow`` follow the routes now there (a list
-  that kept its length was taken as unchanged).
-* A custom path convertor whose ``convert`` raises something other than
-  ``ValueError`` or ``TypeError`` while the HSR link of a router's resource is
-  built makes the request fail with it (it was taken as a refusal, and the
-  link could point under another prefix).
+  its callables checked then (0.9 gave it no OPTIONS route until
+  ``add_options`` was called again): ``add_options(router)`` wraps those
+  methods on the routers. A route appended to the router's ``routes`` (or by
+  ``APIRouter.add_api_route(router, ...)``) gets none until the next route is
+  added with the router's methods or ``add_options`` is called again, and a
+  ``RuntimeWarning`` names it, at the latest when the route first responds.
+  An HSR route replaced in (or removed from) the routes makes OPTIONS answer
+  without the HSR link until then. ``add_options`` called again on a router
+  already included and serving serves the routes it adds at once, where
+  FastAPI includes routers lazily. A copy of such a router (``copy.copy``)
+  shares the wrapped methods, and ``copy.deepcopy`` fails.
 
 New
 ---
