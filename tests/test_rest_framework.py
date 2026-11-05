@@ -2037,14 +2037,26 @@ def test_user_defined_metadata_class_is_kept(client):
     assert "Link" not in response
 
 
-def test_scrudful_metadata_subclass_gets_the_options_response():
-    class Extended(ScrudfulMetadata):
-        def determine_metadata(self, request, view):
-            return {**super().determine_metadata(request, view), "x-extra": True}
+def test_a_custom_metadata_class_subclassing_scrudful_metadata_switches_options_on():
+    """A custom metadata class alone keeps DRF's OPTIONS (its 200 body); one
+    that subclasses ScrudfulMetadata (mixing the custom class in after it)
+    gets scrudful's 204, whose document the custom class can't change."""
+
+    class Combined(ScrudfulMetadata, CustomMetadata):
+        pass
+
+    @scrudful_viewset
+    class Custom(DefaultMetadataViewSet):
+        metadata_class = CustomMetadata
 
     @scrudful_viewset
     class Sub(DefaultMetadataViewSet):
-        metadata_class = Extended
+        metadata_class = Combined
+
+    custom = _options(Custom)
+    custom.render()
+    assert custom.status_code == 200
+    assert custom.data["name"] == "Custom"  # SimpleMetadata's body
 
     response = _options(Sub)
     response.render()
@@ -2053,10 +2065,12 @@ def test_scrudful_metadata_subclass_gets_the_options_response():
     assert "Content-Type" not in response
     assert hsr_link_problems(dict(response.items()), f"{BASE}/_hsr/dynamic") == []
     assert response["Allow"] == "GET, OPTIONS, HEAD"
-    # The subclass's document is still its own.
+    # ScrudfulMetadata's document, never CustomMetadata's.
     view = _live_view(Sub.as_view({"get": "retrieve"}), "/dynamic/1/", pk="1")
     request = Request(APIRequestFactory().options("/dynamic/1/"))
-    assert Extended().determine_metadata(request, view)["x-extra"] is True
+    document = Combined().determine_metadata(request, view)
+    assert document == ScrudfulMetadata().determine_metadata(request, view)
+    assert "name" not in document
 
 
 def test_metadata_describes_non_scrudful_methods(client):

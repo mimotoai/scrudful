@@ -112,26 +112,35 @@ OPTIONS
        204 with ``Allow: OPTIONS``. Bad credentials are answered as DRF
        answers them (a 401, or a 403 when the first authenticator has no
        ``WWW-Authenticate``), a refused throttle with DRF's 429.
-    3. On a detail route (one whose ``lookup_url_kwarg``, else
-       ``lookup_field``, is in the URL kwargs), the object is loaded with
-       ``get_object()``, its ``check_object_permissions`` suppressed. A
+    3. Each method the view serves is checked with its view-level
+       permissions (``check_permissions``), on a request of that method
+       (``rest_framework.request.clone_request``, also the view's
+       ``request``, and the method's action as a viewset's ``action``,
+       meanwhile). A method with an ``allowed_func`` (its handler's, else
+       ``Meta.allowed_func``) skips this check: the hook alone decides, with
+       the object.
+    4. Only if one method passed step 3 is the object loaded, on a detail
+       route (one whose ``lookup_url_kwarg``, else ``lookup_field``, is in
+       the URL kwargs), with ``get_object()``, its
+       ``check_object_permissions`` suppressed. So a requester refused every
+       method gets ``Allow: OPTIONS`` whether the object exists or not, as a
+       GET of either is refused alike: OPTIONS is no existence oracle. A
        ``get_object()`` that raises (``Http404`` for a missing object, or the
        404 of an object the requester may not read) is answered with that
        error, through the view's exception handler (:func:`exception_handler`
        gives it the error Links), and the HTTP Schema Resource link.
-    4. ``Allow`` lists exactly the methods this requester may use: OPTIONS,
-       and each method the view serves for which the method's
-       ``allowed_func(view, request, method, obj)`` (its handler's, else
-       ``Meta.allowed_func``) returns ``True``; without one, for which
-       ``check_permissions`` and, with an object, ``check_object_permissions``
-       pass a request of that method (``rest_framework.request.clone_request``,
-       also the view's ``request``, and the method's action as a viewset's
-       ``action``, meanwhile). DRF's ``PermissionDenied`` or
-       ``NotAuthenticated`` (or Django's ``PermissionDenied``) means not
-       allowed; anything else raised propagates (answered as in step 3). No
-       throttle runs per method. HEAD, which DRF dispatches to the GET
-       handler, is listed when the view serves it and GET is allowed.
-    5. The answer is a 204 without content or ``Content-Type`` (whatever
+    5. ``Allow`` lists exactly the methods this requester may use: OPTIONS,
+       and each method that passed step 3 and, with an object,
+       ``check_object_permissions``; or whose
+       ``allowed_func(view, request, method, obj)`` returns ``True``. DRF's
+       ``PermissionDenied`` or ``NotAuthenticated`` (or Django's
+       ``PermissionDenied``) means not allowed; anything else raised
+       propagates, answered as in step 4: an object check raising
+       ``Http404`` (``DjangoObjectPermissions`` for an object the requester
+       may not read) answers that 404. No throttle runs per method. HEAD,
+       which DRF dispatches to the GET handler, is listed when the view
+       serves it and GET is allowed.
+    6. The answer is a 204 without content or ``Content-Type`` (whatever
        renderer DRF's content negotiation picked, the browsable API's
        included), with ``Allow``, one HTTP Schema Resource link (to its
        :func:`hsr_urls` route, else ``hsr_url``'s URL) and
@@ -1046,9 +1055,11 @@ def scrudful_api_view(
     :class:`ScrudfulMetadata` unless the view's ``metadata_class`` (a
     ``metadata_class`` attribute of the function, or ``DEFAULT_METADATA_CLASS``)
     is something other than DRF's default ``SimpleMetadata``; a custom class
-    (or ``None``) is kept, so subclass :class:`ScrudfulMetadata` to combine them.
-    With :class:`ScrudfulMetadata` (or a subclass), OPTIONS is scrudful's 204
-    (see "OPTIONS" in the module docstring). DRF's ``api_view``
+    (or ``None``) is kept, and OPTIONS is then DRF's (its 200 body, or a 405).
+    With :class:`ScrudfulMetadata` (or a subclass, which can't override
+    ``determine_metadata``), OPTIONS is scrudful's 204 (see "OPTIONS" in the
+    module docstring): a view with a custom metadata class gets it by making
+    that class subclass :class:`ScrudfulMetadata`. DRF's ``api_view``
     serves only the listed methods: list ``"HEAD"`` too for HEAD requests.
     ::
 
@@ -1128,10 +1139,12 @@ def scrudful_viewset(cls: type) -> type:
     OPTIONS is answered by :class:`ScrudfulMetadata` only when the class's
     ``metadata_class`` is DRF's default ``SimpleMetadata``; any other
     value (``None``, or a class set on the viewset, a base class or
-    ``DEFAULT_METADATA_CLASS``) is kept, so subclass or mix in
-    :class:`ScrudfulMetadata` to combine it with a custom metadata class. With
-    :class:`ScrudfulMetadata` (or a subclass), OPTIONS is scrudful's 204 (see
-    "OPTIONS" in the module docstring). A user-defined ``options`` is kept.
+    ``DEFAULT_METADATA_CLASS``) is kept, and OPTIONS is then DRF's (its 200
+    body, or a 405). With :class:`ScrudfulMetadata` (or a subclass, which
+    can't override ``determine_metadata``), OPTIONS is scrudful's 204 (see
+    "OPTIONS" in the module docstring): a custom metadata class that
+    subclasses :class:`ScrudfulMetadata` (or mixes it in first) switches it
+    on. A user-defined ``options`` is kept.
 
     Decorating a subclass of a decorated viewset again re-wraps the original
     methods with the subclass's configuration.
@@ -1467,20 +1480,22 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
 
     1. the HSR link's target is resolved (:func:`_hsr_target`; its
        ``ImproperlyConfigured`` propagates);
-    2. the object is loaded (:func:`_options_object`);
-    3. each method the view serves is checked for this requester
+    2. each method the view serves is checked for this requester, with its
+       view-level permissions, then the object is loaded only if one of them
+       passed, then the methods that passed are checked against the object
        (:func:`_allowed_methods`);
-    4. the answer is a 204 without content or ``Content-Type`` (rendered by
+    3. the answer is a 204 without content or ``Content-Type`` (rendered by
        DRF's ``JSONRenderer``, whatever renderer DRF's content negotiation
        picked), ``Allow: allow_value(...)`` (also set in ``view.headers``,
        which DRF's ``finalize_response`` writes over the response's), the HSR
        link and the expose headers.
 
-    An exception of step 2 or 3 (the ``Http404`` of a missing object, the
-    404 scoped-rbac gives an object the requester may not read, a check's
-    unexpected error) is answered by the view's ``handle_exception``, as DRF
-    answers a handler's: with the error Links of :func:`exception_handler`
-    and the HSR link; one the exception handler doesn't answer propagates.
+    An exception of step 2 (the ``Http404`` of a missing object, the 404
+    scoped-rbac gives an object the requester may not read, an object check
+    raising ``Http404``, a check's unexpected error) is answered by the
+    view's ``handle_exception``, as DRF answers a handler's: with the error
+    Links of :func:`exception_handler` and the HSR link; one the exception
+    handler doesn't answer propagates.
 
     Otherwise (``metadata_class = None`` or a metadata class that isn't a
     :class:`ScrudfulMetadata`), this is DRF's ``APIView.options``: a 405, or
@@ -1491,8 +1506,7 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
         return APIView.options(self, request, *args, **kwargs)
     target = _hsr_target(request)
     try:
-        obj = _options_object(self)
-        allowed = _allowed_methods(self, request, obj)
+        allowed = _allowed_methods(self, request)
     except Exception as exc:
         response = self.handle_exception(exc)
         link = merge_links(response.get("Link"), None, None, hsr_link(target))
@@ -1603,69 +1617,110 @@ def _options_object(view: APIView) -> Any:
 
 
 #: What a per-method check of OPTIONS raises for "not allowed".
+#:
+#: ``Http404`` is deliberately absent (ruling R16), unlike ninja's denials:
+#: a check that raises it, as DRF's ``DjangoObjectPermissions`` does for an
+#: object the requester may not read, hides the object, so the OPTIONS
+#: answers that 404 (as a GET would) rather than an ``Allow`` that reveals
+#: the object exists.
 _DENIALS = (DRFPermissionDenied, NotAuthenticated, PermissionDenied)
 
 
-def _allowed_methods(view: APIView, request: Request, obj: Any) -> list[str]:
+def _allowed_methods(view: APIView, request: Request) -> list[str]:
     """The methods of ``view.allowed_methods`` (those it serves) that the
-    requester of the OPTIONS ``request`` may use on ``obj``
-    (:func:`_may_use`), but OPTIONS, which ``allow_value`` always adds.
-    HEAD, which DRF dispatches to the GET handler, is GET's answer; it is
-    listed only when the view serves it (a ``scrudful_api_view(["GET"])``
-    doesn't)."""
+    requester of the OPTIONS ``request`` may use, but OPTIONS, which
+    ``allow_value`` always adds. HEAD, which DRF dispatches to the GET
+    handler, is GET's answer; it is listed only when the view serves it (a
+    ``scrudful_api_view(["GET"])`` doesn't).
+
+    In two passes (:func:`_may_use`), so that OPTIONS is no existence oracle
+    (ruling R17):
+
+    1. each method's view-level check: ``check_permissions``, or ``True``
+       for a method with an ``allowed_func``, which needs the object;
+    2. only when one of them passed, the object is loaded
+       (:func:`_options_object`), and each method that passed is checked
+       again on it: ``check_object_permissions`` (when there is an
+       object), or its ``allowed_func``. When none passed, nothing is
+       loaded: a missing and an existing object both give ``Allow:
+       OPTIONS``, as a GET of either is refused alike.
+    """
     served = [method.upper() for method in view.allowed_methods]
-    allowed: dict[str, bool] = {}
-    for method in served:
-        if method == "OPTIONS" or (method == "HEAD" and "GET" in served):
-            continue
-        allowed[method] = _may_use(view, request, method, obj)
+    checked = [
+        method
+        for method in served
+        if method != "OPTIONS" and not (method == "HEAD" and "GET" in served)
+    ]
+    hooks = {method: _allowed_func(view, method) for method in checked}
+    allowed = {
+        method: hooks[method] is not None
+        or _may_use(view, request, method, view.check_permissions)
+        for method in checked
+    }
+    obj = _options_object(view) if any(allowed.values()) else None
+    for method in checked:
+        hook = hooks[method]
+        if hook is not None:
+            allowed[method] = _may_use(
+                view, request, method, functools.partial(_hooked, hook, view, obj)
+            )
+        elif allowed[method] and obj is not None:
+            allowed[method] = _may_use(
+                view,
+                request,
+                method,
+                functools.partial(_object_check, view, obj),
+            )
     if "HEAD" in served and "GET" in served:
         allowed["HEAD"] = allowed["GET"]
     return [method for method, may in allowed.items() if may]
 
 
-def _may_use(view: APIView, request: Request, method: str, obj: Any) -> bool:
-    """Whether the requester of ``request`` may use ``method`` on ``obj``.
+def _may_use(
+    view: APIView, request: Request, method: str, check: Callable[[Request], Any]
+) -> bool:
+    """Whether ``check(clone)`` lets the requester of ``request`` use
+    ``method``: it returns, or returns ``True`` (a ``False`` return is not
+    allowed).
 
-    The checks get ``clone_request(request, method)`` (DRF's; with its own
-    parser context, see :func:`_clone_request`), which is also ``view.request``
-    meanwhile, and a viewset has the method's action as ``view.action``, as
-    when DRF dispatches ``method``; both are put back after. The method's
-    ``allowed_func`` (its handler's, else ``Meta.allowed_func``), when there
-    is one, alone decides: ``allowed_func(view, clone, method, obj)``, which
-    must return a ``bool``. Otherwise ``view.check_permissions(clone)`` and,
-    when ``obj`` is not ``None``, ``view.check_object_permissions(clone,
-    obj)``. DRF's ``PermissionDenied`` or ``NotAuthenticated``, or Django's
-    ``PermissionDenied``, means not allowed; anything else raised
-    propagates. No throttle runs.
-
-    Raises
-    ------
-    TypeError
-        If ``allowed_func`` returns something other than a ``bool``.
+    ``clone`` is ``clone_request(request, method)`` (DRF's; with its own
+    parser context, see :func:`_clone_request`), which is also
+    ``view.request`` meanwhile, and a viewset has the method's action as
+    ``view.action``, as when DRF dispatches ``method``; both are put back
+    after. A :data:`_DENIALS` exception means not allowed; anything else
+    raised propagates. No throttle runs.
     """
     clone = _clone_request(request, method)
     values: dict[str, Any] = {"request": clone}
     action_map = getattr(view, "action_map", None)
     if isinstance(action_map, dict):
         values["action"] = action_map.get(method.lower())
-    allowed_func = _allowed_func(view, method)
     with _instance_attributes(view, **values):
         try:
-            if allowed_func is not None:
-                result = allowed_func(view, clone, method, obj)
-                if not isinstance(result, bool):
-                    raise TypeError(
-                        "allowed_func must return a bool, not "
-                        f"{type(result).__name__}"
-                    )
-                return result
-            view.check_permissions(clone)
-            if obj is not None:
-                view.check_object_permissions(clone, obj)
+            return check(clone) is not False
         except _DENIALS:
             return False
-    return True
+
+
+def _object_check(view: APIView, obj: Any, clone: Request) -> None:
+    """``view.check_object_permissions(clone, obj)``."""
+    view.check_object_permissions(clone, obj)
+
+
+def _hooked(
+    allowed_func: Callable[..., Any], view: APIView, obj: Any, clone: Request
+) -> bool:
+    """``allowed_func(view, clone, clone.method, obj)``, which alone decides.
+
+    Raises
+    ------
+    TypeError
+        If it returns something other than a ``bool``.
+    """
+    result = allowed_func(view, clone, clone.method, obj)
+    if not isinstance(result, bool):
+        raise TypeError(f"allowed_func must return a bool, not {type(result).__name__}")
+    return result
 
 
 def _allowed_func(view: APIView, method: str) -> Callable[..., Any] | None:
@@ -1739,6 +1794,9 @@ class ScrudfulMetadata(BaseMetadata):
     only sets ``metadata_class = ScrudfulMetadata``, keeping DRF's
     ``options``, answers OPTIONS with this document as DRF's 200 body.
 
+    Subclassing it changes nothing but the class: a subclass, like this
+    class, switches scrudful's OPTIONS on.
+
     Raises
     ------
     TypeError
@@ -1746,11 +1804,27 @@ class ScrudfulMetadata(BaseMetadata):
         (``determine_metadata_for_<method>``, ``_write``,
         ``required_conditional_headers``): they took the request, and the
         HTTP Schema Resource is built without one, so they would silently do
-        nothing.
+        nothing. When a subclass, or a class it mixes in before this one,
+        defines ``determine_metadata``: its output would be served nowhere,
+        as scrudful's OPTIONS has no body and the :func:`hsr_urls` route
+        builds the document with :func:`http_schema_resource`.
     """
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
+        # The classes before ScrudfulMetadata in the MRO: the subclass and
+        # any mixed-in metadata class whose determine_metadata would win.
+        overriding = cls.__mro__[: cls.__mro__.index(ScrudfulMetadata)]
+        if any("determine_metadata" in vars(klass) for klass in overriding):
+            raise TypeError(
+                f"{cls.__qualname__}.determine_metadata: in scrudful 0.10 the "
+                "output of a ScrudfulMetadata's determine_metadata is served "
+                "nowhere: OPTIONS answers 204 without a body, and the HTTP "
+                "Schema Resource route builds the document itself, without a "
+                "request. Customise the document with the statuses= and "
+                "entity= options of @scrudful / scrudful_api_view or the "
+                "viewset's Meta instead (see the 0.10.0 changelog)"
+            )
         for name in _REMOVED_METADATA_HOOKS:
             if name in vars(cls):
                 raise TypeError(

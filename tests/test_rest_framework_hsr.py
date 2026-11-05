@@ -18,6 +18,7 @@ from rest_framework import viewsets
 from rest_framework.authentication import BasicAuthentication
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
+from rest_framework.metadata import BaseMetadata
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -782,6 +783,7 @@ def test_error_setting_must_be_an_entity(settings):
         "determine_metadata_for_delete",
         "_write",
         "required_conditional_headers",
+        "determine_metadata",
     ],
 )
 def test_a_subclass_defining_a_removed_hook_is_a_type_error(name):
@@ -795,10 +797,37 @@ def test_a_subclass_defining_a_removed_hook_is_a_type_error(name):
     assert "0.10.0 changelog" in message
 
 
+def test_determine_metadata_served_nowhere_is_a_type_error():
+    """R18: OPTIONS has no body and the HSR route builds the document
+    itself, so an override would silently do nothing, mixed in too."""
+
+    class Own(BaseMetadata):
+        def determine_metadata(self, request, view):
+            return {}
+
+    def own_hook(self, request, view):
+        return {}
+
+    cases = [
+        ((ScrudfulMetadata,), {"determine_metadata": own_hook}),
+        ((Own, ScrudfulMetadata), {}),
+    ]
+    for bases, namespace in cases:
+        with pytest.raises(TypeError) as info:
+            type("Custom", bases, namespace)
+        message = str(info.value)
+        assert "Custom.determine_metadata" in message
+        assert "served nowhere" in message
+        assert "204 without a body" in message
+    # Mixed in after ScrudfulMetadata, its determine_metadata never runs:
+    # nothing to drop.
+    combined = type("Combined", (ScrudfulMetadata, Own), {})
+    assert combined.determine_metadata is ScrudfulMetadata.determine_metadata
+
+
 def test_a_subclass_without_removed_hooks_still_works(settings, client):
     class Extended(ScrudfulMetadata):
-        def determine_metadata(self, request, view):
-            return {**super().determine_metadata(request, view), "x-extra": True}
+        label = "extended"
 
     @scrudful_viewset
     class V(ItemViewSet):
@@ -808,9 +837,8 @@ def test_a_subclass_without_removed_hooks_still_works(settings, client):
     request = APIRequestFactory().options("/v/1/")
     request.resolver_match = ResolverMatch(func, (), {"pk": "1"})
     body = Extended().determine_metadata(Request(request), func.cls())
-    assert body["x-extra"] is True
+    assert body == http_schema_resource(func)
     assert body["options"] == OPTIONS_204
-    assert body["get"] == http_schema_resource(func)["get"]
 
     # A ScrudfulMetadata subclass keeps scrudful's OPTIONS.
     class URLconf:
@@ -1383,11 +1411,31 @@ def test_per_method_checks_see_the_method_and_leak_nothing(api_client):
     assert request.user.username == "writer"
 
 
-def test_anonymous_on_locked_resource_gets_204_allow_options(api_client):
-    # IsAdminUser view
-    r = api_client.options("/x/admin-items/1/")
+@pytest.mark.parametrize("pk", ["1", "99"])
+def test_anonymous_on_locked_resource_gets_204_allow_options(api_client, pk):
+    # IsAdminUser view. Refused every method, the requester can't tell an
+    # existing object (1) from a missing one (99), as with a GET (R17): the
+    # object is not loaded.
+    r = api_client.options(f"/x/admin-items/{pk}/")
     assert r.status_code == 204 and r.headers["Allow"] == "OPTIONS"
     assert options_204_problems(r.status_code, dict(r.items()), r.content) == []
+    target = "http://testserver/_hsr/admin-item-detail"
+    assert hsr_link_problems(dict(r.items()), target) == []
+    assert calls("load") == []
+
+
+def test_options_is_no_existence_oracle(api_client):
+    """R17: the same answer for an existing and a missing object when every
+    method is refused, as a GET gives the same refusal for both."""
+    answers = []
+    for pk in ("1", "99"):
+        cache.clear()  # OncePerDay
+        options = api_client.options(f"/x/admin-items/{pk}/")
+        cache.clear()
+        get = api_client.get(f"/x/admin-items/{pk}/")
+        answers.append((options.status_code, options["Allow"], get.status_code))
+    assert answers[0] == answers[1] == (204, "OPTIONS", 401)
+    assert calls("load") == []
 
 
 @pytest.mark.parametrize("url", ["/x/admin-items/1/", "/x/perm-items/1/"])
@@ -1416,17 +1464,47 @@ def test_options_is_throttled_once_as_drf_throttles_the_view(api_client):
     assert api_client.options("/x/admin-items/1/").status_code == 429
 
 
-def test_missing_object_is_404_with_error_links(api_client):
-    r = as_user(api_client, "writer").options("/x/perm-items/99/")
+@pytest.mark.parametrize("user", [None, "reader", "writer"])
+def test_missing_object_is_404_with_error_links(api_client, user):
+    # perm-items is readable by anyone: a GET would be a 404 too.
+    r = as_user(api_client, user).options("/x/perm-items/99/")
     assert r.status_code == 404
     headers = dict(r.items())
     assert link_problems("OPTIONS", 404, headers, True) == []
     assert "<https://api.example/schemas/error>" in r["Link"]
     target = "http://testserver/_hsr/perm-item-detail"
     assert hsr_link_problems(headers, target) == []
-    # No method was checked; Allow is DRF's (every served method).
-    assert calls("view") == []
+    # The view-level checks came first (one passed), then the load, and no
+    # object check; Allow is DRF's (every served method).
+    # (Anonymous: IsAuthenticatedOrReadOnly refuses the writes first.)
+    assert calls("view")[0] == ("GET", "GET", "retrieve")
+    kinds = [call[0] for call in drf_hsr_urls.CALLS]
+    assert kinds.index("load") > max(i for i, k in enumerate(kinds) if k == "view")
+    assert calls("load") == [("99",)]
+    assert calls("object") == []
     assert r["Allow"] == "GET, PUT, PATCH, DELETE, HEAD, OPTIONS"
+    assert as_user(api_client, user).get("/x/perm-items/99/").status_code == 404
+
+
+@pytest.mark.parametrize("user", [None, "reader"])
+def test_an_object_check_raising_http404_is_that_404(api_client, user):
+    """R16: an object permission that hides the object (``Http404``, as
+    DjangoObjectPermissions for an unreadable object) answers the OPTIONS
+    with that 404, as a GET, not with a per-method denial."""
+    r = as_user(api_client, user).options("/x/hidden-items/1/")
+    assert r.status_code == 404
+    headers = dict(r.items())
+    assert link_problems("OPTIONS", 404, headers, True) == []
+    assert "<https://api.example/schemas/error>" in r["Link"]
+    target = "http://testserver/_hsr/hidden-item-detail"
+    assert hsr_link_problems(headers, target) == []
+    assert calls("object") == [("GET", "1")]
+    assert as_user(api_client, user).get("/x/hidden-items/1/").status_code == 404
+    # Its owner sees it.
+    drf_hsr_urls.CALLS.clear()
+    r = as_user(api_client, "writer").options("/x/hidden-items/1/")
+    assert r.status_code == 204
+    assert r["Allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
 
 
 @pytest.mark.parametrize(

@@ -257,6 +257,25 @@ class AdminItemViewSet(XViewSetBase):
         error = X_ERROR
 
 
+class HiddenFromOthers(BasePermission):
+    """An object is invisible (``Http404``) to all but its owner, as DRF's
+    ``DjangoObjectPermissions`` hides an object the requester may not read."""
+
+    def has_object_permission(self, request, view, obj):
+        CALLS.append(("object", request.method, obj.pk))
+        if obj.owner != request.user.username:
+            raise Http404
+        return True
+
+
+@scrudful_viewset
+class HiddenItemViewSet(XViewSetBase):
+    permission_classes = [HiddenFromOthers]
+
+    class Meta:
+        error = X_ERROR
+
+
 class DenyAll(BasePermission):
     def has_permission(self, request, view):
         CALLS.append(("view", request.method, view.request.method, view.action))
@@ -297,6 +316,7 @@ x_router = SimpleRouter()
 x_router.register("perm-items", PermItemViewSet, basename="perm-item")
 x_router.register("admin-items", AdminItemViewSet, basename="admin-item")
 x_router.register("hook-items", HookItemViewSet, basename="hook-item")
+x_router.register("hidden-items", HiddenItemViewSet, basename="hidden-item")
 
 thing_router = SimpleRouter()
 thing_router.register("things", ThingViewSet, basename="thing")
