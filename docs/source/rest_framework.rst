@@ -422,6 +422,9 @@ raising it, or that method's own load, leaves out only that method.
 This differs from ninja and FastAPI, where a 404 that a method's ``auth=`` /
 ``before`` or security dependency raises refuses only that method, and their
 hooks' 404 is always the answer.
+An error other than a 401, 403 or 404 from another method's load (a
+``ValidationError``, or a ``Throttled`` a ``get_queryset`` raises) answers the
+whole OPTIONS, where ninja leaves only that method out of ``Allow``.
 
 A 405 keeps DRF's ``Allow``, every method the view serves. An ``Accept`` that
 none of the view's renderers serves (e.g. ``text/html`` on a view without the

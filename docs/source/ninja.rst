@@ -1030,11 +1030,13 @@ for a preflight too. In this order:
      never runs for a method whose ``auth=`` or ``before`` refused the
      requester. Any ``HttpError`` such a ``load`` raises (a 410, a 400, not
      only a 401, 403 or 404), ``Http404`` or ``PermissionDenied`` leaves only
-     its method out: only step 3's error answers the OPTIONS. A ``load``
-     isn't called again for the very call step 3 made (the same function,
-     path parameters and ``request.auth``): that method gets step 3's answer,
-     and the ``load`` sees only step 3's method, so give a method its own
-     ``load`` to authorize it separately. When step 3 loaded nothing (its
+     its method out: only step 3's error answers the OPTIONS. DRF differs
+     here: an error other than a 401, 403 or 404 from another method's load
+     answers the whole OPTIONS. A ``load`` isn't called again for the very
+     call step 3 made (the same function, path parameters and
+     ``request.auth``): that method gets step 3's answer, and the ``load``
+     sees only step 3's method, so give a method its own ``load`` to
+     authorize it separately. When step 3 loaded nothing (its
      operation's ``auth=`` or ``before`` refused the requester), a ``load``
      it shares runs for each other method, as that method's check.
 
