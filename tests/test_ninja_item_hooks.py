@@ -5,8 +5,10 @@ throttles, ``after_throttles``, then the parameters and body, ``load`` and
 the preconditions (412, 428, 304)."""
 
 import asyncio
+import contextvars
 import functools
 import json
+import threading
 import types
 import uuid
 from typing import Any
@@ -806,6 +808,95 @@ def test_a_handler_with_hooks_calling_itself_fails_closed(asynchronous):
     assert "get_item()" in message and "before=" in message
     assert "plain function" in message
     assert log == [("before", "1"), ("load", 1)]
+
+
+def test_an_async_handler_calling_itself_after_its_run_fails_closed():
+    """A task the handler spawns and leaves running, calling the decorated
+    handler once the operation's run ended (its context still holds the
+    request's record), raises ``RuntimeError``: its ``before`` ran for the
+    request's path parameters, not for that call's."""
+    log: list[Any] = []
+    holder: dict[str, Any] = {}
+
+    def only_one(request, pk, **params):
+        log.append(("before", pk))
+        if int(pk) != 1:
+            raise HttpError(403, "only pk 1")
+
+    def load(request, pk, **params):
+        log.append(("load", pk))
+        return {"id": pk, "name": "secret", "version": 1}
+
+    router = Router()
+
+    @router.get("/i/{pk}", response=ItemOut)
+    @scrudful(load=load, before=only_one)
+    async def get_item(request, pk: int, response: HttpResponse, obj):
+        if pk == 1 and request.GET.get("later"):
+
+            async def later():
+                await asyncio.sleep(0.01)
+                return await get_item(request, pk=2, response=response)
+
+            holder["task"] = asyncio.create_task(later())
+        return obj
+
+    client = TestAsyncClient(api_for(router))
+
+    async def main():
+        assert (await client.get("/i/2")).status_code == 403
+        assert (await client.get("/i/1?later=1")).status_code == 200
+        await holder["task"]
+
+    log.clear()
+    with pytest.raises(RuntimeError, match="after its operation's run ended"):
+        asyncio.run(main())
+    assert ("load", 2) not in log
+
+
+def test_a_sync_handler_calling_itself_after_its_run_fails_closed():
+    """The same from a thread the handler starts in a copy of its context,
+    which calls the decorated handler once the operation's run ended."""
+    log: list[Any] = []
+    holder: dict[str, Any] = {}
+    go = threading.Event()
+
+    def only_one(request, pk, **params):
+        log.append(("before", pk))
+        if int(pk) != 1:
+            raise HttpError(403, "only pk 1")
+
+    def load(request, pk, **params):
+        log.append(("load", pk))
+        return {"id": pk, "name": "secret", "version": 1}
+
+    router = Router()
+
+    @router.get("/i/{pk}", response=ItemOut)
+    @scrudful(load=load, before=only_one)
+    def get_item(request, pk: int, response: HttpResponse, obj):
+        if pk == 1 and request.GET.get("later"):
+
+            def later():
+                go.wait(5)
+                try:
+                    holder["result"] = get_item(request, pk=2, response=response)
+                except RuntimeError as exc:
+                    holder["error"] = exc
+
+            context = contextvars.copy_context()
+            holder["thread"] = threading.Thread(target=context.run, args=(later,))
+            holder["thread"].start()
+        return obj
+
+    client = TestClient(api_for(router))
+    assert client.get("/i/2").status_code == 403
+    assert client.get("/i/1?later=1").status_code == 200
+    go.set()
+    holder["thread"].join(5)
+    assert "result" not in holder
+    assert "after its operation's run ended" in str(holder["error"])
+    assert ("load", 2) not in log
 
 
 def test_an_operation_decorator_may_run_the_handler_twice():

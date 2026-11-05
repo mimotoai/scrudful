@@ -3465,6 +3465,9 @@ class _Raised:
     #: Whether its wrapper is running (the handler with hooks, see
     #: :func:`_entered`): calling it again then is a nested call.
     running: bool = False
+    #: Whether its ``Operation.run`` ended: a call of its handler after it
+    #: (from a task or thread it left running) is refused.
+    finished: bool = False
     #: Whether its wrapper returned: its response then has its Links, whose
     #: callables got the loaded object, so a declared status of it is not
     #: described again (they would get ``None``).
@@ -3873,6 +3876,7 @@ def _raised_links_run(
                     with _serving(operation):
                         response = await run(request, *args, **kw)
                 finally:
+                    raised.finished = True
                     _RAISED.reset(token)
                 described = _described_by(raised, request, response, operation)
                 if described is not None:
@@ -3892,6 +3896,7 @@ def _raised_links_run(
                     with _serving(operation):
                         response = run(request, *args, **kw)
                 finally:
+                    raised.finished = True
                     _RAISED.reset(token)
                 described = _described_by(raised, request, response, operation)
                 if described is not None:
@@ -4715,7 +4720,9 @@ def _check_hooks_allowed(config: _Config, label: str) -> None:
     inside another operation (its function calling it directly): that
     operation's hooks ran for the request, not this one's; and so does a
     call of it from inside itself, while it runs (see :func:`_entered`): its
-    hooks ran for the request's path parameters, not for that call's.
+    hooks ran for the request's path parameters, not for that call's; and so
+    does a call once its operation's run ended (from a task or thread the
+    handler left running, whose context still holds the run's record).
     """
     if not config.hooks:
         return
@@ -4727,6 +4734,14 @@ def _check_hooks_allowed(config: _Config, label: str) -> None:
             "didn't run for this request (only that operation's checks did). "
             "Refusing the request: move the code both need into a plain "
             "function and call that, not the decorated handler."
+        )
+    if raised is not None and raised.finished:
+        raise RuntimeError(
+            f"{label} was called after its operation's run ended (from a task "
+            "or thread the handler left running), so its "
+            f"{config.hooks_label} didn't run for this call. Refusing the "
+            "request: move the code both need into a plain function and call "
+            "that, not the decorated handler."
         )
     if raised is not None and raised.running:
         raise RuntimeError(

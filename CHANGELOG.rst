@@ -217,11 +217,13 @@ Behaviour change (ninja)
   ``REQUEST_METHOD`` (ninja's ``TestClient`` builds such requests),
   scrudful sets it to ``"OPTIONS"`` first, so that check holds there too.
 * A ``@scrudful`` handler with ``before=`` or ``after_throttles=`` called
-  directly from inside another operation's function, or from inside itself
-  while it runs (for other path values, say), raises ``RuntimeError``
-  (naming both): its hooks didn't run for that call. Move the shared code
-  into a plain function instead. (Since 0.7.1, such a call from an operation
-  with hooks of its own ran the handler with its hooks skipped.)
+  directly from inside another operation's function, from inside itself
+  while it runs (for other path values, say), or after its operation's run
+  ended (from a task or thread it left running) raises ``RuntimeError``
+  (naming the handler, and the calling operation): its hooks didn't run for
+  that call. Move the shared code into a plain function instead. (Since
+  0.7.1, such a call from an operation with hooks of its own ran the
+  handler with its hooks skipped.)
 * OPTIONS is answered by an ``Operation.run`` decorator, so the API's and
   routers' ``add_decorator(mode="operation")`` decorators no longer gate it
   (they did in 0.9); ``mode="view"`` ones still run first. A non-preflight
