@@ -1348,10 +1348,20 @@ def test_target_is_hsr_url_when_given():
 
 
 def test_target_from_the_hsr_url_setting(settings):
-    settings.SCRUDFUL = {"HSR_URL": lambda p: f"https://docs.example/s{p}"}
-    router = target_router("a")
-    target = TestClient(mount(router)).get("/1/target").json()["target"]
-    assert target == "https://docs.example/s/{pk}"
+    """The setting's callable gets the route Django resolved the request to
+    (ninja's ``TestClient`` resolves it among the API's patterns alone); the
+    router's own ``hsr_url`` gets the router's path."""
+    seen = []
+
+    def hsr_url(route):
+        seen.append(route)
+        return "https://docs.example/s"
+
+    settings.SCRUDFUL = {"HSR_URL": hsr_url}
+    api = mount(target_router("a"))
+    response = TestClient(api).get("/1")
+    assert hsr_link_problems(dict(response.headers), "https://docs.example/s") == []
+    assert seen == ["<pk>"]
 
 
 def test_the_route_a_path_got_stays_its_target(settings):
@@ -1404,6 +1414,69 @@ def test_target_under_parameterized_prefixes(client, settings, db):
     assert target == "http://a.example/t/acme/orgs/7/items/_hsr/pk"
     r = client.get("/t/acme/orgs/7/items/_hsr/pk", HTTP_HOST="a.example")
     assert hsr_get_problems(r.status_code, dict(r.items()), r.content) == []
+
+
+def hsr_url_setting(route):
+    """A project-wide ``SCRUDFUL["HSR_URL"]``, of the route resolved."""
+    return "https://docs.example/hsr/" + route.replace("<", "").replace(">", "")
+
+
+SETTING_ITEMS = target_router("items")
+SETTING_USERS = target_router("users")
+SETTING_API = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+SETTING_API.add_router("/items", SETTING_ITEMS)
+SETTING_API.add_router("/users", SETTING_USERS)
+#: One router, mounted twice in one API.
+TWICE = target_router("twice")
+TWICE_API = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+TWICE_API.add_router("/plain", TWICE, url_name_prefix="plain")
+TWICE_API.add_router("/other", TWICE, url_name_prefix="other")
+TWICE_API.add_router("/orgs/{org}/items", TWICE, url_name_prefix="orgs")
+urlpatterns += [path("setting/", SETTING_API.urls), path("twice/", TWICE_API.urls)]
+
+
+@pytest.mark.urls(__name__)
+def test_the_hsr_url_setting_tells_routers_apart(client, settings, db):
+    """Two routers' ``"/{pk}"``: the setting's callable gets each one's full
+    route (the URLconf's, the API's and the router's prefixes), so each
+    resource links to its own HTTP Schema Resource."""
+    settings.SCRUDFUL = {"HSR_URL": hsr_url_setting}
+    for prefix in ("items", "users"):
+        target = f"https://docs.example/hsr/setting/{prefix}/pk"
+        for response in (
+            client.get(f"/setting/{prefix}/1"),
+            client.options(f"/setting/{prefix}/1"),
+        ):
+            assert hsr_link_problems(dict(response.items()), target) == [], prefix
+
+
+@pytest.mark.urls(__name__)
+def test_a_router_mounted_twice_links_the_mount_of_the_request(client, settings, db):
+    settings.ALLOWED_HOSTS = ["a.example"]
+    for mount_path in ("plain", "other", "orgs/7/items"):
+        target = f"http://a.example/twice/{mount_path}/_hsr/pk"
+        url = f"/twice/{mount_path}/1"
+        assert client.get(f"{url}/target", HTTP_HOST="a.example").json() == {
+            "target": target
+        }
+        response = client.options(url, HTTP_HOST="a.example")
+        assert hsr_link_problems(dict(response.items()), target) == [], mount_path
+        r = client.get(f"/twice/{mount_path}/_hsr/pk", HTTP_HOST="a.example")
+        assert hsr_get_problems(r.status_code, dict(r.items()), r.content) == []
+    # Under ninja's TestClient too.
+    test_client = TestClient(TWICE_API)
+    for mount_path in ("plain", "other", "orgs/7/items"):
+        target = test_client.get(f"/{mount_path}/1/target").json()["target"]
+        assert target == f"http://testlocation/{mount_path}/_hsr/pk"
+    # The setting gets the mount's route.
+    settings.SCRUDFUL = {"HSR_URL": hsr_url_setting}
+    for mount_path, route in (
+        ("plain", "plain/pk"),
+        ("orgs/7/items", "orgs/org/items/pk"),
+    ):
+        response = client.get(f"/twice/{mount_path}/1", HTTP_HOST="a.example")
+        target = f"https://docs.example/hsr/twice/{route}"
+        assert hsr_link_problems(dict(response.items()), target) == [], mount_path
 
 
 # --- the ninja internals the HSR routes and links rely on ----------------------

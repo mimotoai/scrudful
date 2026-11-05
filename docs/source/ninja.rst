@@ -736,9 +736,10 @@ optional ``SCRUDFUL`` Django setting, then to scrudful's default:
    * - ``hsr_url``
      - ``"HSR_URL"``
      - ``hsr_url(path)``: the absolute URL of the HSR of ``path`` (the
-       router's path, as given to the operation decorator), for a document
-       served elsewhere. The responses link to it as it returns it, even when
-       the router serves the route too.
+       router's path, as given to the operation decorator, ``"/{pk}"``), for
+       a document served elsewhere. The responses link to it as it returns
+       it, even when the router serves the route too. The setting's callable
+       gets another argument, see below.
    * - ``hsr_cache_control``
      - ``"HSR_CACHE_CONTROL"``
      - The ``Cache-Control`` of the HSR route (default ``public,
@@ -762,6 +763,26 @@ when it is set: ``router.base_url = "relative/"`` is a ``ConfigError``. A new
 good: set the attribute before adding operations (``ConfigError`` after), and
 a path that got a route keeps linking to it whatever ``SCRUDFUL["HSR_ROUTE"]``
 says later.
+
+**The** ``SCRUDFUL["HSR_URL"]`` **callable gets the resolved route.** One
+callable serves every router of the project, whose paths repeat (each item
+router has a ``"/{pk}"``), so it is called with the route Django resolved the
+request to, ``request.resolver_match.route``: the full path template in
+Django's route syntax, with the prefixes of the URLconf's includes, the API
+and every router mounting the path. With ``path("api/", api.urls)`` and
+``api.add_router("/items", items)``, the item path gives ``"api/items/<pk>"``
+(``"api/items/<int:pk>"`` for ``"/{int:pk}"``), and a router mounted twice
+gives each mount's (``"api/orgs/<org>/items/<pk>"``). ninja's ``TestClient``
+resolves a request among the API's own patterns, so there it gets
+``"items/<pk>"``. A router's own ``hsr_url`` gets its path, ``"/{pk}"``.
+
+.. code-block:: python
+
+    HSR_URLS = {
+        "api/items/<pk>": "https://api.example.com/schemas/items/item",
+        "api/items": "https://api.example.com/schemas/items/list",
+    }
+    SCRUDFUL = {"HSR_ROUTE": False, "HSR_URL": HSR_URLS.__getitem__}
 
 **A nested router inherits none of them.** A ``ScrudfulRouter`` added to
 another with ``add_router`` keeps its own ``base_url``, ``hsr_route``,
@@ -961,7 +982,8 @@ Things to know:
   handler doesn't show in it (OPTIONS can list a GET that then answers 403).
   Give the router or operation ``allowed=`` for such checks.
 * The ``auth=`` callbacks are those of the mount the request came through: a
-  router mounted twice with different ``auth`` gets each mount's ``Allow``.
+  router mounted twice with different ``auth`` gets each mount's ``Allow``,
+  and its responses link to the HSR route of the request's mount.
 * An error answering OPTIONS (the 404 of ``load``, a 429) has no entry of its
   own in the HSR, whose ``options`` entry is exactly the 204's.
 

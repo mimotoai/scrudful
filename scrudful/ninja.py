@@ -1850,9 +1850,18 @@ class ScrudfulRouter(Router):
         or not for good: the responses of a path with a route link to it,
         whatever the setting says later.
     hsr_url : callable, optional
-        ``hsr_url(path)``: the URL of the HTTP Schema Resource of ``path``
-        (``SCRUDFUL["HSR_URL"]``), for one served elsewhere; the responses
-        link to it, even when the router serves the route too.
+        ``hsr_url(path)``: the absolute URL of the HTTP Schema Resource of
+        ``path``, the router's path as given to the operation decorator
+        (``"/{pk}"``), for one served elsewhere; the responses link to it,
+        even when the router serves the route too. Else
+        ``SCRUDFUL["HSR_URL"](route)``, a project-wide callable, which gets
+        the route Django resolved the request to,
+        ``request.resolver_match.route``: the full path template, in
+        Django's syntax, with the prefixes of the URLconf, the API and the
+        routers mounting it (``"api/items/<pk>"``; ``"items/<pk>"`` under
+        ninja's ``TestClient``, which resolves among the API's patterns
+        alone), which tells every resource, and every mount of a router,
+        apart.
     hsr_cache_control : str, optional
         The ``Cache-Control`` of the HTTP Schema Resource
         (``SCRUDFUL["HSR_CACHE_CONTROL"]``, default ``public, max-age=300``).
@@ -1900,8 +1909,11 @@ class ScrudfulRouter(Router):
         self._scrudful_paths: dict[str, Any] = {}
         #: The HTTP Schema Resource of each path, once built.
         self._scrudful_hsrs: dict[Any, dict[str, Any]] = {}
-        #: The URL name of the HSR route of each path that has one.
+        #: The URL name of the HSR route of each path that has one, in a
+        #: mount without ``url_name_prefix`` (see :func:`_hsr_url_name`).
         self._scrudful_hsr_url_names: dict[str, str] = {}
+        #: The path of the HSR route of each path that has one.
+        self._scrudful_hsr_routes: dict[str, str] = {}
         #: The path of each HSR route name, to refuse two paths one name.
         self._scrudful_hsr_names: dict[str, str] = {}
         #: Unique for the process, so the HSR routes' URL names are too.
@@ -2120,8 +2132,14 @@ class ScrudfulRouter(Router):
         otherwise match ``/_hsr/<name>``. That order is kept by ninja's
         ``BoundRouter._bind_operations`` (which clones the paths for each
         mount) and ``BoundRouter.urls_paths`` (which yields their URL
-        patterns, naming them by an explicit ``url_name`` as is), checked to
-        be ninja 1.7.0's and 1.7.1's.
+        patterns), checked to be ninja 1.7.0's and 1.7.1's.
+
+        The route has no explicit ``url_name``: ``urls_paths`` names it as it
+        names any operation, ``NinjaAPI.get_operation_url_name`` (by default
+        the view's name, ``scrudful_hsr_<serial>_<name>``, unique per
+        router) prefixed with the mount's ``url_name_prefix``, so a router
+        mounted twice in one API has one URL name per mount
+        (:func:`_hsr_url_name`).
 
         Raises
         ------
@@ -2146,6 +2164,7 @@ class ScrudfulRouter(Router):
         url_name = f"scrudful_hsr_{self._scrudful_serial}_{name}"
         route = f"/{HSR_ROUTE_SEGMENT}/{name}"
         view = _hsr_route_view(self, path)
+        view.__name__ = view.__qualname__ = url_name
         super().add_api_operation(
             route,
             ["GET", "HEAD"],
@@ -2154,12 +2173,12 @@ class ScrudfulRouter(Router):
             throttle=[],
             response=NOT_SET,
             include_in_schema=False,
-            url_name=url_name,
         )
         _ScrudfulPathView.adopt(_path_view(self, view), self, route, hsr_route=True)
         # Each mount's clone serves the document of its API.
         _add_run_decorator(view._ninja_operation, _serving_run)
         self._scrudful_hsr_url_names[path] = url_name
+        self._scrudful_hsr_routes[path] = route
         self._scrudful_hsr_names[name] = path
         hsr_routes = {f"/{HSR_ROUTE_SEGMENT}/{n}" for n in self._scrudful_hsr_names}
         for key in list(self.path_operations):
@@ -2574,13 +2593,21 @@ def _hsr_target(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
 
     Resolved in this order:
 
-    1. ``hsr_url(path)``, with the router's ``hsr_url``, else
-       ``SCRUDFUL["HSR_URL"]``, as it returns it;
-    2. else, with the HSR route turned off (``hsr_route=False`` or
-       ``SCRUDFUL["HSR_ROUTE"] = False``), a ``ConfigError``;
-    3. else the path of ``path``'s HSR route, reversed by its URL name (unique
-       per router), with the URL parameters the request matched outside
-       ``path`` (an API's or router's prefix, such as ``"/orgs/{org}/items"``):
+    1. the router's ``hsr_url(path)``, as it returns it;
+    2. else ``SCRUDFUL["HSR_URL"](route)``, as it returns it, ``route`` being
+       the route Django resolved the request to
+       (``request.resolver_match.route``): the full path template, in
+       Django's route syntax, with the prefixes of the URLconf's includes,
+       the API's and the routers' mounts (``"api/items/<pk>"``; ninja's
+       ``TestClient`` resolves among the API's patterns alone, so
+       ``"items/<pk>"``), so that one project-wide callable tells every
+       resource, and every mount of a router, apart;
+    3. else the path of ``path``'s HSR route (a path has one if the route was
+       on when its first scrudful or :func:`described` operation was added),
+       reversed by its URL name in the mount the request came through
+       (:func:`_hsr_url_name`), with the URL parameters the request matched
+       outside ``path`` (an API's or router's prefix, such as
+       ``"/orgs/{org}/items"``):
 
        a. in the URL namespace the request was resolved in (Django's URL
           resolver, so the route of the API and mount the request came
@@ -2594,23 +2621,29 @@ def _hsr_target(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
        ``SCRUDFUL["BASE_URL"]``) when it has one, else with
        ``request.build_absolute_uri()``.
 
-    A router mounted twice in one API (``url_name_prefix``) has one URL name
-    per route for both mounts: 3a gives one of them, which serves the same
-    document.
+    So a router mounted twice in one API (``url_name_prefix``) links each
+    request to the HSR route of its own mount.
 
     Raises
     ------
     ConfigError
-        If the route is off and there is no ``hsr_url``; ``path`` has no HSR
-        route on ``router``; the route can't be reversed (3b outside a
-        ``ScrudfulRouter`` operation, or a request not routed to ``router``);
-        or, for 3b, the installed ninja's ``Operation.api``,
+        If ``hsr_url`` returns something else than an absolute URL; the
+        setting's callable is used for a request Django didn't resolve;
+        ``path`` has no HSR route on ``router``; the route can't be reversed
+        (3b outside a ``ScrudfulRouter`` operation, or a request not routed
+        to ``router``); or the installed ninja's ``Operation.api``,
+        ``BoundRouter.path_operations`` or, for 3b,
         ``NinjaClientBase._resolve`` or ``NinjaAPI.urls`` isn't ninja 1.7's.
     """
-    hsr_url = router._hsr_url()
+    hsr_url, argument = router._scrudful_hsr_url, path
+    if hsr_url is None:
+        hsr_url = _setting(setting_hsr_url)
+        if hsr_url is not None:
+            argument = _resolved_route(request)
     if hsr_url is not None:
+        what = f"hsr_url({argument!r})"
         try:
-            return check_hsr_url_result(hsr_url(path), f"hsr_url({path!r})")
+            return check_hsr_url_result(hsr_url(argument), what)
         except HsrConfigError as exc:
             raise ConfigError(str(exc)) from exc
     route = _hsr_route_path(request, router, path)
@@ -2620,9 +2653,42 @@ def _hsr_target(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
     return request.build_absolute_uri(route)
 
 
-def _hsr_route_path(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
-    """The absolute path of ``path``'s HSR route (steps 3a and 3b of
-    :func:`_hsr_target`)."""
+def _resolved_route(request: HttpRequest) -> str:
+    """The route Django resolved ``request`` to (``resolver_match.route``),
+    the argument of ``SCRUDFUL["HSR_URL"]``.
+
+    Raises
+    ------
+    ConfigError
+        If the request wasn't resolved (no ``resolver_match``).
+    """
+    route = getattr(getattr(request, "resolver_match", None), "route", None)
+    if not isinstance(route, str):
+        raise ConfigError(
+            'SCRUDFUL["HSR_URL"] is called with the route Django resolved the '
+            "request to (request.resolver_match.route), and this request has "
+            "none: send it through Django's URL resolver (or ninja's "
+            "TestClient), or give the ScrudfulRouter its own hsr_url"
+        )
+    return route
+
+
+def _hsr_url_name(router: ScrudfulRouter, path: str) -> str:
+    """The URL name of ``path``'s HSR route in the mount of ``router`` serving
+    the request, as ninja 1.7's ``BoundRouter.urls_paths`` names it: the
+    API's ``get_operation_url_name`` of the mount's clone of the route's
+    operation, prefixed with the mount's ``url_name_prefix``.
+
+    The mount is that of the operation running (:func:`_bound_mount`);
+    without one (it can't be found through ``Operation.run``), the name of
+    a mount without ``url_name_prefix``.
+
+    Raises
+    ------
+    ConfigError
+        If ``path`` has no HSR route on ``router``, or the installed ninja's
+        ``BoundRouter.path_operations`` doesn't hold the route's clone.
+    """
     url_name = router._scrudful_hsr_url_names.get(path)
     if url_name is None:
         raise ConfigError(
@@ -2631,6 +2697,26 @@ def _hsr_route_path(request: HttpRequest, router: ScrudfulRouter, path: str) -> 
             "give the path as given to the operation decorator, of a scrudful "
             "or @described operation added while the route was on"
         )
+    operation = _SERVING_ROUTER_OPERATION.get()
+    if operation is None:
+        return url_name
+    api = _operation_api(operation)
+    bound_router, _ = _bound_mount(api, operation)
+    route_view = bound_router.path_operations.get(router._scrudful_hsr_routes[path])
+    operations = getattr(route_view, "operations", None)
+    if not operations:
+        raise _bound_path_error()
+    name = api.get_operation_url_name(operations[0], router=bound_router.template)
+    prefix = getattr(bound_router, "url_name_prefix", None)
+    if prefix and name:
+        name = f"{prefix}_{name}"
+    return name  # type: ignore[no-any-return]
+
+
+def _hsr_route_path(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
+    """The absolute path of ``path``'s HSR route (steps 3a and 3b of
+    :func:`_hsr_target`)."""
+    url_name = _hsr_url_name(router, path)
     match = getattr(request, "resolver_match", None)
     kwargs: dict[str, Any] = {}
     if match is not None:

@@ -1333,19 +1333,18 @@ def test_options_router_mounted_twice(store):
     client = TestClient(api)
     # One document for both mounts.
     assert hsr_get(client, "/items/{pk}", "/a") == hsr_get(client, "/items/{pk}", "/b")
-    # Each mount's Allow, with its auth. The HSR link is to one mount's route
-    # (one URL name for both, see _hsr_target), which serves that document.
-    targets = {hsr_target("/items/{pk}", prefix) for prefix in ("/a", "/b")}
-    for url, allow in (
-        ("/a/items/1", "GET, PUT, DELETE, OPTIONS"),
-        ("/b/items/1", "OPTIONS"),
+    # Each mount's Allow, with its auth, and the HSR link to its own route.
+    for prefix, allow in (
+        ("/a", "GET, PUT, DELETE, OPTIONS"),
+        ("/b", "OPTIONS"),
     ):
-        response = options_204(client, url, allow, None)
-        [(target, _)] = [
-            link for link in parse_links(response.headers["Link"]) if "_hsr" in link[0]
-        ]
-        assert target in targets
+        target = hsr_target("/items/{pk}", prefix)
+        options_204(client, f"{prefix}/items/1", allow, target)
     assert client.get("/b/items/1").status_code == 401
+    response = client.get("/a/items/1")
+    assert (
+        hsr_link_problems(dict(response.headers), hsr_target("/items/{pk}", "/a")) == []
+    )
 
 
 # --- parity with DRF -----------------------------------------------------------

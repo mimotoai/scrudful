@@ -204,6 +204,16 @@ Behaviour change (ninja)
   APIs that differ (one with an entity and one without included) are a
   ``ConfigError``. An API mounting the router after its HSR was built is
   taken into account (``add_router`` discarded nothing).
+* ``SCRUDFUL["HSR_URL"]`` is called with the route Django resolved the
+  request to (``request.resolver_match.route``: the full path template, with
+  the URLconf's, the API's and the routers' prefixes, e.g.
+  ``"api/items/<pk>"``), so that it gives each resource its own HSR (it got
+  the path relative to its router, ``"/{pk}"``, the same for every item
+  router). A router's own ``hsr_url`` still gets its path.
+* A router mounted twice in one API links each response to the HSR route of
+  the request's mount (it linked one of them, whichever Django reversed).
+  The HSR routes' URL names follow ninja's naming of the mount, its
+  ``url_name_prefix`` included; they stay private.
 * A change of ``SCRUDFUL`` (``override_settings``) discards the built HSRs
   (they kept the base URL they were built with), and so does setting
   ``router.base_url``.
