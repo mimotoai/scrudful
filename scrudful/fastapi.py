@@ -2485,8 +2485,10 @@ class _Completion:
     #: The resource key of each HSR route name given, and its inverse.
     key_of: dict[str, str]
     name_of: dict[str, str]
-    #: The keys some route serves OPTIONS for (one of scrudful's included).
-    with_options: set[str]
+    #: The keys some route serves OPTIONS for (one of scrudful's included),
+    #: in the order recorded (a dict, so that :meth:`rollback` can drop the
+    #: last ones).
+    with_options: dict[str, None]
     #: Whether every entry is a route: no ``Mount``, ``Host`` or other entry
     #: whose contents the full walk (:func:`_collect_paths`) looks into, so a
     #: route added later is under nothing that shadows it; and no route seen
@@ -2496,11 +2498,29 @@ class _Completion:
     #: finds another length, a route was added to it past its methods.
     count: int = 0
 
+    def mark(self) -> tuple[int, int, int, bool]:
+        """Where the records are now, for :meth:`rollback`: :func:`_record`
+        only adds to them, in order."""
+        return len(self.seen), len(self.templates), len(self.with_options), self.simple
+
+    def rollback(self, mark: tuple[int, int, int, bool]) -> None:
+        """Drop what :func:`_record` recorded since ``mark``: a completion
+        that failed leaves its routes unseen, so the next one checks and
+        completes them again, rather than taking them as completed."""
+        seen, templates, with_options, self.simple = mark
+        for records, length in (
+            (self.seen, seen),
+            (self.templates, templates),
+            (self.with_options, with_options),
+        ):
+            for key in list(records)[length:]:
+                del records[key]  # type: ignore[attr-defined]
+
 
 def _completion_of(router: APIRouter, names: Mapping[str, str]) -> _Completion:
     """The :class:`_Completion` of ``router`` once :func:`add_options` gave
     its resources (HSR route ``names``) their routes."""
-    completion = _Completion({}, {}, dict(names), {}, set(), True)
+    completion = _Completion({}, {}, dict(names), {}, {}, True)
     completion.name_of = {key: name for name, key in names.items()}
     _record(completion, _flat(router.routes))
     completion.count = len(router.routes)
@@ -2531,7 +2551,7 @@ def _record(completion: _Completion, entries: Iterable[Any]) -> list[Any]:
         key = _template_key(route.path)
         completion.templates.setdefault(key, route.path)
         if route.methods is None or "OPTIONS" in route.methods:
-            completion.with_options.add(key)
+            completion.with_options[key] = None
         new.append(route)
     return new
 
@@ -2569,9 +2589,14 @@ def _complete(
             # Appended, so none seen yet; else they weren't appended.
             if any(_entry_key(route) in completion.seen for route in entries):
                 entries = None
+        mark = completion.mark()
         new = _record(completion, _flat(router.routes) if entries is None else entries)
         if completion.simple:
-            _complete_routes(router, options, completion, new)
+            try:
+                _complete_routes(router, options, completion, new)
+            except BaseException:
+                completion.rollback(mark)
+                raise
             completion.count = len(router.routes)
             return
     routes = router.routes
@@ -2591,7 +2616,9 @@ def _complete_routes(
 ) -> None:
     """:func:`_complete` of the ``new`` routes of ``router``: check their
     scrudful endpoints' callables, name the resources they add, and give
-    those their HSR and OPTIONS routes; register the endpoints' router."""
+    those their HSR and OPTIONS routes; register the endpoints' router.
+    Everything is checked before anything is committed: a ``ValueError``
+    leaves the names unchanged (and :func:`_complete` the routes unseen)."""
     keys: dict[str, None] = {}
     for route in new:
         endpoint = getattr(route, "endpoint", None)
@@ -2611,7 +2638,7 @@ def _complete_routes(
         if not options.hsr_route or key in completion.name_of:
             continue
         name = _hsr_route_name(template)
-        other = completion.key_of.get(name)
+        other = completion.key_of.get(name, names.get(name))
         if other is not None:
             raise ValueError(
                 f"{completion.templates[other]!r} and {template!r} have the "
@@ -2619,9 +2646,11 @@ def _complete_routes(
                 f"('/{HSR_ROUTE_SEGMENT}/{name}'): rename a path segment, or "
                 "turn the route off (hsr_route=False) and give hsr_url="
             )
+        names[name] = key
+    # All checked: the names and the routes are committed together.
+    for name, key in names.items():
         completion.key_of[name] = key
         completion.name_of[key] = name
-        names[name] = key
     if names:
         _add_hsr_routes(router, router.routes, {}, names)
         by_key = getattr(router, _HSR_ROUTE_ATTRIBUTE)

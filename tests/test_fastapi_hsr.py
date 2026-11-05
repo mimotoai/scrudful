@@ -2580,6 +2580,103 @@ def test_router_resource_added_later_is_checked_as_add_options_checks(make_clien
             return {}
 
 
+def drop_route(router: APIRouter, sub: APIRouter, path: str) -> None:
+    """Remove the route ``path`` of ``sub``, included in ``router``, from
+    both (a FastAPI that includes routers lazily is told, as its own methods
+    tell it)."""
+    for owner in (router, sub):
+        owner.routes[:] = [r for r in owner.routes if getattr(r, "path", None) != path]
+        changed = getattr(owner, "_mark_routes_changed", None)
+        if callable(changed):
+            changed()
+
+
+def test_a_refused_addition_commits_nothing(make_client):
+    """A call adding several resources at once that is refused (one under
+    ``/_hsr/``) leaves none of them taken as completed: once the offending
+    route is gone, the next route added completes the others too, rather
+    than leaving them named but without their routes."""
+    router = APIRouter()
+
+    @router.get("/items/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def get_item(id: int):
+        return {}
+
+    add_options(router, base_url=BASE)
+    sub = APIRouter()
+
+    @sub.get("/new/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def get_new(id: int):
+        return {}
+
+    @sub.get("/_hsr/x")
+    @scrudful(**NOTE_LINKS)
+    async def reserved():  # pragma: no cover
+        return {}
+
+    with pytest.raises(ValueError, match="reserved"):
+        router.include_router(sub)
+    # The project drops the offending route, and goes on adding routes.
+    drop_route(router, sub, "/_hsr/x")
+
+    @router.get("/more/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def get_more(id: int):
+        return {}
+
+    app = FastAPI()
+    app.include_router(router)
+    client = make_client(app)
+    for name in ("new", "more", "items"):
+        target = f"https://api.example/_hsr/{name}.id"
+        options_204(client, f"/{name}/1", "GET, OPTIONS", target)
+        assert hsr_link_problems(client.get(f"/{name}/1").headers, target) == []
+        assert client.get(target).status_code == 200
+
+
+def test_a_refused_name_clash_commits_no_name(make_client):
+    """A resource whose HSR route name clashes, refused, leaves the names of
+    the resources added with it free: ``add_options`` (or the next route
+    added) names them again, as if the call had not been made."""
+    router = APIRouter()
+
+    @router.get("/a.b")
+    @scrudful(**NOTE_LINKS)
+    async def dotted():
+        return {}
+
+    add_options(router, base_url=BASE)
+    sub = APIRouter()
+
+    @sub.get("/first/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def first(id: int):
+        return {}
+
+    @sub.get("/a/b")
+    @scrudful(**NOTE_LINKS)
+    async def clashing():  # pragma: no cover
+        return {}
+
+    with pytest.raises(ValueError, match="same HTTP Schema Resource route name"):
+        router.include_router(sub)
+    drop_route(router, sub, "/a/b")
+
+    @router.get("/second/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def second(id: int):
+        return {}
+
+    app = FastAPI()
+    app.include_router(router)
+    client = make_client(app)
+    for name in ("first", "second"):
+        target = f"https://api.example/_hsr/{name}.id"
+        options_204(client, f"/{name}/1", "GET, OPTIONS", target)
+
+
 def test_router_resource_the_hooks_miss_is_announced(make_client):
     """A route the router's methods don't add (appended to its ``routes``)
     has no OPTIONS or HSR route: a ``RuntimeWarning`` names it, once, when
