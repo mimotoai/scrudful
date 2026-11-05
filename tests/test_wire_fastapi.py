@@ -33,7 +33,7 @@ asserts that its problem list is empty. One test per rule family:
 
 The scenarios are those of the 0.9.0 audit's FastAPI harness (its
 ``harness.py``, ``check_example.py``, ``check_minimal.py`` and
-``check_accept.py``), on three apps:
+``check_accept.py``), on four apps:
 
 - ``examples/fastapi/api.py``, with the test client's URL as its base URL;
 - ``WIRE``, a minimal app for what the example doesn't show: security
@@ -45,7 +45,12 @@ The scenarios are those of the 0.9.0 audit's FastAPI harness (its
   ``allow_methods=["*"]`` and ``expose_headers=list(EXPOSE_HEADERS)``;
 - ``HOOKED``, a router given ``add_options(router, allowed=..., load=...)``
   and included under ``/h``: router mode, an object-level denial, and
-  scrudful's own preflight answer (no CORS middleware).
+  scrudful's own preflight answer (no CORS middleware);
+- ``MOUNTS``, routers given ``add_options`` in the shapes the adapter
+  completes as they change: a router with a nested router, included under
+  ``/v1``; a router included twice (``/one``, ``/two``); and routes added
+  after ``add_options`` and the inclusion, to the nested router and to the
+  parent (``WIRE`` has a late route of its own, in app mode).
 
 Excluded, and documented by ``test_a_returned_error_has_only_the_hsr_link``:
 an error an endpoint returns rather than raises gets none of the error
@@ -323,6 +328,15 @@ def wire_app() -> FastAPI:
 
     add_error_links(app, PROBLEM)
     add_options(app, base_url=f"{BASE}/", load=load)
+
+    # Added after add_options: it gets its OPTIONS and HSR routes then.
+    @app.get("/late/{nid}")
+    @app.head("/late/{nid}")
+    @app.put("/late/{nid}")
+    @scrudful(**CONDITIONAL, entity=NOTE)
+    async def late(nid: int):
+        return {"id": nid, "name": find(nid)["name"]}
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[ORIGIN],
@@ -383,10 +397,47 @@ def hooked_app(router: APIRouter) -> FastAPI:
     return app
 
 
+# --- The mounted routers (MOUNTS) -----------------------------------------------
+
+
+def item_routes(router: APIRouter, prefix: str = "") -> None:
+    """A conditional item (GET, HEAD, PUT) at ``{prefix}/items/{iid}``,
+    without ``responses=``."""
+
+    @router.get(f"{prefix}/items/{{iid}}")
+    @router.head(f"{prefix}/items/{{iid}}")
+    @router.put(f"{prefix}/items/{{iid}}")
+    @scrudful(**CONDITIONAL, entity=NOTE)
+    async def item(iid: int):
+        return {"id": iid, "name": find(iid)["name"]}
+
+
+def mounts_app() -> tuple[FastAPI, dict[str, APIRouter]]:
+    parent, child, twice = APIRouter(), APIRouter(), APIRouter()
+    item_routes(child)
+    parent.include_router(child, prefix="/c")
+    item_routes(parent, "/p")
+    add_options(parent, base_url=f"{BASE}/")
+    item_routes(twice)
+    add_options(twice, base_url=f"{BASE}/")
+    app = FastAPI()
+    app.include_router(parent, prefix="/v1")
+    app.include_router(twice, prefix="/one")
+    app.include_router(twice, prefix="/two")
+    add_error_links(app, PROBLEM)
+    # After add_options and the inclusion: to the nested router, and to
+    # the parent.
+    item_routes(child, "/late")
+    item_routes(parent, "/plate")
+    return app, {"parent": parent, "twice": twice}
+
+
 WIRE = wire_app()
 HOOKED_ROUTER = hooked_router()
 HOOKED = hooked_app(HOOKED_ROUTER)
-APPS = {"example": example.app, "wire": WIRE, "hooked": HOOKED}
+MOUNTS, MOUNTED = mounts_app()
+APPS = {"example": example.app, "wire": WIRE, "hooked": HOOKED, "mounts": MOUNTS}
+ROUTERS = {"hooked": HOOKED_ROUTER, **MOUNTED}
 
 
 # --- The HSR of each kind of resource ---------------------------------------------
@@ -401,10 +452,12 @@ class Kind:
     template: str
     url: str
     hsr: str
+    #: The router given ``add_options``, in router mode.
+    router: str | None = None
 
     @property
     def owner(self) -> FastAPI | APIRouter:
-        return HOOKED_ROUTER if self.app == "hooked" else APPS[self.app]
+        return APPS[self.app] if self.router is None else ROUTERS[self.router]
 
 
 KINDS = {
@@ -426,7 +479,36 @@ KINDS = {
     "bare": Kind("wire", "/bare/{nid}", "/bare/1", "/_hsr/bare.nid"),
     "boom": Kind("wire", "/boom/{nid}", "/boom/1", "/_hsr/boom.nid"),
     "returned": Kind("wire", "/returned/{nid}", "/returned/1", "/_hsr/returned.nid"),
-    "hooked": Kind("hooked", "/items/{iid}", "/h/items/1", "/h/_hsr/items.iid"),
+    "late": Kind("wire", "/late/{nid}", "/late/1", "/_hsr/late.nid"),
+    "hooked": Kind(
+        "hooked", "/items/{iid}", "/h/items/1", "/h/_hsr/items.iid", "hooked"
+    ),
+    "nested": Kind(
+        "mounts", "/c/items/{iid}", "/v1/c/items/1", "/v1/_hsr/c.items.iid", "parent"
+    ),
+    "parent": Kind(
+        "mounts", "/p/items/{iid}", "/v1/p/items/1", "/v1/_hsr/p.items.iid", "parent"
+    ),
+    "nested late": Kind(
+        "mounts",
+        "/c/late/items/{iid}",
+        "/v1/c/late/items/1",
+        "/v1/_hsr/c.late.items.iid",
+        "parent",
+    ),
+    "parent late": Kind(
+        "mounts",
+        "/plate/items/{iid}",
+        "/v1/plate/items/1",
+        "/v1/_hsr/plate.items.iid",
+        "parent",
+    ),
+    "twice one": Kind(
+        "mounts", "/items/{iid}", "/one/items/1", "/one/_hsr/items.iid", "twice"
+    ),
+    "twice two": Kind(
+        "mounts", "/items/{iid}", "/two/items/1", "/two/_hsr/items.iid", "twice"
+    ),
 }
 
 
@@ -596,6 +678,8 @@ def wire_exchanges() -> list[Exchange]:
         hooked("GET", "GET", 200),
         hooked("HEAD", "HEAD", 200),
         hooked("GET 304", "GET", 304, FRESH),
+        hooked("HEAD 304", "HEAD", 304, FRESH),
+        hooked("HEAD 412", "HEAD", 412, STALE),
         hooked("GET 404", "GET", 404, url="/h/items/999"),
         hooked("PUT 428", "PUT", 428, {"X-Key": "writer"}),
         hooked("PUT anonymous 403", "PUT", 403, CURRENT),
@@ -604,10 +688,43 @@ def wire_exchanges() -> list[Exchange]:
         hooked("DELETE writer 204", "DELETE", 204, hooked_writer),
         hooked("POST 405", "POST", 405),
         unknown("hooked", "unknown URL 404", "/h/nope"),
+        *item_exchanges("late"),
     ]
 
 
-EXCHANGES = example_exchanges() + wire_exchanges()
+#: The resources :func:`item_routes` adds (and ``WIRE``'s late one).
+ITEMS = ["late", "nested", "parent", "nested late", "parent late"]
+ITEMS += ["twice one", "twice two"]
+
+
+def item_exchanges(kind: str) -> list[Exchange]:
+    """The exchanges of an item of :func:`item_routes`, conditional HEADs
+    included (its route declares no ``responses=``)."""
+    item = on(kind)
+    url = KINDS[kind].url
+    return [
+        item("GET", "GET", 200),
+        item("HEAD", "HEAD", 200),
+        item("GET 304", "GET", 304, FRESH),
+        item("HEAD 304", "HEAD", 304, FRESH),
+        item("GET 400", "GET", 400, MALFORMED),
+        item("GET 412", "GET", 412, STALE),
+        item("HEAD 412", "HEAD", 412, STALE),
+        item("PUT 428", "PUT", 428),
+        item("PUT 412", "PUT", 412, STALE),
+        item("PUT 200", "PUT", 200, CURRENT),
+        item("GET 404", "GET", 404, url=url.replace("/1", "/999")),
+        item("GET 422 path", "GET", 422, url=url.replace("/1", "/x")),
+        item("DELETE 405", "DELETE", 405),
+    ]
+
+
+def mounts_exchanges() -> list[Exchange]:
+    exchanges = [exchange for kind in ITEMS[1:] for exchange in item_exchanges(kind)]
+    return exchanges + [unknown("mounts", "unknown URL 404", "/v1/nope")]
+
+
+EXCHANGES = example_exchanges() + wire_exchanges() + mounts_exchanges()
 #: The exchanges whose Links agree with an HSR entry: all but an unknown
 #: URL's 404, which has no HSR.
 AGREEING = [exchange for exchange in EXCHANGES if exchange.kind is not None]
@@ -734,6 +851,7 @@ OPTIONS = [
     ("boom", {}),
     ("hooked", {}),
     ("hooked", {"X-Key": "writer"}),
+    *((kind, {}) for kind in ITEMS),
 ]
 OPTION_IDS = [f"{kind}-{bool(headers)}" for kind, headers in OPTIONS]
 
@@ -818,6 +936,10 @@ ALLOW = [
         "/h/items/2",
         {"X-Key": "writer"},
         ITEM - {"DELETE"},
+    ),
+    *(
+        (kind, kind, KINDS[kind].url, {}, {"GET", "HEAD", "PUT", "OPTIONS"})
+        for kind in ITEMS
     ),
 ]
 
