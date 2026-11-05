@@ -72,8 +72,8 @@ Behaviour change (all adapters)
   the API-wide one: ninja and FastAPI ``add_error_links``, DRF
   ``SCRUDFUL["ERROR"]``); without an error helper it has no content. Where the
   API-wide entity differs from the operation's, the errors the framework
-  answers before the operation (ninja 401, 422 and 429; DRF 401, 403, 406 and
-  415) have explicit entries with its content.
+  answers before the operation (ninja 401, 403, 422 and 429; DRF 401, 403, 406
+  and 415) have explicit entries with its content.
 * Every response of a described path carries the **HSR link**: the 2xx, 304
   and HEAD responses, scrudful's early 400, 412 and 428, a 204 or an error the
   view returns, and the errors the framework answers through scrudful's error
@@ -139,6 +139,14 @@ Behaviour change (ninja)
   (``ConfigError`` when the installed ninja's differ).
 * The HSR is compact JSON written by scrudful, whatever the API's renderer
   (0.7–0.9 had the OPTIONS body written by the renderer); OPTIONS has no body.
+* With ``add_error_links``, every 401 and 403 answered for a scrudful
+  operation whose ``error`` differs from the API-wide entity carries the
+  **API-wide entity** (was the operation's ``error`` for those the operation,
+  ``before=`` or ``after_throttles=`` raised): those of ninja's authentication
+  (a failed CSRF check, an ``AuthorizationError``) always did, so each 401 and
+  403 agrees with the HSR, which lists a 403 entry beside the 401, 422 and 429
+  (unless ``responses=`` declares the status). Without an API-wide entity,
+  nothing changes.
 * A path whose HSR link can't be computed (the route off without
   ``hsr_url``, a route that can't be reversed) raises ``ConfigError`` on
   every response of the path.

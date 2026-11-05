@@ -425,8 +425,11 @@ OPTIONS
     - a ``default`` response, the errors: with the content of the
       operation's ``error``, else of the API-wide error entity
       (:func:`add_error_links`). When the operation's ``error`` differs from
-      the API-wide entity, the 401, 422 and 429 ninja answers itself, which
-      get the API-wide entity, are listed with its content;
+      the API-wide entity, the 401, 403, 422 and 429 ninja answers itself,
+      which get the API-wide entity, are listed with its content (every 401
+      and 403 of the operation then carries it, raised by ninja's
+      authentication, a hook or the operation); without an API-wide entity,
+      the 401, 422 and 429, without content;
     - ``parameters``: the precondition headers of a conditional write.
 
     ``head`` (when an operation routes it) is described like ``get``, but
@@ -2533,12 +2536,18 @@ def add_error_links(api: NinjaAPI, error: Entity) -> None:
     entity for the status, if it has one (``responses[status]``, else its
     ``error``), and its media type: it describes the response, as the
     OPTIONS of the operation does, and ``error`` here applies only otherwise.
+    A 401 or 403 is the exception: one the operation (or its ``before`` or
+    ``after_throttles``) raises gets ``error`` here when the operation's
+    ``error`` differs (and no ``responses[status]`` is declared), as the
+    401 and 403 ninja's authentication answers (a failed CSRF check, an
+    ``AuthorizationError``) get it: each 401 and 403 of the operation agrees
+    with the HTTP Schema Resource's 401 and 403 entries.
 
     ``error`` is also the API-wide error entity of the HTTP Schema Resources
     of the paths of the :class:`ScrudfulRouter` routers ``api`` mounts (see
     :func:`http_schema_resource`): the ``default`` response entry of an
-    operation without an ``error`` of its own, and the explicit 401, 422 and
-    429 entries (ninja's own errors) of one whose ``error`` differs. Its
+    operation without an ``error`` of its own, and the explicit 401, 403,
+    422 and 429 entries (ninja's own errors) of one whose ``error`` differs. Its
     relative link URLs resolve against the router's base URL there and, on
     the responses of a ``ScrudfulRouter`` operation, here too.
 
@@ -2983,6 +2992,13 @@ class _Raised:
 _RAISED: ContextVar[_Raised | None] = ContextVar("scrudful_raised", default=None)
 
 
+def _api_error_of(operation: Any) -> Entity | None:
+    """The :func:`add_error_links` entity of the API serving ``operation``
+    (ninja's ``Operation.api``, as :func:`_serving` reads it), if any."""
+    api = getattr(operation, "api", None)
+    return _API_ERRORS.get(api) if isinstance(api, NinjaAPI) else None
+
+
 #: The API serving the scrudful operation running, set by its
 #: ``Operation.run`` decorator (:func:`_raised_links_run`); ``None`` outside
 #: one.
@@ -3278,7 +3294,10 @@ def _raised_links_run(
                 finally:
                     _RAISED.reset(token)
                 if raised.config is not None:
-                    await _run_async(_raised_links(raised.config, request, response))
+                    links = _raised_links(
+                        raised.config, request, response, _api_error_of(operation)
+                    )
+                    await _run_async(links)
                 return response
 
         else:
@@ -3293,7 +3312,10 @@ def _raised_links_run(
                 finally:
                     _RAISED.reset(token)
                 if raised.config is not None:
-                    _run_sync(_raised_links(raised.config, request, response))
+                    links = _raised_links(
+                        raised.config, request, response, _api_error_of(operation)
+                    )
+                    _run_sync(links)
                 return response
 
         return scrudful_run
@@ -4095,37 +4117,56 @@ def _refuse_hook_result(name: str, result: Any, asynchronous: bool) -> NoReturn:
 
 
 def _raised_links(
-    config: _Config, request: HttpRequest, response: HttpResponseBase
+    config: _Config,
+    request: HttpRequest,
+    response: HttpResponseBase,
+    api_error: Entity | None,
 ) -> _Flow[None]:
     """Add the Links of an error the operation raised to ``response``.
 
     ``response`` is the API's answer to it; when it has content, it gets
-    the entity :func:`_raised_entity` picks for its status, whose link
+    the entity :func:`_raised_entity` picks for its status (``api_error``
+    is the serving API's :func:`add_error_links` entity), whose link
     callables get ``None``, and its media type (see :func:`_error_links`).
     It exposes ``Link`` and ``Allow`` either way.
     """
     expose_headers(response)
     if not _carries_body(response):
         return
-    entity = _raised_entity(config, request.method.lower(), response.status_code)
+    entity = _raised_entity(
+        config, request.method.lower(), response.status_code, api_error
+    )
     if entity is not None:
         yield from _error_links(response, entity, request)
 
 
-def _raised_entity(config: _Config, method: str, status: int) -> Entity | None:
+def _raised_entity(
+    config: _Config, method: str, status: int, api_error: Entity | None
+) -> Entity | None:
     """The entity of the response to an error the operation raised.
 
     The one the HTTP Schema Resource describes for ``status`` (see
     :func:`_described_entity`: ``responses[status]``, but ``error`` first
-    for scrudful's own early statuses), else ``error``. None below 400: an
-    operation decorator turned the error into another response, which is
-    its own to describe (a link callable of the default entity would get
-    ``None``, not the object).
+    for scrudful's own early statuses); else, for a 401 or 403 when the
+    API-wide entity ``api_error`` (:func:`add_error_links`) is set and
+    differs from ``error``, ``api_error``, as ninja's own 401 and 403 carry
+    it (R29); else ``error``. None below 400: an operation decorator turned
+    the error into another response, which is its own to describe (a link
+    callable of the default entity would get ``None``, not the object).
     """
     if status < 400:
         return None
     entity = _described_entity(config, method, status, _is_conditional(config, method))
-    return config.error if entity is None else entity
+    if entity is not None:
+        return entity
+    if (
+        status in _AUTH_ERRORS
+        and api_error is not None
+        and config.error is not None
+        and api_error != config.error
+    ):
+        return api_error
+    return config.error
 
 
 def _error_handler(
@@ -4147,7 +4188,7 @@ def _error_handler(
             raised is not None
             and raised.config is not None
             and _raised_entity(
-                raised.config, request.method.lower(), response.status_code
+                raised.config, request.method.lower(), response.status_code, error
             )
             is not None
         ):
@@ -5500,14 +5541,20 @@ def _may_use(
 
 #: The description of each method's ``default`` response entry: the errors.
 _DEFAULT_ERROR = "Error."
-#: The errors ninja answers before an operation runs (authentication,
-#: request validation, throttling), whose bodies get the API-wide error
-#: entity (:func:`add_error_links`), whatever the operation's ``error``.
+#: The errors ninja answers before an operation runs (authentication, its
+#: CSRF check and ``AuthorizationError``, request validation, throttling),
+#: whose bodies get the API-wide error entity (:func:`add_error_links`),
+#: whatever the operation's ``error``.
 _FRAMEWORK_ERRORS = {
     401: "Unauthorized: the request lacks valid authentication credentials.",
+    403: "Forbidden: the requester may not perform this request.",
     422: "Unprocessable Content: the request's parameters or body are invalid.",
     429: "Too Many Requests: the request was throttled.",
 }
+#: The statuses of :data:`_FRAMEWORK_ERRORS` that also carry the API-wide
+#: entity when the operation (or a hook) raises them (R29): an operation
+#: answers each 401 and 403 alike, whoever raised it.
+_AUTH_ERRORS = frozenset({401, 403})
 
 
 def _describe_path(router: ScrudfulRouter, path_view: Any) -> dict[str, Any]:
@@ -5740,8 +5787,10 @@ def _error_entries(
     When ``error`` is set and differs from ``api_error``, ninja's own 401,
     422 and 429, which get ``api_error`` whatever the operation, have
     explicit entries with its content (Agreement picks an exact status
-    before ``default``), unless the operation declares them. Without
-    ``with_content`` (HEAD), the same entries without content.
+    before ``default``), unless the operation declares them; so has the 403
+    when ``api_error`` is set (every 401 and 403 answered for the operation
+    then carries it, see :func:`_raised_entity`). Without ``with_content``
+    (HEAD), the same entries without content.
     """
 
     def entry(description: str, entity: Entity | None, key: str) -> _Flow[Any]:
@@ -5755,7 +5804,9 @@ def _error_entries(
     if error is not None and error != api_error:
         for status, description in _FRAMEWORK_ERRORS.items():
             key = str(status)
-            if key not in responses:
+            # Without an API-wide entity, a 403 is the operation's (ninja's
+            # own carries no entity), under ``default``.
+            if key not in responses and (status != 403 or api_error is not None):
                 responses[key] = yield from entry(description, api_error, key)
     responses["default"] = yield from entry(
         _DEFAULT_ERROR, api_error if error is None else error, "default"

@@ -771,8 +771,13 @@ plus 201 for a ``@scrudful_create`` operation, and scrudful's early responses
 ``statuses=``. Each method also has a ``default`` entry for its errors, with
 the content of the operation's ``error``, else of the API-wide entity
 (:func:`~scrudful.ninja.add_error_links`); when the operation's ``error``
-differs from the API-wide one, the 401, 422 and 429 that ninja answers itself,
-with the API-wide entity, have entries of their own. ``head`` (where an
+differs from the API-wide one, the 401, 403, 422 and 429 that ninja answers
+itself, with the API-wide entity, have entries of their own, and every 401 and
+403 of the operation carries that entity: those of ninja's authentication (a
+failed CSRF check, an ``AuthorizationError``), of ``before=`` and
+``after_throttles=``, and those the operation raises (unless it declares the
+status in ``responses=``). Without an API-wide entity, the 401, 422 and 429
+have entries without content, and a 403 is the operation's. ``head`` (where an
 operation routes it) is described like ``get``, without content, and
 ``options`` is exactly ``{"responses": {"204": {"description": "No
 Content"}}}``.
