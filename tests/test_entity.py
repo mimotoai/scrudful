@@ -1,6 +1,7 @@
 """The shared ``Entity`` and its media type."""
 
 import pytest
+from django.utils.safestring import SafeString
 
 from scrudful import fastapi, ninja, rest_framework
 from scrudful.entity import Entity
@@ -74,3 +75,18 @@ def test_lazy_links_are_not_evaluated_when_made():
         Entity(Lazy())
     assert Lazy.evaluated == 0
     assert entity.context_link_or_func is not None
+
+
+class Text(str):
+    """A ``str`` of a class of the project's own."""
+
+
+@pytest.mark.parametrize(
+    "empty", [SafeString(""), Text(""), b""], ids=["SafeString", "subclass", "bytes"]
+)
+def test_an_empty_string_link_is_unset_whatever_its_class(empty):
+    """An empty ``str`` (or ``bytes``) is no link, as ``""`` is, whatever its
+    class (Django's ``SafeString`` is a ``str`` subclass): a schema link alone
+    needs no context link, and a context link alone no context type."""
+    assert Entity(empty).schema_link_or_func == empty
+    Entity(media_type="text/csv", context_link_or_func=empty)

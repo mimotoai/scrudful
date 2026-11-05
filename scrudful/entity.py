@@ -20,11 +20,15 @@ __all__ = ["Entity", "HsrConfigError"]
 
 
 def _unset(value: Any) -> bool:
-    """Whether a link option is unset: ``None``, or an empty built-in value
-    (``""``, ``False`` ...). Any other object, a lazy URL such as Django's
-    ``reverse_lazy`` included, counts as set without being evaluated, so an
-    entity may name a URL of a URLconf that isn't loaded yet."""
-    return value is None or (type(value).__module__ == "builtins" and not value)
+    """Whether a link option is unset: ``None``, an empty ``str`` or
+    ``bytes`` of any class (Django's ``SafeString`` included), or another
+    empty built-in value (``False``, ``0`` ...). Any other object, a lazy URL
+    such as Django's ``reverse_lazy`` included (it is no ``str``), counts as
+    set without being evaluated, so an entity may name a URL of a URLconf
+    that isn't loaded yet."""
+    if value is None or (isinstance(value, (str, bytes)) and not value):
+        return True
+    return type(value).__module__ == "builtins" and not value
 
 
 @dataclass(frozen=True)

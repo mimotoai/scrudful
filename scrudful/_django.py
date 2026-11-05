@@ -427,9 +427,14 @@ def _plain_links(entity: Entity, request: HttpRequest | None) -> str | None:
         )
     parts = []
     for url, rel, content_type, defaults_, context_of in candidates:
-        # Without a request, a lazy URL is not evaluated (see resolve).
-        if _unset(url) if request is None else not url:
+        if _unset(url):
             continue
+        if request is not None:
+            # A lazy URL is evaluated only with a request (see resolve):
+            # one of nothing gives no Link, as an unset one.
+            url = url if isinstance(url, str) else str(url)
+            if _unset(url):
+                continue
         if context_of is not None:
             content_type = _adapter.context_link_type(context_of, content_type)
         parts.append(

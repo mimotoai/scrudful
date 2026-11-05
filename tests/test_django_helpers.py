@@ -9,6 +9,7 @@ from django.http import Http404
 from django.test import RequestFactory
 from django.urls import path, reverse_lazy
 from django.utils.functional import lazy
+from django.utils.safestring import SafeString
 
 from scrudful import _django
 from scrudful._adapter import prefers_html
@@ -415,6 +416,45 @@ def test_a_failing_handler404_logs_nothing_of_its_own(
         except Http404 as exc:
             view(rf.get("/x", HTTP_ACCEPT="application/json"), exc)
     assert not caplog.records
+
+
+CONTEXT_LINK = (
+    '<https://x/c>; rel="http://www.w3.org/ns/json-ld#context"; '
+    'type="application/ld+json"'
+)
+
+
+def test_handler_gives_a_link_by_one_rule_when_made_and_answering(rf, settings):
+    """Whether a link is given is decided alike when the handler is made
+    and when it answers: an empty ``str`` of any class (``SafeString``) is no
+    link, so a rel of it isn't checked either."""
+    settings.SCRUDFUL = None
+    view = error_handler(
+        404,
+        Entity(
+            SafeString(""),
+            context_link_or_func="https://x/c",
+            schema_rel_or_func="a\nb",
+        ),
+    )
+    response = view(rf.get("/x", HTTP_ACCEPT="application/json"), Http404())
+    assert response["Link"] == CONTEXT_LINK
+
+
+def _no_url() -> str:
+    return ""
+
+
+def test_handler_gives_no_link_for_a_lazy_url_of_nothing(rf, settings):
+    """A lazy URL counts as given when the handler is made, which doesn't
+    evaluate it; one that evaluates to ``""`` gives no Link when it answers
+    (not one to the request's own URL)."""
+    settings.SCRUDFUL = None
+    view = error_handler(
+        404, Entity(lazy(_no_url, str)(), context_link_or_func="https://x/c")
+    )
+    response = view(rf.get("/x", HTTP_ACCEPT="application/json"), Http404())
+    assert response["Link"] == CONTEXT_LINK
 
 
 def test_handler_rejects_a_link_value_it_cant_write():
