@@ -621,6 +621,7 @@ from scrudful._django import (
     aware,
     conditional_response,
     error_handler,
+    hsr_response,
     page_url,
     precondition_headers,
     scrudful_setting,
@@ -631,13 +632,10 @@ from scrudful._hsr import (
     HSR_ROUTE_SEGMENT,
     absolute_for_hsr,
     allow_value,
-    hsr_etag,
     hsr_link,
-    hsr_response_links,
     hsr_route_name,
     is_preflight,
     options_operation,
-    serialize_hsr,
 )
 from scrudful.collection import (
     ENVELOPE_FIELDS,
@@ -2326,35 +2324,9 @@ def _hsr_route_view(
 def _hsr_response(
     request: HttpRequest, router: ScrudfulRouter, path: str
 ) -> HttpResponseBase:
-    """The answer to a GET or HEAD of ``path``'s HTTP Schema Resource.
-
-    A 200 whose body is :func:`~scrudful._hsr.serialize_hsr` of the document
-    (the bytes the ``ETag`` hashes, not the API renderer's), with the HSR's
-    own Links and the router's ``Cache-Control``; or, for an
-    ``If-None-Match`` matching the ``ETag`` (weak comparison), a 304 with the
-    ``ETag`` and ``Cache-Control``.
-    """
-    body = serialize_hsr(router._hsr(path))
-    etag = hsr_etag(body)
-    cache_control = router._hsr_cache_control()
-    result = evaluate_preconditions(
-        request.method or "GET",
-        precondition_headers(request),
-        etag=etag,
-        last_modified=None,
-        require_precondition=False,
-    )
-    if result is not None:
-        early = conditional_response(result)
-        if result.status == 304:
-            early["Cache-Control"] = cache_control
-        return early
-    response = HttpResponse(body, content_type="application/json")
-    response["Link"] = hsr_response_links()
-    response["ETag"] = etag
-    response["Cache-Control"] = cache_control
-    expose_headers(response)
-    return response
+    """The answer to a GET or HEAD of ``path``'s HTTP Schema Resource, with the
+    router's ``Cache-Control`` (see :func:`scrudful._django.hsr_response`)."""
+    return hsr_response(request, router._hsr(path), router._hsr_cache_control())
 
 
 def _hsr_target(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:

@@ -1,34 +1,47 @@
-"""The HTTP Schema Resource of a DRF view, built without a request.
+"""The HTTP Schema Resource of a DRF view, built without a request, and
+served by ``hsr_urls()``.
 
-The module is its own URLconf (``pytestmark`` below).
+The module is its own URLconf (``pytestmark`` below); the ``hsr_urls()``
+tests use ``tests/drf_hsr_urls.py`` (the ``urls`` fixture) or a URLconf class.
 """
 
 import json
 
 import pytest
 from django.contrib.auth.models import User
+from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
-from django.urls import path
+from django.test import Client, RequestFactory
+from django.urls import include, path, resolve, reverse
 from rest_framework import viewsets
 from rest_framework.authentication import BasicAuthentication
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.test import APIClient, APIRequestFactory
 from rest_framework.views import APIView
 
-from scrudful._hsr import HsrConfigError
+from scrudful._hsr import (
+    HsrConfigError,
+    hsr_etag,
+    hsr_response_links,
+    serialize_hsr,
+)
 from scrudful.rest_framework import (
     Entity,
     ScrudfulMetadata,
     ScrudfulViewFunc,
+    _hsr_target,
+    hsr_urls,
     http_schema_resource,
     scrudful,
     scrudful_api_view,
     scrudful_viewset,
 )
-from tests.semantic_http import validate_http_schema_resource
+from tests import drf_hsr_urls
+from tests.semantic_http import hsr_get_problems, validate_http_schema_resource
 
 pytestmark = [pytest.mark.urls(__name__), pytest.mark.django_db]
 
@@ -771,3 +784,370 @@ def test_a_subclass_without_removed_hooks_still_works():
     assert response.status_code == 200
     assert response.data["x-extra"] is True
     assert response.data["options"] == OPTIONS_204
+
+
+# --- hsr_urls() ----------------------------------------------------------------
+
+NO_INCLUDE = (
+    "add path('', include(scrudful.rest_framework.hsr_urls())) to your root "
+    "URLconf, or set SCRUDFUL['HSR_URL']"
+)
+
+
+@pytest.fixture
+def urls(settings):
+    """A URLconf of a DefaultRouter, a hand-mounted path(), scrudful_api_views,
+    a namespaced include and hsr_urls() (``tests/drf_hsr_urls.py``)."""
+    settings.ROOT_URLCONF = "tests.drf_hsr_urls"
+
+
+def target(url, **extra):
+    """``_hsr_target`` of a GET of ``url``, resolved by the current URLconf."""
+    request = RequestFactory().get(url, **extra)
+    request.resolver_match = resolve(url)
+    return _hsr_target(request)
+
+
+def schema_ref(response, method="get", status="200"):
+    content = json.loads(response.content)[method]["responses"][status]["content"]
+    return content["application/json"]["schema"]["$ref"]
+
+
+def get_problems(response):
+    return hsr_get_problems(
+        response.status_code, dict(response.items()), response.content
+    )
+
+
+@pytest.mark.parametrize(
+    "view_name, url",
+    [
+        ("item-detail", "/items/1/"),
+        ("item-list", "/items/"),
+        ("notes", "/notes/1"),
+        ("api:thing-detail", "/api/things/1/"),
+        ("api:thing-list", "/api/things/"),
+        ("stats", "/stats"),
+        ("report", "/report"),
+    ],
+)
+def test_hsr_urls_serves_every_scrudful_view(urls, client, view_name, url):
+    response = client.get(f"/_hsr/{view_name}")
+    assert get_problems(response) == []
+    assert json.loads(response.content) == http_schema_resource(resolve(url).func)
+    assert response.content == serialize_hsr(json.loads(response.content))
+    assert response["ETag"] == hsr_etag(response.content)
+    assert response["Link"] == hsr_response_links()
+    # ThingViewSet's Meta.hsr_cache_control, else the default.
+    cache_control = (
+        "public, max-age=3600" if "thing" in view_name else "public, max-age=300"
+    )
+    assert response["Cache-Control"] == cache_control
+    assert "Link" in response["Access-Control-Expose-Headers"]
+
+
+def test_hsr_route_takes_a_namespaced_view_name(urls, client):
+    # Django's str converter excludes only "/": the ":" of a namespace is kept.
+    assert (
+        reverse("scrudful_hsr", kwargs={"view_name": "api:thing-detail"})
+        == "/_hsr/api:thing-detail"
+    )
+    response = client.get("/_hsr/api:thing-detail")
+    assert response.status_code == 200
+    assert schema_ref(response) == "https://things.example/schemas/thing"
+    # Not the un-namespaced name.
+    assert client.get("/_hsr/thing-detail").status_code == 404
+
+
+@pytest.mark.parametrize(
+    "view_name", ["plain-detail", "api-root", "scrudful_hsr", "nope", "api:nope"]
+)
+def test_hsr_of_no_scrudful_view_is_a_json_404(urls, client, view_name):
+    response = client.get(f"/_hsr/{view_name}")
+    assert response.status_code == 404
+    assert response["Content-Type"] == "application/json"
+    assert json.loads(response.content) == {"detail": "Not found."}
+
+
+def test_hsr_identical_across_hosts_and_requesters(urls, settings):
+    settings.ALLOWED_HOSTS = ["a.example", "b.example"]
+    anonymous = Client()
+    alice = Client()
+    alice.force_login(User.objects.create_user("alice"))
+    # Two view functions of one viewset: each request builds its own
+    # document (the first to need it), so a request-dependent build differs.
+    a = anonymous.get("/_hsr/item-detail", HTTP_HOST="a.example")
+    b = alice.get("/_hsr/other-item-detail", HTTP_HOST="b.example")
+    assert a.status_code == b.status_code == 200
+    assert a.content == b.content
+    assert a["ETag"] == b["ETag"]
+    # Every method, whatever the requester (allowed_func is OPTIONS' Allow).
+    assert list(json.loads(a.content)) == ["get", "put", "delete", "options", "head"]
+    assert schema_ref(a) == "https://api.example/schemas/item"
+    # The same document again, the other way round.
+    again = alice.get("/_hsr/item-detail", HTTP_HOST="b.example")
+    assert again.content == a.content
+
+
+def test_hsr_get_answers_if_none_match_with_304_and_serves_head(urls, client):
+    etag = client.get("/_hsr/item-detail")["ETag"]
+    assert etag.startswith('"')  # strong
+    for if_none_match in (etag, f"W/{etag}", f'"other", {etag}', "*"):
+        response = client.get("/_hsr/item-detail", HTTP_IF_NONE_MATCH=if_none_match)
+        assert response.status_code == 304
+        assert response.content == b""
+        assert response["ETag"] == etag
+        assert response["Cache-Control"] == "public, max-age=300"
+    other = client.get("/_hsr/item-detail", HTTP_IF_NONE_MATCH='"other"')
+    assert other.status_code == 200
+    head = client.head("/_hsr/item-detail")
+    assert head.status_code == 200
+    assert head.content == b""
+    assert head["ETag"] == etag
+    assert head["Link"] == hsr_response_links()
+
+
+@pytest.mark.parametrize("method", ["post", "put", "patch", "delete", "options"])
+def test_hsr_route_answers_other_methods_405(urls, method):
+    # CSRF-exempt: an unsafe method gets the 405, not CSRF's 403.
+    client = Client(enforce_csrf_checks=True)
+    response = getattr(client, method)("/_hsr/item-detail")
+    assert response.status_code == 405
+    assert response["Allow"] == "GET, HEAD"
+
+
+@pytest.fixture
+def throttle_cache():
+    cache.clear()
+    yield
+    cache.clear()
+
+
+def test_hsr_route_runs_no_permission_check_or_throttle(urls, client, throttle_cache):
+    # The resource: admins only, once a day.
+    assert client.get("/locked/1/").status_code in (401, 403)
+    admin = Client()
+    admin.force_login(User.objects.create_user("admin", is_staff=True))
+    assert admin.get("/locked/1/").status_code == 200
+    assert admin.get("/locked/1/").status_code == 429
+    # Its HTTP Schema Resource: anyone, any number of times.
+    for requester in (client, admin, client):
+        assert get_problems(requester.get("/_hsr/locked-detail")) == []
+
+
+def test_hsr_cache_control_from_the_setting_and_meta(urls, client, settings):
+    settings.SCRUDFUL = {
+        "BASE_URL": BASE_URL,
+        "HSR_CACHE_CONTROL": "public, max-age=60",
+    }
+    assert client.get("/_hsr/item-detail")["Cache-Control"] == "public, max-age=60"
+    # Meta.hsr_cache_control, on the 200 and the 304.
+    thing = client.get("/_hsr/api:thing-detail")
+    assert thing["Cache-Control"] == "public, max-age=3600"
+    not_modified = client.get(
+        "/_hsr/api:thing-detail", HTTP_IF_NONE_MATCH=thing["ETag"]
+    )
+    assert not_modified.status_code == 304
+    assert not_modified["Cache-Control"] == "public, max-age=3600"
+
+
+class UnnamedURLconf:
+    urlpatterns = [
+        path("plain/", drf_hsr_urls.schema),  # not scrudful: needs no name
+        path(
+            "v1/",
+            include([path("notes/<int:pk>", drf_hsr_urls.NoteView.as_view())]),
+        ),
+        path("", include(hsr_urls())),
+    ]
+
+
+class UnnamedAPIViewURLconf:
+    urlpatterns = [path("stats/", drf_hsr_urls.stats), path("", include(hsr_urls()))]
+
+
+def test_unnamed_scrudful_view_is_improperly_configured(settings, client):
+    settings.ROOT_URLCONF = UnnamedURLconf
+    with pytest.raises(ImproperlyConfigured, match="'v1/notes/<int:pk>'") as info:
+        client.get("/_hsr/notes")
+    assert "name=" in str(info.value)
+    with pytest.raises(ImproperlyConfigured, match="'v1/notes/<int:pk>'"):
+        target("/v1/notes/1")
+    settings.ROOT_URLCONF = UnnamedAPIViewURLconf
+    with pytest.raises(ImproperlyConfigured, match="'stats/'"):
+        client.get("/_hsr/stats")
+
+
+class ClashURLconf:
+    urlpatterns = [
+        path("notes/<int:pk>", drf_hsr_urls.NoteView.as_view(), name="clash"),
+        path("stats", drf_hsr_urls.stats, name="clash"),
+        path("", include(hsr_urls())),
+    ]
+
+
+def test_one_name_for_two_scrudful_views_is_improperly_configured(settings, client):
+    settings.ROOT_URLCONF = ClashURLconf
+    with pytest.raises(ImproperlyConfigured, match="'clash'") as info:
+        client.get("/_hsr/clash")
+    assert "'notes/<int:pk>'" in str(info.value)
+    assert "'stats'" in str(info.value)
+
+
+class NoIncludeURLconf:
+    urlpatterns = [
+        path(
+            "items/<str:pk>/",
+            drf_hsr_urls.ItemViewSet.as_view({"get": "retrieve"}),
+            name="item-detail",
+        )
+    ]
+
+
+def test_missing_include_is_improperly_configured(settings):
+    # Task 12 makes OPTIONS (and Task 13 every response) link to this target.
+    settings.ROOT_URLCONF = NoIncludeURLconf
+    with pytest.raises(ImproperlyConfigured) as info:
+        target("/items/1/")
+    assert str(info.value) == NO_INCLUDE
+    settings.SCRUDFUL = {
+        "BASE_URL": BASE_URL,
+        "HSR_URL": lambda view_name: f"https://schemas.example/{view_name}",
+    }
+    assert target("/items/1/") == "https://schemas.example/item-detail"
+
+
+def test_hsr_target_is_the_route_resolved_against_the_base_url(urls):
+    assert target("/items/1/") == "https://api.example/_hsr/item-detail"
+    assert target("/notes/1") == "https://api.example/_hsr/notes"
+    # Meta.base_url, and a scrudful_api_view's base_url=.
+    assert target("/api/things/1/") == "https://things.example/_hsr/api:thing-detail"
+    assert target("/report") == "https://reports.example/_hsr/report"
+    # A DRF Request, as the views have.
+    request = RequestFactory().get("/items/")
+    request.resolver_match = resolve("/items/")
+    assert _hsr_target(Request(request)) == "https://api.example/_hsr/item-list"
+
+
+def test_hsr_target_without_a_base_url_is_the_requests(urls, settings):
+    settings.SCRUDFUL = None
+    settings.ALLOWED_HOSTS = ["testserver", "a.example"]
+    assert target("/items/1/") == "http://testserver/_hsr/item-detail"
+    assert (
+        target("/items/1/", HTTP_HOST="a.example")
+        == "http://a.example/_hsr/item-detail"
+    )
+
+
+def test_hsr_target_without_resolver_match_is_improperly_configured(urls):
+    with pytest.raises(ImproperlyConfigured, match="resolver_match"):
+        _hsr_target(RequestFactory().get("/items/1/"))
+
+
+def test_hsr_url_setting_and_meta(urls, settings):
+    settings.SCRUDFUL = {
+        "BASE_URL": BASE_URL,
+        "HSR_URL": lambda view_name: f"https://schemas.example/{view_name}",
+    }
+    assert target("/items/1/") == "https://schemas.example/item-detail"
+    assert target("/api/things/1/") == "https://schemas.example/api:thing-detail"
+    # Meta.hsr_url wins over the setting.
+    assert (
+        target("/elsewhere/1/") == "https://schemas.example/hsr/elsewhere-detail.json"
+    )
+
+
+def test_hsr_route_false_with_hsr_url(urls, settings, client):
+    # Meta.hsr_route = False: out of hsr_urls(), linked to its Meta.hsr_url.
+    assert client.get("/_hsr/elsewhere-detail").status_code == 404
+    assert client.get("/_hsr/elsewhere-list").status_code == 404
+    assert (
+        target("/elsewhere/1/") == "https://schemas.example/hsr/elsewhere-detail.json"
+    )
+    # SCRUDFUL["HSR_ROUTE"] = False: needs an HSR_URL.
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL, "HSR_ROUTE": False}
+    assert client.get("/_hsr/item-detail").status_code == 404
+    with pytest.raises(ImproperlyConfigured, match="HSR_URL"):
+        target("/items/1/")
+    settings.SCRUDFUL = {
+        "BASE_URL": BASE_URL,
+        "HSR_ROUTE": False,
+        "HSR_URL": lambda view_name: f"https://schemas.example/{view_name}",
+    }
+    assert client.get("/_hsr/item-detail").status_code == 404
+    assert target("/items/1/") == "https://schemas.example/item-detail"
+    # Meta.hsr_route = True overrides the setting.
+    assert client.get("/_hsr/api:thing-detail").status_code == 200
+    assert target("/api/things/1/") == "https://schemas.example/api:thing-detail"
+
+
+def test_meta_hsr_route_false_without_hsr_url_is_improperly_configured(settings):
+    @scrudful_viewset
+    class Off(drf_hsr_urls.ItemViewSetBase):
+        class Meta:
+            hsr_route = False
+
+    class OffURLconf:
+        urlpatterns = [
+            path("off/<str:pk>/", Off.as_view({"get": "retrieve"}), name="off"),
+            path("", include(hsr_urls())),
+        ]
+
+    settings.ROOT_URLCONF = OffURLconf
+    with pytest.raises(ImproperlyConfigured, match="hsr_route"):
+        target("/off/1/")
+
+
+@pytest.mark.parametrize(
+    "key, value, match, route, link",
+    [
+        # Read by the route, the link, or both.
+        ("HSR_ROUTE", "no", "HSR_ROUTE.*bool", True, True),
+        ("HSR_URL", "https://x/", "HSR_URL.*callable", False, True),
+        ("HSR_CACHE_CONTROL", 300, "HSR_CACHE_CONTROL.*str", True, False),
+    ],
+)
+def test_hsr_settings_are_checked(
+    urls, settings, client, key, value, match, route, link
+):
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL, key: value}
+    if route:
+        with pytest.raises(ImproperlyConfigured, match=match):
+            client.get("/_hsr/item-detail")
+    if link:
+        with pytest.raises(ImproperlyConfigured, match=match):
+            target("/items/1/")
+
+
+@pytest.mark.parametrize(
+    "name, value, match",
+    [
+        ("hsr_route", "no", "hsr_route.*bool"),
+        ("hsr_url", "https://x/", "hsr_url.*callable"),
+        ("hsr_cache_control", 300, "hsr_cache_control.*str"),
+    ],
+)
+def test_hsr_meta_options_are_checked(name, value, match):
+    meta = type("Meta", (), {name: value})
+    with pytest.raises(TypeError, match=match):
+        scrudful_viewset(type("V", (drf_hsr_urls.ItemViewSetBase,), {"Meta": meta}))
+
+
+class MovedURLconf:
+    urlpatterns = [
+        path("stats", drf_hsr_urls.stats, name="stats"),
+        path("v2/schemas/stats", drf_hsr_urls.schema, name="stats-schema"),
+        path("", include(hsr_urls())),
+    ]
+
+
+def test_a_root_urlconf_change_rebuilds_the_documents_and_the_scan(
+    urls, settings, client
+):
+    assert schema_ref(client.get("/_hsr/stats")) == "https://api.example/schemas/stats"
+    settings.ROOT_URLCONF = MovedURLconf
+    # The same view function: its link callable reverses in the new URLconf.
+    assert (
+        schema_ref(client.get("/_hsr/stats")) == "https://api.example/v2/schemas/stats"
+    )
+    assert client.get("/_hsr/item-detail").status_code == 404

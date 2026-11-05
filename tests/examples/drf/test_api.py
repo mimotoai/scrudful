@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 import pytest
 from django.db import connection
-from django.urls import include, path
+from django.urls import include, path, resolve
 from items import views
 from items.models import Item
 from rest_framework.routers import SimpleRouter
@@ -17,7 +17,9 @@ from rest_framework.test import APIClient
 
 from scrudful._adapter import allow_header, describe_options, options_links
 from scrudful._hsr import options_operation
+from scrudful.rest_framework import http_schema_resource
 from tests.semantic_http import (
+    hsr_get_problems,
     link_problems,
     parse_links,
     validate_http_schema_resource,
@@ -772,3 +774,21 @@ def test_only_json_is_served_and_accepted(client, item):
     assert response.status_code == 415
     hsr = client.options("/items/").json()
     assert list(hsr["post"]["requestBody"]["content"]) == ["application/json"]
+
+
+@pytest.mark.parametrize(
+    "view_name, path",
+    [
+        ("item-detail", "/items/1/"),
+        ("item-list", "/items/"),
+        ("readonly-item-detail", "/readonly-items/1/"),
+        ("readonly-item-list", "/readonly-items/"),
+        ("item-stats", "/stats/"),
+    ],
+)
+def test_hsr_urls_serve_every_view(client, view_name, path):
+    """The example's URLconf includes ``hsr_urls()``."""
+    response = client.get(f"/_hsr/{view_name}")
+    headers = dict(response.items())
+    assert hsr_get_problems(response.status_code, headers, response.content) == []
+    assert response.json() == http_schema_resource(resolve(path).func)

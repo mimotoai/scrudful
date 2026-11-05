@@ -120,8 +120,24 @@ from urllib.parse import urlsplit
 
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.core.signals import setting_changed
-from django.http import Http404, HttpRequest, HttpResponseBase
+from django.http import (
+    Http404,
+    HttpRequest,
+    HttpResponseBase,
+    HttpResponseNotAllowed,
+    JsonResponse,
+)
+from django.urls import (
+    NoReverseMatch,
+    URLPattern,
+    URLResolver,
+    get_resolver,
+    get_urlconf,
+    path,
+    reverse,
+)
 from django.utils.encoding import iri_to_uri
+from django.views.decorators.csrf import csrf_exempt
 from rest_framework.exceptions import (
     APIException,
     ErrorDetail,
@@ -172,13 +188,19 @@ from scrudful._adapter import (
 from scrudful._django import (
     aware,
     error_handler,
+    hsr_response,
     page_url,
     scrudful_setting,
     slice_page,
 )
 from scrudful._django import conditional_response as django_conditional_response
 from scrudful._django import precondition_headers as django_precondition_headers
-from scrudful._hsr import HsrConfigError, absolute_for_hsr, options_operation
+from scrudful._hsr import (
+    DEFAULT_HSR_CACHE_CONTROL,
+    HsrConfigError,
+    absolute_for_hsr,
+    options_operation,
+)
 from scrudful.conditional import (
     ConditionalResult,
     evaluate_preconditions,
@@ -204,6 +226,7 @@ __all__ = [
     "exception_handler",
     "handler404",
     "handler500",
+    "hsr_urls",
     "http_schema_resource",
     "scrudful",
     "scrudful_api_view",
@@ -275,7 +298,11 @@ _DEFAULT_MEDIA_TYPE = "application/json"
 #: Options a view's handlers share: ``Meta``'s are kept on the class (see
 #: :func:`scrudful_viewset`), for the handlers it doesn't wrap.
 _VIEW_OPTIONS = ("base_url", "statuses", "allowed_func")
-#: The ``Meta`` options of a :func:`scrudful_viewset` class, checked.
+#: Where a :func:`scrudful_viewset` class's HTTP Schema Resource is served
+#: (see :func:`hsr_urls`): ``Meta`` options of the class alone.
+_HSR_OPTIONS = ("hsr_route", "hsr_url", "hsr_cache_control")
+#: The ``Meta`` options of a :func:`scrudful_viewset` class, checked: the
+#: :data:`_VIEW_OPTIONS` and :data:`_HSR_OPTIONS`.
 _META_OPTIONS_ATTR = "_scrudful_meta_options"
 #: The description of each method's ``default`` response entry: the errors.
 _DEFAULT_ERROR = "Error."
@@ -1133,8 +1160,21 @@ def scrudful_viewset(cls: type) -> type:
         OPTIONS (see :class:`ScrudfulViewFunc`).
     base_url : str, optional
         The absolute URL relative link URLs are resolved against (see
-        :class:`ScrudfulViewFunc`), for the errors and every handler of the
-        class too.
+        :class:`ScrudfulViewFunc`), for the errors, every handler of the
+        class and the HTTP Schema Resource link too.
+    hsr_route : bool, optional
+        ``False`` takes the class's routes out of :func:`hsr_urls` (and needs
+        ``hsr_url``); ``True`` keeps them in with ``SCRUDFUL["HSR_ROUTE"]``
+        set to ``False``. Default: ``SCRUDFUL["HSR_ROUTE"]``, else ``True``.
+    hsr_url : callable, optional
+        ``hsr_url(view_name)``, the URL of the HTTP Schema Resource of the
+        route named ``view_name`` (namespace-qualified, as
+        ``request.resolver_match.view_name``), where it is served elsewhere,
+        in place of ``SCRUDFUL["HSR_URL"]`` and the :func:`hsr_urls` route.
+    hsr_cache_control : str, optional
+        The ``Cache-Control`` of the :func:`hsr_urls` route's responses, in
+        place of ``SCRUDFUL["HSR_CACHE_CONTROL"]`` (default ``public,
+        max-age=300``).
     href_func : callable, optional
         ``href_func(view, request, obj)``, the URL of an item, for
         :class:`ScrudfulPagination` (required by it; not used by the wrapped
@@ -1147,8 +1187,11 @@ def scrudful_viewset(cls: type) -> type:
 
     shared = options("", _VIEW_OPTIONS)
     shared["statuses"] = _check_view_options(None, **shared)
-    # For the handlers it doesn't wrap (an @action's, say), and the errors.
-    setattr(cls, _META_OPTIONS_ATTR, shared)
+    hsr = options("", _HSR_OPTIONS)
+    _check_hsr_options(**hsr)
+    # For the handlers it doesn't wrap (an @action's, say), the errors and
+    # the HTTP Schema Resource route.
+    setattr(cls, _META_OPTIONS_ATTR, {**shared, **hsr})
     item = options(
         "",
         _VALIDATOR_OPTIONS
@@ -1497,10 +1540,16 @@ def http_schema_resource(view_func: Callable[..., Any]) -> dict[str, Any]:
             "http_schema_resource() takes a DRF view function, what as_view() "
             f"or scrudful_api_view returns, not {view_func!r}"
         )
+    return copy.deepcopy(_built_hsr(view_func))
+
+
+def _built_hsr(view_func: Callable[..., Any]) -> dict[str, Any]:
+    """The HTTP Schema Resource of the DRF view function ``view_func``, built
+    once (not a copy)."""
     hsr = _HSRS.get(view_func)
     if hsr is None:
         hsr = _HSRS[view_func] = _describe_view(_describe_mode_view(view_func))
-    return copy.deepcopy(hsr)
+    return hsr
 
 
 #: The HTTP Schema Resource of each view function (see :func:`http_schema_resource`).
@@ -1510,13 +1559,326 @@ _HSRS: weakref.WeakKeyDictionary[Callable[..., Any], dict[str, Any]] = (
 
 
 def _forget_hsrs(sender: Any, setting: str, **kwargs: Any) -> None:
-    """Discard the built documents when a setting they depend on changes
-    (``override_settings``, in tests)."""
-    if setting in ("SCRUDFUL", "REST_FRAMEWORK"):
+    """Discard the built documents (and the :func:`hsr_urls` scans) when a
+    setting they depend on changes (``override_settings``, in tests): link
+    callables may ``reverse()`` in the root URLconf."""
+    if setting in ("SCRUDFUL", "REST_FRAMEWORK", "ROOT_URLCONF"):
         _HSRS.clear()
+    if setting == "ROOT_URLCONF":
+        _SCRUDFUL_VIEWS.clear()
 
 
 setting_changed.connect(_forget_hsrs)
+
+
+# --- Serving the HTTP Schema Resource ------------------------------------------
+
+#: The message of a missing :func:`hsr_urls` include (see :func:`_hsr_target`).
+_NO_HSR_URLS = (
+    "add path('', include(scrudful.rest_framework.hsr_urls())) to your root "
+    "URLconf, or set SCRUDFUL['HSR_URL']"
+)
+
+
+def hsr_urls() -> list[URLPattern]:
+    """The URL pattern serving every scrudful view's HTTP Schema Resource.
+
+    Include it once, in the root URLconf::
+
+        urlpatterns = [
+            ...,
+            path("", include(scrudful.rest_framework.hsr_urls())),
+        ]
+
+    It serves ``_hsr/<view_name>``, named ``scrudful_hsr``, where
+    ``view_name`` is the namespace-qualified URL name of a route
+    (``request.resolver_match.view_name``, such as ``"item-detail"`` or
+    ``"api:item-detail"``). On the first request it scans the URLconf, through
+    every ``include()`` and namespace, for the routes of scrudful views:
+    those of a :func:`scrudful_viewset` class, of a view with a
+    :class:`ScrudfulViewFunc` handler, or of a :func:`scrudful_api_view`,
+    however they are mounted (a router, ``path()``). Each is served
+    :func:`http_schema_resource` of its view function.
+
+    The view is a plain Django view: it runs no authentication, permission
+    check or throttle, is CSRF-exempt, and answers GET and HEAD with:
+
+    - a 200, ``application/json``, the compact JSON of the document, the
+      Links of the HTTP Schema Resource's own schema and context, a strong
+      ``ETag`` and ``Cache-Control`` (the view's ``Meta.hsr_cache_control``,
+      else ``SCRUDFUL["HSR_CACHE_CONTROL"]``, else ``public, max-age=300``);
+    - a 304 with the ``ETag`` and ``Cache-Control`` for a matching
+      ``If-None-Match`` (weak comparison);
+    - a JSON 404, ``{"detail": "Not found."}``, for a name that isn't a
+      scrudful view's route, or whose view has its route turned off
+      (``Meta.hsr_route = False``, or ``SCRUDFUL["HSR_ROUTE"] = False``
+      without ``Meta.hsr_route = True``).
+
+    Other methods get a 405 with ``Allow: GET, HEAD``. The scan is redone
+    when ``ROOT_URLCONF`` changes.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        On a request, when a scrudful view's route has no URL name, or two
+        different scrudful views' routes share one; or a setting is invalid.
+    """
+    return [path("_hsr/<str:view_name>", _hsr_view, name="scrudful_hsr")]
+
+
+@csrf_exempt
+def _hsr_view(request: HttpRequest, view_name: str) -> HttpResponseBase:
+    """The view of :func:`hsr_urls`."""
+    if request.method not in ("GET", "HEAD"):
+        response = HttpResponseNotAllowed(["GET", "HEAD"])
+        expose_headers(response)
+        return response
+    view_func = _scrudful_views().get(view_name)
+    if view_func is None or not _hsr_route_on(view_func.cls):
+        return JsonResponse({"detail": "Not found."}, status=404)
+    return hsr_response(
+        request, _built_hsr(view_func), _hsr_cache_control(view_func.cls)
+    )
+
+
+#: The scrudful view function of each URL name, per URL resolver (see
+#: :func:`_scrudful_views`).
+_SCRUDFUL_VIEWS: weakref.WeakKeyDictionary[
+    URLResolver, dict[str, Callable[..., Any]]
+] = weakref.WeakKeyDictionary()
+
+
+def _scrudful_views() -> dict[str, Callable[..., Any]]:
+    """The scrudful view function of each namespace-qualified URL name of the
+    current URLconf, scanned once per URL resolver (see :func:`hsr_urls`)."""
+    resolver = get_resolver(get_urlconf())
+    views = _SCRUDFUL_VIEWS.get(resolver)
+    if views is None:
+        views = _SCRUDFUL_VIEWS[resolver] = _scan_scrudful_views(resolver)
+    return views
+
+
+def _scan_scrudful_views(resolver: URLResolver) -> dict[str, Callable[..., Any]]:
+    """The scrudful view function of each URL name under ``resolver``.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If a scrudful view's route has no name, or one name is given to the
+        routes of two different scrudful views.
+    """
+    found: dict[str, tuple[Callable[..., Any], str]] = {}
+
+    def visit(patterns: Sequence[Any], namespaces: list[str], prefix: str) -> None:
+        for pattern in patterns:
+            route = _join_route(prefix, str(pattern.pattern))
+            if isinstance(pattern, URLResolver):
+                inner = (
+                    namespaces + [pattern.namespace]
+                    if pattern.namespace
+                    else namespaces
+                )
+                visit(pattern.url_patterns, inner, route)
+                continue
+            callback = getattr(pattern, "callback", None)
+            if not _is_scrudful_view_func(callback):
+                continue
+            if pattern.name is None:
+                raise ImproperlyConfigured(_unnamed_message(callback, route))
+            view_name = ":".join([*namespaces, pattern.name])
+            seen = found.get(view_name)
+            if seen is None:
+                found[view_name] = (callback, route)
+            elif not _same_view_func(seen[0], callback):
+                raise ImproperlyConfigured(
+                    f"the URL name {view_name!r} names the routes {seen[1]!r} "
+                    f"and {route!r} of two different scrudful views: give each "
+                    "its own name, as each has its own HTTP Schema Resource"
+                )
+
+    visit(resolver.url_patterns, [], "")
+    return {view_name: callback for view_name, (callback, _) in found.items()}
+
+
+def _join_route(prefix: str, route: str) -> str:
+    """``prefix`` and ``route`` joined, as ``ResolverMatch.route`` joins them."""
+    return prefix + route.removeprefix("^") if prefix else route
+
+
+def _unnamed_message(callback: Any, route: str) -> str:
+    cls = getattr(callback, "cls", None)
+    what = f"{cls.__module__}.{cls.__qualname__}" if isinstance(cls, type) else "it"
+    return (
+        f"the route {route!r} of the scrudful view {what} has no URL name: "
+        "name it (path(..., name=...)), as its HTTP Schema Resource is served "
+        "and linked by name (see scrudful.rest_framework.hsr_urls)"
+    )
+
+
+def _is_scrudful_view_func(callback: Any) -> bool:
+    """Whether ``callback`` is a DRF view function of a scrudful view: of a
+    :func:`scrudful_viewset` class, or with a :class:`ScrudfulViewFunc` handler
+    (:func:`scrudful_api_view`'s included) for a method it routes."""
+    cls = getattr(callback, "cls", None)
+    if not (isinstance(cls, type) and issubclass(cls, APIView)):
+        return False
+    if getattr(cls, _META_OPTIONS_ATTR, None) is not None:
+        return True
+    return bool(_view_func_handlers(callback))
+
+
+def _view_func_handlers(view_func: Callable[..., Any]) -> list[ScrudfulViewFunc]:
+    """The :class:`ScrudfulViewFunc` handlers of the methods ``view_func``
+    routes: its action map's, else the class's handlers for the methods of
+    ``http_method_names``."""
+    cls = view_func.cls  # type: ignore[attr-defined]
+    actions = getattr(view_func, "actions", None)
+    names = (
+        list(actions.values())
+        if actions is not None
+        else [method.lower() for method in cls.http_method_names]
+    )
+    handlers = (getattr(cls, name, None) for name in names)
+    return [handler for handler in handlers if isinstance(handler, ScrudfulViewFunc)]
+
+
+def _same_view_func(a: Callable[..., Any], b: Callable[..., Any]) -> bool:
+    """Whether ``a`` and ``b`` are one view (``as_view()`` called alike)."""
+    return a is b or (
+        getattr(a, "cls", None) is getattr(b, "cls", None)
+        and getattr(a, "actions", None) == getattr(b, "actions", None)
+        and getattr(a, "initkwargs", None) == getattr(b, "initkwargs", None)
+    )
+
+
+def _hsr_target(request: HttpRequest | Request) -> str:
+    """The URL of the HTTP Schema Resource of the view ``request`` was routed
+    to: the target of the HSR link of its responses (and OPTIONS).
+
+    Resolved in this order, with ``view_name`` the request's
+    ``resolver_match.view_name``:
+
+    1. ``hsr_url(view_name)``, with the view's ``Meta.hsr_url``, else
+       ``SCRUDFUL["HSR_URL"]``, as it returns it;
+    2. else, with the route turned off (``Meta.hsr_route = False``, or
+       ``SCRUDFUL["HSR_ROUTE"] = False`` without ``Meta.hsr_route = True``),
+       ``ImproperlyConfigured``;
+    3. else the :func:`hsr_urls` route of ``view_name``, made absolute against
+       the view's base URL (``Meta.base_url``; else the ``base_url`` its
+       scrudful handlers share, a :func:`scrudful_api_view`'s; else
+       ``SCRUDFUL["BASE_URL"]``) when it has one, else with
+       ``request.build_absolute_uri()``.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If the request has no ``resolver_match``; the route is off and there
+        is no ``hsr_url``; the request's route has no URL name; the
+        :func:`hsr_urls` route can't be reversed (the root URLconf doesn't
+        include it); or a setting is invalid.
+    """
+    match = getattr(request, "resolver_match", None)
+    if match is None:
+        raise ImproperlyConfigured(
+            "the HTTP Schema Resource link needs the request's resolver_match: "
+            "a request routed through the URLconf"
+        )
+    view_func = match.func
+    cls = getattr(view_func, "cls", None)
+    hsr_url = _hsr_url(cls)
+    if hsr_url is not None:
+        return hsr_url(match.view_name)
+    if not _hsr_route_on(cls):
+        raise ImproperlyConfigured(
+            "Meta.hsr_route = False (or SCRUDFUL['HSR_ROUTE'] = False) needs "
+            "Meta.hsr_url or SCRUDFUL['HSR_URL'], hsr_url(view_name), the URL "
+            "the HTTP Schema Resource is served at"
+        )
+    if match.url_name is None:
+        raise ImproperlyConfigured(_unnamed_message(view_func, match.route))
+    try:
+        route = reverse("scrudful_hsr", kwargs={"view_name": match.view_name})
+    except NoReverseMatch:
+        raise ImproperlyConfigured(_NO_HSR_URLS) from None
+    base_url = _hsr_base_url(view_func)
+    if base_url is not None:
+        return resolve_uri(route, base_url)
+    return request.build_absolute_uri(route)
+
+
+def _hsr_base_url(view_func: Callable[..., Any]) -> str | None:
+    """The base URL of ``view_func``'s HSR link (see :func:`_hsr_target`)."""
+    cls = getattr(view_func, "cls", None)
+    base_url = _class_meta_options(cls).get("base_url")
+    if base_url is not None:
+        return base_url
+    if isinstance(cls, type) and issubclass(cls, APIView):
+        handler_bases = {handler.base_url for handler in _view_func_handlers(view_func)}
+        if len(handler_bases) == 1 and None not in handler_bases:
+            return handler_bases.pop()
+    return _setting_base_url()
+
+
+def _hsr_route_on(cls: Any) -> bool:
+    """Whether :func:`hsr_urls` serves the view class ``cls``'s routes:
+    ``Meta.hsr_route``, else ``SCRUDFUL["HSR_ROUTE"]``, else ``True``."""
+    value = _class_meta_options(cls).get("hsr_route")
+    if value is not None:
+        return value
+    value = scrudful_setting("HSR_ROUTE", True)
+    if not isinstance(value, bool):
+        raise ImproperlyConfigured(
+            f"SCRUDFUL['HSR_ROUTE'] must be a bool, not {type(value).__name__}"
+        )
+    return value
+
+
+def _hsr_url(cls: Any) -> Callable[[str], str] | None:
+    """``Meta.hsr_url`` of the view class ``cls``, else
+    ``SCRUDFUL["HSR_URL"]``, else ``None``."""
+    value = _class_meta_options(cls).get("hsr_url")
+    if value is not None:
+        return value
+    value = scrudful_setting("HSR_URL", None)
+    if value is not None and not callable(value):
+        raise ImproperlyConfigured(
+            "SCRUDFUL['HSR_URL'] must be a callable, hsr_url(view_name), not "
+            f"{type(value).__name__}"
+        )
+    return value
+
+
+def _hsr_cache_control(cls: Any) -> str:
+    """``Meta.hsr_cache_control`` of the view class ``cls``, else
+    ``SCRUDFUL["HSR_CACHE_CONTROL"]``, else ``public, max-age=300``."""
+    value = _class_meta_options(cls).get("hsr_cache_control")
+    if value is not None:
+        return value
+    value = scrudful_setting("HSR_CACHE_CONTROL", DEFAULT_HSR_CACHE_CONTROL)
+    if not isinstance(value, str):
+        raise ImproperlyConfigured(
+            "SCRUDFUL['HSR_CACHE_CONTROL'] must be a str, not "
+            f"{type(value).__name__}"
+        )
+    return value
+
+
+def _check_hsr_options(hsr_route: Any, hsr_url: Any, hsr_cache_control: Any) -> None:
+    """Check the :data:`_HSR_OPTIONS` of a :func:`scrudful_viewset` ``Meta``."""
+    if hsr_route is not None and not isinstance(hsr_route, bool):
+        raise TypeError(
+            f"Meta.hsr_route must be a bool, not {type(hsr_route).__name__}"
+        )
+    if hsr_url is not None and not callable(hsr_url):
+        raise TypeError(
+            "Meta.hsr_url must be a callable, hsr_url(view_name), not "
+            f"{type(hsr_url).__name__}"
+        )
+    if hsr_cache_control is not None and not isinstance(hsr_cache_control, str):
+        raise TypeError(
+            "Meta.hsr_cache_control must be a str, not "
+            f"{type(hsr_cache_control).__name__}"
+        )
 
 
 def _describe_mode_view(view_func: Callable[..., Any]) -> APIView:
@@ -2196,9 +2558,14 @@ def _scrudful_handler(view: APIView, name: str) -> ScrudfulViewFunc | None:
 
 
 def _meta_options(view: Any) -> dict[str, Any]:
-    """The checked :data:`_VIEW_OPTIONS` of ``view``'s
+    """The checked :data:`_VIEW_OPTIONS` and :data:`_HSR_OPTIONS` of ``view``'s
     :func:`scrudful_viewset` ``Meta`` (empty for another view)."""
-    return getattr(type(view), _META_OPTIONS_ATTR, None) or {}
+    return _class_meta_options(type(view))
+
+
+def _class_meta_options(cls: Any) -> dict[str, Any]:
+    """:func:`_meta_options` of the view class ``cls``."""
+    return getattr(cls, _META_OPTIONS_ATTR, None) or {}
 
 
 def _view_base_url(view: Any) -> str | None:

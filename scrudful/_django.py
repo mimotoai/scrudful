@@ -30,8 +30,9 @@ from django.utils.cache import patch_vary_headers
 from django.views import defaults
 
 from scrudful import _adapter
+from scrudful._hsr import hsr_etag, hsr_response_links, serialize_hsr
 from scrudful.collection import InvalidPage
-from scrudful.conditional import ConditionalResult
+from scrudful.conditional import ConditionalResult, evaluate_preconditions
 from scrudful.entity import Entity
 from scrudful.problem import PROBLEM_JSON, problem_from_errors
 from scrudful.utils import join_links, link_content, resolve_uri
@@ -123,6 +124,39 @@ def conditional_response(
             response["Link"] = link
     for name, value in result.headers.items():
         response[name] = value
+    _adapter.expose_headers(response)
+    return response
+
+
+def hsr_response(
+    request: HttpRequest, document: Mapping[str, Any], cache_control: str
+) -> HttpResponseBase:
+    """The answer to a GET or HEAD of the HTTP Schema Resource ``document``.
+
+    A 200 whose body is :func:`~scrudful._hsr.serialize_hsr` of the document
+    (the bytes the strong ``ETag`` hashes), with the HSR's own Links and
+    ``cache_control`` as ``Cache-Control``; or, for an ``If-None-Match``
+    matching the ``ETag`` (weak comparison), a 304 with the ``ETag`` and
+    ``Cache-Control``. The same for every adapter and every requester.
+    """
+    body = serialize_hsr(document)
+    etag = hsr_etag(body)
+    result = evaluate_preconditions(
+        request.method or "GET",
+        precondition_headers(request),
+        etag=etag,
+        last_modified=None,
+        require_precondition=False,
+    )
+    if result is not None:
+        early = conditional_response(result)
+        if result.status == 304:
+            early["Cache-Control"] = cache_control
+        return early
+    response = HttpResponse(body, content_type="application/json")
+    response["Link"] = hsr_response_links()
+    response["ETag"] = etag
+    response["Cache-Control"] = cache_control
     _adapter.expose_headers(response)
     return response
 
