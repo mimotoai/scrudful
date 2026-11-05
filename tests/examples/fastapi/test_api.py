@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from examples.fastapi import api
-from scrudful._hsr import options_operation
+from scrudful._hsr import hsr_link, options_operation
 from scrudful.fastapi import add_options
 from tests.semantic_http import (
     HSR_DOCUMENT_REL,
@@ -30,6 +30,9 @@ CONTEXT_LINK = (
     'type="application/ld+json"'
 )
 LINKS = f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+#: The HSR links of /users/{user_id} and /users, on each of their responses.
+USER_HSR_LINK = hsr_link(f"{BASE}/_hsr/users.user_id")
+USERS_HSR_LINK = hsr_link(f"{BASE}/_hsr/users")
 ERROR_LINKS = (
     f'<{BASE}/schemas/error.json>; rel="describedby"; type="application/schema+json", '
     f'<{BASE}/contexts/error.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; '
@@ -102,7 +105,7 @@ def test_get_user(client):
     assert response.json() == JOHN
     assert response.headers["etag"] == '"user-1-v1"'
     assert response.headers["last-modified"] == SEED_MODIFIED
-    assert response.headers["link"] == LINKS
+    assert response.headers["link"] == f"{LINKS}, {USER_HSR_LINK}"
     assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
 
 
@@ -155,7 +158,7 @@ def test_head_user(client):
     assert response.status_code == 200
     assert response.content == b""
     assert response.headers["etag"] == '"user-1-v1"'
-    assert response.headers["link"] == LINKS
+    assert response.headers["link"] == f"{LINKS}, {USER_HSR_LINK}"
     response = client.head("/users/1", headers={"If-None-Match": '"user-1-v1"'})
     assert response.status_code == 304
 
@@ -170,7 +173,7 @@ def test_create_user(client):
     assert (body["id"], body["name"], body["age"]) == (4, "Lisa", 23)
     assert body["created_at"] == body["updated_at"]
     assert response.headers["location"] == f"{BASE}/users/4"
-    assert response.headers["link"] == LINKS
+    assert response.headers["link"] == f"{LINKS}, {USERS_HSR_LINK}"
     assert response.headers["access-control-expose-headers"] == "Link, Location, Allow"
     assert "etag" not in response.headers
     assert "last-modified" not in response.headers
@@ -273,7 +276,7 @@ def test_put_replaces_user_and_returns_fresh_validators(client):
     body = response.json()
     assert (body["id"], body["name"], body["age"]) == (2, "Alicia", 25)
     assert response.headers["etag"] == '"user-2-v2"'
-    assert response.headers["link"] == LINKS
+    assert response.headers["link"] == f"{LINKS}, {USER_HSR_LINK}"
     assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
     last_modified = parsedate_to_datetime(response.headers["last-modified"])
     assert before <= last_modified <= after
@@ -386,7 +389,8 @@ def test_delete_user(client):
     assert response.status_code == 204
     assert response.content == b""
     assert "etag" not in response.headers
-    assert "link" not in response.headers
+    # No content: only the HSR link.
+    assert response.headers["link"] == USER_HSR_LINK
     assert client.get("/users/2").status_code == 404
     assert client.delete("/users/2").status_code == 404
     again = client.delete("/users/2", headers={"If-Match": '"user-2-v1"'})
@@ -560,9 +564,20 @@ def test_example_links_everywhere(client, method, path, arguments, status):
         None if status in NO_ENTRY else hsr,
     )
     assert problems == []
+    # The HSR link of the path, on every response of a described one.
+    hsr_link_value = {USER: USER_HSR_LINK, USERS: USERS_HSR_LINK}.get(path)
+    if path.startswith("/users/"):
+        hsr_link_value = USER_HSR_LINK
+    if hsr_link_value is None:
+        assert HSR_DOCUMENT_REL not in response.headers.get("link", "")
+    else:
+        assert response.headers["link"].endswith(hsr_link_value)
     if status in (404, 405, 422):
         # The Links are still those of the error entity.
-        assert response.headers["link"] == ERROR_LINKS
+        expected = ERROR_LINKS
+        if hsr_link_value is not None:
+            expected = f"{ERROR_LINKS}, {hsr_link_value}"
+        assert response.headers["link"] == expected
         assert response.headers["content-type"] == "application/json"
 
 

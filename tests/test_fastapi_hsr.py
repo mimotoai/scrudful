@@ -1569,6 +1569,38 @@ def test_target_in_router_mode_fills_the_prefix(make_client):
     )
 
 
+@pytest.mark.parametrize(
+    "template, url, target",
+    [
+        # The longest prefix whose rest the template matches, "/v1/files/a",
+        # isn't the one the router came through.
+        ("/files/{p:path}", "/v1/files/a/files/b", "/v1/_hsr/files.p-path"),
+        ("/{p:path}/raw", "/v1/a/raw/b/raw", "/v1/_hsr/p-path.raw"),
+    ],
+)
+def test_target_in_router_mode_with_a_path_convertor(
+    make_client, template, url, target
+):
+    """A router template containing a ``path`` parameter matches the rest of
+    the URL after several prefixes: the target takes the one the request was
+    routed through, whose parameters are the request's."""
+    router = APIRouter()
+
+    @router.get(template)
+    @scrudful(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    async def get_file(p: str, request: Request):
+        return {"target": _hsr_target(request, template)}
+
+    add_options(router, base_url="http://testserver/")
+    app = FastAPI()
+    app.include_router(router, prefix="/v1")
+    client = make_client(app)
+    response = client.get(url)
+    assert response.json() == {"target": f"http://testserver{target}"}
+    assert hsr_link_problems(response.headers, f"http://testserver{target}") == []
+    assert client.get(target).status_code == 200
+
+
 def target_sub_app() -> FastAPI:
     """An app whose ``/items/{id}`` and (under its own Mount) ``/m/things/{id}``
     answer ``_hsr_target`` for their own resources."""
@@ -1676,6 +1708,60 @@ def test_router_resource_added_later_has_no_route_until_add_options(make_client)
         "https://api.example/_hsr/things.id"
     )
     assert client.get("/_hsr/things.id").status_code == 200
+
+
+def test_router_resource_added_later_is_undescribed_until_add_options(make_client):
+    """A router resource added after :func:`add_options` has neither an HSR
+    route nor an OPTIONS route: it isn't described, so its responses carry no
+    HSR link (rather than each failing), until add_options is called again."""
+    router = APIRouter()
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+
+    @router.get("/items/{id}")
+    @scrudful(**links)
+    async def get_item(id: int):
+        return {}
+
+    add_options(router, base_url=BASE)
+
+    @router.get("/things/{id}")
+    @scrudful(etag_func=lambda **kwargs: "v1", **links, error=APP_ERROR)
+    async def get_thing(id: int):
+        if id == 404:
+            raise HTTPException(404)
+        return {}
+
+    def client_of() -> TestClient:
+        app = FastAPI()
+        app.include_router(router)
+        add_error_links(app, APP_ERROR)
+        return make_client(app)
+
+    client = client_of()
+    for url, headers, status in [
+        ("/things/1", {}, 200),
+        ("/things/1", {"If-None-Match": '"v1"'}, 304),
+        ("/things/1", {"If-Match": '"no"'}, 412),
+        ("/things/404", {}, 404),
+    ]:
+        response = client.get(url, headers=headers)
+        assert response.status_code == status
+        assert HSR_DOCUMENT_REL not in response.headers.get("link", "")
+    assert client.options("/things/1").status_code == 405
+    assert (
+        hsr_link_problems(
+            client.get("/items/1").headers, "https://api.example/_hsr/items.id"
+        )
+        == []
+    )
+    add_options(router, base_url=BASE)
+    client = client_of()
+    assert (
+        hsr_link_problems(
+            client.get("/things/1").headers, "https://api.example/_hsr/things.id"
+        )
+        == []
+    )
 
 
 def test_target_needs_a_request_to_a_url_of_the_path(make_client):
@@ -2184,8 +2270,11 @@ def test_a_route_whose_dependencies_dont_match_its_dependant_raises(make_client)
     for route in app.router.routes:
         if getattr(route, "methods", None) == {"PUT"}:
             route.dependencies = [Security(lambda: None)]
-    with pytest.raises(RuntimeError, match=r"APIRoute\.dependencies"):
+    with pytest.raises(RuntimeError, match=r"APIRoute\.dependencies") as raised:
         make_client(app).options("/notes/1", headers=ADMIN)
+    # It names the likelier cause first: dependencies changed after the
+    # route was built.
+    assert "changed after" in str(raised.value)
 
 
 def test_dependency_overrides_apply_to_the_checks(make_client):

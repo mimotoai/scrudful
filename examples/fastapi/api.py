@@ -11,7 +11,9 @@ Run it with ``python examples/fastapi/api.py`` and try, for example::
 Every response with content carries the ``Link`` headers of its schema and
 JSON-LD context (Semantic HTTP 0.1): the user's on success, the error's on
 scrudful's own 400, 412 and 428 and on the errors FastAPI answers (404, 405,
-422). OPTIONS answers with the path's HTTP Schema Resource. Set
+422, and a JSON 500). OPTIONS answers with a 204 linking to the path's HTTP
+Schema Resource (served at ``/_hsr/users.user_id`` and ``/_hsr/users``), and
+every response of ``/users`` and ``/users/{user_id}`` carries that link too. Set
 ``SCRUDFUL_BASE_URL`` to the URL the app is served at (default
 ``http://localhost:8000/``): the relative link URLs resolve against it.
 """

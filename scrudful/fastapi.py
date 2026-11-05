@@ -33,6 +33,7 @@ from fastapi import params as fastapi_params
 from fastapi import routing as fastapi_routing
 from fastapi import exception_handlers as fastapi_handlers
 from fastapi.datastructures import DefaultPlaceholder
+from fastapi.encoders import jsonable_encoder
 from fastapi.dependencies import models as fastapi_dependencies_models
 from fastapi.dependencies import utils as fastapi_dependency_utils
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
@@ -69,6 +70,7 @@ from scrudful._adapter import (
     describe_content,
     describe_read,
     describe_write,
+    essence,
     evaluated_signature,
     evaluates_preconditions,
     expose_headers,
@@ -105,8 +107,8 @@ from scrudful.conditional import (
     quote_etag,
 )
 from scrudful.entity import Entity
+from scrudful.problem import PROBLEM_JSON, problem_from_errors
 from scrudful.utils import (
-    join_links,
     link_content,
     merge_expose_headers,
     resolve_uri,
@@ -268,8 +270,11 @@ def scrudful(
         ``media_type`` as their Content-Type; without it they carry no Link
         and are ``application/json``. Headers dependencies set on the
         injected ``Response`` are kept: all of them on a 304 (except
-        ``Content-*`` metadata), only ``Set-Cookie`` on the others (a Link a
-        dependency set describes the success representation).
+        ``Content-*`` metadata), only ``Set-Cookie`` and ``Link`` on the
+        others. A Link a dependency set is merged by relation with the
+        error's and the HSR link (one with the relation of one of them
+        replaces it, as on a success; see
+        :func:`scrudful._adapter.merge_links`).
 
         The preconditions are evaluated before the endpoint runs, so two
         concurrent requests carrying the same If-Match can both pass. Strict
@@ -287,9 +292,9 @@ def scrudful(
     links describe: the 2xx but 204 it produces, to any method but TRACE
     (whose content is the echoed request; see
     :func:`scrudful._adapter.has_default_entity`). Another response it
-    returns (an error, a 204, a redirect) gets no Links from scrudful, and
-    keeps any Link the endpoint set. Raise an error (``HTTPException``)
-    rather than return it to give it Links, through :func:`add_error_links`.
+    returns (an error, a 204, a redirect) gets none of them, and keeps any
+    Link the endpoint set. Raise an error (``HTTPException``) rather than
+    return it to give it Links, through :func:`add_error_links`.
     The Link header is appended to any Link value the endpoint (or a
     dependency) set; a Link it set with the relation of the schema link
     (``describedby`` by default) replaces that link, and one with either
@@ -303,6 +308,16 @@ def scrudful(
     ``ETag``, ``Link`` and ``Location`` the response carries. Starlette's
     ``CORSMiddleware`` replaces that header on cross-origin requests, so if
     you use it, list these names in its ``expose_headers`` instead.
+
+    When an :func:`add_options` call describes the endpoint's path (the
+    app's, or that of the router the endpoint is on), every response the
+    endpoint returns (the 2xx, a HEAD, scrudful's 304, 400, 412 and 428, and
+    any other) also gets the HTTP Schema Resource link of the path (the
+    ``https://w3id.org/semantic-http/ns#http-schema-resource-document``
+    relation, ``type="application/json"``), last; a Link with that relation
+    the endpoint (or a dependency) set replaces it. A CORS preflight gets
+    none. Without :func:`add_options`, no HTTP Schema Resource is served,
+    and no response links one.
 
     If the endpoint returns a Starlette ``Response`` the headers are added to
     it, otherwise to the response FastAPI builds. ``HTTPException`` raised by
@@ -430,12 +445,13 @@ def scrudful(
         injected: Headers,
         kwargs: Mapping[str, Any],
         base: str,
+        hsr: str | None,
     ) -> Response:
         result = with_error_body(error_body_func, request, result)
         if result.body is None or error is None:
-            return _conditional_response(result, injected)
-        link = join_links(*await _entity_links(error, kwargs, base))
-        return _conditional_response(result, injected, link, error.media_type)
+            return _conditional_response(result, injected, hsr=hsr)
+        links = await _entity_links(error, kwargs, base)
+        return _conditional_response(result, injected, links, error.media_type, hsr)
 
     def decorator(endpoint: Endpoint) -> Endpoint:
         if inspect.isgeneratorfunction(endpoint) or inspect.isasyncgenfunction(
@@ -465,6 +481,9 @@ def scrudful(
             )
             method = request.method.upper()
             base = _live_base(request, wrapper)
+            # Before the endpoint runs: a misconfiguration it raises (two
+            # resources with one HSR route name) must not follow a write.
+            hsr = _response_hsr_link(request)
 
             if has_validators and evaluates_preconditions(method):
                 etag, last_modified = await validators(kwargs)
@@ -477,7 +496,7 @@ def scrudful(
                 )
                 if result is not None:
                     return await early_response(
-                        request, result, response.headers, kwargs, base
+                        request, result, response.headers, kwargs, base, hsr
                     )
 
             content = await _call(endpoint, kwargs)
@@ -492,15 +511,17 @@ def scrudful(
                     etag, last_modified = await validators(kwargs)
                 if send:
                     set_validator_headers(headers, etag, last_modified)
+            schema = context = None
             if has_default_entity(method, status):
                 # Another response the endpoint returns (an error, a 204, a
                 # redirect, or a TRACE) is not described by its links: it
-                # gets none.
-                link = merge_links(
-                    ", ".join(headers.getlist("link")), *await links(kwargs, base)
-                )
-                if link is not None:
-                    headers["Link"] = link
+                # gets none of them, only the HSR link.
+                schema, context = await links(kwargs, base)
+            link = merge_links(
+                ", ".join(headers.getlist("link")) or None, schema, context, hsr
+            )
+            if link is not None:
+                headers["Link"] = link
             _join_expose_lines(headers)
             expose_headers(headers)
             return content
@@ -520,11 +541,23 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
     ``fastapi.exceptions.RequestValidationError`` (FastAPI's defaults are
     ``fastapi.exception_handlers.http_exception_handler`` and
     ``request_validation_exception_handler``), and those registered for
-    ``fastapi.HTTPException`` or for a status code (other than 500, which is
-    Starlette's server error handler): the errors the endpoints raise, the
-    422 of request validation, and the 404 and 405 Starlette's routing
-    raises as ``HTTPException`` for an unknown path or an unrouted method.
-    A handler registered for another class is not wrapped.
+    ``fastapi.HTTPException`` or for a status code: the errors the endpoints
+    raise, the 422 of request validation, and the 404 and 405 Starlette's
+    routing raises as ``HTTPException`` for an unknown path or an unrouted
+    method. A handler registered for another class is not wrapped.
+
+    It also wraps the app's server error handler, the one for ``500`` or
+    ``Exception`` (Starlette's ``ServerErrorMiddleware`` takes the last
+    registered of the two), which answers an exception no other handler
+    does; without one, it installs one for ``Exception`` answering a JSON
+    500, ``{"detail": "Internal Server Error"}``, in place of Starlette's
+    ``text/plain`` one. Starlette's ``ServerErrorMiddleware`` calls it, and
+    sends its response, only with ``debug`` off: an app with ``debug=True``
+    answers with Starlette's traceback page instead. Either way it raises
+    the exception again once the response is sent (so that the server logs
+    it; Starlette's ``TestClient`` raises it unless created with
+    ``raise_server_exceptions=False``). That middleware is outside every
+    user middleware, so the 500 gets no headers of a ``CORSMiddleware``.
 
     Each wrapped handler returns the response the original makes, with the
     same status, headers and body, and when it has JSON content (an
@@ -533,8 +566,29 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
     relation of one of them suppresses it; see
     :func:`scrudful._adapter.merge_links`), and serves it as
     ``error.media_type``. Responses without content (e.g. a 304) or with
-    other content are left unchanged. Link URLs are resolved against the
-    ``base_url`` of :func:`add_options`, else the request's URL.
+    other content get no entity Links, and keep their Content-Type. Link
+    URLs are resolved against the ``base_url`` of :func:`add_options`, else
+    the request's URL.
+
+    With an ``application/problem+json`` entity
+    (:data:`scrudful.problem.PROBLEM_JSON`), the bodies of FastAPI's default
+    validation handler and of the JSON 500 above are RFC 9457 problem
+    details: the 422 is
+    ``problem_from_errors(422, exc.errors(), "Request validation failed")``
+    (:func:`scrudful.problem.problem_from_errors`, FastAPI's errors as the
+    ``errors`` member, encoded with ``jsonable_encoder`` as FastAPI encodes
+    them), the 500 ``problem_from_errors(500, None)``. A handler of the
+    app's own keeps its body. The entity deciding is the one of the
+    response's Links (below).
+
+    When an :func:`add_options` call describes the resource the request was
+    routed to (its URL matched a route of a path with a scrudful endpoint),
+    every response of a wrapped handler, whatever its content, also gets the
+    resource's HTTP Schema Resource link, last (a Link with that relation
+    the handler set replaces it), and the expose headers: the 401, 403, 404,
+    405 and 422 of a described path, and its 500. A request whose URL no
+    route matches (an unknown path's 404), or that is to a path without a
+    scrudful endpoint, gets none.
 
     The media type is relabelled whatever the handler chose: a custom
     handler's JSON response (``application/json``, or another ``+json``
@@ -551,11 +605,12 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
     which no endpoint serves, gets ``error``. The HTTP Schema Resources
     describe ``error`` as the content of those errors.
 
-    So a custom handler registered before the call is kept, and calling this
-    again replaces the entity of the earlier call: no Link is added twice. A
-    handler registered after the call replaces the wrapped one; call this
-    after registering your handlers and before the app serves requests (its
-    middleware stack, holding the handlers, is built on the first request).
+    So a custom handler registered before the call is kept (wrapped), and
+    calling this again replaces the entity of the earlier call: no Link is
+    added twice. A handler registered after the call replaces the wrapped
+    one; call this after registering your handlers and before the app
+    serves requests (its middleware stack, holding the handlers, is built on
+    the first request).
 
     scrudful's own 400, 412 and 428 are returned by the endpoint, not raised:
     they get the ``error`` of :func:`scrudful`, not this one.
@@ -619,6 +674,13 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
     for exc_class, default in defaults.items():
         handlers.setdefault(exc_class, default)
         keys.append(exc_class)
+    # The server error handler: Starlette's ServerErrorMiddleware takes the
+    # last of the app's handlers for 500 and Exception; without one, a JSON 500.
+    server = [key for key in handlers if key is Exception or _is_500(key)]
+    if not server:
+        handlers[Exception] = _server_error
+        server = [Exception]
+    keys += server
     for key in keys:
         handler = handlers[key]
         # Calling this again replaces the earlier entity.
@@ -633,33 +695,80 @@ def _error_handler(
 
     @functools.wraps(handler)
     async def scrudful_handler(request: Request, exc: Exception) -> Any:
-        response = await _call_handler(handler, request, exc)
-        if (
-            request.scope.get("type") != "http"
-            or not isinstance(response, Response)
-            or not _has_json_content(response)
-        ):
+        if request.scope.get("type") != "http":
+            return await _call_handler(handler, request, exc)
+        entity, kwargs = _raised_entity(request, error)
+        response = _problem_response(handler, exc, entity)
+        if response is None:
+            response = await _call_handler(handler, request, exc)
+        if not isinstance(response, Response):
             return response
         headers = response.headers
-        route = request.scope.get("route")
-        # The routed endpoint: an included router's Starlette route (as
-        # scrudful's router-mode OPTIONS) leaves the router in "route".
-        endpoint = getattr(route, "endpoint", None) or request.scope.get("endpoint")
-        base = _live_base(request, endpoint)
-        entity, kwargs = _raised_entity(request, error)
+        hsr = _response_hsr_link(request)
+        schema = context = None
+        if _has_json_content(response):
+            route = request.scope.get("route")
+            # The routed endpoint: an included router's Starlette route (as
+            # scrudful's router-mode OPTIONS) leaves the router in "route".
+            endpoint = getattr(route, "endpoint", None) or request.scope.get("endpoint")
+            base = _live_base(request, endpoint)
+            schema, context = await _entity_links(entity, kwargs, base)
+            headers["Content-Type"] = entity.media_type
+        elif hsr is None:
+            # Other content (or none, e.g. a 304) gets no entity Links.
+            return response
         link = merge_links(
-            ", ".join(headers.getlist("link")),
-            *await _entity_links(entity, kwargs, base),
+            ", ".join(headers.getlist("link")) or None, schema, context, hsr
         )
         if link is not None:
             headers["Link"] = link
-        headers["Content-Type"] = entity.media_type
         _join_expose_lines(headers)
         expose_headers(headers)
         return response
 
     scrudful_handler._scrudful_error_handler = handler  # type: ignore[attr-defined]
     return scrudful_handler
+
+
+def _is_500(key: Any) -> bool:
+    """Whether an ``exception_handlers`` key is the status code 500 (not
+    ``True`` or a class)."""
+    return isinstance(key, int) and not isinstance(key, bool) and key == 500
+
+
+async def _server_error(request: Request, exc: Exception) -> Response:
+    """The app's server error handler :func:`add_error_links` installs when it
+    has none: a JSON 500, ``{"detail": "Internal Server Error"}`` (problem
+    details for a problem-details entity, see :func:`_problem_response`)."""
+    return JSONResponse({"detail": "Internal Server Error"}, status_code=500)
+
+
+def _problem_response(
+    handler: Callable[[Request, Exception], Any], exc: Exception, entity: Entity
+) -> Response | None:
+    """With an ``application/problem+json`` ``entity``, the RFC 9457 problem
+    details answering ``exc`` in place of a default ``handler``'s body, else
+    ``None`` (the handler answers).
+
+    - FastAPI's request validation 422 (``{"detail": [errors]}``, whose
+      ``detail`` problem details want a string):
+      ``problem_from_errors(422, exc.errors(), "Request validation
+      failed")``, JSON-safe as FastAPI's own (``jsonable_encoder``: an
+      error's ``ctx`` may hold the exception a validator raised);
+    - the JSON 500 of :func:`_server_error`: ``problem_from_errors(500, None)``.
+
+    A handler of the app's own keeps its body.
+    """
+    if essence(entity.media_type) != PROBLEM_JSON:
+        return None
+    if handler is fastapi_handlers.request_validation_exception_handler and (
+        isinstance(exc, RequestValidationError)
+    ):
+        problem = problem_from_errors(422, exc.errors(), "Request validation failed")
+        return JSONResponse(jsonable_encoder(problem), status_code=422)
+    if handler is _server_error:
+        return JSONResponse(problem_from_errors(500, None), status_code=500)
+    return None
 
 
 def _live_base(request: Request, endpoint: Any = None) -> str:
@@ -885,7 +994,13 @@ def add_options(
        ``Access-Control-Request-Method``) is a 204 with no content, no Links
        and no ``Allow``, before any dependency, ``load`` or ``allowed`` runs.
        A ``CORSMiddleware`` in front usually answers it first, and adds its
-       headers to this one when it doesn't.
+       headers to this one when it doesn't. Configure it for Semantic HTTP's
+       browser clients: ``allow_methods=["*"]`` (or a list with ``OPTIONS``
+       and the resources' methods: its default, ``GET`` only, answers the
+       preflight of a PUT or of an OPTIONS with a 400), and
+       ``expose_headers=list(scrudful.utils.EXPOSE_HEADERS)`` (it replaces
+       the ``Access-Control-Expose-Headers`` scrudful sets on a
+       cross-origin response).
     2. Each method the resource's routes serve (all of them: a plain FastAPI
        or Starlette route on the path too) is checked for this requester,
        without the object. With ``allowed``, every method passes this step:
@@ -906,11 +1021,16 @@ def add_options(
        and without validating the endpoint's own parameters; a dependency
        with ``yield`` is cleaned up before the answer. An ``HTTPException``
        with 401, 403 or 404, or a parameter of theirs failing validation
-       (FastAPI's 422), means not allowed. No other dependency, and never
-       the endpoint, runs, so computing ``Allow`` consumes no throttle
-       quota (FastAPI has no throttles of its own: a throttling dependency
-       without a security scheme below it isn't run) and writes nothing a
-       non-security dependency would. A security dependency that needs the
+       (FastAPI's 422), means not allowed. No other dependency of the
+       route, and never the endpoint, runs: a throttling dependency
+       declared beside the security ones (in ``dependencies=`` or as a
+       parameter) isn't run, and consumes no quota (FastAPI has no
+       throttles of its own). A security dependency runs whole, though,
+       with its own sub-dependencies, plain ones included: a database
+       session or a throttle that a ``get_current_user`` depends on runs
+       for each method checked, and what it consumes or writes, it does
+       on OPTIONS too. Keep such work out of security dependencies, or
+       give ``allowed``. A security dependency that needs the
        request's body (a body, form or file parameter, at any depth) can't
        be resolved: it is skipped, and does not refuse its method. ``HEAD``
        is listed only when a route serves it (FastAPI's GET route doesn't;
@@ -1059,6 +1179,13 @@ def add_options(
     callables are awaited. Validator callbacks are not called. Relative URLs
     are resolved against ``base_url``; the live Links of the responses
     resolve against it too (else against the request's URL).
+
+    Every response of a resource it describes links to the resource's
+    document as its OPTIONS does: those the :func:`scrudful` endpoints
+    return, and the errors :func:`add_error_links`'s handlers answer for it
+    (see there). A router's resource added after this call has no HSR route
+    and no OPTIONS route until it is called again: it is not described, and
+    its responses get no HSR link (a link would lead to a 404).
 
     Call it once the routes are added (the endpoints added later are
     described, but their callables are not checked); calling it again adds
@@ -2198,9 +2325,12 @@ def _security_dependencies(route: Any, dependant: Any) -> list[Any]:
     of a user resolved from a token (:func:`_uses_security`). Of those, any
     that needs the request's body (a body, form or file parameter anywhere
     below it) is left out: it can't be resolved without the body. No other
-    dependency (a plain ``Depends`` without a scheme below it, even in
-    ``dependencies=``: a throttle, a database write) and never the endpoint
-    is resolved, so computing ``Allow`` consumes and writes nothing.
+    dependency of the route (a plain ``Depends`` without a scheme below it,
+    even in ``dependencies=``: a throttle, a database write) and never the
+    endpoint is resolved. A security dependency is resolved whole, though,
+    its plain sub-dependencies included: what those consume or write (a
+    throttle or a session a ``get_current_user`` depends on), the checks do
+    too.
     """
     declared = _declared_security(getattr(dependant, "call", None))
     parameterless = _parameterless_security(route, dependant)
@@ -2231,7 +2361,10 @@ def _parameterless_security(route: Any, dependant: Any) -> list[Any]:
     ------
     RuntimeError
         If ``route.dependencies`` doesn't match those sub-dependants (their
-        calls, in order), as in the FastAPI releases scrudful supports.
+        calls, in order), as in the FastAPI releases scrudful supports: it
+        was changed after FastAPI built the route (FastAPI builds
+        ``route.dependant`` once, when the route is created), or the
+        installed FastAPI builds them otherwise.
     """
     declared = getattr(route, "dependencies", None)
     if not declared:
@@ -2245,9 +2378,14 @@ def _parameterless_security(route: Any, dependant: Any) -> list[Any]:
         raise RuntimeError(
             "scrudful's per-requester Allow of OPTIONS reads which of a route's "
             "dependencies= are Security(...) off APIRoute.dependencies, which "
-            "the installed FastAPI doesn't turn into the leading sub-dependants "
-            "of APIRoute.dependant, in order, as FastAPI 0.100 to 0.159 do: "
-            "upgrade scrudful, or use a FastAPI release it supports"
+            "doesn't match the leading sub-dependants of APIRoute.dependant "
+            f"of the route {getattr(route, 'path', route)!r}: either its "
+            "dependencies were changed after the route was created (FastAPI "
+            "builds the dependant once, so a dependency added then doesn't run "
+            "either: give it in dependencies= of the route, its router or the "
+            "app), or the installed FastAPI builds them otherwise than FastAPI "
+            "0.100 to 0.159 do (upgrade scrudful, or use a FastAPI release it "
+            "supports)"
         )
     return [
         sub
@@ -2709,8 +2847,112 @@ def _hsr_not_found() -> Response:
     return JSONResponse({"detail": "Not Found"}, status_code=404)
 
 
+def _response_hsr_link(request: Request) -> str | None:
+    """The HTTP Schema Resource link of a response to ``request``, or ``None``
+    when it gets none.
+
+    The rule: a response gets the link exactly when the request was routed
+    to a route of a resource that an :func:`add_options` call describes, the
+    resource the link is about. The decorator gives it to every response a
+    :func:`scrudful` endpoint returns, and :func:`add_error_links`'s
+    handlers to every error they answer (the 500 included); the OPTIONS
+    answer has its own.
+
+    - A request no route serves (an unknown URL's 404) gets none: there is
+      no resource to describe.
+    - So does one that no :func:`add_options` covers (:func:`_covering_owners`:
+      the app's, else that of the router whose endpoint serves it), or whose
+      route is on no resource it describes (a path without a scrudful
+      endpoint, or under a mounted app or a Mount with middleware); and a
+      CORS preflight (it carries no Links).
+    - So does one of a router's resource added after its :func:`add_options`
+      (and before calling it again), which has no HSR route: the router
+      serves neither its document nor its OPTIONS, so it is not described,
+      and a link would lead to a 404. Failing each of its responses instead
+      would turn a call made too early into an outage of the resource.
+    - Otherwise the link targets :func:`_hsr_target`, whose ``ValueError``
+      (two resources with one HSR route name) propagates.
+    """
+    scope = request.scope
+    if scope.get("type") != "http" or (
+        "route" not in scope and "endpoint" not in scope
+    ):
+        return None
+    if is_preflight(request.method, request.headers.get):
+        return None
+    for owner in _covering_owners(request):
+        paths = _scrudful_paths(owner)
+        key = _routed_resource(request, owner, paths)
+        if key is None:
+            continue
+        options = _hsr_options(owner)
+        if (
+            options.hsr_url is None
+            and options.hsr_route
+            and _hsr_route_of(owner, key) is None
+        ):
+            return None
+        return hsr_link(_hsr_target(request, key, owner=owner, paths=paths))
+    return None
+
+
+def _covering_owners(request: Request) -> list[FastAPI | APIRouter]:
+    """The apps and routers whose :func:`add_options` may cover ``request``:
+    the request's app, when it has it, then the router of the endpoint
+    serving the request, when it has it (see :func:`_live_base`)."""
+    owners: list[FastAPI | APIRouter] = []
+    app = request.scope.get("app")
+    options = getattr(app, _OPTIONS_ATTRIBUTE, None)
+    if isinstance(app, FastAPI) and isinstance(options, _HsrOptions):
+        if options.explicit:
+            owners.append(app)
+    router_ref = None
+    with contextlib.suppress(TypeError):  # not weakly referenceable
+        router_ref = _ROUTER_ENDPOINTS.get(request.scope.get("endpoint"))
+    router = None if router_ref is None else router_ref()
+    if router is not None:
+        owners.append(router)
+    return owners
+
+
+def _routed_resource(
+    request: Request, owner: FastAPI | APIRouter, paths: Mapping[str, _Resource]
+) -> str | None:
+    """The key of the resource of ``owner``'s ``paths`` whose route served
+    ``request``, or ``None``.
+
+    The route is the scope's ``route`` (the one Starlette routed to, also
+    the one matched by path alone whose 405 it raises), found among the
+    resources' routes; else its ``endpoint`` (a router's route, of which an
+    older FastAPI routes a copy, or a Starlette ``Route`` that records no
+    ``route``). Of the resources it is on (a route included twice, or under
+    two Mounts), the first one whose template matches the request's URL
+    (see :func:`_root_of`).
+    """
+    route = request.scope.get("route")
+    endpoint = request.scope.get("endpoint")
+
+    def keys_of(found: Callable[[Any], bool]) -> list[str]:
+        return [
+            key
+            for key, resource in paths.items()
+            if any(found(getattr(r, "original_route", r)) for r in resource.routes)
+        ]
+
+    keys = keys_of(lambda r: r is route) if route is not None else []
+    if not keys and endpoint is not None:
+        keys = keys_of(lambda r: getattr(r, "endpoint", None) is endpoint)
+    for key in keys:
+        if _root_of(request, paths[key], owner) is not None:
+            return key
+    return None
+
+
 def _hsr_target(
-    request: Request, path: str, owner: FastAPI | APIRouter | None = None
+    request: Request,
+    path: str,
+    owner: FastAPI | APIRouter | None = None,
+    paths: Mapping[str, _Resource] | None = None,
 ) -> str:
     """The URL of the HTTP Schema Resource of ``path``: the target of the HSR
     link of the responses (and OPTIONS) of ``path``.
@@ -2720,7 +2962,9 @@ def _hsr_target(
     :func:`_live_base` finds it: the app's, else that of the router whose
     scrudful endpoint serves it), and ``path`` a resource key
     (:func:`_template_key`) or any template of a resource of ``owner``'s
-    (a router's own templates, for a router). Resolved in this order:
+    (a router's own templates, for a router); ``paths`` are ``owner``'s
+    :func:`_scrudful_paths`, when the caller has them. Resolved in this
+    order:
 
     1. ``hsr_url(template)``, with ``template`` the resource's (its first
        route's), as it returns it;
@@ -2728,7 +2972,7 @@ def _hsr_target(
        without ``hsr_url``) a ``ValueError``;
     3. else the path of ``owner``'s HSR route for the resource, reversed on
        ``owner``'s own routes, under the request's URL path of ``owner``'s
-       root (see :func:`_owner_root`: where the request's app is mounted,
+       root (see :func:`_root_of`: where the request's app is mounted,
        parameters filled, and for a router, the prefix it came through);
        made absolute against ``owner``'s ``base_url`` (an absolute path, so
        the base URL's own path is replaced) when it has one, else against
@@ -2740,14 +2984,16 @@ def _hsr_target(
         If no :func:`add_options` covers the request; no scrudful endpoint
         of ``owner`` serves ``path``; the route is off and there is no
         ``hsr_url``; the resource has no HSR route (a router's resource
-        added after its :func:`add_options`); two resources have one route
-        name, or a path is under ``/_hsr/``; or the request isn't to a URL
-        of ``path``.
+        added after its :func:`add_options`, whose responses therefore get
+        no HSR link, see :func:`_response_hsr_link`); two resources have one
+        route name, or a path is under ``/_hsr/``; or the request isn't to
+        a URL of ``path``.
     """
     if owner is None:
         owner = _hsr_owner(request)
     options = _hsr_options(owner)
-    paths = _scrudful_paths(owner)
+    if paths is None:
+        paths = _scrudful_paths(owner)
     resource = _resource(owner, paths, path)
     if options.hsr_url is not None:
         return options.hsr_url(resource.template)
@@ -2766,7 +3012,13 @@ def _hsr_target(
     if isinstance(owner, FastAPI):
         params[_HSR_PARAMETER] = next(n for n, k in names.items() if k == key)
     route_path = owner.url_path_for(route.name, **params)
-    url_path = _owner_root(request, resource, owner) + str(route_path)
+    root = _root_of(request, resource, owner)
+    if root is None:
+        raise ValueError(
+            f"the HTTP Schema Resource link of {resource.template!r} needs a "
+            f"request to a URL of it, not to {request.scope['path']!r}"
+        )
+    url_path = root + str(route_path)
     if options.base_url:
         return resolve_uri(url_path, options.base_url)
     return str(request.url.replace(path=url_path, query="", fragment=""))
@@ -2777,32 +3029,39 @@ def _hsr_target(
 _PATH_SAFE = "/!$&'()*+,;=:@-._~"
 
 
-def _owner_root(
+def _root_of(
     request: Request, resource: _Resource, owner: FastAPI | APIRouter
-) -> str:
+) -> str | None:
     """The URL path (quoted) of ``owner``'s root, for a request to a URL of
     ``resource``: the part of the request's path before the part
-    ``resource``'s template (in ``owner``'s frame) matches.
+    ``resource``'s template (in ``owner``'s frame) matches; ``None`` when
+    the request's path isn't a URL of ``resource``.
 
     For an app, the request's ``root_path`` (where the app is mounted,
     parameters and all, whether the Mount is named or not), or a shorter
     prefix of it when ``resource`` is under a ``Mount`` of the app's own
     (whose path the template has); for a router, the ``root_path`` and the
-    prefix the router is included under, as the request filled it. Of
-    several, the longest: only a template starting with a ``path``
-    parameter matches several (a router's ``"/{p:path}"``).
+    prefix the router is included under, as the request filled it.
 
-    Raises
-    ------
-    ValueError
-        If the request's path isn't a URL of ``resource``.
+    A template containing a ``path`` parameter anywhere (``"/{p:path}"``,
+    ``"/files/{p:path}"``, ``"/{p:path}/raw"``) can match the rest of the
+    path after several of these prefixes: ``"/files/{p:path}"`` matches
+    after both ``/v1`` and ``/v1/files/a`` in ``/v1/files/a/files/b``. Of
+    those, the longest whose parameters are the request's ``path_params``
+    (as the route serving it converted them: here ``p`` is ``a/files/b``,
+    so ``/v1``) is taken. When the request lacks the template's parameters
+    (an OPTIONS the app answers, a route of the resource naming them
+    otherwise than the template), they can't tell, and the longest is taken,
+    which may be another prefix than the one the request came through.
+    ``scope["route"].path_format`` can't tell either: FastAPI's lazily
+    included routers route the router's own route, without the prefix.
     """
     scope = request.scope
     root = scope.get("root_path", "")
     path = scope["path"]
     if not path.startswith(root):  # Starlette < 0.33: the rest of the path
         path = root + path
-    regex = compile_path(resource.template)[0]
+    regex, _, convertors = compile_path(resource.template)
     if isinstance(owner, FastAPI):
         # root_path, then its prefixes: without the Mounts within the app.
         candidates = [root[:i] for i in range(len(root), -1, -1)]
@@ -2812,39 +3071,53 @@ def _owner_root(
         candidates = [
             path[:i] for i in range(len(path) - 1, len(root) - 1, -1) if path[i] == "/"
         ]
+    known = scope.get("path_params") or {}
+    matching = []
     for base in candidates:
-        if regex.match(path[len(base) :]):
+        match = regex.match(path[len(base) :])
+        if match is None:
+            continue
+        if _same_parameters(match, convertors, known):
             return quote(base, safe=_PATH_SAFE)
-    raise ValueError(
-        f"the HTTP Schema Resource link of {resource.template!r} needs a request "
-        f"to a URL of it, not to {path!r}"
-    )
+        matching.append(base)
+    return quote(matching[0], safe=_PATH_SAFE) if matching else None
+
+
+def _same_parameters(
+    match: re.Match[str], convertors: Mapping[str, Any], known: Mapping[str, Any]
+) -> bool:
+    """Whether the parameters of a template's ``match`` that the request's
+    path parameters ``known`` have are those, once ``convertors`` convert
+    them."""
+    for name, value in match.groupdict().items():
+        if name not in known:
+            continue
+        try:
+            converted = convertors[name].convert(value)
+        except Exception:  # a custom convertor refusing it
+            return False
+        if converted != known[name]:
+            return False
+    return True
 
 
 def _hsr_owner(request: Request) -> FastAPI | APIRouter:
     """The app or router whose :func:`add_options` covers ``request``: the
-    app's, else that of the router whose scrudful endpoint serves it.
+    app's, else that of the router whose scrudful endpoint serves it (the
+    first of :func:`_covering_owners`).
 
     Raises
     ------
     ValueError
         If there is none.
     """
-    app = request.scope.get("app")
-    options = getattr(app, _OPTIONS_ATTRIBUTE, None)
-    if isinstance(app, FastAPI) and isinstance(options, _HsrOptions):
-        if options.explicit:
-            return app
-    router_ref = None
-    with contextlib.suppress(TypeError):  # not weakly referenceable
-        router_ref = _ROUTER_ENDPOINTS.get(request.scope.get("endpoint"))
-    router = None if router_ref is None else router_ref()
-    if router is None:
+    owners = _covering_owners(request)
+    if not owners:
         raise ValueError(
             "no add_options covers this request: call add_options on the app, "
             "or on the router of the endpoint serving it"
         )
-    return router
+    return owners[0]
 
 
 def _has_validators(config: _EndpointConfig) -> bool:
@@ -3198,8 +3471,9 @@ def _check_error(error: Any) -> None:
 def _conditional_response(
     result: ConditionalResult,
     injected: Headers,
-    link: str | None = None,
+    links: tuple[str | None, str | None] = (None, None),
     media_type: str | None = None,
+    hsr: str | None = None,
 ) -> Response:
     """Build the early response, keeping headers set on the injected Response.
 
@@ -3207,15 +3481,19 @@ def _conditional_response(
     builds itself, so dependency headers would be lost. A 304 gets all of them
     (``Cache-Control``, ``Vary``, ... as a 200 would carry, RFC 9110 §15.4.5),
     except representation metadata and those it already has. Error responses
-    get only the cookies: other headers (e.g. a ``public`` Cache-Control, or
-    a Link describing the success representation) must not apply to them.
+    get only the cookies and the Links: other headers (e.g. a ``public``
+    Cache-Control) must not apply to them.
 
-    ``link`` (the Links of the ``error`` entity) and ``media_type`` (its
-    Content-Type, default ``application/json``) apply to a response with a
-    body, the 400, 412 and 428; a 304 gets neither.
+    ``links`` (the schema and context link-values of the ``error`` entity)
+    and ``media_type`` (its Content-Type, default ``application/json``) apply
+    to a response with a body, the 400, 412 and 428; a 304 gets neither.
+    The injected ``Link`` lines are merged with them and with ``hsr`` (the
+    HSR link) by relation (:func:`scrudful._adapter.merge_links`): a link a
+    dependency set with the relation of one of them replaces it.
     """
     if result.body is None:
         response = Response(status_code=result.status, headers=result.headers)
+        links = (None, None)
     else:
         response = JSONResponse(
             result.body,
@@ -3223,14 +3501,15 @@ def _conditional_response(
             headers=result.headers,
             media_type=media_type,
         )
-        if link:
-            response.headers["Link"] = link
     headers = response.headers
     own = {name for name, _ in headers.raw}
+    injected_links = []
     for raw_name, raw_value in injected.raw:
         name = raw_name.decode("latin-1").lower()
         value = raw_value.decode("latin-1")
-        if name == "set-cookie":
+        if name == "link":
+            injected_links.append(value)
+        elif name == "set-cookie":
             headers.append(name, value)
         elif name == "access-control-expose-headers":
             merged = merge_expose_headers(headers.get(name), value.split(","))
@@ -3242,6 +3521,9 @@ def _conditional_response(
             and name.encode("latin-1") not in own
         ):
             headers.append(name, value)
+    link = merge_links(", ".join(injected_links) or None, *links, hsr)
+    if link is not None:
+        headers["Link"] = link
     expose_headers(headers)
     return response
 
