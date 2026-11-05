@@ -831,8 +831,8 @@ operation's. **An error status the operation declares in** ``responses=``
 **has an entry of its own** with that entity's content, which wins over all
 of these: every response with that status carries it, those ninja answers
 before the operation (its authentication's 401, its validation's 422, the
-latter as problem details for a problem-details entity) included. ``head`` (where an
-operation routes it) is described like ``get``, without content, and
+latter as problem details for a problem-details entity) included. ``head``
+(where an operation routes it) is described like ``get``, without content, and
 ``options`` is exactly ``{"responses": {"204": {"description": "No
 Content"}}}``.
 

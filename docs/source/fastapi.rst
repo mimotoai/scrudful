@@ -430,8 +430,9 @@ An error entity describes JSON bodies: its ``media_type`` must be
 ``application/problem+json``), other than JSON-LD; anything else raises
 ``ValueError``. scrudful's own 400, 412 and 428 are served with the endpoint's
 ``error.media_type`` as their ``Content-Type``, else with that of
-``add_error_links``'s entity (``application/json`` without either). The responses :func:`~scrudful.fastapi.add_error_links` touches
-are those with JSON content only, and each is served with the entity's
+``add_error_links``'s entity (``application/json`` without either). The
+responses :func:`~scrudful.fastapi.add_error_links` touches are those with
+JSON content only, and each is served with the entity's
 ``media_type``, whatever the handler chose: a custom handler's
 ``application/json`` response is relabelled, say, ``application/problem+json``,
 so its body must be content the entity describes. Responses without content

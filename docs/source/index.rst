@@ -13,7 +13,8 @@ Decorate a view or endpoint, give it validator callbacks (``etag_func``,
 <https://w3id.org/semantic-http/0.1/>`_ (spec commit ``37ec1ce``): OPTIONS
 answers a 204 whose ``Allow`` lists what the requester may use, each path's
 HTTP Schema Resource is served by GET and linked from every response, and the
-framework's own error pages are JSON unless ``Accept`` prefers HTML.
+framework's own error pages are JSON (Django's 404 and 500 pages unless
+``Accept`` prefers HTML).
 
 Upgrading from 0.9? See "Migrating from 0.9" in :doc:`usage` and the
 :doc:`changelog`.
