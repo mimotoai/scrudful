@@ -724,6 +724,15 @@ def handler404(error: Entity) -> Callable[..., HttpResponse]:
 
     In ``urls.py``: ``handler404 = scrudful.ninja.handler404(ERROR)``, with
     ``ERROR`` an :class:`Entity` of plain (non-callable) link values.
+
+    Raises
+    ------
+    TypeError
+        If ``error`` is not an :class:`Entity`, or a link of it is a
+        callable.
+    ValueError
+        If ``error``'s media type is not JSON, or a rel or type of its links
+        has characters a Link can't carry.
     """
     return error_handler(404, error)
 
@@ -732,6 +741,15 @@ def handler500(error: Entity) -> Callable[..., HttpResponse]:
     """A Django ``handler500`` that answers JSON unless the client prefers HTML.
 
     In ``urls.py``: ``handler500 = scrudful.ninja.handler500(ERROR)``.
+
+    Raises
+    ------
+    TypeError
+        If ``error`` is not an :class:`Entity`, or a link of it is a
+        callable.
+    ValueError
+        If ``error``'s media type is not JSON, or a rel or type of its links
+        has characters a Link can't carry.
     """
     return error_handler(500, error)
 

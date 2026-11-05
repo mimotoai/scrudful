@@ -15,7 +15,7 @@ from typing import Any, Literal, TypedDict
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from django.conf import settings
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import DisallowedHost, ImproperlyConfigured
 from django.core.paginator import UnorderedObjectListWarning
 from django.db.models import QuerySet
 from django.http import (
@@ -335,14 +335,15 @@ def json_response(
     return render(data, status, content_type)
 
 
-def _plain_links(entity: Entity, request: HttpRequest) -> str | None:
+def _plain_links(entity: Entity, request: HttpRequest | None) -> str | None:
     """The Link field value of ``entity``'s plain schema and context links.
 
     The same rels, types and defaults as the adapters' error Links; a
     relative URL resolves against ``SCRUDFUL["BASE_URL"]`` when it is set,
     as the adapters' Links and HTTP Schema Resources do, else against the
     request (``build_absolute_uri()``, called only then: an absolute link
-    needs no host of the request's).
+    needs no host of the request's). Without a ``request``, each URL is
+    taken as it is, the settings unread: a check of the rels and types.
 
     Raises
     ------
@@ -352,10 +353,12 @@ def _plain_links(entity: Entity, request: HttpRequest) -> str | None:
         If a relative link needs the request's host and ``ALLOWED_HOSTS``
         refuses it.
     """
-    base = setting_base_url()
+    base = setting_base_url() if request is not None else None
 
     def resolve(url: Any) -> str:
         nonlocal base
+        if request is None:
+            return str(url)
         if base is None:
             if urlsplit(str(url)).scheme:
                 return str(url)
@@ -411,18 +414,32 @@ def error_handler(
     ``login_required = False``, public under Django's
     ``LoginRequiredMiddleware`` (Django exempts its error handlers anyway).
 
-    It never raises for its Links: Django logs the error it answers only
-    once the handler returns, so a Link it can't build (an invalid
-    ``SCRUDFUL["BASE_URL"]``; a relative link without a base URL, on a
-    request whose host ``ALLOWED_HOSTS`` refuses) is logged, on the
-    ``scrudful._django`` logger with the exception, and the error is
-    served without the entity's Links.
+    ``error`` is checked here, when the handler is made: an
+    :class:`~scrudful.entity.Entity` of a JSON media type (its bodies are
+    JSON), with plain link values whose rels and types a Link can carry.
+
+    It doesn't raise for a Link that depends on the settings or the request:
+    Django logs the error it answers only once the handler returns, so a
+    Link it can't build for one of those (an invalid ``SCRUDFUL["BASE_URL"]``;
+    a relative link without a base URL, on a request whose host
+    ``ALLOWED_HOSTS`` refuses) is logged, on the ``scrudful._django`` logger
+    with the exception and the request's path, and the error is served
+    without the entity's Links. Anything else raised building them
+    propagates, to Django's own handling of an error handler that fails.
 
     Raises
     ------
     TypeError
-        If a link of ``error`` is a callable.
+        If ``error`` is not an :class:`~scrudful.entity.Entity`, or a link
+        of it is a callable.
+    ValueError
+        If ``error``'s media type is not JSON (``application/json`` or a
+        ``+json`` type), or a rel or type of its links has characters a
+        Link can't carry (control characters, or outside Latin-1).
     """
+    if not isinstance(error, Entity):
+        raise TypeError(f"error must be an Entity, not {type(error).__name__}")
+    _adapter.check_error_media_type(error.media_type)
     if any(
         callable(value)
         for value in (
@@ -435,6 +452,9 @@ def error_handler(
         )
     ):
         raise TypeError("handler404/handler500 need an Entity with plain link values")
+    # Each Link with a URL of the same form: what depends on neither the
+    # settings nor the request fails now.
+    _plain_links(error, None)
 
     def view(request: HttpRequest, exception: Exception | None = None) -> HttpResponse:
         if _adapter.prefers_html(request.headers.get("Accept"), error.media_type):
@@ -452,13 +472,14 @@ def error_handler(
             response = json_response(body, status, error.media_type)
             try:
                 link = _plain_links(error, request)
-            except Exception:
+            except (ImproperlyConfigured, DisallowedHost, HsrConfigError):
                 # Serve the error, and keep Django's own log of what it is
                 # answering, rather than fail inside the error handler.
                 logger.exception(
                     "scrudful handler%s: the error entity's Links can't be "
-                    "built; answering without them",
+                    "built for %s; answering without them",
                     status,
+                    request.path,
                 )
                 link = None
             if link:

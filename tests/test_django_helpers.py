@@ -183,6 +183,70 @@ def test_handler_rejects_callable_links():
         )
 
 
+def test_handler_logs_the_request_it_cant_link(rf, settings, caplog):
+    """The log of a Link the handler can't build names the request's path,
+    so one of many identical errors can be traced."""
+    settings.SCRUDFUL = {"BASE_URL": "/v1/"}
+    view = error_handler(404, Entity("/s", context_link_or_func="/c"))
+    with caplog.at_level("ERROR", logger="scrudful"):
+        view(rf.get("/some/where", HTTP_ACCEPT="application/json"), Http404())
+    [record] = caplog.records
+    assert "/some/where" in record.getMessage()
+
+
+def test_handler_lets_an_unexpected_error_propagate(rf, settings, monkeypatch):
+    """Only the documented causes (the setting, the host, the entity's
+    configuration) are logged and served without Links: anything else
+    raised building them is a bug, which takes Django's own 500 path."""
+    settings.SCRUDFUL = None
+
+    def broken(*args):
+        raise KeyError("bug")
+
+    view = error_handler(404, Entity("https://x/s", context_link_or_func="https://x/c"))
+    monkeypatch.setattr(_django, "link_content", broken)
+    with pytest.raises(KeyError, match="bug"):
+        view(rf.get("/nowhere", HTTP_ACCEPT="application/json"), Http404())
+
+
+@pytest.mark.parametrize("error", [None, "https://x/s", {"media_type": "x"}])
+def test_handler_needs_an_entity(error):
+    with pytest.raises(TypeError, match="must be an Entity, not"):
+        error_handler(404, error)
+
+
+@pytest.mark.parametrize("media_type", ["text/turtle", "text/html", "text/csv"])
+def test_handler_needs_a_json_entity(media_type):
+    """Its bodies are JSON: an entity of another media type would label them
+    as content no entity describes (and ``text/html`` would never select
+    Django's HTML page)."""
+    with pytest.raises(ValueError, match="JSON error bodies"):
+        error_handler(404, Entity(media_type=media_type))
+
+
+@pytest.mark.parametrize("adapter_name", ["rest_framework", "ninja"])
+def test_the_public_handlers_check_their_entity(adapter_name):
+    adapter = importlib.import_module(f"scrudful.{adapter_name}")
+    with pytest.raises(ValueError, match="JSON error bodies"):
+        adapter.handler404(Entity(media_type="text/turtle"))
+    with pytest.raises(TypeError, match="must be an Entity"):
+        adapter.handler500(None)
+
+
+def test_handler_rejects_a_link_value_it_cant_write():
+    """A rel or type a Link can't carry is refused when the handler is made,
+    not on each error it answers."""
+    with pytest.raises(ValueError, match="control"):
+        error_handler(
+            404,
+            Entity(
+                "https://x/s",
+                context_link_or_func="https://x/c",
+                schema_rel_or_func="a\nb",
+            ),
+        )
+
+
 # --- The SCRUDFUL setting's keys --------------------------------------------------
 
 

@@ -487,15 +487,16 @@ does when the view has none.
 doesn't handle, are answered by Django's ``handler404`` and ``handler500``:
 :func:`~scrudful.rest_framework.handler404` and
 :func:`~scrudful.rest_framework.handler500` (see `Setup`_) take an ``Entity``
-of plain (non-callable) link values and answer JSON (problem details for an
-``application/problem+json`` entity, else ``{"detail": <reason phrase>}``)
-with its Links, resolved against ``SCRUDFUL["BASE_URL"]``, unless ``Accept``
-prefers ``text/html``, and always send ``Vary: Accept``. Django uses them with
-``DEBUG`` off. They get no HSR link. They never raise for their Links: one
-they can't build (an invalid ``SCRUDFUL["BASE_URL"]``, or a relative link
-without a base URL on a request whose host ``ALLOWED_HOSTS`` refuses) is
-logged on the ``scrudful._django`` logger, and the error served without the
-Links, so Django still logs the error it answers.
+of plain (non-callable) link values, of a JSON media type (checked when the
+handler is made: ``TypeError``, ``ValueError``), and answer JSON (problem
+details for an ``application/problem+json`` entity, else ``{"detail": <reason
+phrase>}``) with its Links, resolved against ``SCRUDFUL["BASE_URL"]``, unless
+``Accept`` prefers ``text/html``, and always send ``Vary: Accept``. Django uses
+them with ``DEBUG`` off. They get no HSR link. A Link they can't build for the
+settings or the request (an invalid ``SCRUDFUL["BASE_URL"]``, or a relative
+link without a base URL on a request whose host ``ALLOWED_HOSTS`` refuses) is
+logged on the ``scrudful._django`` logger, with the request's path, and the
+error served without the Links, so Django still logs the error it answers.
 
 Callbacks
 ---------
