@@ -2234,25 +2234,35 @@ def lookup_failing(view_name):
     raise LookupError(f"no HSR for {view_name}")
 
 
+@pytest.mark.parametrize("debug", [False, True])
 @pytest.mark.parametrize(
-    "urlconf, hsr_url, error",
+    "urlconf, hsr_url, error, match",
     [
-        (WritingNoIncludeURLconf, None, ImproperlyConfigured),
-        (WritingURLconf, lookup_failing, LookupError),
-        (WritingURLconf, lambda view_name: "/relative", ImproperlyConfigured),
+        (WritingNoIncludeURLconf, None, ImproperlyConfigured, "include.*hsr_urls"),
+        (WritingURLconf, lookup_failing, LookupError, "no HSR for writes"),
+        (
+            WritingURLconf,
+            lambda view_name: "/relative",
+            ImproperlyConfigured,
+            "absolute URL",
+        ),
     ],
 )
 def test_an_hsr_link_that_cant_be_resolved_fails_before_the_handler(
-    settings, client, urlconf, hsr_url, error
+    settings, client, urlconf, hsr_url, error, match, debug
 ):
     """The link is resolved before the handler runs, so a misconfigured one
-    never turns a write that happened into a 500."""
+    never turns a write that happened into a 500; and the error raised is
+    the one that names the fix, with DEBUG on too (DRF's handle_exception
+    needs the negotiated renderer to re-raise it)."""
+    settings.DEBUG = debug
     settings.ROOT_URLCONF = urlconf
     if hsr_url is not None:
         settings.SCRUDFUL = {"BASE_URL": BASE_URL, "HSR_URL": hsr_url}
     WRITES.clear()
-    with pytest.raises(error):
-        client.post("/writes", {}, format="json")
+    for method in ("post", "get", "options"):
+        with pytest.raises(error, match=match):
+            getattr(client, method)("/writes", {}, format="json")
     assert WRITES == []
 
 
