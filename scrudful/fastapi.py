@@ -2579,7 +2579,7 @@ async def _options_answer(
         subject = request
     try:
         allowed = {
-            method: options.allowed is not None or await _may_use(method, f)
+            method: options.allowed is not None or await _may_use(f)
             for method, f in served.items()
         }
         obj = None
@@ -2687,11 +2687,12 @@ def _exception_handler(
     return None
 
 
-async def _may_use(method: str, found: tuple[Any, Scope]) -> bool:
-    """Whether the requester may use ``method``, served by the route of
-    ``found`` (with the scope it gets), by the route's security dependencies
-    (:func:`_security_dependencies`), resolved on a copy of the scope with
-    ``method`` (:func:`_resolves`). A route without dependencies (a Starlette
+async def _may_use(found: tuple[Any, Scope]) -> bool:
+    """Whether the requester may use the method of ``found``, a route serving
+    it and the scope it gets (whose method is the method checked, see
+    :func:`_match`), by the route's security dependencies
+    (:func:`_security_dependencies`), resolved on a copy of that scope
+    (:func:`_resolves`). A route without dependencies (a Starlette
     ``Route``) has none: allowed. One with a security dependency that needs
     the request's body, which OPTIONS doesn't have, can't be checked: not
     allowed, for every requester (announced, see :func:`_announce_body`)."""
@@ -2705,7 +2706,7 @@ async def _may_use(method: str, found: tuple[Any, Scope]) -> bool:
         return False
     if not checks:
         return True
-    return await _resolves(route, checks, {**scope, "method": method})
+    return await _resolves(route, checks, scope)
 
 
 def _security_dependencies(route: Any, dependant: Any) -> tuple[list[Any], bool]:
