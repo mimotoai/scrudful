@@ -1680,44 +1680,90 @@ def _add_to_new_app(error):
     add_error_links(FastAPI(), error)
 
 
-def test_dependency_links_merge_by_relation_on_early_errors(make_client, store):
-    """A Link a dependency set on the injected ``Response`` is kept on the
-    early 400/412/428, merged by relation: its ``describedby`` and context
-    links replace the error entity's, as a Link the endpoint sets replaces
-    its own on a success."""
+#: Links a dependency sets: the success representation's schema and context
+#: (relations in other cases, and the rdf-context one), and an author link.
+DEPENDENCY_SCHEMA_LINK = (
+    '<http://example.com/other>; rel="DescribedBy"; type="application/schema+json"'
+)
+DEPENDENCY_CONTEXT_LINKS = (
+    '<http://example.com/other.jsonld>; rel="http://www.w3.org/ns/JSON-LD#context"; '
+    'type="application/ld+json", <http://example.com/other.csvm>; '
+    'rel="https://w3id.org/semantic-http/ns#rdf-context"; type="application/csvm+json"'
+)
+AUTHOR_LINK = '<http://example.com/me>; rel="author"'
+
+
+def _dependency_links_app(store, error):
+    """``/items/{item_id}`` (GET, PUT), whose dependency sets the success
+    representation's schema and context links, an author link and a cookie."""
     app = FastAPI()
-    dependency_link = (
-        '<http://example.com/other>; rel="describedby"; '
-        'type="application/schema+json", <http://example.com/other.jsonld>; '
-        'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
-    )
 
     def set_headers(response: Response):
-        response.headers["Link"] = dependency_link
+        response.headers.append("Link", DEPENDENCY_SCHEMA_LINK)
+        response.headers.append("Link", f"{DEPENDENCY_CONTEXT_LINKS}, {AUTHOR_LINK}")
         response.set_cookie("session", "abc")
 
-    for path, error in (("/with-error", ERROR), ("/without-error", None)):
+    @app.api_route(
+        "/items/{item_id}",
+        methods=["GET", "PUT"],
+        dependencies=[Depends(set_headers)],
+    )
+    @scrudful(etag_func=store.etag, error=error)
+    async def item(item_id: int):
+        return {}
 
-        @app.api_route(
-            path, methods=["GET", "PUT"], dependencies=[Depends(set_headers)]
-        )
-        @scrudful(etag_func=store.etag, error=error)
-        async def item():
-            return {}
+    add_options(app, base_url=TEST_BASE_URL)
+    return app
 
-    client = make_client(app)
-    response = client.put("/with-error", headers={"If-Match": '"other"'})
-    assert response.status_code == 412
-    assert response.headers["link"] == dependency_link
+
+EARLY_ERRORS = [
+    ("PUT", {"If-Match": '"other"'}, 412),
+    ("PUT", {}, 428),
+    ("GET", {"If-Match": "v1"}, 400),
+]
+
+
+@pytest.mark.parametrize("method, headers, status", EARLY_ERRORS)
+def test_dependency_content_links_are_dropped_on_early_errors(
+    make_client, store, method, headers, status
+):
+    """Ruling R27: a dependency's ``describedby`` and RDF context links
+    describe the success representation, not the early error's body: they
+    are dropped from the 400/412/428, which carry the error entity's (and
+    agree with the HSR's entry). Its other Links and its cookies are kept."""
+    client = make_client(_dependency_links_app(store, ERROR))
+    hsr = options_hsr(client, "/items/1")
+    response = client.request(method, "/items/1", headers=headers)
+    assert response.status_code == status
+    assert response.headers["link"] == f"{AUTHOR_LINK}, {ERROR_LINKS}, {ITEMS_HSR_LINK}"
+    assert link_problems(method, status, response.headers, True, hsr) == []
     assert response.headers["set-cookie"] == "session=abc; Path=/; SameSite=lax"
-    response = client.put("/without-error", headers={"If-Match": '"other"'})
-    assert response.status_code == 412
-    assert response.headers["link"] == dependency_link
-    assert response.headers["set-cookie"] == "session=abc; Path=/; SameSite=lax"
-    # A 304 keeps every dependency header, as a 200 would carry it.
-    response = client.get("/with-error", headers={"If-None-Match": '"v1"'})
+
+
+@pytest.mark.parametrize("method, headers, status", EARLY_ERRORS)
+def test_dependency_content_links_are_dropped_without_an_error_entity(
+    make_client, store, method, headers, status
+):
+    """Without ``error``, nothing describes the early error's body: no
+    ``describedby`` or context link at all, as in 0.9; the author link and
+    the HSR link stay."""
+    client = make_client(_dependency_links_app(store, None))
+    response = client.request(method, "/items/1", headers=headers)
+    assert response.status_code == status
+    assert response.headers["link"] == f"{AUTHOR_LINK}, {ITEMS_HSR_LINK}"
+
+
+def test_a_304_keeps_the_dependency_links(make_client, store):
+    """A 304 stands for the success representation: it keeps every
+    dependency header, its schema and context links included, as a 200
+    would carry them."""
+    client = make_client(_dependency_links_app(store, ERROR))
+    response = client.get("/items/1", headers={"If-None-Match": '"v1"'})
     assert response.status_code == 304
-    assert response.headers["link"] == dependency_link
+    assert response.headers["link"] == (
+        f"{DEPENDENCY_SCHEMA_LINK}, {DEPENDENCY_CONTEXT_LINKS}, {AUTHOR_LINK}, "
+        f"{ITEMS_HSR_LINK}"
+    )
 
 
 def test_relative_link_resolved(make_client):

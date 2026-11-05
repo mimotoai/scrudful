@@ -60,7 +60,10 @@ from scrudful._adapter import (
     BODY_HEADERS,
     DEFAULT_SCHEMA_REL,
     DEFAULT_SCHEMA_TYPE,
+    JSON_LD_CONTEXT_REL,
     METHOD_KEYS,
+    RDF_CONTEXT_REL,
+    SCHEMA_REL,
     SCHEMA_TYPE,
     check_error_body_func,
     check_error_media_type,
@@ -109,7 +112,9 @@ from scrudful.conditional import (
 from scrudful.entity import Entity
 from scrudful.problem import PROBLEM_JSON, problem_from_errors
 from scrudful.utils import (
+    _split_top_level,
     link_content,
+    link_relations,
     merge_expose_headers,
     resolve_uri,
 )
@@ -271,10 +276,13 @@ def scrudful(
         and are ``application/json``. Headers dependencies set on the
         injected ``Response`` are kept: all of them on a 304 (except
         ``Content-*`` metadata), only ``Set-Cookie`` and ``Link`` on the
-        others. A Link a dependency set is merged by relation with the
-        error's and the HSR link (one with the relation of one of them
-        replaces it, as on a success; see
-        :func:`scrudful._adapter.merge_links`).
+        others. Of the Links a dependency set, those with the
+        ``describedby`` relation or an RDF context one (JSON-LD's or
+        ``rdf-context``) are dropped from the 400, 412 and 428: they
+        describe the success representation, and the body is the error's,
+        which only ``error``'s Links describe. The others (an ``author``
+        link, say) are kept, before the error's Links and the HSR link; one
+        with the HSR relation replaces scrudful's.
 
         The preconditions are evaluated before the endpoint runs, so two
         concurrent requests carrying the same If-Match can both pass. Strict
@@ -3487,9 +3495,16 @@ def _conditional_response(
     ``links`` (the schema and context link-values of the ``error`` entity)
     and ``media_type`` (its Content-Type, default ``application/json``) apply
     to a response with a body, the 400, 412 and 428; a 304 gets neither.
-    The injected ``Link`` lines are merged with them and with ``hsr`` (the
-    HSR link) by relation (:func:`scrudful._adapter.merge_links`): a link a
-    dependency set with the relation of one of them replaces it.
+
+    The injected ``Link`` lines are kept, with ``hsr`` (the HSR link) after
+    them unless one of them has its relation (it wins,
+    :func:`scrudful._adapter.merge_links`). On the 400, 412 and 428 an
+    injected link with the ``describedby`` relation or an RDF context one
+    (JSON-LD's or ``rdf-context``; relations compared case-insensitively)
+    is dropped (ruling R27): a dependency's schema and context links
+    describe the success representation, not the error body, which only the
+    ``error`` entity's describe (and without one nothing does). A 304 keeps
+    them: it stands for the success representation.
     """
     if result.body is None:
         response = Response(status_code=result.status, headers=result.headers)
@@ -3521,11 +3536,33 @@ def _conditional_response(
             and name.encode("latin-1") not in own
         ):
             headers.append(name, value)
-    link = merge_links(", ".join(injected_links) or None, *links, hsr)
+    existing = ", ".join(injected_links) or None
+    if result.status != 304:
+        existing = _without_content_links(existing)
+    link = merge_links(existing, *links, hsr)
     if link is not None:
         headers["Link"] = link
     expose_headers(headers)
     return response
+
+
+#: The relations of the links describing a response's content: its schema
+#: link and its RDF context links (lower-cased).
+_CONTENT_LINK_RELS = frozenset(
+    rel.lower() for rel in (SCHEMA_REL, JSON_LD_CONTEXT_REL, RDF_CONTEXT_REL)
+)
+
+
+def _without_content_links(value: str | None) -> str | None:
+    """The Link field ``value`` without its link-values having a relation of
+    :data:`_CONTENT_LINK_RELS` (any of a ``rel`` holding several), or
+    ``None`` when none is left."""
+    kept = [
+        link.strip(" \t")
+        for link in _split_top_level(value or "", ",")
+        if link.strip(" \t") and not link_relations(link) & _CONTENT_LINK_RELS
+    ]
+    return ", ".join(kept) or None
 
 
 def _join_expose_lines(headers: MutableHeaders) -> None:

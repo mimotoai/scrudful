@@ -193,6 +193,19 @@ def author(response: Response) -> None:
     response.headers.append("Link", AUTHOR_LINK)
 
 
+#: The success representation's schema and context links, as a dependency
+#: might set them.
+SUCCESS_LINKS = (
+    f'<{BASE}/schemas/note.json>; rel="describedby"; '
+    f'type="application/schema+json", <{BASE}/contexts/note.jsonld>; '
+    'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
+)
+
+
+def success_links(response: Response) -> None:
+    response.headers.append("Link", f"{SUCCESS_LINKS}, {AUTHOR_LINK}")
+
+
 def load(request: Request, **params: Any) -> Any:
     """The object of OPTIONS: a missing note is a 404."""
     LOADS.append("wire")
@@ -283,6 +296,12 @@ def wire_app() -> FastAPI:
     @app.put("/linked/{nid}", dependencies=[Depends(author)])
     @scrudful(**CONDITIONAL, entity=NOTE)
     async def linked(nid: int):
+        return {"id": nid, "name": find(nid)["name"]}
+
+    @app.get("/described/{nid}", dependencies=[Depends(success_links)])
+    @app.put("/described/{nid}", dependencies=[Depends(success_links)])
+    @scrudful(**CONDITIONAL, entity=NOTE)
+    async def described(nid: int):
         return {"id": nid, "name": find(nid)["name"]}
 
     @app.get("/boom/{nid}")
@@ -394,6 +413,9 @@ KINDS = {
     "ld": Kind("wire", "/ld/{nid}", "/ld/1", "/_hsr/ld.nid"),
     "own": Kind("wire", "/own/{nid}", "/own/1", "/_hsr/own.nid"),
     "linked": Kind("wire", "/linked/{nid}", "/linked/1", "/_hsr/linked.nid"),
+    "described": Kind(
+        "wire", "/described/{nid}", "/described/1", "/_hsr/described.nid"
+    ),
     "boom": Kind("wire", "/boom/{nid}", "/boom/1", "/_hsr/boom.nid"),
     "returned": Kind("wire", "/returned/{nid}", "/returned/1", "/_hsr/returned.nid"),
     "hooked": Kind("hooked", "/items/{iid}", "/h/items/1", "/h/_hsr/items.iid"),
@@ -549,6 +571,11 @@ def wire_exchanges() -> list[Exchange]:
         linked("GET 412", "GET", 412, STALE),
         linked("PUT 428", "PUT", 428),
         linked("GET 404", "GET", 404, url="/linked/999"),
+        on("described")("GET 200", "GET", 200),
+        on("described")("GET 304", "GET", 304, FRESH),
+        on("described")("GET 400", "GET", 400, MALFORMED),
+        on("described")("GET 412", "GET", 412, STALE),
+        on("described")("PUT 428", "PUT", 428),
         on("boom")("GET 500", "GET", 500),
         on("boom")("GET 500 JSON", "GET", 500, JSON),
         unknown("wire", "unknown URL 404", "/nope"),
@@ -1077,6 +1104,29 @@ def test_a_dependency_link_is_kept(clients, method, headers, status):
     links = parse_links(response.headers["link"])
     assert links[0] == ("https://people.example/ada", {"rel": "author"})
     assert links[-1][0] == target("linked")
+
+
+@pytest.mark.parametrize(
+    "method, headers, status",
+    [("GET", MALFORMED, 400), ("GET", STALE, 412), ("PUT", {}, 428)],
+)
+def test_a_dependency_s_success_links_leave_the_early_errors(
+    clients, method, headers, status
+):
+    """Ruling R27: a dependency setting the success representation's schema
+    and context links doesn't relabel the early 400/412/428, whose problem
+    details body the error entity's Links describe (agreeing with the HSR);
+    its author link stays."""
+    hsr = hsr_of(clients, "described")
+    response = clients["wire"].request(method, "/described/1", headers=headers)
+    assert response.status_code == status
+    assert [link for link, _ in parse_links(response.headers["link"])] == [
+        "https://people.example/ada",
+        PROBLEM.schema_link_or_func,
+        PROBLEM.context_link_or_func,
+        target("described"),
+    ]
+    assert link_problems(method, status, headers_of(response), True, hsr) == []
 
 
 def test_own_links_win(clients):
