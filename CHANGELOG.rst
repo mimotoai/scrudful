@@ -235,8 +235,10 @@ Behaviour change (ninja)
   ``"/{pk}"`` at one prefix): the HSR link would target it. Add the
   ``ScrudfulRouter`` first, or use ``hsr_route=False`` and ``hsr_url=``. A
   route the check can't cover fully (a prefix converter no sample value
-  fits, sample values that build no matching URL, or a prefix whose sample
-  values give more than 243 combinations) gets a ``RuntimeWarning``;
+  fits, sample values that build no matching URL, a sample value whose
+  ``to_python`` raises something else than ``ValueError``, such as a model
+  lookup's ``DoesNotExist``, which never fails the URLconf, or a prefix
+  whose sample values give more than 243 combinations) gets a ``RuntimeWarning``;
   a ``NinjaAPI`` subclass overriding ``_get_urls`` or ``_get_bound_routers``
   gets ``ConfigError`` there.
 * Every operation on a ``ScrudfulRouter`` needs an entity: adding a plain

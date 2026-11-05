@@ -5706,24 +5706,45 @@ def _route(prefix: str, path: str) -> str:
     return ninja_router.normalize_path(route).lstrip("/")  # type: ignore[no-any-return]
 
 
-def _converter_samples(converter: Any) -> list[str]:
-    """The sample values ``converter`` accepts: by its regex and by its
-    ``to_python`` (as Django's resolver does, a ``ValueError`` refuses)."""
+def _converter_samples(converter: Any) -> tuple[list[str], str | None]:
+    """The sample values ``converter`` accepts, by its regex and by its
+    ``to_python`` (as Django's resolver does, a ``ValueError`` refuses), and
+    the first one its ``to_python`` refused by raising anything else (a
+    lookup's ``ObjectDoesNotExist``), described (``None`` without one):
+    that refuses it too, as building the URLconf mustn't fail on it."""
+    raised: str | None = None
 
     def accepted(value: str) -> bool:
+        nonlocal raised
         if not re.fullmatch(converter.regex, value):
             return False
         try:
             converter.to_python(value)
         except ValueError:
             return False
+        except Exception as exc:
+            if raised is None:
+                raised = f"{type(exc).__name__}, not ValueError, for {value!r}"
+            return False
         return True
 
     values = [value for value in _SAMPLE_VALUES if accepted(value)]
-    return values or [value for value in _FALLBACK_SAMPLES if accepted(value)][:1]
+    if not values:
+        values = [value for value in _FALLBACK_SAMPLES if accepted(value)][:1]
+    return values, raised
 
 
-def _sample_urls(route: str) -> tuple[list[str], str | None]:
+class _Samples(NamedTuple):
+    """The URL paths :func:`_sample_urls` built for an HSR route."""
+
+    #: The URLs the route matches (none: nothing is checked).
+    urls: list[str]
+    #: Why they don't cover every combination of sample values, as the
+    #: warning gives it (``None``: they do, the check is complete).
+    unchecked_reason: str | None
+
+
+def _sample_urls(route: str) -> _Samples:
     """URL paths that the Django ``route`` matches, and why they don't cover
     every combination of sample values (``None`` when they do).
 
@@ -5737,22 +5758,31 @@ def _sample_urls(route: str) -> tuple[list[str], str | None]:
     shadow of some values of a parameter only (an ``int`` segment where the
     prefix takes any ``str``) is found; a shadow of one literal value
     (``"/orgs/acme/{a}/{b}"``) isn't. Without a value for a parameter there
-    is no URL.
+    is no URL. A value whose ``to_python`` raised something else than a
+    ``ValueError`` is left out, and named in the reason.
     """
     pattern = RoutePattern(route, is_endpoint=True)
     names: list[str] = []
     choices: list[list[str]] = []
+    reasons: list[str] = []
     for name, converter in pattern.converters.items():
-        values = _converter_samples(converter)
+        values, raised = _converter_samples(converter)
         if not values:
-            return [], (
+            return _Samples(
+                [],
                 "no sample value fits the converter of its prefix's "
-                f"{name!r} (its regex, or its to_python, refuses them)"
+                f"{name!r} (its regex, or its to_python, refuses them"
+                + (f"; its to_python raised {raised}" if raised else "")
+                + ")",
+            )
+        if raised is not None:
+            reasons.append(
+                f"the to_python of the converter of its prefix's {name!r} "
+                f"raised {raised}, so that value wasn't tried"
             )
         names.append(name)
         choices.append(values)
     total = math.prod(len(values) for values in choices)
-    reason = None
     combinations: Iterable[tuple[str, ...]] = itertools.product(*choices)
     if total > _MAX_SAMPLE_URLS:
         first = tuple(values[0] for values in choices)
@@ -5765,7 +5795,7 @@ def _sample_urls(route: str) -> tuple[list[str], str | None]:
             itertools.product(*choices), max(_MAX_SAMPLE_URLS - len(covering), 0)
         )
         combinations = dict.fromkeys([*covering, *rest])
-        reason = (
+        reasons.append(
             f"the {len(names)} parameters of its prefix give {total} combinations "
             f"of sample values, over the {_MAX_SAMPLE_URLS} checked, so each "
             "parameter's values were tried but not every combination of them"
@@ -5779,8 +5809,8 @@ def _sample_urls(route: str) -> tuple[list[str], str | None]:
         if pattern.match(url) is not None:
             urls.append(url)
     if not urls:
-        return [], "no URL built from the sample values matches it"
-    return urls, reason
+        return _Samples([], "no URL built from the sample values matches it")
+    return _Samples(urls, "; ".join(reasons) or None)
 
 
 def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
@@ -5839,14 +5869,15 @@ def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
             break
     if route is None:
         raise _bound_path_error()
-    urls, partial = _sample_urls(route)
-    if partial is not None:
+    samples = _sample_urls(route)
+    if samples.unchecked_reason is not None:
         key = (path_view._scrudful_router._scrudful_serial, route)
         if key not in _UNCHECKED_ROUTES:
             warnings.warn(
                 "scrudful can't check every URL of the HTTP Schema Resource "
                 f"route {route!r} of {_described_path(path_view)!r} against "
-                f"the earlier paths of the API: {partial}. Make sure no router "
+                "the earlier paths of the API: "
+                f"{samples.unchecked_reason}. Make sure no router "
                 "added to the API before this ScrudfulRouter (nor the API "
                 "itself) has a path matching it.",
                 RuntimeWarning,
@@ -5856,7 +5887,9 @@ def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
             _UNCHECKED_ROUTES.add(key)
     for other, view in earlier:
         pattern = RoutePattern(other, is_endpoint=True)
-        url = next((url for url in urls if pattern.match(url) is not None), None)
+        url = next(
+            (url for url in samples.urls if pattern.match(url) is not None), None
+        )
         if url is None:
             continue
         label = _route_label(other, view, path_view._scrudful_router)

@@ -1419,6 +1419,80 @@ def test_a_prefix_whose_converter_refuses_every_sample_warns():
         api.urls
 
 
+class LookupConverter:
+    """A converter looking its value up (as a model-lookup converter's
+    ``to_python`` does), raising ``ObjectDoesNotExist`` for a value it
+    doesn't know (Django's resolver expects a ``ValueError``); ``known``
+    is the one value it knows."""
+
+    regex = "[^/]+"
+    known: str | None = None
+
+    def to_python(self, value):
+        if value != self.known:
+            raise ObjectDoesNotExist(value)
+        return value
+
+    def to_url(self, value):
+        return value  # pragma: no cover
+
+
+class KnowsTheWord(LookupConverter):
+    known = "scrudful-sample"
+
+
+register_converter(LookupConverter, "scrudful_test_lookup")
+register_converter(KnowsTheWord, "scrudful_test_knows_word")
+
+
+def test_a_converter_raising_for_every_sample_warns_and_builds():
+    """A ``to_python`` raising anything but a ``ValueError`` for a sample
+    value (a lookup's ``ObjectDoesNotExist``) refuses it, as no other error
+    must fail the URLconf: with none left, the route is unchecked, and a
+    warning names the error."""
+
+    def anything(request, k: str, a: str, b: str):
+        return {}  # pragma: no cover
+
+    api = prefixed_router_api("/k/{k}/{a}/{b}", anything, "/k/{scrudful_test_lookup:x}")
+    with pytest.warns(RuntimeWarning) as caught:
+        assert api.urls
+    assert [str(w.message) for w in caught] == [
+        "scrudful can't check every URL of the HTTP Schema Resource route "
+        "'k/<scrudful_test_lookup:x>/_hsr/pk' of '/{pk}' against the earlier "
+        "paths of the API: no sample value fits the converter of its prefix's "
+        "'x' (its regex, or its to_python, refuses them; its to_python raised "
+        "ObjectDoesNotExist, not ValueError, for 'scrudful-sample'). Make sure "
+        "no router added to the API before this ScrudfulRouter (nor the API "
+        "itself) has a path matching it."
+    ]
+
+
+def test_a_converter_raising_for_some_samples_is_checked_with_the_others():
+    """A sample value whose ``to_python`` raised is left out, the others are
+    still checked (here, a shadow found with the word), and a warning says
+    the check is partial."""
+
+    def shadow(request, k: str, a: str, b: str):
+        return {"shadow": True}  # pragma: no cover
+
+    api = prefixed_router_api(
+        "/k/{k}/{a}/{b}", shadow, "/k/{scrudful_test_knows_word:x}"
+    )
+    with pytest.warns(RuntimeWarning, match=r"raised ObjectDoesNotExist.*for '0'"):
+        with pytest.raises(ConfigError, match="shadowed by GET"):
+            api.urls
+
+
+def test_the_sample_urls_name_what_they_leave_unchecked():
+    from scrudful.ninja import _sample_urls
+
+    complete = _sample_urls("items/<int:pk>")
+    assert complete.urls == ["items/0"] and complete.unchecked_reason is None
+    none = _sample_urls("k/<scrudful_test_lookup:x>")
+    assert none.urls == [] and "no sample value fits" in none.unchecked_reason
+
+
 SIX = "/{x1}/{x2}/{x3}/{x4}/{x5}/{x6}"
 
 
