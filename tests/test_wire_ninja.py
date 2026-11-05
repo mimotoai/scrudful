@@ -591,17 +591,30 @@ REQUESTERS = {"wire": ({}, WRITER), "api": ({}, ACME)}
 
 
 @pytest.mark.parametrize("kind", sorted(HSR_ROUTES))
-def test_hsr_invariance(client, world, kind):
+def test_hsr_invariance(client, world, kind, monkeypatch):
     """Two Hosts and two requesters (anonymous, authenticated): one HSR, as
-    bytes and ETag. Each request is answered from the document built once,
-    so a first build for one requester can't hide another's."""
+    bytes and ETag. The built documents (each router's ``_scrudful_hsrs``)
+    are discarded before each request, so each builds its own: a document
+    that depended on the requester or its Host would differ."""
     anonymous, authenticated = REQUESTERS[HSR_ROUTES[kind].split("/")[1]]
-    responses = [
-        client.get(HSR_ROUTES[kind], headers={"Host": host, **credentials})
-        for host in ("a.example", "b.example")
-        for credentials in (anonymous, authenticated)
-    ]
+    builds = []
+    describe = scrudful_ninja._describe_path
+
+    def counting(router, path_view):
+        builds.append(path_view)
+        return describe(router, path_view)
+
+    monkeypatch.setattr(scrudful_ninja, "_describe_path", counting)
+    responses = []
+    for host in ("a.example", "b.example"):
+        for credentials in (anonymous, authenticated):
+            for router in list(scrudful_ninja._SCRUDFUL_ROUTERS):
+                router._scrudful_hsrs.clear()
+            responses.append(
+                client.get(HSR_ROUTES[kind], headers={"Host": host, **credentials})
+            )
     assert {response.status_code for response in responses} == {200}
+    assert len(builds) == len(responses)  # each request built its own
     assert len({response.content for response in responses}) == 1
     assert len({response["ETag"] for response in responses}) == 1
     # Built without a request: no Host leaks into it.
