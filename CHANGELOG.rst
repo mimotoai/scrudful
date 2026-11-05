@@ -255,6 +255,11 @@ Behaviour change (DRF)
   ``TypeError`` when the class is created.
 * The built HSRs are discarded when ``SCRUDFUL``, ``REST_FRAMEWORK`` or
   ``ROOT_URLCONF`` change (``override_settings``).
+* ``Meta.hsr_route = False`` without ``Meta.hsr_url`` or
+  ``SCRUDFUL["HSR_URL"]`` raises ``ImproperlyConfigured`` when the class is
+  decorated, as ninja's and FastAPI's ``hsr_route=False`` without ``hsr_url``
+  do (it was reported by the system check and raised on each request, which
+  still catch a route turned off by ``SCRUDFUL["HSR_ROUTE"]``).
 
 Behaviour change (FastAPI)
 --------------------------

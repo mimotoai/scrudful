@@ -1341,8 +1341,10 @@ def scrudful_viewset(cls: type) -> type:
         class and the HTTP Schema Resource link too.
     hsr_route : bool, optional
         ``False`` takes the class's routes out of :func:`hsr_urls` (and needs
-        ``hsr_url``); ``True`` keeps them in with ``SCRUDFUL["HSR_ROUTE"]``
-        set to ``False``. Default: ``SCRUDFUL["HSR_ROUTE"]``, else ``True``.
+        ``hsr_url`` or ``SCRUDFUL["HSR_URL"]``: ``ImproperlyConfigured`` when
+        the class is decorated otherwise); ``True`` keeps them in with
+        ``SCRUDFUL["HSR_ROUTE"]`` set to ``False``. Default (``None``):
+        ``SCRUDFUL["HSR_ROUTE"]``, else ``True``.
     hsr_url : callable, optional
         ``hsr_url(view_name)``, the URL of the HTTP Schema Resource of the
         route named ``view_name`` (namespace-qualified, as
@@ -2911,7 +2913,14 @@ def _hsr_cache_control(cls: Any) -> str:
 
 
 def _check_hsr_options(hsr_route: Any, hsr_url: Any, hsr_cache_control: Any) -> None:
-    """Check the :data:`_HSR_OPTIONS` of a :func:`scrudful_viewset` ``Meta``."""
+    """Check the :data:`_HSR_OPTIONS` of a :func:`scrudful_viewset` ``Meta``.
+
+    ``hsr_route = False`` needs an ``hsr_url``: ``Meta.hsr_url``, else
+    ``SCRUDFUL["HSR_URL"]`` (read now), as ninja's and FastAPI's
+    ``hsr_route=False`` do. A route turned off by ``SCRUDFUL["HSR_ROUTE"]``
+    alone, or a setting changed later, is caught by the system check
+    (``scrudful.E004``) and on the view's requests.
+    """
     if hsr_route is not None and not isinstance(hsr_route, bool):
         raise TypeError(
             f"Meta.hsr_route must be a bool, not {type(hsr_route).__name__}"
@@ -2921,6 +2930,8 @@ def _check_hsr_options(hsr_route: Any, hsr_url: Any, hsr_cache_control: Any) -> 
             "Meta.hsr_url must be a callable, hsr_url(view_name), not "
             f"{type(hsr_url).__name__}"
         )
+    if hsr_route is False and hsr_url is None and setting_hsr_url() is None:
+        raise ImproperlyConfigured(_ROUTE_OFF)
     if hsr_cache_control is not None and not isinstance(hsr_cache_control, str):
         raise TypeError(
             "Meta.hsr_cache_control must be a str, not "

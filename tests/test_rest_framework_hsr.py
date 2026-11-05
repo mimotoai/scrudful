@@ -1740,21 +1740,32 @@ def test_hsr_route_false_with_hsr_url(urls, settings, client):
     assert target("/api/things/1/") == "https://schemas.example/api:thing-detail"
 
 
-def test_meta_hsr_route_false_without_hsr_url_is_improperly_configured(settings):
-    @scrudful_viewset
-    class Off(drf_hsr_urls.ItemViewSetBase):
-        class Meta:
-            hsr_route = False
+def test_meta_hsr_route_false_without_hsr_url_is_refused_when_decorating(settings):
+    """As ninja's ScrudfulRouter(hsr_route=False) and FastAPI's
+    add_options(hsr_route=False) refuse it without an hsr_url."""
+    meta = type("Meta", (), {"hsr_route": False})
+    with pytest.raises(ImproperlyConfigured, match="hsr_route = False.*hsr_url"):
+        scrudful_viewset(type("Off", (drf_hsr_urls.ItemViewSetBase,), {"Meta": meta}))
+    # SCRUDFUL["HSR_URL"] is an hsr_url.
+    settings.SCRUDFUL = {
+        "BASE_URL": BASE_URL,
+        "HSR_URL": lambda view_name: f"https://schemas.example/{view_name}",
+    }
+    off = scrudful_viewset(type("Off", (drf_hsr_urls.ItemViewSetBase,), {"Meta": meta}))
 
     class OffURLconf:
         urlpatterns = [
-            path("off/<str:pk>/", Off.as_view({"get": "retrieve"}), name="off"),
+            path("off/<str:pk>/", off.as_view({"get": "retrieve"}), name="off"),
             path("", include(hsr_urls())),
         ]
 
     settings.ROOT_URLCONF = OffURLconf
+    assert target("/off/1/") == "https://schemas.example/off"
+    # The setting removed after decorating: the request (and E004) catch it.
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL}
     with pytest.raises(ImproperlyConfigured, match="hsr_route"):
         target("/off/1/")
+    assert [error.id for error in scrudful_check_errors()] == ["scrudful.E004"]
 
 
 @pytest.mark.parametrize(

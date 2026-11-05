@@ -174,7 +174,10 @@ The optional ``SCRUDFUL`` Django setting is a dict of these keys; a viewset's
    * - ``"HSR_ROUTE"``
      - ``Meta.hsr_route``
      - Whether :func:`~scrudful.rest_framework.hsr_urls` serves the view's
-       HSR (default ``True``). ``False`` needs an ``hsr_url``.
+       HSR (default ``True``). ``False`` needs an ``hsr_url``:
+       ``Meta.hsr_route = False`` without ``Meta.hsr_url`` or
+       ``SCRUDFUL["HSR_URL"]`` raises ``ImproperlyConfigured`` when the class
+       is decorated (``scrudful.E004`` reports the setting's).
    * - ``"HSR_URL"``
      - ``Meta.hsr_url``
      - ``hsr_url(view_name)``: the absolute URL of the HSR of the route named
