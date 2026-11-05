@@ -1814,8 +1814,11 @@ def _routes_fingerprint(routes: list[Any]) -> tuple[Any, ...] | None:
     walks, ``routes``, those of the ``Mount``\\ s and ``Host``\\ s it looks
     into and those of the routers FastAPI includes lazily
     (``original_router``, the included ``APIRouter``, of the entries
-    :func:`_flat` expands), with the identity of each of their entries, in
-    order; ``None`` when one of those entries can't be seen into (a FastAPI
+    :func:`_flat` expands), with each of their entries, in order (a tuple
+    of the entries themselves, not of their ids: copied and compared, by
+    identity, in C rather than in a Python loop, and kept alive, so a new
+    route can't reuse a removed one's id); ``None`` when one of those
+    entries can't be seen into (a FastAPI
     whose included routers have no ``original_router``), so the caller
     walks the routes each time, as before the index: reading
     ``original_router`` needs no version guard, since without it nothing is
@@ -1832,7 +1835,7 @@ def _routes_fingerprint(routes: list[Any]) -> tuple[Any, ...] | None:
         if id(current) in seen:
             continue
         seen.add(id(current))
-        parts.append((id(current), tuple(id(route) for route in current)))
+        parts.append((id(current), tuple(current)))
         for route in current:
             if isinstance(route, Route):
                 continue
@@ -2211,31 +2214,35 @@ class _OptionsRoute(BaseRoute):
     def matches(self, scope: Scope) -> tuple[Match, Scope]:
         if scope.get("type") != "http" or scope.get("method") != "OPTIONS":
             return Match.NONE, {}
-        path = _options_path(self.owner, scope)
-        if path is None:
+        served = _options_path(self.owner, scope)
+        if served is None:
             return Match.NONE, {}
-        return Match.FULL, {_SERVED_KEY: path}
+        return Match.FULL, {_SERVED_KEY: served}
 
     def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
         raise NoMatchFound(name, path_params)
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
-        path = scope.get(_SERVED_KEY) or _options_path(self.owner, scope)
-        if path is None:
+        served = scope.get(_SERVED_KEY) or _options_path(self.owner, scope)
+        if served is None:
             raise HTTPException(status_code=404)
+        path, paths = served
         request = Request(scope, receive, send)
         routes = self.owner.router.routes
 
         def routed(method: str) -> tuple[Any, Scope] | None:
             return _match(routes, {**scope, "method": method})
 
-        response = await _options_answer(request, self.owner, path, routed, None)
+        response = await _options_answer(request, self.owner, path, routed, None, paths)
         await response(scope, receive, send)
 
 
-def _options_path(app: FastAPI, scope: Scope) -> str | None:
+def _options_path(
+    app: FastAPI, scope: Scope
+) -> tuple[str, Mapping[str, _Resource]] | None:
     """The resource key (:func:`_template_key`) whose document answers the
-    OPTIONS ``scope``.
+    OPTIONS ``scope``, and ``app``'s :func:`_scrudful_paths` (looked up once
+    for the request).
 
     That of the first route whose path matches the URL (see
     :func:`_match_path`), when it is a scrudful path; ``None`` when another
@@ -2246,9 +2253,13 @@ def _options_path(app: FastAPI, scope: Scope) -> str | None:
     if _match(routes, {**scope, "method": "OPTIONS"}) is not None:
         return None
     path = _match_path(routes, scope)
-    if path is None or _template_key(path) not in _scrudful_paths(app):
+    if path is None:
         return None
-    return _template_key(path)
+    paths = _scrudful_paths(app)
+    key = _template_key(path)
+    if key not in paths:
+        return None
+    return key, paths
 
 
 def _match_path(routes: Sequence[Any], scope: Scope, prefix: str = "") -> str | None:
@@ -2770,13 +2781,14 @@ def _options_endpoint(router: APIRouter, path: str) -> Callable[[Request], Any]:
     it later are described)."""
 
     async def scrudful_options(request: Request) -> Response:
-        resource = _resource(router, _scrudful_paths(router), path)
+        paths = _scrudful_paths(router)
+        resource = _resource(router, paths, path)
 
         def routed(method: str) -> tuple[Any, Scope] | None:
             return _router_match(request, resource, method)
 
         params = dict(request.path_params)
-        return await _options_answer(request, router, path, routed, params)
+        return await _options_answer(request, router, path, routed, params, paths)
 
     scrudful_options._scrudful_options = True  # type: ignore[attr-defined]
     with contextlib.suppress(TypeError):  # not weakly referenceable
@@ -2852,12 +2864,14 @@ async def _options_answer(
     path: str,
     routed: Callable[[str], tuple[Any, Scope] | None],
     params: dict[str, Any] | None,
+    paths: Mapping[str, _Resource],
 ) -> Response:
     """The answer to the OPTIONS ``request`` of the resource ``path`` (a
     :func:`_template_key`) of ``owner``; ``routed(method)`` is the route
     serving ``method`` at the request's URL and the scope it gets
     (:func:`_match`), ``params`` the URL's path parameters (``None``: those
-    of the route of the resource's first method). In order:
+    of the route of the resource's first method), ``paths`` ``owner``'s
+    :func:`_scrudful_paths`, looked up once for the request. In order:
 
     1. a CORS preflight (:func:`scrudful._hsr.is_preflight`) is a 204 with no
        content and no Links, before anything else runs;
@@ -2881,12 +2895,12 @@ async def _options_answer(
     if is_preflight(request.method, request.headers.get):
         return Response(status_code=204)
     options = _hsr_options(owner)
-    resource = _resource(owner, _scrudful_paths(owner), path)
+    resource = _resource(owner, paths, path)
     target: str | None = None
     if options.hsr_url is not None or not options.hsr_route:
-        target = _hsr_target(request, path, owner=owner)
+        target = _hsr_target(request, path, owner=owner, paths=paths)
     elif _hsr_route_of(owner, _template_key(resource.template)) is not None:
-        target = _hsr_target(request, path, owner=owner)
+        target = _hsr_target(request, path, owner=owner, paths=paths)
     found = {method: routed(method) for method in _served_methods(resource)}
     served = {method: f for method, f in found.items() if f is not None}
     if params is None:

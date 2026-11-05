@@ -404,6 +404,47 @@ def test_routes_it_cant_fingerprint_are_walked_each_time(make_client, monkeypatc
     assert hsr_link_problems(response.headers, f"{BASE}_hsr/later.id") == []
 
 
+@pytest.mark.parametrize("mode", ["app", "router"])
+def test_a_request_fingerprints_the_routes_once(make_client, monkeypatch, mode):
+    """A GET, an OPTIONS and an HSR GET each walk the lists of routes once
+    to see whether they changed (not once per lookup), in app and router
+    mode."""
+    import scrudful.fastapi as module
+
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    app = FastAPI()
+    owner = app if mode == "app" else APIRouter()
+
+    @owner.get("/items/{id}")
+    @scrudful(**links)
+    async def get_item(id: int):
+        return {}
+
+    add_options(owner, base_url=BASE)
+    prefix = ""
+    if mode == "router":
+        app.include_router(owner, prefix="/v1")
+        prefix = "/v1"
+    client = make_client(app)
+    assert client.get(f"{prefix}/items/1").status_code == 200
+    calls = []
+    fingerprint = module._routes_fingerprint
+
+    def counted(routes):
+        calls.append(routes)
+        return fingerprint(routes)
+
+    monkeypatch.setattr(module, "_routes_fingerprint", counted)
+    for method, url, status in [
+        ("GET", f"{prefix}/items/1", 200),
+        ("OPTIONS", f"{prefix}/items/1", 204),
+        ("GET", f"{prefix}/_hsr/items.id", 200),
+    ]:
+        calls.clear()
+        assert client.request(method, url).status_code == status
+        assert len(calls) == 1, (method, url)
+
+
 def test_unknown_path_raises():
     app = make_app()
     with pytest.raises(ValueError, match=r"'/people/\{id\}'.*'/users/\{id\}'"):
