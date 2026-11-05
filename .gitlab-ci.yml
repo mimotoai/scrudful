@@ -48,17 +48,30 @@ floor-fastapi:
     - uv pip install -p /tmp/floor/bin/python "fastapi==0.100.*" "pydantic==2.3.*" "anyio<4" "httpx==0.24.*"
     - /tmp/floor/bin/python -m pytest -q -p no:cacheprovider tests/test_fastapi_adapter.py tests/test_fastapi_hsr.py tests/test_wire_fastapi.py
 
-# django-ninja>=1.7: scrudful checks ninja's internals it relies on against
-# both 1.7.0 and 1.7.1 (its `_run_authentication` differs between them), and
-# the locked `test` matrix installs 1.7.1 only. Beside the ninja modules, the
-# shared ones with ninja cases (the HSR route under LoginRequiredMiddleware,
-# the Django helpers, the envelope); test_error_body.py also needs FastAPI's
-# test client, which the floor doesn't install.
-floor-ninja:
+# The ninja extra allows the releases scrudful checks ninja's internals
+# against, 1.7.0 to 1.7.3 (`_run_authentication` changed in 1.7.1,
+# `_get_bound_routers` in 1.7.2), and the locked `test` matrix installs 1.7.1
+# only: floor-ninja runs the oldest, latest-ninja the newest the extra allows
+# (the one `.floor` installs). Beside the ninja modules, the shared ones with
+# ninja cases (the HSR route under LoginRequiredMiddleware, the Django
+# helpers, the envelope); test_error_body.py also needs FastAPI's test client,
+# which `.floor` doesn't install.
+.ninja:
   extends: .floor
   script:
-    - uv pip install -p /tmp/floor/bin/python "django-ninja==1.7.0"
+    - if [ -n "$NINJA" ]; then uv pip install -p /tmp/floor/bin/python "$NINJA"; fi
+    - /tmp/floor/bin/python -c "import importlib.metadata as m; print('django-ninja', m.version('django-ninja'))"
     - /tmp/floor/bin/python -m pytest -q -p no:cacheprovider tests/test_ninja_*.py tests/test_wire_ninja.py tests/test_login_required.py tests/test_django_helpers.py tests/test_rest_framework_envelope.py
+
+floor-ninja:
+  extends: .ninja
+  variables:
+    NINJA: "django-ninja==1.7.0"
+
+latest-ninja:
+  extends: .ninja
+  variables:
+    NINJA: ""
 
 # A merge request that changes the package (scrudful/, or the published parts
 # of pyproject.toml) must raise the version above the target branch's and every
