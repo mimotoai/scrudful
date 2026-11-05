@@ -65,14 +65,30 @@ class Cookie(APIKeyCookie):
         return key
 
 
+def _refusal(value: str | None) -> int | None:
+    """The status a hook raises: ``deny`` is a 403, else the status given."""
+    if value is None:
+        return None
+    return 403 if value == "deny" else int(value)
+
+
 def before(request: Any, **kwargs: Any) -> None:
-    if request.headers.get("X-Before") == "deny":
-        raise HttpError(403, "before says no")
+    status = _refusal(request.headers.get("X-Before"))
+    if status is not None:
+        raise HttpError(status, "before says no")
 
 
 def after_throttles(request: Any, **kwargs: Any) -> None:
-    if request.headers.get("X-After") == "deny":
-        raise HttpError(403, "after_throttles says no")
+    status = _refusal(request.headers.get("X-After"))
+    if status is not None:
+        raise HttpError(status, "after_throttles says no")
+
+
+def load(request: Any, pk: int, **kwargs: Any) -> Any:
+    """The object; a pk above 1000 is refused with the status ``pk - 1000``."""
+    if pk > 1000:
+        raise HttpError(pk - 1000, "load says no")
+    return {"id": pk}
 
 
 router = ScrudfulRouter(base_url=BASE_URL)
@@ -80,7 +96,7 @@ router = ScrudfulRouter(base_url=BASE_URL)
 
 @router.get("/{pk}", response=Thing, auth=Key())
 @scrudful(
-    load=lambda request, pk, **kw: {"id": pk},
+    load=load,
     error=OWN,
     before=before,
     after_throttles=after_throttles,
@@ -91,8 +107,8 @@ def get_thing(request: Any, pk: int, obj: Any) -> Any:
         raise HttpError(401, "who are you")
     if pk == 403:
         raise HttpError(403, "not yours")
-    if pk == 404:
-        raise HttpError(404, "gone")
+    if pk in (404, 422, 429):
+        raise HttpError(pk, "the operation says no")
     return obj
 
 
@@ -214,3 +230,48 @@ def test_without_an_api_wide_entity_the_operations_entity_stays():
     assert response.status_code == 403
     assert link_problems("GET", 403, dict(response.items()), True, hsr) == []
     assert schema_links(response) == [OWN.schema_link_or_func]
+
+
+@pytest.mark.parametrize("status", [422, 429])
+def test_the_hsr_lists_422_and_429_with_the_api_wide_entity(status):
+    responses = hsr_of(Client(), "/p/things/_hsr/pk")["get"]["responses"]
+    [schema] = [
+        entry["schema"]["$ref"] for entry in responses[str(status)]["content"].values()
+    ]
+    assert schema == API_WIDE.schema_link_or_func
+
+
+@pytest.mark.parametrize("status", [422, 429])
+@pytest.mark.parametrize(
+    "url, headers",
+    [
+        ("/p/things/{status}", {"X-Key": "ok"}),
+        ("/p/things/1", {"X-Key": "ok", "X-Before": "{status}"}),
+        ("/p/things/1", {"X-Key": "ok", "X-After": "{status}"}),
+        ("/p/things/{load_pk}", {"X-Key": "ok"}),
+    ],
+    ids=["operation", "before", "after_throttles", "load"],
+)
+def test_a_raised_422_or_429_carries_the_api_wide_entity(url, headers, status):
+    """ninja's own 422 (validation) and 429 (throttling) carry the API-wide
+    entity, which the HSR's explicit entries describe: so does one the
+    operation raises itself, as its 401 and 403 do."""
+    values = {"status": status, "load_pk": 1000 + status}
+    client = Client()
+    hsr = hsr_of(client, "/p/things/_hsr/pk")
+    response = client.get(
+        url.format(**values),
+        headers={key: value.format(**values) for key, value in headers.items()},
+    )
+    assert response.status_code == status
+    assert link_problems("GET", status, dict(response.items()), True, hsr) == []
+    assert schema_links(response) == [API_WIDE.schema_link_or_func]
+
+
+def test_a_raised_403_of_load_carries_the_api_wide_entity():
+    client = Client()
+    hsr = hsr_of(client, "/p/things/_hsr/pk")
+    response = client.get("/p/things/1403", headers={"X-Key": "ok"})
+    assert response.status_code == 403
+    assert link_problems("GET", 403, dict(response.items()), True, hsr) == []
+    assert schema_links(response) == [API_WIDE.schema_link_or_func]

@@ -4625,12 +4625,14 @@ def _raised_entity(
 
     The one the HTTP Schema Resource describes for ``status`` (see
     :func:`_described_entity`: ``responses[status]``, but ``error`` first
-    for scrudful's own early statuses); else, for a 401 or 403 when the
+    for scrudful's own early statuses); else, for a status ninja answers
+    itself too (401, 403, 422, 429: :data:`_FRAMEWORK_ERRORS`) when the
     API-wide entity ``api_error`` (:func:`add_error_links`) is set and
-    differs from ``error``, ``api_error``, as ninja's own 401 and 403 carry
-    it; else ``error``. None below 400: an operation decorator turned
-    the error into another response, which is its own to describe (a link
-    callable of the default entity would get ``None``, not the object).
+    differs from ``error``, ``api_error``, as ninja's own carry it, so that
+    every response of the status agrees with its one entry; else ``error``.
+    None below 400: an operation decorator turned the error into another
+    response, which is its own to describe (a link callable of the default
+    entity would get ``None``, not the object).
     """
     if status < 400:
         return None
@@ -4639,7 +4641,7 @@ def _raised_entity(
     if entity is not None:
         return entity
     if (
-        status in _AUTH_ERRORS
+        status in _FRAMEWORK_ERRORS
         and api_error is not None
         and config.error is not None
         and api_error != config.error
@@ -6120,16 +6122,19 @@ _DEFAULT_ERROR = "Error."
 #: The errors ninja answers before an operation runs (authentication, its
 #: CSRF check and ``AuthorizationError``, request validation, throttling),
 #: whose bodies get the API-wide error entity (:func:`add_error_links`),
-#: whatever the operation's ``error``.
+#: whatever the operation's ``error``. So do those of these statuses the
+#: operation raises (its function, ``load``, ``before=``,
+#: ``after_throttles=``; see :func:`_raised_entity`): an operation answers
+#: each of them alike, whoever raised it.
 _FRAMEWORK_ERRORS = {
     401: "Unauthorized: the request lacks valid authentication credentials.",
     403: "Forbidden: the requester may not perform this request.",
     422: "Unprocessable Content: the request's parameters or body are invalid.",
     429: "Too Many Requests: the request was throttled.",
 }
-#: The statuses of :data:`_FRAMEWORK_ERRORS` that also carry the API-wide
-#: entity when the operation (or a hook) raises them: an operation
-#: answers each 401 and 403 alike, whoever raised it.
+#: The statuses of :data:`_FRAMEWORK_ERRORS` that ninja's authentication
+#: answers: without an API-wide entity, those of an operation with an
+#: ``error`` carry it (see :func:`_described_by`).
 _AUTH_ERRORS = frozenset({401, 403})
 
 
