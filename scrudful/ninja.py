@@ -4442,7 +4442,6 @@ def _is_ninja_code(func: Any, name: str) -> bool:
     if digest is not None:
         return digest in _NINJA_SOURCES[name]
     if not _sourceless_warned:
-        _sourceless_warned = True
         # No stacklevel: the check runs deep in scrudful, where an
         # operation, a router or a request reaches it, never at one frame of
         # the app's own code.
@@ -4453,6 +4452,9 @@ def _is_ninja_code(func: Any, name: str) -> bool:
             "code can keep. Install ninja with its source to check it fully.",
             RuntimeWarning,
         )
+        # Recorded once warned: a warning raised as an error leaves it
+        # unrecorded, so the next check warns (or fails) again.
+        _sourceless_warned = True
     code = getattr(func, "__code__", None)
     if code is None:
         return False

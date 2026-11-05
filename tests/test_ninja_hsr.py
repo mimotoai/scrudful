@@ -2009,6 +2009,29 @@ def test_without_source_the_bound_router_fingerprint_is_checked(
         make_api()
 
 
+def test_without_source_the_warning_raised_as_an_error_is_given_again(
+    monkeypatch, fresh_ninja_code
+):
+    """The warning is recorded as given only once it was: raised as an error,
+    the next check (a retried build) warns again instead of running on the
+    weaker check unannounced."""
+    import scrudful.ninja
+
+    monkeypatch.setattr(scrudful.ninja, "_source_digest", lambda func: None)
+    run = ninja.operation.Operation.run
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        for _ in range(2):
+            with pytest.raises(RuntimeWarning, match="can't read the source"):
+                scrudful.ninja._is_ninja_code(run, "Operation.run")
+    with pytest.warns(RuntimeWarning, match="can't read the source"):
+        assert scrudful.ninja._is_ninja_code(run, "Operation.run")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        scrudful.ninja._is_ninja_code.cache_clear()
+        assert scrudful.ninja._is_ninja_code(run, "Operation.run")
+
+
 def test_target_under_test_client_needs_ninjas_resolve(monkeypatch, fresh_ninja_code):
     cls = ninja.testing.client.NinjaClientBase
     monkeypatch.setattr(cls, "_resolve", wrapping(cls._resolve))
