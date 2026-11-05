@@ -113,8 +113,8 @@ Behaviour change (all adapters)
   collection's links) raise ``ConfigError`` chained to it; a callable one
   raises the adapter's configuration error when the HSR is built (0.9
   accepted both).
-  ``ScrudfulPagination`` names the view's ``Meta`` in an
-  ``ImproperlyConfigured`` for an undecorated view's.
+  ``ScrudfulPagination`` raises ``ImproperlyConfigured``, naming the view's
+  ``Meta``, when an undecorated view's links fail this check.
 * Problem details: with an ``application/problem+json`` error entity, the
   framework's validation errors are rewritten as RFC 9457 problem details,
   ``problem_from_errors(status, errors, "Request validation failed")``, its
@@ -287,7 +287,8 @@ Behaviour change (DRF)
   ``get_object``; it must handle each route it serves (raise ``Http404`` for
   a missing object), since anything else it raises is the OPTIONS's answer.
   A plain ``APIView`` is loaded only on its lookup kwarg
-  (``lookup_url_kwarg``), so its collection routes load nothing.
+  (``lookup_url_kwarg``, else ``lookup_field``), so its collection routes
+  load nothing.
 * The view class's ``finalize_response`` adds the HSR link to every response
   of a routed scrudful view, OPTIONS's 401, 406 and 429 included; a view with
   a renderer that isn't JSON (the browsable API) also sends ``Vary: Accept``.

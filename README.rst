@@ -1084,7 +1084,8 @@ this release, also need the 0.9.0 changes in the changelog):
       and on a generic view's route with a URL kwarg other than ``format``,
       whatever the kwarg is named: it must handle each route it serves
       (raise ``Http404`` for a missing object). A plain ``APIView`` is loaded
-      only when the URL kwargs have its ``lookup_url_kwarg``;
+      only when the URL kwargs have its lookup kwarg (``lookup_url_kwarg``,
+      else ``lookup_field``);
     * DRF: an undecorated action of a ``scrudful_viewset`` (``E007``) still
       answers, but no HSR describes it, and its responses get no HSR link;
     * django-ninja, serving the HSRs elsewhere: a ``SCRUDFUL["HSR_URL"]``
