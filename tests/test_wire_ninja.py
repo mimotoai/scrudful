@@ -599,9 +599,9 @@ def test_hsr_invariance(client, world, kind, monkeypatch):
     builds = []
     describe = scrudful_ninja._describe_path
 
-    def counting(router, path_view):
+    def counting(router, path_view, api_error):
         builds.append(path_view)
-        return describe(router, path_view)
+        return describe(router, path_view, api_error)
 
     monkeypatch.setattr(scrudful_ninja, "_describe_path", counting)
     responses = []

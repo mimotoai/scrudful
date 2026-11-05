@@ -186,6 +186,14 @@ Behaviour change (ninja)
 * ``add_error_links``'s entity is also the HSR's API-wide error entity, and
   calling it discards the built HSRs; its link callables are called as
   ``(None, None)`` there.
+* A router mounted on several APIs serves, on each API's HSR route, the HSR
+  of that API's ``add_error_links`` entity, or of none (was one document for
+  all, whose ``default`` entry described the entity of the APIs that called
+  ``add_error_links``, even on an API that didn't). ``http_schema_resource``
+  and ``http_schema_resource_view`` take ``api=`` to say which; without it,
+  APIs that differ (one with an entity and one without included) are a
+  ``ConfigError``. An API mounting the router after its HSR was built is
+  taken into account (``add_router`` discarded nothing).
 * A change of ``SCRUDFUL`` (``override_settings``) discards the built HSRs
   (they kept the base URL they were built with), and so does setting
   ``router.base_url``.
@@ -351,8 +359,8 @@ New
 * ninja: ``ScrudfulRouter(base_url=, hsr_route=, hsr_url=, hsr_cache_control=,
   allowed=)``; ``allowed=`` on ``scrudful``, ``scrudful_create`` and
   ``scrudful_list``; ``described(entity)`` and ``add_api_operation(...,
-  scrudful_entity=)``; ``http_schema_resource(router, path)`` and
-  ``http_schema_resource_view(router, path)``.
+  scrudful_entity=)``; ``http_schema_resource(router, path, *, api=None)``
+  and ``http_schema_resource_view(router, path, *, api=None)``.
 * DRF: ``hsr_urls()``, ``http_schema_resource(view_func)`` and
   ``http_schema_resource_view(view_func)``; ``entity=``, ``statuses=``,
   ``allowed_func=`` and ``base_url=`` on ``scrudful``, ``scrudful_api_view``

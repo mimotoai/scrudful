@@ -437,6 +437,55 @@ def test_api_wide_entity_differing_between_apis_is_config_error():
         http_schema_resource(router, "/{pk}")
 
 
+def test_each_api_mounting_a_router_serves_its_own_error_entries():
+    """The ``default`` entry is the API-wide entity of the API serving the
+    HSR route: one router on an API with ``add_error_links`` and on one
+    without serves each its own document. The first's 404 agrees with its
+    entry; the second's carries no entity, and its entry describes none."""
+
+    def load(request, pk):
+        raise HttpError(404, "gone")
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(load=load, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    with_links, without = mount(router), mount(router)
+    add_error_links(with_links, API_ERROR)
+    for api, content in ((with_links, entity_content(API_ERROR)), (without, None)):
+        client = TestClient(api)
+        hsr = client.get("/_hsr/pk").json()
+        assert hsr["get"]["responses"]["default"].get("content") == content
+        assert http_schema_resource(router, "/{pk}", api=api) == hsr
+        response = client.get("/1")
+        assert response.status_code == 404
+        if content is not None:
+            headers = dict(response.headers)
+            assert link_problems("GET", 404, headers, True, hsr) == []
+        else:
+            assert "describedby" not in response.headers["Link"]
+    # Without api=, the APIs mounting it disagree: say which.
+    with pytest.raises(ConfigError, match="api="):
+        http_schema_resource(router, "/{pk}")
+
+
+def test_an_api_mounting_the_router_after_a_build_is_seen():
+    """``add_router`` is ninja's, so no cache is cleared when an API mounts
+    the router: the document is looked up by the entity it was built with."""
+    api, router = make_api()
+    add_error_links(api, API_ERROR)
+    other = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    add_error_links(other, OP_ERROR)
+    default = http_schema_resource(router, "/{pk}")["get"]["responses"]["default"]
+    assert default["content"] == entity_content(API_ERROR)
+    other.add_router("/again", router)
+    with pytest.raises(ConfigError, match="add_error_links"):
+        http_schema_resource(router, "/{pk}")
+
+
 def test_api_wide_entity_of_a_nested_router():
     parent = ScrudfulRouter(base_url=BASE_URL)
     _, child = make_api()

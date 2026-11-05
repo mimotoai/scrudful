@@ -807,8 +807,16 @@ Content"}}}``.
 
 * It is built once per path template, without a request: on the first GET of
   its route (or :func:`~scrudful.ninja.http_schema_resource` call), and again
-  after an operation is added to the router or ``add_error_links`` is
-  called. It is the same for every requester and ``Host``.
+  after an operation is added to the router, ``add_error_links`` is called,
+  ``SCRUDFUL`` changes or the router's ``base_url`` is set. It is the same for
+  every requester and ``Host``.
+* Its error entries are those of the API serving it: a router mounted on two
+  APIs serves, on each API's HSR route, the document of that API's
+  ``add_error_links`` entity (or of none). Pass ``api=`` to
+  :func:`~scrudful.ninja.http_schema_resource` and
+  :func:`~scrudful.ninja.http_schema_resource_view` for such a router:
+  without it, they describe the entity of the APIs mounting it, and raise
+  ``ConfigError`` when those differ.
 * Link callables are called in *describe* mode, ``func(None, None)``: they
   must return the target they return on the responses, without request or
   object, or the HSR disagrees with the Links. One that raises is a
