@@ -27,7 +27,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass, field
-from typing import Annotated, Any, TypeVar, get_args, get_origin
+from typing import Annotated, Any, NamedTuple, TypeVar, get_args, get_origin
 from urllib.parse import quote
 
 from fastapi import APIRouter, FastAPI, Request, Response
@@ -1000,6 +1000,26 @@ class _Resource:
 _iter_route_contexts = getattr(fastapi_routing, "iter_route_contexts", None)
 
 
+class _Built(NamedTuple):
+    """A built HTTP Schema Resource, with what it was built from: valid while
+    its path's routes are the same objects in the same order, and the
+    :func:`add_error_links` entity is equal."""
+
+    #: The path's routes (their ``original_route``), compared by identity.
+    routes: tuple[Any, ...]
+    api_error: Entity | None
+    document: dict[str, Any]
+
+
+class _Serialized(NamedTuple):
+    """A served document's bytes and ``ETag``: valid while ``document`` is
+    the built one (compared by identity)."""
+
+    document: dict[str, Any]
+    body: bytes
+    etag: str
+
+
 @dataclass
 class _HsrOptions:
     """The :func:`add_options` options of an app or router, and its built
@@ -1016,17 +1036,10 @@ class _HsrOptions:
     #: Whether :func:`add_options` gave them (else they are the defaults, for
     #: :func:`http_schema_resource` on an app without it).
     explicit: bool = False
-    #: Each built document, by path template, with what it was built from:
-    #: the routes of the path (compared by identity) and the error entity of
-    #: :func:`add_error_links`.
-    built: dict[str, tuple[tuple[Any, ...], Entity | None, dict[str, Any]]] = field(
-        default_factory=dict
-    )
-    #: Each served document's bytes and ETag, by path template, with the
-    #: document they serialize (compared by identity).
-    serialized: dict[str, tuple[dict[str, Any], bytes, str]] = field(
-        default_factory=dict
-    )
+    #: Each built document, by resource key.
+    built: dict[str, _Built] = field(default_factory=dict)
+    #: Each served document's bytes and ETag, by resource key.
+    serialized: dict[str, _Serialized] = field(default_factory=dict)
     #: The owner's resources, indexed (see :func:`_scrudful_paths`).
     index: _PathsIndex | None = field(default=None, compare=False, repr=False)
     #: The resource keys of a router announced as having no OPTIONS or HSR
@@ -1570,13 +1583,13 @@ def _hsr_flow(
     built = options.built.get(key)
     if (
         built is not None
-        and len(built[0]) == len(originals)
-        and all(old is new for old, new in zip(built[0], originals))
-        and built[1] == api_error
+        and len(built.routes) == len(originals)
+        and all(old is new for old, new in zip(built.routes, originals))
+        and built.api_error == api_error
     ):
-        return built[2]
+        return built.document
     document = yield from _describe_path(routes, options.base_url, api_error)
-    options.built[key] = (originals, api_error, document)
+    options.built[key] = _Built(originals, api_error, document)
     return document
 
 
@@ -1715,20 +1728,20 @@ def _find_scrudful_paths(routes: Sequence[Any]) -> dict[str, _Resource]:
 
 
 def _routes_fingerprint(routes: list[Any]) -> tuple[Any, ...] | None:
-    """What changes when a route is added under ``routes`` (or removed): the
-    identity and length of each list of routes :func:`_collect_paths` walks,
-    ``routes``, those of the ``Mount``\\ s and ``Host``\\ s it looks into and
-    those of the routers FastAPI includes lazily (``original_router``, the
-    included ``APIRouter``, of the entries :func:`_flat` expands); ``None``
-    when one of those entries can't be seen into (a FastAPI whose included
-    routers have no ``original_router``), so the caller walks the routes
-    each time, as before the index: reading ``original_router`` needs no
-    version guard, since without it nothing is kept, so nothing goes stale.
+    """What changes when a route is added under ``routes``, removed, replaced
+    or moved: the identity of each list of routes :func:`_collect_paths`
+    walks, ``routes``, those of the ``Mount``\\ s and ``Host``\\ s it looks
+    into and those of the routers FastAPI includes lazily
+    (``original_router``, the included ``APIRouter``, of the entries
+    :func:`_flat` expands), with the identity of each of their entries, in
+    order; ``None`` when one of those entries can't be seen into (a FastAPI
+    whose included routers have no ``original_router``), so the caller
+    walks the routes each time, as before the index: reading
+    ``original_router`` needs no version guard, since without it nothing is
+    kept, so nothing goes stale.
 
     It walks the lists, not the routes' templates and endpoints, so it is
-    cheap next to :func:`_find_scrudful_paths`; a route replaced in place,
-    keeping its list's length, isn't seen (FastAPI and Starlette add routes,
-    they don't replace them).
+    cheap next to :func:`_find_scrudful_paths`.
     """
     parts: list[Any] = []
     pending = [routes]
@@ -1738,7 +1751,7 @@ def _routes_fingerprint(routes: list[Any]) -> tuple[Any, ...] | None:
         if id(current) in seen:
             continue
         seen.add(id(current))
-        parts.append((id(current), len(current)))
+        parts.append((id(current), tuple(id(route) for route in current)))
         for route in current:
             if isinstance(route, Route):
                 continue
@@ -3292,12 +3305,13 @@ async def _hsr_get(
     options = _hsr_options(owner)
     key = _template_key(path)
     serialized = options.serialized.get(key)
-    if serialized is None or serialized[0] is not document:
+    if serialized is None or serialized.document is not document:
         body = serialize_hsr(document)
-        serialized = (document, body, hsr_etag(body))
+        serialized = _Serialized(document, body, hsr_etag(body))
         options.serialized[key] = serialized
-    _, body, etag = serialized
-    return _hsr_response(request, body, etag, options.hsr_cache_control)
+    return _hsr_response(
+        request, serialized.body, serialized.etag, options.hsr_cache_control
+    )
 
 
 def _hsr_response(

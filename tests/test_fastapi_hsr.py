@@ -305,6 +305,76 @@ def test_requests_dont_walk_the_routes_again(make_client, monkeypatch):
     assert client.get(f"/_hsr/{name}").status_code == 200
 
 
+def test_a_route_replaced_in_place_is_seen(make_client):
+    """The index is kept while the routes are the same objects: one replaced
+    in place, keeping its list's length, rebuilds it too."""
+    from fastapi.routing import APIRoute
+
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    app = FastAPI()
+
+    @app.get("/items/{id}")
+    @scrudful(**links)
+    async def get_item(id: int):
+        return {}
+
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    assert (
+        hsr_link_problems(client.get("/items/1").headers, f"{BASE}_hsr/items.id") == []
+    )
+
+    async def get_thing(id: int):
+        return {}
+
+    routes = app.router.routes
+    index = next(
+        i for i, r in enumerate(routes) if getattr(r, "path", "") == "/items/{id}"
+    )
+    routes[index] = APIRoute(
+        "/things/{id}", scrudful(**links)(get_thing), methods=["GET"]
+    )
+    response = client.get("/things/1")
+    assert hsr_link_problems(response.headers, f"{BASE}_hsr/things.id") == []
+    assert client.get("/_hsr/things.id").status_code == 200
+
+
+def test_routes_reordered_in_place_are_seen(make_client):
+    """So are two routes swapped: the document describes the one that now
+    comes first, as Starlette now routes to it."""
+    app = FastAPI()
+
+    @app.get("/items/{id}")
+    @scrudful(schema_link_or_func="/a.json", context_link_or_func="/c.jsonld")
+    async def get_a(id: int):
+        return {}
+
+    @app.get("/items/{item_id}")
+    @scrudful(schema_link_or_func="/b.json", context_link_or_func="/c.jsonld")
+    async def get_b(item_id: int):
+        return {}
+
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+
+    def schema(name: str) -> str:
+        hsr = client.get(f"/_hsr/{name}").json()
+        content = hsr["get"]["responses"]["200"]["content"]["application/json"]
+        return content["schema"]["$ref"]
+
+    assert schema("items.id") == "https://api.example/a.json"
+    routes = app.router.routes
+    first = next(
+        i for i, r in enumerate(routes) if getattr(r, "path", "") == "/items/{id}"
+    )
+    routes[first], routes[first + 1] = routes[first + 1], routes[first]
+    # Named after its first route's template, now get_b's.
+    assert schema("items.item_id") == "https://api.example/b.json"
+    response = client.get("/items/1")
+    hsr = client.get("/_hsr/items.item_id").json()
+    assert link_problems("GET", 200, response.headers, True, hsr) == []
+
+
 def test_routes_it_cant_fingerprint_are_walked_each_time(make_client, monkeypatch):
     """Without a fingerprint (an included router it can't see into), nothing
     is kept: each request walks the routes, as before the index."""
