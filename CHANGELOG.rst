@@ -179,38 +179,37 @@ Behaviour change (ninja)
   ``ConfigError`` at startup until scrudful has verified it.
 * ``ScrudfulRouter``'s OPTIONS runs the operations' checks: the loading
   operation's ``auth=`` and ``before`` (then ``load``), and each method's
-  ``auth=`` and ``before`` (or ``allowed``), then, for a ``@scrudful``
-  item operation with a ``load``, that ``load``, on a copy of the request
-  with that method, unless it is the very call the loading operation made
-  (the same function, method, a HEAD counting as a GET, path parameters
-  and ``request.auth``; so a
-  ``load`` shared with the loading operation runs again for each other
-  method, and one authorizing by ``request.method`` is checked per method,
-  as DRF loads per action): any ``HttpError``, ``Http404`` or ``PermissionDenied`` it
-  raises leaves only that method out of ``Allow`` (only the loading
-  operation's error answers the OPTIONS; another exception still
-  propagates; an ``HttpError`` other than a 401, 403 or 404 is logged, with
-  its traceback, on the ``scrudful.ninja`` logger, as an error for a 5xx and
-  as a warning otherwise), so authorization in a method's ``load`` shapes ``Allow``; it
-  runs only once the method's ``auth=`` and ``before`` passed. A method whose
-  path parameters don't validate (its request would be a 422), or whose path
-  validation raises anything, is left out of ``Allow``, and its ``load``
-  doesn't run: an ``HttpError``, ``Http404`` or ``PermissionDenied``
+  ``auth=`` and ``before`` (or ``allowed``), then, for a ``@scrudful`` item
+  operation with a ``load``, that ``load``, on a copy of the request with that
+  method, unless it is the very call the loading operation made (the same
+  function, method, a HEAD counting as a GET, path parameters and
+  ``request.auth``; so a ``load`` shared with the loading operation runs again
+  for each other method, and one authorizing by ``request.method`` is checked
+  per method, as DRF loads per action): any ``HttpError``, ``Http404`` or
+  ``PermissionDenied`` it raises leaves only that method out of ``Allow``
+  (only the loading operation's error answers the OPTIONS; another exception
+  still propagates; an ``HttpError`` other than a 401, 403 or 404 is logged,
+  with its traceback, on the ``scrudful.ninja`` logger, as an error for a 5xx
+  and as a warning otherwise), so authorization in a method's ``load`` shapes
+  ``Allow``; it runs only once the method's ``auth=`` and ``before`` passed. A
+  method whose path parameters don't validate (its request would be a 422), or
+  whose path validation raises anything, is left out of ``Allow``, and its
+  ``load`` doesn't run: an ``HttpError``, ``Http404`` or ``PermissionDenied``
   silently, anything else (an app's own error, a lookup's
   ``ObjectDoesNotExist``) logged once per route, with its traceback, on the
   ``scrudful.ninja`` logger. A path scrudful can't validate as ninja does (a
   custom path model) isn't checked, with a ``RuntimeWarning`` once per route
   naming it: its method is listed, unless it has its own ``load`` to run,
-  which can't be called without the path parameters, and is then left out.
-  The loading operation's path follows the same rules: when it can't be
-  validated, OPTIONS loads no object and still answers. OPTIONS never
-  answers a 500 or raises ``ConfigError`` for such a path. Bad credentials make the
-  requester anonymous (ninja's auth callbacks return ``None``), so they get
-  the anonymous ``Allow``. A raised ``HttpError`` 401, 403 or 404,
-  ``Http404`` or ``PermissionDenied`` from ``auth=`` or ``before`` refuses a
-  method; from ``allowed``, a 401, 403 or ``PermissionDenied`` refuses it and
-  a 404 is the OPTIONS's answer; anything else raised is answered by the
-  API's exception handler.
+  which can't be called without the path parameters, and is then left out. The
+  loading operation's path follows the same rules: when it can't be validated,
+  OPTIONS loads no object and still answers. OPTIONS never answers a 500 or
+  raises ``ConfigError`` for such a path. Bad credentials make the requester
+  anonymous (ninja's auth callbacks return ``None``), so they get the
+  anonymous ``Allow``. A raised ``HttpError`` 401, 403 or 404, ``Http404`` or
+  ``PermissionDenied`` from ``auth=`` or ``before`` refuses a method; from
+  ``allowed``, a 401, 403 or ``PermissionDenied`` refuses it and a 404 is the
+  OPTIONS's answer; anything else raised is answered by the API's exception
+  handler.
 * The per-method checks of OPTIONS get a copy of the request with that
   method in ``request.method``, while ``request.META["REQUEST_METHOD"]``
   stays ``"OPTIONS"``: a ``load`` that locks its row should lock only when
@@ -228,20 +227,20 @@ Behaviour change (ninja)
   (they did in 0.9); ``mode="view"`` ones still run first. A non-preflight
   OPTIONS is throttled once with the API's or the mount's throttles.
 * ``ScrudfulRouter`` serves each path's HSR at ``/_hsr/<name>`` under its
-  prefix (``"/{pk}"`` → ``_hsr/pk``, ``""`` → ``_hsr/_root``), before its other
-  paths; the API's and routers' ``add_decorator`` decorators wrap that route
-  too. An operation under ``/_hsr/``, or two paths with one name, is a
+  prefix (``"/{pk}"`` → ``_hsr/pk``, ``""`` → ``_hsr/_root``), before its
+  other paths; the API's and routers' ``add_decorator`` decorators wrap that
+  route too. An operation under ``/_hsr/``, or two paths with one name, is a
   ``ConfigError``. So is, when the API's URL patterns are built
-  (``api.urls``), a path of a router added to the API before it, or of the
-  API itself, that Django would match first (``"/{kind}/{pk}"`` beside a
+  (``api.urls``), a path of a router added to the API before it, or of the API
+  itself, that Django would match first (``"/{kind}/{pk}"`` beside a
   ``"/{pk}"`` at one prefix): the HSR link would target it. Add the
   ``ScrudfulRouter`` first, or use ``hsr_route=False`` and ``hsr_url=``. A
-  route the check can't cover fully (a prefix converter no sample value
-  fits, sample values that build no matching URL, a sample value whose
-  ``to_python`` raises something else than ``ValueError``, such as a model
-  lookup's ``DoesNotExist``, which never fails the URLconf, or a prefix
-  whose sample values give more than 243 combinations) gets a ``RuntimeWarning``;
-  a ``NinjaAPI`` subclass overriding ``_get_urls`` or ``_get_bound_routers``
+  route the check can't cover fully (a prefix converter no sample value fits,
+  sample values that build no matching URL, a sample value whose ``to_python``
+  raises something else than ``ValueError``, such as a model lookup's
+  ``DoesNotExist``, which never fails the URLconf, or a prefix whose sample
+  values give more than 243 combinations) gets a ``RuntimeWarning``; a
+  ``NinjaAPI`` subclass overriding ``_get_urls`` or ``_get_bound_routers``
   gets ``ConfigError`` there.
 * Every operation on a ``ScrudfulRouter`` needs an entity: adding a plain
   operation without ``@described(Entity(...))`` (or ``scrudful_entity=``)
