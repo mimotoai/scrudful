@@ -1115,6 +1115,7 @@ def test_405_needs_ninjas_path_view(monkeypatch, fresh_ninja_code, method):
         hsr_api()
 
 
+@pytest.mark.filterwarnings("ignore:scrudful can't read the source:RuntimeWarning")
 def test_without_source_the_path_view_fingerprints_are_checked(
     monkeypatch, fresh_ninja_code
 ):

@@ -214,6 +214,11 @@ Behaviour change (ninja)
   the request's mount (it linked one of them, whichever Django reversed).
   The HSR routes' URL names follow ninja's naming of the mount, its
   ``url_name_prefix`` included; they stay private.
+* The ninja internals OPTIONS relies on are checked when a path gets its
+  OPTIONS operation, at startup (were checked by the first OPTIONS request
+  only, which then failed with ``ConfigError``). Where ninja's source isn't
+  installed, the weaker check by names is announced by a ``RuntimeWarning``,
+  once.
 * A change of ``SCRUDFUL`` (``override_settings``) discards the built HSRs
   (they kept the base URL they were built with), and so does setting
   ``router.base_url``.

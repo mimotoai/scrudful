@@ -557,6 +557,7 @@ import re
 import textwrap
 import tokenize
 import types
+import warnings
 import weakref
 from collections.abc import (
     Awaitable,
@@ -2114,6 +2115,7 @@ class ScrudfulRouter(Router):
                 "clone",
                 "scrudful's OPTIONS (answered in an Operation.run decorator)",
             )
+            _check_options_internals()
             # Inner: answers OPTIONS before ninja's checks and view_func (and
             # the add_decorator(mode="operation") wrappers of view_func).
             _add_run_decorator(options_operation, _options_run(self, path, path_view))
@@ -4243,16 +4245,32 @@ def _without_docstring(tokens: list[tokenize.TokenInfo]) -> list[tokenize.TokenI
     return tokens[:body] + tokens[end + 1 :]
 
 
+#: Whether :func:`_is_ninja_code` warned of a ninja without source (once).
+_SOURCELESS_WARNED: set[bool] = set()
+
+
 @functools.cache
 def _is_ninja_code(func: Any, name: str) -> bool:
     """Whether ``func`` is the code of ninja's method ``name`` (e.g.
     ``"Operation.run"``) scrudful was written against: by the digest of its
-    source, else (no source) by its names, locals and arguments. Memoized:
-    each function is read once, whatever the number of operations and
-    mounts."""
+    source, else (no source: compiled without the ``.py`` files, frozen,
+    zipped) by its names, locals and arguments, a weaker check that a
+    changed release keeping them passes, of which a ``RuntimeWarning`` warns
+    once. Memoized: each function is read once, whatever the number of
+    operations and mounts."""
     digest = _source_digest(func)
     if digest is not None:
         return digest in _NINJA_SOURCES[name]
+    if not _SOURCELESS_WARNED:
+        _SOURCELESS_WARNED.add(True)
+        warnings.warn(
+            f"scrudful can't read the source of ninja's {name} (nor, likely, of "
+            "its other internals scrudful relies on): it checks only their "
+            "names, locals and arguments, which a ninja release changing their "
+            "code can keep. Install ninja with its source to check it fully.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     code = getattr(func, "__code__", None)
     if code is None:
         return False
@@ -5736,6 +5754,36 @@ def _bound_mount(api: NinjaAPI, running: Any) -> tuple[Any, Any]:
                 running._scrudful_bound = bound_router, path_view
                 return bound_router, path_view
     raise _bound_path_error()
+
+
+def _check_options_internals() -> None:
+    """Check, once a path gets its OPTIONS (when the app starts), every ninja
+    internal its answer relies on: the per-request checks
+    (:func:`_options_throttled`, :func:`_bound_mount`,
+    :func:`_authenticated`, :func:`_path_values`) then only find them
+    checked (memoized, see :func:`_is_ninja_code`), unless an API or
+    operation class of the app's own overrides one.
+
+    Raises
+    ------
+    ConfigError
+        If the installed ninja's differ from ninja 1.7.0's and 1.7.1's.
+    """
+    try:
+        from ninja.params import models as ninja_params
+    except ImportError:  # pragma: no cover - ninja 1.7 has it
+        ninja_params = None  # type: ignore[assignment]
+    use = "scrudful's OPTIONS"
+    for owner, owner_name, method in (
+        (Operation, "Operation", "_check_throttles"),
+        (Operation, "Operation", "_run_authentication"),
+        (AsyncOperation, "AsyncOperation", "_run_authentication"),
+        (NinjaAPI, "NinjaAPI", "_get_bound_routers"),
+        (getattr(ninja_router, "BoundRouter", None), "BoundRouter", "_bind_operations"),
+        (getattr(ninja_params, "ParamModel", None), "ParamModel", "resolve"),
+        (getattr(ninja_params, "PathModel", None), "PathModel", "get_request_data"),
+    ):
+        _check_ninja_internal(owner, owner_name, method, use)
 
 
 def _bound_path_error() -> ConfigError:

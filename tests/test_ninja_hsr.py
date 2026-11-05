@@ -1484,12 +1484,19 @@ def test_a_router_mounted_twice_links_the_mount_of_the_request(client, settings,
 
 @pytest.fixture
 def fresh_ninja_code():
-    """The check of ninja's code is memoized per function: start afresh."""
+    """The check of ninja's code is memoized per function, and warns once
+    without the source: start afresh."""
     import scrudful.ninja
 
     scrudful.ninja._is_ninja_code.cache_clear()
+    scrudful.ninja._SOURCELESS_WARNED.clear()
     yield
     scrudful.ninja._is_ninja_code.cache_clear()
+    scrudful.ninja._SOURCELESS_WARNED.clear()
+
+
+#: The warning of a ninja install without the source of its internals.
+SOURCELESS = "ignore:scrudful can't read the source:RuntimeWarning"
 
 
 def wrapping(func):
@@ -1518,6 +1525,7 @@ def test_hsr_routes_need_a_bound_router(monkeypatch, fresh_ninja_code):
         make_api()
 
 
+@pytest.mark.filterwarnings(SOURCELESS)
 def test_without_source_the_bound_router_fingerprint_is_checked(
     monkeypatch, fresh_ninja_code
 ):
@@ -2356,6 +2364,55 @@ def test_options_needs_ninjas_internals(monkeypatch, fresh_ninja_code, owner, me
         send(api, "/1")
 
 
+@pytest.mark.parametrize(
+    "owner, method",
+    [
+        ("Operation", "_run_authentication"),
+        ("AsyncOperation", "_run_authentication"),
+        ("NinjaAPI", "_get_bound_routers"),
+        ("ParamModel", "resolve"),
+        ("PathModel", "get_request_data"),
+        ("Operation", "_check_throttles"),
+        ("BoundRouter", "_bind_operations"),
+    ],
+)
+def test_ninjas_internals_are_checked_when_options_is_added(
+    monkeypatch, fresh_ninja_code, owner, method
+):
+    """At startup, when a path gets its OPTIONS, not on its first OPTIONS:
+    an upgraded ninja fails the app, not its OPTIONS requests. The HSR route
+    is off, which needs BoundRouter's methods for itself."""
+    cls = {
+        "Operation": ninja.operation.Operation,
+        "AsyncOperation": ninja.operation.AsyncOperation,
+        "NinjaAPI": NinjaAPI,
+        "ParamModel": ninja.params.models.ParamModel,
+        "PathModel": ninja.params.models.PathModel,
+        "BoundRouter": ninja.router.BoundRouter,
+    }[owner]
+    original = vars(cls)[method]
+    if isinstance(original, classmethod):
+        replaced = classmethod(wrapping(original.__func__))
+    else:
+        replaced = wrapping(original)
+    monkeypatch.setattr(cls, method, replaced)
+    with pytest.raises(ConfigError, match=rf"relies on ninja's {owner}\.{method} "):
+        make_api(hsr_route=False, hsr_url=lambda path: "https://docs.example/h")
+
+
+def test_without_the_source_of_ninjas_internals_scrudful_warns_once(
+    monkeypatch, fresh_ninja_code
+):
+    import scrudful.ninja
+
+    monkeypatch.setattr(scrudful.ninja, "_source_digest", lambda func: None)
+    with pytest.warns(RuntimeWarning, match="can't read the source") as caught:
+        api, _ = make_api()
+        make_api()
+        assert options(TestClient(api), "/1").status_code == 204
+    assert len(caught) == 1
+
+
 @pytest.mark.parametrize("shape", [[], {}])
 def test_options_needs_the_bound_path_operations(monkeypatch, shape):
     api, _ = make_api()
@@ -2411,6 +2468,7 @@ def test_options_needs_the_auth_callbacks(monkeypatch):
         options(client, "/1")
 
 
+@pytest.mark.filterwarnings(SOURCELESS)
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_without_source_the_options_fingerprints_are_checked(
     monkeypatch, fresh_ninja_code, asynchronous

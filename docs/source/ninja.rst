@@ -607,7 +607,8 @@ it. When the
 operation is built, scrudful compares ninja's ``_run_checks`` and ``run``
 with those releases': by a digest of their source (comments, docstrings and
 blank lines aside), or, where the source isn't installed (``.pyc`` only),
-only by the names, local variables and arguments they use. On a ninja whose
+only by the names, local variables and arguments they use, a weaker check of
+which scrudful warns once (``RuntimeWarning``). On a ninja whose
 code differs, or with an ``Operation`` subclass overriding either method,
 ``before=`` raises ``ConfigError`` at startup instead of skipping a check:
 upgrade scrudful, or keep ninja at a verified release (an app using
@@ -973,6 +974,11 @@ for a preflight too. In this order:
 
 Things to know:
 
+* The OPTIONS answer relies on ninja 1.7's internals (its authentication and
+  throttle checks, its bound routers, its path validation): scrudful checks
+  them, as it checks those of ``before=``, when a path gets its OPTIONS
+  operation, so a ninja release that changed them fails the app at startup
+  with ``ConfigError``, not its OPTIONS requests.
 * OPTIONS isn't gated: an anonymous requester of a locked path gets a 204
   with ``Allow: OPTIONS``, not a 401. Bad credentials make the requester
   anonymous (ninja's auth callbacks return ``None`` for them, without telling

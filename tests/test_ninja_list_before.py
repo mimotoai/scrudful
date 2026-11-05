@@ -571,6 +571,7 @@ def _different_names_run_checks(self, request):
     return self._check_permissions(request)
 
 
+@pytest.mark.filterwarnings("ignore:scrudful can't read the source:RuntimeWarning")
 def test_without_source_the_code_fingerprint_is_checked(
     monkeypatch, items, fresh_checks_cache
 ):
@@ -588,6 +589,7 @@ def test_without_source_the_code_fingerprint_is_checked(
         list_router(before=Recorder())
 
 
+@pytest.mark.filterwarnings("ignore:scrudful can't read the source:RuntimeWarning")
 @pytest.mark.parametrize(
     "error",
     [tokenize.TokenError("EOF in multi-line statement"), IndentationError("x")],
