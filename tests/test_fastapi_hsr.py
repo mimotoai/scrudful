@@ -3608,6 +3608,17 @@ def test_security_is_read_annotation_by_annotation(make_client):
     assert "get_db" not in security_annotations.CALLS
 
 
+def unreadable_app() -> FastAPI:
+    """:func:`tests.fastapi_security_annotations.unreadable_app`, skipping on
+    a FastAPI that refuses the annotation itself, when the route is created
+    (pydantic's ``PydanticUndefinedAnnotation``, a ``NameError``): there such
+    an endpoint can't be written."""
+    try:
+        return security_annotations.unreadable_app()
+    except NameError as exc:
+        pytest.skip(f"this FastAPI refuses an annotation it can't evaluate: {exc}")
+
+
 def test_a_security_annotation_that_cant_be_evaluated_refuses_its_method(
     make_client,
 ):
@@ -3616,7 +3627,7 @@ def test_a_security_annotation_that_cant_be_evaluated_refuses_its_method(
     method is not allowed, for every requester (fail closed), and a
     ``RuntimeWarning`` names each such route, once."""
     security_annotations.CALLS.clear()
-    app = security_annotations.unreadable_app()
+    app = unreadable_app()
     with pytest.warns(RuntimeWarning) as caught:
         add_options(app, base_url=BASE)
     messages = sorted(str(warning.message) for warning in caught)
@@ -3645,7 +3656,7 @@ def test_an_allowed_hook_decides_a_method_whose_security_cant_be_read(
     make_client,
 ):
     """With ``allowed``, the hook decides: nothing is announced."""
-    app = security_annotations.unreadable_app()
+    app = unreadable_app()
     add_options(app, base_url=BASE, allowed=lambda request, method, obj: True)
     options_204(make_client(app), "/notes/1", "GET, PUT, OPTIONS, PATCH")
 

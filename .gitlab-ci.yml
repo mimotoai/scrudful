@@ -28,6 +28,26 @@ test:
   script:
     - uv run --locked -p "$PYTHON" pytest -q
 
+# The lowest framework releases pyproject.toml supports, which the locked
+# `test` matrix never installs: each floor-<framework> job installs scrudful
+# with the test tools (`.floor`), then pins its framework and runs that
+# adapter's test modules.
+.floor:
+  stage: test
+  image: ghcr.io/astral-sh/uv:0.9.0-python3.12-bookworm
+  before_script:
+    - uv venv -p 3.12 /tmp/floor
+    - uv pip install -p /tmp/floor/bin/python -e ".[drf,fastapi,ninja]" pytest pytest-django pytest-randomly jsonschema pyld freezegun
+
+# fastapi>=0.100: a FastAPI that copies an included router's routes. Its
+# Starlette 0.27 test client needs the pydantic, anyio and httpx of its time;
+# newer ones deprecate what it uses, which the suite's warnings-as-errors fails.
+floor-fastapi:
+  extends: .floor
+  script:
+    - uv pip install -p /tmp/floor/bin/python "fastapi==0.100.*" "pydantic==2.3.*" "anyio<4" "httpx==0.24.*"
+    - /tmp/floor/bin/python -m pytest -q -p no:cacheprovider tests/test_fastapi_adapter.py tests/test_fastapi_hsr.py tests/test_wire_fastapi.py
+
 # A merge request that changes the package (scrudful/, or the published parts
 # of pyproject.toml) must raise the version above the target branch's and every
 # release on PyPI.

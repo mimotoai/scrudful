@@ -400,6 +400,21 @@ def hooked_app(router: APIRouter) -> FastAPI:
 # --- The mounted routers (MOUNTS) -----------------------------------------------
 
 
+def includes_lazily() -> bool:
+    """Whether this FastAPI serves a route added to a router after
+    ``include_router`` (it includes routers lazily); older releases copy the
+    router's routes when it is included, so they never serve such a route."""
+    router, app = APIRouter(), FastAPI()
+    app.include_router(router)
+    router.add_api_route("/probe", lambda: None)
+    return TestClient(app).get("/probe").status_code == 200
+
+
+#: The kinds of resource added to an included router after its inclusion,
+#: which only a FastAPI that includes routers lazily serves.
+LATE_KINDS = () if includes_lazily() else ("nested late", "parent late")
+
+
 def item_routes(router: APIRouter, prefix: str = "") -> None:
     """A conditional item (GET, HEAD, PUT) at ``{prefix}/items/{iid}``,
     without ``responses=``."""
@@ -510,6 +525,8 @@ KINDS = {
         "mounts", "/items/{iid}", "/two/items/1", "/two/_hsr/items.iid", "twice"
     ),
 }
+for _kind in LATE_KINDS:
+    del KINDS[_kind]
 
 
 @dataclass(frozen=True)
@@ -695,6 +712,7 @@ def wire_exchanges() -> list[Exchange]:
 #: The resources :func:`item_routes` adds (and ``WIRE``'s late one).
 ITEMS = ["late", "nested", "parent", "nested late", "parent late"]
 ITEMS += ["twice one", "twice two"]
+ITEMS = [kind for kind in ITEMS if kind not in LATE_KINDS]
 
 
 def item_exchanges(kind: str) -> list[Exchange]:
