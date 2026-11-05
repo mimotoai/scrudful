@@ -182,6 +182,36 @@ OPTIONS
     raises ``ImproperlyConfigured`` without either (see :func:`_hsr_target`).
     With ``metadata_class = None`` OPTIONS is DRF's 405; with a metadata
     class that isn't a :class:`ScrudfulMetadata`, DRF's 200 with its body.
+
+System checks
+    ``manage.py check``, which ``runserver`` and ``migrate`` run before they
+    start, reports the misconfigurations of the scrudful views' routes. The
+    :func:`hsr_urls` pattern checks them in Django's URL check (tagged
+    ``urls``), which loads the URLconf; without that pattern in the
+    URLconf, the check this module registers with
+    ``django.core.checks.register`` when imported does, so only once
+    something imported it before the checks started (an
+    ``AppConfig.ready()`` of the project's, or the test run). Either scans
+    the root URLconf for the routes of scrudful views, as :func:`hsr_urls`
+    does, and reports as errors:
+
+    - ``scrudful.E001``: a scrudful view's route without a URL name (unless
+      the view has an ``hsr_url``, which needs none);
+    - ``scrudful.E002``: a URL name given to the routes of two different
+      scrudful views;
+    - ``scrudful.E003``: scrudful views relying on the :func:`hsr_urls`
+      route (no ``Meta.hsr_url`` or ``SCRUDFUL["HSR_URL"]``) without the
+      route included in the URLconf;
+    - ``scrudful.E004``: a view whose route is turned off without an
+      ``hsr_url``;
+    - ``scrudful.E005``: a view whose HTTP Schema Resource can't be built
+      (a relative link URL without a base URL, a schema without an RDF
+      context, a link callable failing when called as ``func(view, None)``);
+    - ``scrudful.E006``: an invalid ``SCRUDFUL`` setting.
+
+    Each would otherwise fail on a request. The check builds each document
+    as :func:`http_schema_resource` does (no request, no database access by
+    scrudful; link callables are called), without keeping it.
 """
 
 from __future__ import annotations
@@ -193,9 +223,11 @@ import inspect
 import types
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
+from django.conf import settings
+from django.core import checks
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.core.signals import setting_changed
 from django.http import (
@@ -2054,6 +2086,14 @@ _NO_HSR_URLS = (
 )
 
 
+#: The message of a route turned off without ``hsr_url`` (see :func:`_hsr_target`).
+_ROUTE_OFF = (
+    "Meta.hsr_route = False (or SCRUDFUL['HSR_ROUTE'] = False) needs "
+    "Meta.hsr_url or SCRUDFUL['HSR_URL'], hsr_url(view_name), the URL "
+    "the HTTP Schema Resource is served at"
+)
+
+
 def hsr_urls() -> list[URLPattern]:
     """The URL pattern serving every scrudful view's HTTP Schema Resource.
 
@@ -2091,13 +2131,24 @@ def hsr_urls() -> list[URLPattern]:
     Other methods get a 405 with ``Allow: GET, HEAD``. The scan is redone
     when ``ROOT_URLCONF`` changes.
 
+    A misconfigured route breaks only its own requests: a scrudful view's
+    route without a URL name raises on each of its own requests (its HSR
+    link needs the name), and a URL name given to the routes of two
+    different scrudful views raises on a GET of ``_hsr/<that name>``; every
+    other name is served. Django's system checks (``manage.py check``, and
+    ``runserver`` and ``migrate`` before they start) report both, and a
+    missing include, before any request (``scrudful.E001`` to
+    ``scrudful.E005``, see "System checks" in the module docstring).
+
     Raises
     ------
     ImproperlyConfigured
-        On a request, when a scrudful view's route has no URL name, or two
-        different scrudful views' routes share one; or a setting is invalid.
+        On a GET of a name given to two different scrudful views' routes;
+        or when a setting is invalid.
     """
-    return [path("_hsr/<str:view_name>", _hsr_view, name="scrudful_hsr")]
+    pattern = path("_hsr/<str:view_name>", _hsr_view, name="scrudful_hsr")
+    pattern.__class__ = _HsrURLPattern
+    return [pattern]
 
 
 @csrf_exempt
@@ -2105,7 +2156,11 @@ def _hsr_view(request: HttpRequest, view_name: str) -> HttpResponseBase:
     """The view of :func:`hsr_urls`."""
     if request.method not in ("GET", "HEAD"):
         return hsr_not_allowed()
-    view_func = _scrudful_views().get(view_name)
+    scan = _scrudful_views()
+    clash = scan.clashes.get(view_name)
+    if clash is not None:
+        raise ImproperlyConfigured(clash)
+    view_func = scan.views.get(view_name)
     if view_func is None or not _hsr_route_on(view_func.cls):
         return JsonResponse({"detail": "Not found."}, status=404)
     return hsr_response(
@@ -2176,33 +2231,48 @@ def http_schema_resource_view(
     return csrf_exempt(scrudful_hsr_view)
 
 
-#: The scrudful view function of each URL name, per URL resolver (see
-#: :func:`_scrudful_views`).
-_SCRUDFUL_VIEWS: weakref.WeakKeyDictionary[
-    URLResolver, dict[str, Callable[..., Any]]
-] = weakref.WeakKeyDictionary()
+class _Scan(NamedTuple):
+    """The scrudful views' routes under a URL resolver (see
+    :func:`_scan_scrudful_views`)."""
+
+    #: The scrudful view function of each namespace-qualified URL name.
+    views: dict[str, Callable[..., Any]]
+    #: The error of each URL name given to the routes of two different
+    #: scrudful views (excluded from ``views``).
+    clashes: dict[str, str]
+    #: ``(view function, error)`` of each scrudful view's route without a URL
+    #: name.
+    unnamed: list[tuple[Callable[..., Any], str]]
+    #: The first :func:`hsr_urls` pattern, if the URLconf includes it.
+    hsr_pattern: URLPattern | None = None
 
 
-def _scrudful_views() -> dict[str, Callable[..., Any]]:
-    """The scrudful view function of each namespace-qualified URL name of the
-    current URLconf, scanned once per URL resolver (see :func:`hsr_urls`)."""
+#: The scrudful views' routes, per URL resolver (see :func:`_scrudful_views`).
+_SCRUDFUL_VIEWS: weakref.WeakKeyDictionary[URLResolver, _Scan] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _scrudful_views() -> _Scan:
+    """The scrudful views' routes of the current URLconf, scanned once per URL
+    resolver (see :func:`hsr_urls`)."""
     resolver = get_resolver(get_urlconf())
-    views = _SCRUDFUL_VIEWS.get(resolver)
-    if views is None:
-        views = _SCRUDFUL_VIEWS[resolver] = _scan_scrudful_views(resolver)
-    return views
+    scan = _SCRUDFUL_VIEWS.get(resolver)
+    if scan is None:
+        scan = _SCRUDFUL_VIEWS[resolver] = _scan_scrudful_views(resolver)
+    return scan
 
 
-def _scan_scrudful_views(resolver: URLResolver) -> dict[str, Callable[..., Any]]:
-    """The scrudful view function of each URL name under ``resolver``.
-
-    Raises
-    ------
-    ImproperlyConfigured
-        If a scrudful view's route has no name, or one name is given to the
-        routes of two different scrudful views.
-    """
+def _scan_scrudful_views(resolver: URLResolver) -> _Scan:
+    """The scrudful view function of each URL name under ``resolver``, and the
+    errors of the routes it can't serve, each kept apart (R28): an unnamed
+    route (which no name reaches) and a name given to the routes of two
+    different scrudful views (whose name is left out of ``views``, and whose
+    request raises), so that one bad route breaks only its own requests."""
     found: dict[str, tuple[Callable[..., Any], str]] = {}
+    clashes: dict[str, str] = {}
+    unnamed: list[tuple[Callable[..., Any], str]] = []
+    hsr_patterns: list[URLPattern] = []
 
     def visit(patterns: Sequence[Any], namespaces: list[str], prefix: str) -> None:
         for pattern in patterns:
@@ -2215,24 +2285,124 @@ def _scan_scrudful_views(resolver: URLResolver) -> dict[str, Callable[..., Any]]
                 )
                 visit(pattern.url_patterns, inner, route)
                 continue
+            if isinstance(pattern, _HsrURLPattern) and not hsr_patterns:
+                hsr_patterns.append(pattern)
             callback = getattr(pattern, "callback", None)
             if not _is_scrudful_view_func(callback):
                 continue
             if pattern.name is None:
-                raise ImproperlyConfigured(_unnamed_message(callback, route))
+                unnamed.append((callback, _unnamed_message(callback, route)))
+                continue
             view_name = ":".join([*namespaces, pattern.name])
             seen = found.get(view_name)
             if seen is None:
                 found[view_name] = (callback, route)
-            elif not _same_view_func(seen[0], callback):
-                raise ImproperlyConfigured(
+            elif view_name not in clashes and not _same_view_func(seen[0], callback):
+                clashes[view_name] = (
                     f"the URL name {view_name!r} names the routes {seen[1]!r} "
                     f"and {route!r} of two different scrudful views: give each "
                     "its own name, as each has its own HTTP Schema Resource"
                 )
 
     visit(resolver.url_patterns, [], "")
-    return {view_name: callback for view_name, (callback, _) in found.items()}
+    views = {
+        view_name: callback
+        for view_name, (callback, _) in found.items()
+        if view_name not in clashes
+    }
+    return _Scan(views, clashes, unnamed, hsr_patterns[0] if hsr_patterns else None)
+
+
+@checks.register(checks.Tags.urls)
+def _check_hsr_urls(
+    app_configs: Any = None, **kwargs: Any
+) -> list[checks.CheckMessage]:
+    """Django's system check of the scrudful views' routes of the root URLconf
+    (see "System checks" in the module docstring), when it has no
+    :func:`hsr_urls` pattern: with one, the pattern's own check reports
+    them (:class:`_HsrURLPattern`), in Django's URL check."""
+    if not getattr(settings, "ROOT_URLCONF", None):
+        return []
+    resolver = get_resolver()
+    scan = _scan_scrudful_views(resolver)
+    if scan.hsr_pattern is not None:
+        return []
+    return _scrudful_url_errors(resolver, scan)
+
+
+class _HsrURLPattern(URLPattern):
+    """The URL pattern of :func:`hsr_urls`, whose check (run by Django's URL
+    system check, which loads the URLconf) reports the errors of the
+    scrudful views' routes of the root URLconf: Django's URL check runs
+    whether or not this module was imported before the checks started."""
+
+    def check(self) -> list[checks.CheckMessage]:
+        messages = list(super().check())
+        if not getattr(settings, "ROOT_URLCONF", None):
+            return messages
+        resolver = get_resolver()
+        scan = _scan_scrudful_views(resolver)
+        if scan.hsr_pattern is self:  # once, though included twice
+            messages.extend(_scrudful_url_errors(resolver, scan))
+        return messages
+
+
+def _scrudful_url_errors(
+    resolver: URLResolver, scan: _Scan
+) -> list[checks.CheckMessage]:
+    """The errors of the system check (see :func:`_check_hsr_urls`)."""
+    try:
+        return _hsr_url_errors(resolver, scan)
+    except ImproperlyConfigured as exc:  # an invalid SCRUDFUL setting
+        return [checks.Error(str(exc), id="scrudful.E006")]
+
+
+def _hsr_url_errors(resolver: URLResolver, scan: _Scan) -> list[checks.CheckMessage]:
+    """The errors of :func:`_scrudful_url_errors`."""
+    errors: list[checks.CheckMessage] = []
+    for callback, message in scan.unnamed:
+        if _hsr_url(callback.cls) is None:  # an hsr_url needs no name
+            errors.append(checks.Error(message, obj=callback.cls, id="scrudful.E001"))
+    for message in scan.clashes.values():
+        errors.append(checks.Error(message, id="scrudful.E002"))
+    needs_route = []
+    for view_name, view_func in scan.views.items():
+        if _hsr_url(view_func.cls) is not None:
+            continue
+        if _hsr_route_on(view_func.cls):
+            needs_route.append(view_name)
+        else:
+            errors.append(
+                checks.Error(
+                    f"the route {view_name!r}: {_ROUTE_OFF}",
+                    obj=view_func.cls,
+                    id="scrudful.E004",
+                )
+            )
+    if needs_route:
+        try:
+            reverse(
+                "scrudful_hsr",
+                kwargs={"view_name": needs_route[0]},
+                urlconf=resolver.urlconf_name,
+            )
+        except NoReverseMatch:
+            errors.append(checks.Error(_NO_HSR_URLS, id="scrudful.E003"))
+    for view_name, view_func in scan.views.items():
+        try:
+            # Built as the route builds it, but not kept (the settings may
+            # change before a request).
+            _describe_view(_describe_mode_view(view_func))
+        except ImproperlyConfigured as exc:
+            errors.append(
+                checks.Error(
+                    f"the HTTP Schema Resource of the route {view_name!r} can't "
+                    f"be built: {exc}",
+                    obj=view_func.cls,
+                    id="scrudful.E005",
+                )
+            )
+    return errors
 
 
 def _join_route(prefix: str, route: str) -> str:
@@ -2361,11 +2531,7 @@ def _hsr_target(request: HttpRequest | Request) -> str:
     if hsr_url is not None:
         return hsr_url(match.view_name)
     if not _hsr_route_on(cls):
-        raise ImproperlyConfigured(
-            "Meta.hsr_route = False (or SCRUDFUL['HSR_ROUTE'] = False) needs "
-            "Meta.hsr_url or SCRUDFUL['HSR_URL'], hsr_url(view_name), the URL "
-            "the HTTP Schema Resource is served at"
-        )
+        raise ImproperlyConfigured(_ROUTE_OFF)
     if match.url_name is None:
         raise ImproperlyConfigured(_unnamed_message(view_func, match.route))
     try:

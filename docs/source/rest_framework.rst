@@ -47,6 +47,28 @@ routed request of a scrudful view, not only an OPTIONS, raises
 through no URL (a view called directly, with ``APIRequestFactory``) gets no
 HSR link.
 
+``manage.py check`` (which ``runserver`` and ``migrate`` run too) reports these
+misconfigurations before any request, as errors of Django's URL system check:
+
+* ``scrudful.E001``: a scrudful view's route has no URL name (unless the view
+  has an ``hsr_url``, which needs none);
+* ``scrudful.E002``: one URL name is given to the routes of two different
+  scrudful views;
+* ``scrudful.E003``: scrudful views rely on the HSR route (no ``Meta.hsr_url``
+  or ``SCRUDFUL["HSR_URL"]``) and the ``hsr_urls()`` include is missing;
+* ``scrudful.E004``: a view's HSR route is turned off without an ``hsr_url``;
+* ``scrudful.E005``: a view's HSR can't be built (a relative link URL without
+  a base URL, a schema link without an RDF context, a link callable failing
+  when called as ``func(view, None)``);
+* ``scrudful.E006``: the ``SCRUDFUL`` setting is invalid.
+
+The check builds each view's HSR as the route does (without a request; link
+callables are called) and keeps none. With the include, it runs in Django's own
+URL check, which loads the URLconf. ``scrudful.E003`` (the include missing) is
+reported only when ``scrudful.rest_framework`` was imported before the checks
+started, which registers the check: import it in an ``AppConfig.ready()`` of
+yours for ``manage.py check`` to report it too.
+
 ``scrudful_viewset``, ``scrudful_api_view`` and a ``@scrudful`` method in the
 body of an ``APIView`` (or viewset) class install scrudful's OPTIONS and HSR
 link, through :class:`~scrudful.rest_framework.ScrudfulMetadata`, but only when
@@ -209,7 +231,8 @@ permission check or throttle, and is CSRF-exempt.
 
 * Give every route of a scrudful view a URL name: an unnamed one raises
   ``ImproperlyConfigured`` on its requests, and two scrudful views sharing one
-  name make every ``/_hsr/`` request raise it.
+  name make a GET of that name's ``/_hsr/`` raise it. Either breaks only its
+  own requests: the other names are served (``manage.py check`` reports both).
 * The ``_hsr`` segment is the route's: don't put a route of yours under
   ``/_hsr/``.
 * **Serving it elsewhere.** Turn the route off for a view

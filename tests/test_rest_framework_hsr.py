@@ -6,10 +6,15 @@ tests use ``tests/drf_hsr_urls.py`` (the ``urls`` fixture) or a URLconf class.
 """
 
 import json
+import os
+import pathlib
+import subprocess
+import sys
 from urllib.parse import urlsplit
 
 import pytest
 from django.contrib.auth.models import Group, User
+from django.core import checks
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from django.test import Client, RequestFactory
@@ -1052,21 +1057,24 @@ class UnnamedAPIViewURLconf:
 
 
 def test_unnamed_scrudful_view_is_improperly_configured(settings, client):
+    """A request of the unnamed route raises; the HSR route has no name of it
+    to serve, so any name it is asked for is a 404 (R28)."""
     settings.ROOT_URLCONF = UnnamedURLconf
     with pytest.raises(ImproperlyConfigured, match="'v1/notes/<int:pk>'") as info:
-        client.get("/_hsr/notes")
-    assert "name=" in str(info.value)
-    with pytest.raises(ImproperlyConfigured, match="'v1/notes/<int:pk>'"):
         target("/v1/notes/1")
+    assert "name=" in str(info.value)
+    assert client.get("/_hsr/notes").status_code == 404
     settings.ROOT_URLCONF = UnnamedAPIViewURLconf
     with pytest.raises(ImproperlyConfigured, match="'stats/'"):
-        client.get("/_hsr/stats")
+        target("/stats/")
+    assert client.get("/_hsr/stats").status_code == 404
 
 
 class ClashURLconf:
     urlpatterns = [
         path("notes/<int:pk>", drf_hsr_urls.NoteView.as_view(), name="clash"),
         path("stats", drf_hsr_urls.stats, name="clash"),
+        path("report", drf_hsr_urls.report, name="report"),
         path("", include(hsr_urls())),
     ]
 
@@ -1077,6 +1085,32 @@ def test_one_name_for_two_scrudful_views_is_improperly_configured(settings, clie
         client.get("/_hsr/clash")
     assert "'notes/<int:pk>'" in str(info.value)
     assert "'stats'" in str(info.value)
+    # The other names are served (R28).
+    response = client.get("/_hsr/report")
+    assert response.status_code == 200
+    assert get_problems(response) == []
+
+
+class OneBadRouteURLconf:
+    """A named scrudful route beside an unnamed one (the final review's probe)."""
+
+    thing = drf_hsr_urls.ItemViewSet.as_view({"get": "retrieve", "put": "update"})
+    urlpatterns = [
+        path("things/<str:pk>/", thing, name="thing"),
+        path("other/<str:pk>/", thing),
+        path("", include(hsr_urls())),
+    ]
+
+
+def test_one_bad_route_leaves_the_others_hsrs_served(settings, client):
+    """An unnamed scrudful route breaks only its own requests (R28)."""
+    settings.ROOT_URLCONF = OneBadRouteURLconf
+    response = client.get("/_hsr/thing")
+    assert response.status_code == 200
+    assert get_problems(response) == []
+    assert client.get("/things/1/").status_code == 200
+    with pytest.raises(ImproperlyConfigured, match="'other/<str:pk>/'"):
+        client.get("/other/1/")
 
 
 class NoIncludeURLconf:
@@ -1100,6 +1134,113 @@ def test_missing_include_is_improperly_configured(settings):
         "HSR_URL": lambda view_name: f"https://schemas.example/{view_name}",
     }
     assert target("/items/1/") == "https://schemas.example/item-detail"
+
+
+def scrudful_check_errors():
+    """The ``scrudful.*`` messages of Django's URL system checks."""
+    return [
+        message
+        for message in checks.run_checks(tags=[checks.Tags.urls])
+        if message.id.startswith("scrudful.")
+    ]
+
+
+def test_system_check_passes_a_correct_urlconf(urls):
+    assert scrudful_check_errors() == []
+
+
+def test_system_check_reports_an_unnamed_route(settings):
+    settings.ROOT_URLCONF = UnnamedURLconf
+    [error] = scrudful_check_errors()
+    assert isinstance(error, checks.Error)
+    assert error.id == "scrudful.E001"
+    assert "'v1/notes/<int:pk>'" in error.msg and "name=" in error.msg
+    # With hsr_url, the link of an unnamed route needs no name of it.
+    settings.SCRUDFUL = {
+        "BASE_URL": BASE_URL,
+        "HSR_URL": lambda view_name: f"https://schemas.example/{view_name}",
+    }
+    assert scrudful_check_errors() == []
+
+
+def test_system_check_reports_a_name_clash(settings):
+    settings.ROOT_URLCONF = ClashURLconf
+    [error] = scrudful_check_errors()
+    assert error.id == "scrudful.E002"
+    assert "'clash'" in error.msg
+    assert "'notes/<int:pk>'" in error.msg and "'stats'" in error.msg
+
+
+def test_system_check_reports_a_missing_include(settings):
+    settings.ROOT_URLCONF = NoIncludeURLconf
+    [error] = scrudful_check_errors()
+    assert error.id == "scrudful.E003"
+    assert error.msg == NO_INCLUDE
+    settings.SCRUDFUL = {
+        "BASE_URL": BASE_URL,
+        "HSR_URL": lambda view_name: f"https://schemas.example/{view_name}",
+    }
+    assert scrudful_check_errors() == []
+
+
+def test_system_check_reports_a_route_off_without_hsr_url(settings):
+    settings.ROOT_URLCONF = NoIncludeURLconf
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL, "HSR_ROUTE": False}
+    [error] = scrudful_check_errors()
+    assert error.id == "scrudful.E004"
+    assert "hsr_url" in error.msg
+
+
+def test_system_check_reports_an_invalid_setting(urls, settings):
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL, "HSR_ROUTE": "yes"}
+    [error] = scrudful_check_errors()
+    assert error.id == "scrudful.E006"
+    assert "HSR_ROUTE" in error.msg
+
+
+def test_system_check_reports_an_hsr_that_cannot_be_built(urls, settings):
+    # The views' relative links need a base URL.
+    settings.SCRUDFUL = None
+    errors = scrudful_check_errors()
+    assert errors
+    assert {error.id for error in errors} == {"scrudful.E005"}
+    assert any("item-detail" in error.msg for error in errors)
+    assert all("relative" in error.msg for error in errors)
+    # Reported once: by the hsr_urls() pattern, not again by the registered
+    # check.
+    assert len({error.msg for error in errors}) == len(errors)
+
+
+#: Runs the system checks in a fresh process, where nothing imported
+#: scrudful.rest_framework before they start (as ``manage.py check``).
+FRESH_CHECK = """
+import sys, django
+django.setup()
+from django.conf import settings
+from django.core import checks
+settings.ROOT_URLCONF = "tests.drf_hsr_urls"
+assert "scrudful.rest_framework" not in sys.modules
+print(sorted({m.id for m in checks.run_checks() if m.id.startswith("scrudful.")}))
+"""
+
+
+def test_system_check_runs_in_a_fresh_process():
+    """Django's URL check loads the URLconf, so the hsr_urls() pattern's check
+    runs though this module wasn't imported when the checks started."""
+    env = {
+        **os.environ,
+        "DJANGO_SETTINGS_MODULE": "tests.settings",  # SCRUDFUL = None
+        "PYTHONPATH": os.pathsep.join([".", "examples/scrudful_rest_framework"]),
+    }
+    result = subprocess.run(
+        [sys.executable, "-W", "error", "-c", FRESH_CHECK],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=pathlib.Path(__file__).resolve().parent.parent,
+    )
+    assert result.stdout.strip() == "['scrudful.E005']"
 
 
 def test_hsr_target_is_the_route_resolved_against_the_base_url(urls):
