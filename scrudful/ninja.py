@@ -5751,7 +5751,7 @@ def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
     combination of sample values (past the cap), or there are none (a prefix
     parameter whose converter accepts no sample value), a ``RuntimeWarning``
     says so, once per route, naming the route and the reason; the URLs there
-    are are still checked.
+    are still checked.
 
     Raises
     ------
@@ -5790,7 +5790,6 @@ def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
     if partial is not None:
         key = (path_view._scrudful_router._scrudful_serial, route)
         if key not in _UNCHECKED_ROUTES:
-            _UNCHECKED_ROUTES.add(key)
             warnings.warn(
                 "scrudful can't check every URL of the HTTP Schema Resource "
                 f"route {route!r} of {_described_path(path_view)!r} against "
@@ -5799,6 +5798,9 @@ def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
                 "itself) has a path matching it.",
                 RuntimeWarning,
             )
+            # Recorded once warned: a warning raised as an error leaves it
+            # unrecorded, so a retried build warns (or fails) again.
+            _UNCHECKED_ROUTES.add(key)
     for other, view in earlier:
         pattern = RoutePattern(other, is_endpoint=True)
         url = next((url for url in urls if pattern.match(url) is not None), None)

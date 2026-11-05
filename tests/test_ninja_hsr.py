@@ -6,6 +6,7 @@ import json
 import re
 import types
 import uuid
+import warnings
 from typing import Any, List
 
 import ninja.operation
@@ -1453,6 +1454,18 @@ def test_past_the_cap_an_unshadowed_route_warns_and_is_served():
         api.urls
     r = TestClient(api).get("/a/b/c/d/e/f/_hsr/pk")
     assert hsr_get_problems(r.status_code, dict(r.headers), r.content) == []
+
+
+def test_an_unchecked_route_warning_raised_as_an_error_warns_again():
+    """With the warning turned into an error, the build fails; a retried
+    build warns again rather than serving the route silently unchecked."""
+    api = six_parameter_api(None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(RuntimeWarning, match=r"can't check every"):
+            api.urls
+    with pytest.warns(RuntimeWarning, match=r"can't check every.*<x6>/_hsr/pk'"):
+        api.urls
 
 
 def test_a_router_mounted_twice_at_one_prefix_names_its_earlier_mount():
