@@ -1003,10 +1003,11 @@ class _Serialized(NamedTuple):
     etag: str
 
 
-@dataclass
-class _HsrOptions:
-    """The :func:`add_options` options of an app or router, and its built
-    HTTP Schema Resources."""
+@dataclass(frozen=True)
+class _HsrConfig:
+    """The :func:`add_options` options of an app or router, checked
+    (:func:`_check_hsr_options`): fixed once given, since the caches of its
+    :class:`_HsrOptions` are valid only for them."""
 
     base_url: str | None = None
     hsr_route: bool = True
@@ -1016,9 +1017,22 @@ class _HsrOptions:
     allowed: Callable[..., Any] | None = None
     #: ``load(request, **path_params)``, the object of the OPTIONS checks.
     load: Callable[..., Any] | None = None
-    #: Whether :func:`add_options` gave them (else they are the defaults, for
-    #: :func:`http_schema_resource` on an app without it).
-    explicit: bool = False
+
+
+#: The options of an app or router :func:`add_options` wasn't given, for
+#: :func:`http_schema_resource` on it.
+_DEFAULT_HSR_CONFIG = _HsrConfig()
+
+
+@dataclass(eq=False)
+class _HsrOptions:
+    """An app's or router's :func:`add_options` configuration (``config``,
+    ``None`` without it), and what scrudful keeps for it: its built HTTP
+    Schema Resources, its index and its completion. The configuration's
+    fields read through, and can't be assigned: calling :func:`add_options`
+    again replaces the whole."""
+
+    config: _HsrConfig | None = None
     #: Each built document, by resource key and ``id`` of the
     #: :func:`add_error_links` entity it describes (a router included in
     #: several apps has one per app's entity, ``None``'s for an app without
@@ -1036,6 +1050,40 @@ class _HsrOptions:
     #: A router's routes as :func:`add_options` and the completions since
     #: left them (see :func:`_complete`).
     completion: _Completion | None = field(default=None, compare=False, repr=False)
+
+    @property
+    def explicit(self) -> bool:
+        """Whether :func:`add_options` gave the options (else they are the
+        defaults, for :func:`http_schema_resource` on an app without it)."""
+        return self.config is not None
+
+    @property
+    def _config(self) -> _HsrConfig:
+        return _DEFAULT_HSR_CONFIG if self.config is None else self.config
+
+    @property
+    def base_url(self) -> str | None:
+        return self._config.base_url
+
+    @property
+    def hsr_route(self) -> bool:
+        return self._config.hsr_route
+
+    @property
+    def hsr_url(self) -> Callable[[str], str] | None:
+        return self._config.hsr_url
+
+    @property
+    def hsr_cache_control(self) -> str:
+        return self._config.hsr_cache_control
+
+    @property
+    def allowed(self) -> Callable[..., Any] | None:
+        return self._config.allowed
+
+    @property
+    def load(self) -> Callable[..., Any] | None:
+        return self._config.load
 
 
 @dataclass(eq=False)
@@ -1419,8 +1467,10 @@ def add_options(
         stack ``solve_dependencies`` takes differ.
     """
     _check_owner(app)
-    options = _check_hsr_options(
-        base_url, hsr_route, hsr_url, hsr_cache_control, allowed, load
+    options = _HsrOptions(
+        _check_hsr_options(
+            base_url, hsr_route, hsr_url, hsr_cache_control, allowed, load
+        )
     )
     routes = app.router.routes if isinstance(app, FastAPI) else app.routes
     _check_options_callables(routes)
@@ -1454,7 +1504,7 @@ def _check_hsr_options(
     hsr_cache_control: Any,
     allowed: Any,
     load: Any,
-) -> _HsrOptions:
+) -> _HsrConfig:
     """The :func:`add_options` options, checked."""
     if hsr_cache_control is not None and not isinstance(hsr_cache_control, str):
         raise TypeError(
@@ -1480,7 +1530,7 @@ def _check_hsr_options(
             "path's HTTP Schema Resource is served at (see "
             "http_schema_resource_endpoint), which every resource links to"
         )
-    return _HsrOptions(
+    return _HsrConfig(
         base_url=base_url,
         hsr_route=hsr_route,
         hsr_url=hsr_url,
@@ -1491,7 +1541,6 @@ def _check_hsr_options(
         ),
         allowed=allowed,
         load=load,
-        explicit=True,
     )
 
 

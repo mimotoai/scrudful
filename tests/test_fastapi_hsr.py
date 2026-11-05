@@ -1086,6 +1086,12 @@ def test_add_options_stores_its_options():
     assert options.allowed is allowed
     assert options.load is load
     assert _hsr_options(FastAPI()).hsr_cache_control == "public, max-age=300"
+    # Fixed once given: the caches kept with them are valid only for them.
+    with pytest.raises(AttributeError):
+        options.hsr_route = True  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        options.config.base_url = None  # type: ignore[misc, union-attr]
+    assert options.explicit and not _hsr_options(FastAPI()).explicit
 
 
 @pytest.mark.parametrize(
