@@ -198,8 +198,10 @@ OPTIONS
     that none of the view's renderers serves (e.g. ``text/html`` on a view
     without the browsable API) still gets DRF's 406, raised before OPTIONS
     is handled. The HTTP Schema Resource itself is served by GET, by
-    :func:`hsr_urls` (or :func:`http_schema_resource_view`): a view's OPTIONS
-    raises ``ImproperlyConfigured`` without either (see :func:`_hsr_target`).
+    :func:`hsr_urls` (or, with an ``hsr_url`` naming where it is mounted, by
+    :func:`http_schema_resource_view`): without the include or an
+    ``hsr_url``, every routed request of a scrudful view, not only its
+    OPTIONS, raises ``ImproperlyConfigured`` (see :func:`_hsr_target`).
     With ``metadata_class = None`` OPTIONS is DRF's 405; with a metadata
     class that isn't a :class:`ScrudfulMetadata`, DRF's 200 with its body.
 
@@ -595,8 +597,10 @@ class ScrudfulViewFunc:
         for the ``Allow`` of OPTIONS: when given, it alone decides (see
         "OPTIONS" in the module docstring). ``request`` is a request of
         ``method``; it must return a ``bool`` (else ``TypeError``), and may
-        raise DRF's ``PermissionDenied`` or ``NotAuthenticated``, or any 401
-        or 403 ``APIException``, for ``False``.
+        raise DRF's ``PermissionDenied`` or ``NotAuthenticated``, any 401 or
+        403 ``APIException``, or Django's ``PermissionDenied``, for
+        ``False``; an ``Http404`` (or ``NotFound``) it raises is the
+        OPTIONS's 404.
     base_url : str, optional
         The absolute URL that relative link URLs are resolved against
         (default ``SCRUDFUL["BASE_URL"]``), in the HTTP Schema Resource and
@@ -2310,7 +2314,7 @@ def http_schema_resource(view_func: Callable[..., Any]) -> dict[str, Any]:
       parameters. A request body and a success response (but a 204) have
       the content of the handler's ``entity`` (by default, JSON with the
       handler's links), and the 400, 412 and 428 the content of its
-      ``error`` entity;
+      ``error`` entity, else of ``SCRUDFUL["ERROR"]``;
     - ``head``: the same responses as ``get``, without content;
     - ``options``: a 204 without content;
     - any other method: its success responses.
@@ -3614,8 +3618,9 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
     first JSON renderer as scrudful's own 400, 412 and 428 are (see
     :class:`ScrudfulViewFunc`), so that it agrees with the HTTP Schema
     Resource.
-    Without an ``error`` entity, or when the view has no such handler,
-    the response is DRF's, unchanged but for ``Access-Control-Expose-Headers``
+    Without an ``error`` entity (the handler's, else the view-wide one,
+    below) and, on a scrudful view, without ``SCRUDFUL["ERROR"]``, the
+    response is DRF's, unchanged but for ``Access-Control-Expose-Headers``
     on a scrudful view (below); so is ``None`` for an exception DRF does not
     handle.
 
@@ -4060,9 +4065,9 @@ class ScrudfulPagination(BasePagination):
     an entry's ``etag`` and ``last_modified`` come from ``Meta.etag_func(obj)``
     and ``Meta.last_modified_func(obj)``; without it they are ``None`` (those
     callbacks take the URL arguments, not an object). An entry's ``link`` holds
-    the schema and context links of the view's item ``Meta`` options; their
-    callbacks are called as for the item routes, with the object's lookup value
-    as the URL keyword (``pk=...``).
+    the schema and context links of the view's item ``Meta`` options
+    (``Meta.entity``'s, when set); their callbacks are called as for the item
+    routes, with the object's lookup value as the URL keyword (``pk=...``).
 
     A non-integer or out of range ``page`` or ``page_size`` is a 400 naming
     the parameter (both, when both are bad, unless a subclass overrides
@@ -4070,6 +4075,16 @@ class ScrudfulPagination(BasePagination):
     ``IntegerField``'s: ``invalid`` (not an integer), ``min_value`` (below 1)
     or ``max_value`` (``page_size`` above ``max_page_size``). A ``page`` past
     the last one is a 404 (page 1 always exists).
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If the view has no ``Meta.href_func``, or ``Meta``'s links have a
+        schema link without an RDF context link (on a view
+        :func:`scrudful_viewset` didn't decorate, which would have refused
+        it already).
+    TypeError
+        If ``href_func`` returns ``None`` for an object.
     """
 
     page_size = 100

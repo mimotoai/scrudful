@@ -237,7 +237,8 @@ allows:
   POST ``@action`` answering 200; else DRF's: 201 for POST, 204 for DELETE,
   200 for the others. A status that isn't a 2xx raises ``ValueError``;
 * scrudful's 304, 400, 412 and 428 for a conditional method, the 400, 412
-  and 428 with the ``error`` entity's content, and the precondition headers;
+  and 428 with the ``error`` entity's content, else ``SCRUDFUL["ERROR"]``'s,
+  and the precondition headers;
 * a ``default`` entry for the errors :func:`~scrudful.rest_framework.exception_handler`
   answers, with the content of the handler's ``error`` (the view-wide one for
   a handler that isn't scrudful), else ``SCRUDFUL["ERROR"]``'s. When
@@ -472,7 +473,8 @@ use ``functools.wraps(exception_handler)``, which copies it:
 
 Without the marker, such a handler's errors still carry the error Links, but
 the HSR doesn't describe them. Without the setting, or without an ``error``
-entity, such errors are DRF's own, with no Link but the HSR link. The example
+entity and ``SCRUDFUL["ERROR"]``, such errors are DRF's own, with no Link but
+the HSR link. The example
 project (``examples/scrudful_rest_framework``) is conformant on the wire: its
 tests run the wire-conformance suite's checks on its responses.
 

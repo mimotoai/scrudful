@@ -50,7 +50,9 @@ def problem_details(request: Any, result: ConditionalResult) -> dict[str, Any]:
 def problem_from_errors(
     status: int, errors: Any, detail: str | None = None
 ) -> dict[str, Any]:
-    """RFC 9457 problem details for a framework validation error.
+    """RFC 9457 problem details for a framework error: a validation error
+    (``errors`` its list), or a 404 or 500 page (``errors=None``), as the
+    Django error handlers and FastAPI's JSON 500 answer.
 
     ``type`` is ``about:blank``, ``title`` the reason phrase of ``status`` and
     ``detail`` the given ``detail`` or that phrase. ``errors`` (the framework's
