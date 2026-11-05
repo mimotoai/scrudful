@@ -280,8 +280,9 @@ Things to know:
   ``Dependant`` and exit stack it takes): an installed FastAPI whose differ
   from the releases scrudful supports raises ``RuntimeError`` on OPTIONS.
 * Given an ``APIRouter``, ``add_options`` adds an OPTIONS route to each of its
-  resources (at its first route's path), answered with the router's options.
-  Prefer calling it on the app.
+  resources (at its first route's path), those of the routers included in it
+  (at any depth, under their prefixes) too, answered with the router's
+  options. Prefer calling it on the app.
 
 Error Links and the JSON 500
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -337,6 +337,9 @@ Behaviour change (FastAPI)
   other route (an ``APIRouter`` gets one route per resource), named after the
   template with each convertor but ``str`` joined by ``-`` (``users.id``,
   ``users.id-int``).
+* ``add_options(router)`` adds an OPTIONS route to the resources of the
+  routers included in the router too, at any depth (they advertised and
+  served an HSR, but answered OPTIONS with FastAPI's 405).
 * ``add_options`` raises **ValueError** (was ``TypeError``) for a link callable
   of a scrudful endpoint, or of its ``error``, that can't be called as
   ``func()``, checked up front for all of them; and for a base URL that isn't

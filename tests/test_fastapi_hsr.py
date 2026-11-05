@@ -2774,6 +2774,126 @@ def test_router_mode_options(make_client):
     )
 
 
+#: Each level's ``include_router`` prefix: none, literals, parameters.
+NESTED_PREFIXES = [
+    ("", "", ""),
+    ("/v1", "/m", "/l"),
+    ("/t/{tenant}", "/orgs/{org}", "/teams/{team}"),
+]
+#: The value of each prefix parameter in the URLs.
+PREFIX_VALUES = {"tenant": "acme", "org": "o1", "team": "red"}
+
+
+@pytest.mark.parametrize("app_prefix, middle_prefix, leaf_prefix", NESTED_PREFIXES)
+def test_router_mode_nested_routers_answer_options(
+    make_client, app_prefix, middle_prefix, leaf_prefix
+):
+    """Every resource reachable through nested ``include_router`` calls,
+    three levels deep, answers OPTIONS, links to an HSR its router serves
+    and has its include's dependencies checked; ``load`` gets every
+    prefix's parameters."""
+    loaded = []
+
+    def load(request: Request, **params: Any) -> Any:
+        loaded.append(params)
+        return params
+
+    leaf, middle, parent = APIRouter(), APIRouter(), APIRouter()
+
+    @leaf.get("/items/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read_item(id: int):
+        return {}
+
+    @leaf.put("/items/{id}", dependencies=[Security(require_role("writer"))])
+    @scrudful(**NOTE_LINKS)
+    async def write_item(id: int):
+        return {}
+
+    @middle.get("/things")
+    @scrudful(**NOTE_LINKS)
+    async def things():
+        return []
+
+    @parent.get("/top")
+    @scrudful(**NOTE_LINKS)
+    async def top():
+        return {}
+
+    middle.include_router(
+        leaf, prefix=leaf_prefix, dependencies=[Security(require_role("reader"))]
+    )
+    parent.include_router(middle, prefix=middle_prefix)
+    add_options(parent, base_url=BASE, load=load)
+    app = FastAPI()
+    app.include_router(parent, prefix=app_prefix)
+    client = make_client(app)
+
+    def check(url: str, template: str, allow: str, **kwargs: Any) -> None:
+        url = url.format(**PREFIX_VALUES)
+        response = client.get(url, **kwargs)
+        assert response.status_code == 200, url
+        (target,) = [
+            target
+            for target, params in parse_links(response.headers["link"])
+            if params.get("rel") == HSR_DOCUMENT_REL
+        ]
+        options_204(client, url, allow, target, **kwargs)
+        assert client.get(target).json() == http_schema_resource(parent, template)
+
+    item = f"{app_prefix}{middle_prefix}{leaf_prefix}/items/1"
+    item_template = f"{middle_prefix}{leaf_prefix}/items/{{id}}"
+    options_204(client, item.format(**PREFIX_VALUES), "OPTIONS")
+    check(item, item_template, "GET, OPTIONS", headers=READER)
+    check(item, item_template, "GET, PUT, OPTIONS", headers=ADMIN)
+    prefixes = app_prefix + middle_prefix + leaf_prefix
+    expected = {
+        name: value
+        for name, value in PREFIX_VALUES.items()
+        if "{" + name + "}" in prefixes
+    }
+    assert loaded == [{**expected, "id": "1"}] * 2
+    things_template = f"{middle_prefix}/things"
+    check(f"{app_prefix}{things_template}", things_template, "GET, OPTIONS")
+    check(f"{app_prefix}/top", "/top", "GET, OPTIONS")
+
+
+def test_router_mode_nested_route_serving_options_is_kept(make_client):
+    """A nested router's own OPTIONS route keeps answering, and calling
+    ``add_options`` again adds no second OPTIONS route."""
+    leaf, parent = APIRouter(), APIRouter()
+
+    @leaf.get("/items/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read_item(id: int):
+        return {}
+
+    @leaf.options("/items/{id}")
+    async def own_options(id: int):
+        return Response(status_code=200, headers={"X-Own": "yes"})
+
+    @leaf.get("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read_note(id: int):
+        return {}
+
+    parent.include_router(leaf, prefix="/l")
+    add_options(parent, base_url=BASE)
+    add_options(parent, base_url=BASE)
+    automatic = [
+        route
+        for route in parent.routes
+        if getattr(getattr(route, "endpoint", None), "_scrudful_options", False)
+    ]
+    assert [route.path for route in automatic] == ["/l/notes/{id}"]
+    app = FastAPI()
+    app.include_router(parent)
+    client = make_client(app)
+    assert client.options("/l/items/1").headers["x-own"] == "yes"
+    target = "https://api.example/_hsr/l.notes.id"
+    options_204(client, "/l/notes/1", "GET, OPTIONS", target)
+
+
 def test_router_mode_load_error_links_resolve_against_the_router_base(make_client):
     def load(request: Request, **params: Any) -> Any:
         raise HTTPException(status_code=404)

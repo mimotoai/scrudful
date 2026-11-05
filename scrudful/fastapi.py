@@ -1143,8 +1143,11 @@ def add_options(
     document and OPTIONS answer, although a URL both match (``/items/new``,
     ``/items/5``) reaches whichever route comes first; avoid such overlaps,
     or give them the same methods. Given an ``APIRouter``,
-    it adds an OPTIONS route to each resource of the router's own routes
-    that has a scrudful route (at the path of its first route), answered as
+    it adds an OPTIONS route to each resource of the router's routes that
+    has a scrudful route (at the path of its first route), those of the
+    routers included in it, at any depth and with their prefixes, included
+    (``/c/items/{id}`` for a router included with ``prefix="/c"``), unless a
+    route already serves OPTIONS for it, answered as
     above with the router's options, linking to the router's document of it
     (keyed by the router's own templates), its checks running the
     dependencies the app and ``include_router`` give the routes;
@@ -2202,10 +2205,15 @@ def _match(routes: Sequence[Any], scope: Scope) -> tuple[Any, Scope] | None:
 
 def _add_path_options(router: APIRouter) -> None:
     """:func:`add_options` for an ``APIRouter``: an OPTIONS route per
-    resource (:func:`_template_key`), at its first route's path."""
-    paths: dict[str, list[Route]] = {}
-    for route in router.routes:
-        if isinstance(route, Route):
+    resource (:func:`_template_key`), at its first route's path, of the
+    router's routes and of those of the routers included in it, at any
+    depth, with their prefixes (FastAPI includes them lazily, or copies
+    their routes: :func:`_flat` gives them either way). A resource a route
+    already serves OPTIONS for (this router's OPTIONS route from an earlier
+    call, a nested router's, or one of yours) gets none."""
+    paths: dict[str, list[Any]] = {}
+    for route in _flat(router.routes):
+        if isinstance(getattr(route, "original_route", route), Route):
             paths.setdefault(_template_key(route.path), []).append(route)
     for key, routes in paths.items():
         if any(_endpoint_config(route.endpoint) for route in routes) and not any(
