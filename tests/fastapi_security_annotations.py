@@ -10,6 +10,7 @@ itself leaves OPTIONS unable to tell what it declares. Used by
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Security
@@ -111,4 +112,108 @@ def unreadable_app() -> FastAPI:
     async def patch(id: int, user: Any = Depends(unreadable_user)):
         return {"id": id}  # pragma: no cover
 
+    return app
+
+
+# --- Dependencies that are not functions ------------------------------------
+# Their annotations are evaluated in the globals of the function their
+# signature comes from (``__call__``, ``__init__``, a partial's ``func``), as
+# ``inspect.signature(eval_str=True)`` and FastAPI evaluate them.
+
+
+class Paginator:
+    """A callable-instance dependency with a plain ``Depends``: no security."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+
+    def __call__(self, db: Annotated[object, Depends(get_db)], page: int = 1) -> int:
+        return page
+
+
+class Checker:
+    """A callable-instance security dependency."""
+
+    def __call__(self, user: Annotated[str, Security(writer)]) -> str:
+        return user
+
+
+def with_role(role: str, user: Annotated[str, Security(writer)]) -> str:
+    """A security dependency given as a ``functools.partial``."""
+    return user
+
+
+class ClassUser:
+    """A class security dependency (its ``__init__`` declares it)."""
+
+    def __init__(self, user: Annotated[str, Security(writer)]) -> None:
+        self.user = user
+
+
+class ClassPage:
+    """A class dependency with a plain ``Depends``: no security."""
+
+    def __init__(self, db: Annotated[object, Depends(get_db)], page: int = 1) -> None:
+        self.page = page
+
+
+class MixedChecker:
+    """A callable instance with a ``Security(...)`` beside an annotation
+    that can't be evaluated."""
+
+    def __call__(
+        self, user: Annotated[str, Security(writer)], db: Session = Depends(get_db)
+    ) -> str:
+        return user  # pragma: no cover
+
+
+def mixed_role(
+    role: str, user: Annotated[str, Security(writer)], db: Session = Depends(get_db)
+) -> str:
+    """The same, for a ``functools.partial``."""
+    return user  # pragma: no cover
+
+
+class MixedUser:
+    """The same, for a class."""
+
+    def __init__(
+        self, user: Annotated[str, Security(writer)], db: Session = Depends(get_db)
+    ) -> None:
+        self.user = user  # pragma: no cover
+
+
+def callables_app() -> FastAPI:
+    """``/notes/{id}``: GET and DELETE for anyone (a callable instance and a
+    class, each with a plain ``Depends``); PUT, POST and PATCH for writers (a
+    callable instance, a ``functools.partial`` and a class, each with a
+    ``Security(...)``)."""
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**LINKS)
+    async def read(id: int, page: int = Depends(Paginator(10))):
+        return {"id": id}
+
+    @app.put("/notes/{id}")
+    @scrudful(**LINKS)
+    async def write(id: int, user: Annotated[str, Depends(Checker())]):
+        return {"id": id}
+
+    @app.post("/notes/{id}")
+    @scrudful(**LINKS)
+    async def act(id: int, user: str = Depends(functools.partial(with_role, "x"))):
+        return {"id": id}
+
+    @app.delete("/notes/{id}")
+    @scrudful(**LINKS)
+    async def remove(id: int, page: Annotated[ClassPage, Depends(ClassPage)]):
+        return {"id": id}
+
+    @app.patch("/notes/{id}")
+    @scrudful(**LINKS)
+    async def patch(id: int, user: ClassUser = Depends(ClassUser)):
+        return {"id": id}
+
+    add_options(app, base_url=BASE)
     return app

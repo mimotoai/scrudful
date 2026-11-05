@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import hashlib
 import re
+import typing
 import warnings
 from typing import Any
 
@@ -3606,6 +3608,51 @@ def test_security_is_read_annotation_by_annotation(make_client):
     )
     # The check alone ran, not the plain dependency beside it.
     assert "get_db" not in security_annotations.CALLS
+
+
+def test_dependencies_that_are_not_functions_are_read_in_their_globals(
+    make_client,
+):
+    """A callable instance, a ``functools.partial`` and a class dependency,
+    under ``from __future__ import annotations``, have their annotations
+    evaluated in the globals of their ``__call__``, ``func`` or
+    ``__init__``: a plain ``Depends`` in them leaves the method listed for
+    anyone, a ``Security(...)`` refuses whom it refuses, and nothing is
+    announced (the suite runs with warnings as errors)."""
+    try:
+        app = security_annotations.callables_app()
+    except NameError as exc:
+        pytest.skip(f"this FastAPI can't evaluate these annotations: {exc}")
+    client = make_client(app)
+    assert client.put("/notes/1").status_code == 403
+    assert client.put("/notes/1", headers=security_annotations.WRITER).status_code
+    options_204(client, "/notes/1", "GET, DELETE, OPTIONS", NOTE_TARGET)
+    options_204(
+        client,
+        "/notes/1",
+        "GET, PUT, POST, DELETE, OPTIONS, PATCH",
+        NOTE_TARGET,
+        headers=security_annotations.WRITER,
+    )
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        security_annotations.MixedChecker(),
+        functools.partial(security_annotations.mixed_role, "x"),
+        security_annotations.MixedUser,
+    ],
+    ids=["instance", "partial", "class"],
+)
+def test_resolved_signature_reads_a_non_function_in_its_globals(call):
+    """One annotation that can't be evaluated leaves the others of a callable
+    instance, a partial or a class evaluated, in their function's globals."""
+    from scrudful._adapter import resolved_signature
+
+    parameters = resolved_signature(call).parameters
+    assert typing.get_origin(parameters["user"].annotation) is typing.Annotated
+    assert parameters["db"].annotation == "Session"
 
 
 def unreadable_app() -> FastAPI:

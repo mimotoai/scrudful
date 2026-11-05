@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import http
 import inspect
 import re
@@ -277,18 +278,27 @@ def resolved_signature(func: Callable[..., Any]) -> inspect.Signature:
     For endpoints written with ``from __future__ import annotations``, as
     :func:`evaluated_signature`, but each annotation is evaluated on its own:
     one that can't be (e.g. a name imported only under ``TYPE_CHECKING``) is
-    left as it is, and the others are still evaluated.
+    left as it is, and the others are still evaluated. When all can be, this
+    is ``inspect.signature(func, eval_str=True)``; else each is evaluated in
+    the globals that would have used (:func:`annotation_globals`), so a
+    callable instance, a ``functools.partial`` or a class is read as a
+    function is.
     """
     try:
-        signature = inspect.signature(func)
+        signature = inspect.signature(func, eval_str=True)
     except NameError:
-        # Python 3.14+, see evaluated_signature.
-        if sys.version_info < (3, 14):
-            raise
-        from annotationlib import Format
+        try:
+            signature = inspect.signature(func)
+        except NameError:
+            # Python 3.14+, see evaluated_signature.
+            if sys.version_info < (3, 14):
+                raise
+            from annotationlib import Format
 
-        signature = inspect.signature(func, annotation_format=Format.FORWARDREF)
-    globalns = getattr(inspect.unwrap(func), "__globals__", {})
+            signature = inspect.signature(func, annotation_format=Format.FORWARDREF)
+    # Also for a signature eval_str leaves as it is (a ``__signature__``,
+    # such as a wrapper's, which may hold strings).
+    globalns = annotation_globals(func)
 
     def resolve(annotation: Any) -> Any:
         if isinstance(annotation, str):
@@ -305,6 +315,41 @@ def resolved_signature(func: Callable[..., Any]) -> inspect.Signature:
         ],
         return_annotation=resolve(signature.return_annotation),
     )
+
+
+def annotation_globals(func: Any) -> dict[str, Any]:
+    """The globals ``func``'s string annotations are evaluated in, as
+    ``inspect.signature(func, eval_str=True)`` picks them: through
+    ``__wrapped__`` and ``functools.partial``, those of the function the
+    signature comes from (a bound method's function, a class's ``__init__``
+    or ``__new__``, a callable instance's ``__call__``), else those of the
+    object's module."""
+    seen: set[int] = set()
+    obj = func
+    while id(obj) not in seen:
+        seen.add(id(obj))
+        unwrapped = inspect.unwrap(obj)
+        if unwrapped is not obj:
+            obj = unwrapped
+        elif isinstance(obj, functools.partial):
+            obj = obj.func
+        elif inspect.ismethod(obj):
+            obj = obj.__func__
+        elif inspect.isfunction(obj):
+            return obj.__globals__  # type: ignore[no-any-return]
+        elif inspect.isclass(obj):
+            for name in ("__init__", "__new__"):
+                method = getattr(obj, name, None)
+                if inspect.isfunction(method):
+                    return method.__globals__  # type: ignore[no-any-return]
+            break
+        else:
+            call = getattr(type(obj), "__call__", None)
+            if not inspect.isfunction(call):
+                break
+            obj = call
+    module = sys.modules.get(getattr(obj, "__module__", None) or "")
+    return vars(module) if module is not None else {}
 
 
 def resolve_annotation(annotation: Any, globalns: dict[str, Any]) -> Any:
