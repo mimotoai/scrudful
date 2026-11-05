@@ -2998,6 +2998,31 @@ class ScopedWritesViewSet(ByActionViewSet):
         return Group.objects.all()
 
 
+class BrokenWriteViewSet(ByActionViewSet):
+    """``update``'s own queryset has a bug (not a denial, not a 404)."""
+
+    def get_queryset(self):
+        SEEN_ACTIONS.append(self.action)
+        if self.action == "update":
+            raise ValueError("a bug in update's queryset")
+        return Group.objects.all()
+
+
+#: What each action's queryset of ``LockingViewSet`` saw of its request:
+#: ``request.method``, and the request line's
+#: (``request.META["REQUEST_METHOD"]``).
+SEEN_LOCKS = []
+
+
+class LockingViewSet(ByActionViewSet):
+    """Locks the row of a write, as the docs show, only when the request
+    line's method isn't OPTIONS."""
+
+    def get_queryset(self):
+        SEEN_LOCKS.append((self.request.method, self.request.META["REQUEST_METHOD"]))
+        return Group.objects.all()
+
+
 class SlugThing:
     pk = "thing"
 
@@ -3181,6 +3206,8 @@ class LoadingURLconf:
     router.register("scoped-writes", ScopedWritesViewSet, basename="scoped-writes")
     router.register("hook-hides-delete", HookHidesDeleteViewSet, basename="hhd")
     router.register("hook-hides-get", HookHidesGetViewSet, basename="hhg")
+    router.register("broken-write", BrokenWriteViewSet, basename="broken-write")
+    router.register("locking", LockingViewSet, basename="locking")
     urlpatterns = [
         path("", include(router.urls)),
         path("slugs/<slug:slug>/", slug_detail, name="slug-detail"),
@@ -3266,6 +3293,59 @@ def test_options_leaves_out_a_method_its_own_load_or_check_refuses(loading, clie
     assert r.status_code == 204
     assert r["Allow"] == "GET, OPTIONS, HEAD"
     assert SEEN_ACTIONS == ["retrieve", "update", "partial_update", "destroy"]
+
+
+def test_another_exception_of_another_methods_load_propagates(loading, client):
+    """Another method's own load raising neither a denial nor a 404 (a bug
+    in its queryset) is not taken for "not allowed": it propagates, as that
+    method's request would raise it, rather than drop the method from every
+    requester's ``Allow``."""
+    group = Group.objects.create(name="g")
+    with pytest.raises(ValueError, match="a bug in update's queryset"):
+        client.options(f"/broken-write/{group.pk}/")
+    assert SEEN_ACTIONS == ["retrieve", "update"]
+    client.raise_request_exception = False
+    assert client.options(f"/broken-write/{group.pk}/").status_code == 500
+
+
+def test_each_load_of_options_tells_it_by_the_request_line(loading, client):
+    """Each action's load gets a request of its method, while
+    ``request.META["REQUEST_METHOD"]`` stays ``"OPTIONS"``: the docs tell a
+    load that locks its row to check the latter."""
+    SEEN_LOCKS.clear()
+    group = Group.objects.create(name="g")
+    assert client.options(f"/locking/{group.pk}/").status_code == 204
+    assert SEEN_LOCKS == [
+        ("GET", "OPTIONS"),
+        ("PUT", "OPTIONS"),
+        ("PATCH", "OPTIONS"),
+        ("DELETE", "OPTIONS"),
+    ]
+
+
+def test_options_gives_a_request_without_a_request_line_its_method(loading):
+    """A request built by hand may have no ``META["REQUEST_METHOD"]`` (DRF's
+    and Django's test tools always set it, so it is removed here): on
+    OPTIONS, scrudful sets it to ``"OPTIONS"`` before the per-method checks,
+    so the documented check holds there too. One that has it keeps it."""
+    group = Group.objects.create(name="g")
+    url = f"/locking/{group.pk}/"
+    match = resolve(url)
+    for meta, seen in ((None, "OPTIONS"), ("KEPT", "KEPT")):
+        SEEN_LOCKS.clear()
+        request = APIRequestFactory().options(url)
+        if meta is None:
+            del request.META["REQUEST_METHOD"]
+        else:
+            request.META["REQUEST_METHOD"] = meta
+        response = match.func(request, *match.args, **match.kwargs)
+        assert response.status_code == 204
+        assert SEEN_LOCKS == [
+            ("GET", seen),
+            ("PUT", seen),
+            ("PATCH", seen),
+            ("DELETE", seen),
+        ]
 
 
 def test_options_of_a_generic_view_loads_the_object_for_each_method(loading, client):
