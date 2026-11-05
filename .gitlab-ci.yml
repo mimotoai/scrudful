@@ -48,6 +48,15 @@ floor-fastapi:
     - uv pip install -p /tmp/floor/bin/python "fastapi==0.100.*" "pydantic==2.3.*" "anyio<4" "httpx==0.24.*"
     - /tmp/floor/bin/python -m pytest -q -p no:cacheprovider tests/test_fastapi_adapter.py tests/test_fastapi_hsr.py tests/test_wire_fastapi.py
 
+# django-ninja>=1.7: scrudful checks ninja's internals it relies on against
+# both 1.7.0 and 1.7.1 (its `_run_authentication` differs between them), and
+# the locked `test` matrix installs 1.7.1 only.
+floor-ninja:
+  extends: .floor
+  script:
+    - uv pip install -p /tmp/floor/bin/python "django-ninja==1.7.0"
+    - /tmp/floor/bin/python -m pytest -q -p no:cacheprovider tests/test_ninja_*.py tests/test_wire_ninja.py
+
 # A merge request that changes the package (scrudful/, or the published parts
 # of pyproject.toml) must raise the version above the target branch's and every
 # release on PyPI.

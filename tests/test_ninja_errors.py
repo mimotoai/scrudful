@@ -1,6 +1,7 @@
 """Links on error responses: errors raised in an operation, ``add_error_links``."""
 
 import functools
+import http
 import json
 import uuid
 from typing import Any
@@ -1217,7 +1218,8 @@ def test_validation_422_is_problem_details(asynchronous):
     assert body["errors"][0]["loc"] == ["body", "payload", "name"]
     assert {key: body[key] for key in ("type", "title", "status", "detail")} == {
         "type": "about:blank",
-        "title": "Unprocessable Content",
+        # Python's phrase: "Unprocessable Entity" before 3.13.
+        "title": http.HTTPStatus(422).phrase,
         "status": 422,
         "detail": "Request validation failed",
     }
