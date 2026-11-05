@@ -15,6 +15,7 @@ from tests.semantic_http import (
     undescribed_problems,
     link_problems,
     parse_links,
+    status_entry_problems,
     validate_http_schema_resource,
 )
 
@@ -213,9 +214,68 @@ def test_link_problems_person_agreement():
     assert link_problems("GET", 200, PERSON_GET_HEADERS, True, PERSON) == []
 
 
-def test_link_problems_head_uses_get_entry():
-    body = {"get": PERSON["get"]}
+def test_link_problems_head_needs_a_head_entry_and_agrees_with_get():
+    """A HEAD's status is looked up in ``head`` (which describes no content);
+    its Links agree with the ``get`` entry it mirrors."""
+    head = {"responses": {"200": {"description": "OK"}}}
+    body = {"get": PERSON["get"], "head": head}
     assert link_problems("HEAD", 200, PERSON_GET_HEADERS, False, body) == []
+    no_head = {"get": PERSON["get"]}
+    assert link_problems("HEAD", 200, PERSON_GET_HEADERS, False, no_head) == [
+        "the HSR has no head operation for the 200 response"
+    ]
+    wrong_status = {"get": PERSON["get"], "head": {"responses": {"204": {}}}}
+    assert link_problems("HEAD", 200, PERSON_GET_HEADERS, False, wrong_status)
+
+
+@pytest.mark.parametrize(
+    "method, status, responses, has_content",
+    [
+        ("GET", 304, {"200": {}}, False),  # no 304 entry
+        ("DELETE", 204, {"200": {}}, False),  # the 204 entry became 200
+        ("PUT", 428, {"default": {}}, True),  # a default entry hides a 428
+        ("GET", 200, {"default": {}}, True),  # so does it hide a 200
+        ("GET", 412, {"4XX": {}, "default": {}}, True),  # 4XX is a key, so passes
+    ],
+)
+def test_status_entry_problems_need_an_explicit_key(
+    method, status, responses, has_content
+):
+    problems = status_entry_problems(
+        method, status, {method.lower(): {"responses": responses}}
+    )
+    assert bool(problems) == (
+        str(status) not in responses and f"{status // 100}XX" not in responses
+    )
+
+
+def test_status_entry_problems_other_errors_may_use_default():
+    hsr = {"get": {"responses": {"default": {}}}}
+    assert status_entry_problems("GET", 404, hsr) == []
+    assert status_entry_problems("GET", 500, hsr) == []
+
+
+def test_status_entry_problems_204_and_304_entries_have_no_content():
+    content = {"application/json": {}}
+    for status in (204, 304):
+        hsr = {"get": {"responses": {str(status): {"content": content}}}}
+        assert status_entry_problems("GET", status, hsr)
+        hsr = {"get": {"responses": {str(status): {"description": "x"}}}}
+        assert status_entry_problems("GET", status, hsr) == []
+
+
+def test_status_entry_problems_a_405_has_no_entry():
+    assert status_entry_problems("POST", 405, {"get": {}}) == []
+
+
+def test_link_problems_no_content_responses_need_their_entry():
+    """Agreement runs on a 204 or 304 with no content too."""
+    hsr = {"get": {"responses": {"200": {}}}, "delete": {"responses": {"200": {}}}}
+    assert link_problems("GET", 304, {}, False, hsr)
+    assert link_problems("DELETE", 204, {}, False, hsr)
+    hsr = {"get": {"responses": {"304": {}}}, "delete": {"responses": {"204": {}}}}
+    assert link_problems("GET", 304, {}, False, hsr) == []
+    assert link_problems("DELETE", 204, {}, False, hsr) == []
 
 
 def test_link_problems_agreement_mismatch():

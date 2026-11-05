@@ -594,14 +594,9 @@ def wire_exchanges() -> list[Exchange]:
 
 
 EXCHANGES = example_exchanges() + wire_exchanges()
-#: The exchanges whose Links agree with an HSR entry: not a 405, which
-#: answers a method the HSR has no entry for, nor a 304 (a HEAD's too),
-#: whose entry has no content, nor an unknown URL's 404, which has no HSR.
-AGREEING = [
-    exchange
-    for exchange in EXCHANGES
-    if exchange.status not in (304, 405) and exchange.kind is not None
-]
+#: The exchanges whose Links agree with an HSR entry: all but an unknown
+#: URL's 404, which has no HSR.
+AGREEING = [exchange for exchange in EXCHANGES if exchange.kind is not None]
 
 
 # --- Fixtures and helpers ------------------------------------------------------

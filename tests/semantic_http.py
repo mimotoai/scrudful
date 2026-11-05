@@ -171,9 +171,9 @@ def link_problems(
         # options_204_problems only tests whether the body is empty: a
         # stand-in body says whether the response had content.
         problems += options_204_problems(status, headers, b"x" if has_content else b"")
-    if hsr is not None and (has_content or method == "HEAD"):
+    if hsr is not None:
         problems += _agreement_problems(
-            method, status, content_type, schemas, contexts, hsr
+            method, status, content_type, has_content, schemas, contexts, hsr
         )
     return problems
 
@@ -201,16 +201,52 @@ def _context_problems(
     return []
 
 
+#: The error statuses scrudful itself answers: the HSR describes each of them
+#: with an entry of its own, never through ``default``.
+_OWN_ERRORS = (400, 412, 428)
+#: The statuses whose responses have no content, so whose entries have none.
+_NO_CONTENT = (204, 304)
+
+
+def _response_entry(operation: Any, status: int, explicit: bool) -> Any:
+    """The response object for ``status``: its own key (``"412"`` or ``"4XX"``),
+    else, unless ``explicit``, ``default``."""
+    responses = (operation or {}).get("responses") or {}
+    keys = [str(status), f"{status // 100}XX"] + ([] if explicit else ["default"])
+    return next((responses[key] for key in keys if key in responses), None)
+
+
+def status_entry_problems(
+    method: str, status: int, hsr: Mapping[str, Any]
+) -> list[str]:
+    """How the HSR's entry for ``method`` and ``status`` breaks the rules.
+
+    A success or redirect (below 400) and scrudful's own 400, 412 and 428 need
+    an explicit key (``"204"`` or ``"2XX"``, not ``default``), which a ``default``
+    entry with the same content would hide. A 204 and a 304 have no ``content``.
+    HEAD is checked against the ``head`` operation, not ``get``. A 405 answers a
+    method the HSR has no entry for, so it has none.
+    """
+    if status == 405:
+        return []
+    key = method.lower()
+    operation = hsr.get(key)
+    if not isinstance(operation, Mapping):
+        return [f"the HSR has no {key} operation for the {status} response"]
+    explicit = status < 400 or status in _OWN_ERRORS
+    response = _response_entry(operation, status, explicit)
+    if response is None:
+        return [f"no {key} {status} entry" + (" (default does not count)" * explicit)]
+    if status in _NO_CONTENT and response.get("content"):
+        return [f"the {key} {status} entry has content"]
+    return []
+
+
 def _select_entry(
     operation: Any, status: int, content_type: str
 ) -> dict[str, Any] | None:
     """The Media Type Object for ``status`` and ``content_type``, if listed."""
-    responses = (operation or {}).get("responses") or {}
-    response = (
-        responses.get(str(status))
-        or responses.get(f"{status // 100}XX")
-        or responses.get("default")
-    )
+    response = _response_entry(operation, status, explicit=False)
     for key, entry in ((response or {}).get("content") or {}).items():
         if essence(key) == essence(content_type):
             return entry
@@ -221,10 +257,19 @@ def _agreement_problems(
     method: str,
     status: int,
     content_type: str | None,
+    has_content: bool,
     schemas: list[tuple[str, dict[str, str]]],
     contexts: list[tuple[str, dict[str, str]]],
     hsr: dict,
 ) -> list[str]:
+    problems = status_entry_problems(method, status, hsr)
+    if status == 405 or problems:
+        return problems
+    # A HEAD sends no content, so its ``head`` entries describe none (the
+    # status entry above is checked on them); its headers are those of the
+    # GET it mirrors, so its Links agree with the ``get`` entry.
+    if not has_content and (method != "HEAD" or status in _NO_CONTENT):
+        return problems
     if content_type is None:
         return ["no Content-Type to choose the HTTP Schema Resource entry by"]
     key = "get" if method == "HEAD" else method.lower()
