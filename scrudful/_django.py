@@ -44,7 +44,7 @@ from scrudful._hsr import (
 )
 from scrudful.collection import InvalidPage
 from scrudful.conditional import ConditionalResult, evaluate_preconditions
-from scrudful.entity import Entity
+from scrudful.entity import Entity, _unset
 from scrudful.problem import PROBLEM_JSON, problem_from_errors
 from scrudful.utils import join_links, link_content, resolve_uri
 
@@ -355,8 +355,9 @@ def _plain_links(entity: Entity, request: HttpRequest | None) -> str | None:
     relative URL resolves against ``SCRUDFUL["BASE_URL"]`` when it is set,
     as the adapters' Links and HTTP Schema Resources do, else against the
     request (``build_absolute_uri()``, called only then: an absolute link
-    needs no host of the request's). Without a ``request``, each URL is
-    taken as it is, the settings unread: a check of the rels and types.
+    needs no host of the request's). Without a ``request``, each URL is a
+    fixed placeholder (a lazy URL, such as ``reverse_lazy``'s, is not
+    evaluated) and the settings are unread: a check of the rels and types.
 
     Raises
     ------
@@ -371,7 +372,7 @@ def _plain_links(entity: Entity, request: HttpRequest | None) -> str | None:
     def resolve(url: Any) -> str:
         nonlocal base
         if request is None:
-            return str(url)
+            return "about:blank"
         if base is None:
             if urlsplit(str(url)).scheme:
                 return str(url)
@@ -400,7 +401,8 @@ def _plain_links(entity: Entity, request: HttpRequest | None) -> str | None:
         )
     parts = []
     for url, rel, content_type, defaults_, context_of in candidates:
-        if not url:
+        # Without a request, a lazy URL is not evaluated (see resolve).
+        if _unset(url) if request is None else not url:
             continue
         if context_of is not None:
             content_type = _adapter.context_link_type(context_of, content_type)

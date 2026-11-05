@@ -177,9 +177,16 @@ def check_base_url(url: Any, what: str) -> None:
     Raises
     ------
     HsrConfigError
-        If ``url`` is not a ``str`` with a scheme and a host.
+        If ``url`` is not a ``str`` with a scheme and a host, or can't be
+        parsed as a URL at all (``urlsplit``'s ``ValueError``, as for
+        ``"http://[::1"``).
     """
-    parts = urlsplit(url) if isinstance(url, str) else None
+    try:
+        parts = urlsplit(url) if isinstance(url, str) else None
+    except ValueError as exc:
+        raise HsrConfigError(
+            f"{what} must be an absolute URL, not {url!r} ({exc})"
+        ) from exc
     if parts is None or not (parts.scheme and parts.netloc):
         raise HsrConfigError(f"{what} must be an absolute URL, not {url!r}")
 

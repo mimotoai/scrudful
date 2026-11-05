@@ -19,6 +19,14 @@ from scrudful._adapter import (
 __all__ = ["Entity", "HsrConfigError"]
 
 
+def _unset(value: Any) -> bool:
+    """Whether a link option is unset: ``None``, or an empty built-in value
+    (``""``, ``False`` ...). Any other object, a lazy URL such as Django's
+    ``reverse_lazy`` included, counts as set without being evaluated, so an
+    entity may name a URL of a URLconf that isn't loaded yet."""
+    return value is None or (type(value).__module__ == "builtins" and not value)
+
+
 @dataclass(frozen=True)
 class Entity:
     """The schema and RDF context of a request or response body.
@@ -97,9 +105,13 @@ class Entity:
     def __post_init__(self) -> None:
         media_type = media_type_key(self.media_type)
         object.__setattr__(self, "media_type", media_type)
-        if not self.context_link_or_func:
+        if _unset(self.context_link_or_func):
             schema = self.schema_link_or_func
-            if schema and not callable(schema) and not is_in_band(media_type):
+            if (
+                not _unset(schema)
+                and not callable(schema)
+                and not is_in_band(media_type)
+            ):
                 raise HsrConfigError(
                     SCHEMA_WITHOUT_CONTEXT.format(media_type=media_type)
                 )
@@ -108,7 +120,7 @@ class Entity:
             raise ValueError(
                 f"{media_type} content carries its own RDF; it takes no context " "link"
             )
-        if not is_json(media_type) and not self.context_type_or_func:
+        if not is_json(media_type) and _unset(self.context_type_or_func):
             raise ValueError(
                 f"{media_type} content needs a context type: give "
                 "context_type_or_func, the media type of the lifting description"

@@ -46,3 +46,31 @@ def test_reexported():
 def test_entity_rejects_schema_without_context():
     with pytest.raises(ValueError, match="x-rdf-context"):
         Entity(schema_link_or_func="https://x/s")
+
+
+class Lazy:
+    """A lazy URL, as Django's ``reverse_lazy`` gives: evaluating it (its
+    truth, its text) is counted."""
+
+    evaluated = 0
+
+    def __bool__(self):
+        Lazy.evaluated += 1
+        return True
+
+    def __str__(self):
+        Lazy.evaluated += 1
+        return "https://x/lazy"
+
+
+def test_lazy_links_are_not_evaluated_when_made():
+    """A lazy link counts as given without being evaluated, so an entity can
+    name a URL of a URLconf not loaded yet."""
+    Lazy.evaluated = 0
+    entity = Entity(Lazy(), context_link_or_func=Lazy())
+    assert Lazy.evaluated == 0
+    # And a lazy schema link alone is refused, as a plain one is.
+    with pytest.raises(ValueError, match="context"):
+        Entity(Lazy())
+    assert Lazy.evaluated == 0
+    assert entity.context_link_or_func is not None

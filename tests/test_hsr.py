@@ -112,7 +112,18 @@ def test_check_base_url_accepts_absolute_urls(url):
 
 
 @pytest.mark.parametrize(
-    "url", ["/relative/", "api.example", "", "https://", 3, b"https://x/", ["x"]]
+    "url",
+    [
+        "/relative/",
+        "api.example",
+        "",
+        "https://",
+        3,
+        b"https://x/",
+        ["x"],
+        # urlsplit raises ValueError for it: refused alike.
+        "http://[::1",
+    ],
 )
 def test_check_base_url_rejects_the_rest_alike(url):
     """A non-str is refused as an absolute-URL error, like a relative str."""

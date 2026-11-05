@@ -7,6 +7,7 @@ import pytest
 from django.core.exceptions import ImproperlyConfigured
 from django.http import Http404
 from django.test import RequestFactory
+from django.urls import path, reverse_lazy
 
 from scrudful import _django
 from scrudful._adapter import prefers_html
@@ -232,6 +233,43 @@ def test_the_public_handlers_check_their_entity(adapter_name):
         adapter.handler404(Entity(media_type="text/turtle"))
     with pytest.raises(TypeError, match="must be an Entity"):
         adapter.handler500(None)
+
+
+class LazyErrorURLconf:
+    urlpatterns = [
+        path("errors/schema", lambda request: None, name="error-schema"),
+        path("errors/context", lambda request: None, name="error-context"),
+    ]
+
+
+def test_handler_doesnt_resolve_lazy_links_when_made(rf, settings):
+    """Made in ``urls.py`` above the ``urlpatterns`` its ``reverse_lazy``
+    links name, the handler resolves them only when it answers."""
+    settings.SCRUDFUL = {"BASE_URL": "https://api.example/"}
+    settings.ROOT_URLCONF = "tests.no_such_urlconf"  # not importable yet
+    view = error_handler(
+        404,
+        Entity(
+            reverse_lazy("error-schema"),
+            context_link_or_func=reverse_lazy("error-context"),
+        ),
+    )
+    settings.ROOT_URLCONF = LazyErrorURLconf
+    response = view(rf.get("/x", HTTP_ACCEPT="application/json"), Http404())
+    assert response["Link"].startswith("<https://api.example/errors/schema>")
+    assert "<https://api.example/errors/context>" in response["Link"]
+
+
+def test_handler_serves_an_unparsable_base_url_without_links(rf, settings, caplog):
+    """A ``SCRUDFUL["BASE_URL"]`` that can't even be parsed is an invalid
+    setting like any other: logged, and the error served without Links."""
+    settings.SCRUDFUL = {"BASE_URL": "http://[::1"}
+    view = error_handler(404, Entity("/s", context_link_or_func="/c"))
+    with caplog.at_level("ERROR", logger="scrudful"):
+        response = view(rf.get("/x", HTTP_ACCEPT="application/json"), Http404())
+    assert response.status_code == 404 and "Link" not in response
+    [record] = caplog.records
+    assert isinstance(record.exc_info[1], ImproperlyConfigured)
 
 
 def test_handler_rejects_a_link_value_it_cant_write():

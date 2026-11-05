@@ -110,6 +110,15 @@ Behaviour change (all adapters)
 * ``Access-Control-Expose-Headers`` always lists ``Link`` and ``Allow`` (was
   ``ETag``, ``Link`` and ``Location``, each only when present); ``ETag`` and
   ``Location`` still only when present.
+* A lazy link value (Django's ``reverse_lazy``) counts as given without being
+  evaluated when an ``Entity`` is made, and ``handler404`` / ``handler500``
+  don't evaluate one when made either, so both may be made in ``urls.py``
+  above the ``urlpatterns`` they name.
+* A base URL that can't be parsed at all (``"http://[::1"``) is refused as a
+  relative one is (``HsrConfigError``, so ``scrudful.E006`` /
+  ``ImproperlyConfigured`` for ``SCRUDFUL["BASE_URL"]``), not with a bare
+  ``ValueError``; the Django error handlers serve their error without Links
+  for it.
 * A schema link without an RDF context link, for a non-in-band media type, is
   refused (its Media Type Object would fail the spec's JSON Schema): an
   ``Entity`` with a plain schema link raises
