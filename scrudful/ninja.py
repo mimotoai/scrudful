@@ -3876,9 +3876,10 @@ def _check_ninja_internal(owner: Any, owner_name: str, method: str, use: str) ->
     func = getattr(owner, method, None) if owner is not None else None
     if func is None or not _is_ninja_code(func, name):
         raise ConfigError(
-            f"{use} rely on ninja's {name}: the installed ninja's differs from "
-            "ninja 1.7.0's and 1.7.1's, which they are verified against: "
-            "upgrade scrudful, or keep ninja at one of those releases"
+            f"{use}: scrudful relies on ninja's {name} here, and the installed "
+            "ninja's differs from ninja 1.7.0's and 1.7.1's, which scrudful is "
+            "verified against: upgrade scrudful, or keep ninja at one of those "
+            "releases"
         )
 
 

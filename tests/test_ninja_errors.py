@@ -1110,7 +1110,8 @@ def test_405_needs_ninjas_path_view(monkeypatch, fresh_ninja_code, method):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(ninja.operation.PathView, method, changed)
-    with pytest.raises(ConfigError, match=rf"ninja's PathView\.{method}: .*upgrade"):
+    pattern = rf"ninja's PathView\.{method} here, .*upgrade"
+    with pytest.raises(ConfigError, match=pattern):
         hsr_api()
 
 

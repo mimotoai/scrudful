@@ -1058,7 +1058,7 @@ def test_hsr_routes_need_ninjas_bound_router(monkeypatch, fresh_ninja_code, meth
     cls = ninja.router.BoundRouter
     monkeypatch.setattr(cls, method, wrapping(getattr(cls, method)))
     with pytest.raises(
-        ConfigError, match=rf"rely on ninja's BoundRouter\.{method}: .*upgrade"
+        ConfigError, match=rf"relies on ninja's BoundRouter\.{method} here, .*upgrade"
     ):
         make_api()
 
@@ -1902,7 +1902,8 @@ def test_options_needs_ninjas_internals(monkeypatch, fresh_ninja_code, owner, me
     else:
         replaced = wrapping(original)
     monkeypatch.setattr(cls, method, replaced)
-    with pytest.raises(ConfigError, match=rf"rely on ninja's {owner}\.{method}: "):
+    pattern = rf"relies on ninja's {owner}\.{method} here, "
+    with pytest.raises(ConfigError, match=pattern):
         send(api, "/1")
 
 
@@ -1932,7 +1933,7 @@ def test_options_needs_ninjas_operation_clone(monkeypatch, fresh_ninja_code):
     through ``Operation.clone``: checked when the operation is added."""
     cls = ninja.operation.Operation
     monkeypatch.setattr(cls, "clone", wrapping(cls.clone))
-    with pytest.raises(ConfigError, match=r"rely on ninja's Operation\.clone: "):
+    with pytest.raises(ConfigError, match=r"relies on ninja's Operation\.clone here, "):
         make_api()
 
 
