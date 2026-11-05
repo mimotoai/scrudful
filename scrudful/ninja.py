@@ -3181,7 +3181,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                     try:
                         content = await _run_async(flow(request, values, answers))
                     except Exception as exc:
-                        _note_raised(config, exc)
+                        _note_raised(exc)
                         raise
                     _note_answered()
                     return content
@@ -3194,7 +3194,7 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                     try:
                         content = _run_sync(flow(request, values, answers))
                     except Exception as exc:
-                        _note_raised(config, exc)
+                        _note_raised(exc)
                         raise
                     _note_answered()
                     return content
@@ -3355,20 +3355,26 @@ _ERROR_CLASSES: tuple[type[Exception], ...] = tuple(
 
 @dataclass(eq=False, slots=True)
 class _Raised:
-    """What the scrudful operation running ``Operation.run`` raised, and the
-    path parameters ``run`` got (for the hooks, see :func:`_install_hooks`)."""
+    """The scrudful operation running ``Operation.run``, whether it raised,
+    and the path parameters ``run`` got (for the hooks, see
+    :func:`_install_hooks`).
 
-    #: The operation's, once its wrapper or one of its hooks raised an
-    #: ``HttpError`` or ``Http404``.
-    config: _Config | None = None
+    One per ``run``: the operation whose ``run`` it is answers the request,
+    so its configuration describes whatever error the request raised.
+    """
+
+    #: The configuration of the operation running.
+    operation: _Config
     #: The path parameters, as the URL gives them (strings, unless the path
     #: uses a converter).
     path_params: dict[str, Any] = field(default_factory=dict)
+    #: Whether the operation's wrapper or one of its hooks raised an
+    #: ``HttpError`` or ``Http404`` (:func:`_note_raised`): the API's answer
+    #: to it gets the Links of :attr:`operation`'s entity for its status.
+    raised_error: bool = False
     #: Whether the operation's hooks (``before``, ``after_throttles``) ran
     #: and allowed the request (see :func:`_check_hooks_allowed`).
     hooks_allowed: bool = False
-    #: The configuration of the operation running.
-    operation: _Config | None = None
     #: Whether its wrapper returned: its response then has its Links, whose
     #: callables got the loaded object, so a declared status of it is not
     #: described again (they would get ``None``).
@@ -3380,12 +3386,7 @@ class _Raised:
         authentication, throttling or validation; a decorator's): that
         entity describes it, whatever the API-wide one."""
         config = self.operation
-        if (
-            config is not None
-            and not self.answered
-            and status >= 400
-            and status in config.responses
-        ):
+        if not self.answered and status >= 400 and status in config.responses:
             return config
         return None
 
@@ -3682,14 +3683,13 @@ def _note_answered() -> None:
         raised.answered = True
 
 
-def _note_raised(config: _Config, exc: Exception) -> None:
-    """Note ``exc`` if it is an ``HttpError`` or ``Http404`` the operation of
-    ``config`` raised (its wrapper, or a hook): its response gets the
-    Links of the operation's entity for the status (see
-    :func:`_raised_links_run`)."""
+def _note_raised(exc: Exception) -> None:
+    """Note ``exc`` if it is an ``HttpError`` or ``Http404`` the operation
+    running raised (its wrapper, or a hook): its response gets the Links of
+    the operation's entity for the status (see :func:`_raised_links_run`)."""
     raised = _RAISED.get()
     if raised is not None and isinstance(exc, (HttpError, Http404)):
-        raised.config = config
+        raised.raised_error = True
 
 
 def _described_by(
@@ -3701,8 +3701,8 @@ def _described_by(
     whose status its ``responses=`` declares (:meth:`_Raised.declared`),
     such as ninja's own 401. The body of ninja's request validation 422 is
     then problem details when that entity is (:func:`_problem_422`)."""
-    if raised.config is not None:
-        return raised.config
+    if raised.raised_error:
+        return raised.operation
     declared = raised.declared(response.status_code)
     if declared is not None and response.status_code == 422:
         entity = declared.responses[422]
@@ -3742,7 +3742,7 @@ def _raised_links_run(
 
             @functools.wraps(run)
             async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                raised = _Raised(path_params=kw, operation=config)
+                raised = _Raised(config, path_params=kw)
                 token = _RAISED.set(raised)
                 try:
                     with _serving(operation):
@@ -3761,7 +3761,7 @@ def _raised_links_run(
 
             @functools.wraps(run)
             def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                raised = _Raised(path_params=kw, operation=config)
+                raised = _Raised(config, path_params=kw)
                 token = _RAISED.set(raised)
                 try:
                     with _serving(operation):
@@ -4461,7 +4461,7 @@ def _install_hooks(
 
     def answer(request: HttpRequest, exc: Exception) -> HttpResponseBase:
         """The API's answer to what a hook raised."""
-        _note_raised(config, exc)
+        _note_raised(exc)
         return operation.api.on_exception(request, exc)  # type: ignore[no-any-return]
 
     def allowed(hook: str, result: Any) -> None:
@@ -4665,13 +4665,16 @@ def _error_handler(
         raised = _RAISED.get()
         if raised is not None and (
             (
-                raised.config is not None
+                raised.raised_error
                 and _raised_entity(
-                    raised.config, request.method.lower(), response.status_code, error
+                    raised.operation,
+                    request.method.lower(),
+                    response.status_code,
+                    error,
                 )
                 is not None
             )
-            or (raised.config is None and raised.declared(response.status_code))
+            or (not raised.raised_error and raised.declared(response.status_code))
         ):
             # A scrudful operation raised it, or declares its status: its
             # entity describes the response, and :func:`_raised_links_run`

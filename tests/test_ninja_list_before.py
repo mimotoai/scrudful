@@ -814,7 +814,9 @@ def test_checks_copy_sets_the_csrf_flag_as_ninja(asynchronous, csrf_exempt):
     flags = []
     # The path parameters, as scrudful's Operation.run decorator sets them.
     token = scrudful.ninja._RAISED.set(
-        scrudful.ninja._Raised(path_params={"parent": "7"})
+        scrudful.ninja._Raised(
+            scrudful.ninja._scrudful_config(operation), path_params={"parent": "7"}
+        )
     )
     try:
         for checks in (
