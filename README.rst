@@ -814,11 +814,12 @@ Notes:
   9110 semantics, e.g. for a PUT that may create) or raises, through ninja's
   exception handlers; an object it returns exists even if its validators are
   ``None``. Whether PUT may create and how hidden rows are reported is yours
-  to choose; the docs show the four patterns.
+  to choose; the docs show the four patterns. OPTIONS calls it too (see
+  "OPTIONS and the HTTP Schema Resource"), so keep it free of side effects.
 * Use ``ScrudfulRouter`` (and ``NinjaAPI(default_router=ScrudfulRouter(...))``
   for operations on the API itself): it answers OPTIONS with the 204 and its
-  per-requester ``Allow`` (the operations' ``auth=`` and ``before=`` decide,
-  or an ``allowed=`` hook), serves each path's HTTP Schema Resource, links it
+  per-requester ``Allow`` (the operations' ``auth=``, ``before=`` and own
+  ``load`` decide, or an ``allowed=`` hook), serves each path's HTTP Schema Resource, links it
   from every response, and answers a method no operation routes with a JSON
   405. Every operation on it needs an entity: a plain one takes
   ``@described(Entity(...))``. Scrudful operations on a plain ``Router`` get
