@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
+from django.core.exceptions import ImproperlyConfigured
 from django.http import HttpResponse
 from django.test import override_settings
 from django.urls import include, path
@@ -35,6 +36,7 @@ from rest_framework.test import APIClient, APIRequestFactory
 from rest_framework.throttling import BaseThrottle
 
 from scrudful._adapter import allow_header, describe_options, options_links
+from scrudful._hsr import options_operation
 from scrudful.rest_framework import (
     Entity,
     ScrudfulMetadata,
@@ -84,6 +86,15 @@ def content(schema, context=None, context_type="application/ld+json"):
 
 
 THING_CONTENT = content(SCHEMA, CONTEXT, "application/x-context")
+#: The ``default`` entry of a method whose errors carry no error entity.
+DEFAULT_ERROR = {"description": "Error."}
+
+
+def answered_hsr(body):
+    """``body`` with the ``options`` entry of the 200 OPTIONS response that
+    returned it, for agreement checks of that response: until OPTIONS answers
+    204, the HTTP Schema Resource's own entry (a 204) doesn't describe it."""
+    return {**body, "options": describe_options()}
 
 
 class Store:
@@ -121,6 +132,13 @@ def fresh_store():
     store.reset()
     yield
     store.reset()
+
+
+@pytest.fixture(autouse=True)
+def base_url(settings):
+    """The HTTP Schema Resource resolves relative links against the base URL,
+    never the request: APIClient's host, so the URIs are those of 0.9."""
+    settings.SCRUDFUL = {"BASE_URL": f"{BASE}/"}
 
 
 @pytest.fixture
@@ -520,17 +538,17 @@ def nested_etag(view, request, parent_pk):
 class NestedViewSet(viewsets.ViewSet):
     class Meta:
         schema_link_or_func = staticmethod(
-            lambda view, request, parent_pk, **kwargs: f"{SCHEMA}?parent={parent_pk}"
+            lambda view, request, **kwargs: f"{SCHEMA}?item"
         )
         context_link_or_func = staticmethod(
-            lambda view, request, parent_pk, **kwargs: f"{CONTEXT}?parent={parent_pk}"
+            lambda view, request, **kwargs: f"{CONTEXT}?item"
         )
         list_etag_func = nested_etag
         list_schema_link_or_func = staticmethod(
-            lambda view, request, parent_pk: f"{SCHEMA}?list={parent_pk}"
+            lambda view, request, **kwargs: f"{SCHEMA}?list"
         )
         list_context_link_or_func = staticmethod(
-            lambda view, request, parent_pk: f"{CONTEXT}?list={parent_pk}"
+            lambda view, request, **kwargs: f"{CONTEXT}?list"
         )
 
     def list(self, request, parent_pk):
@@ -599,6 +617,19 @@ def api_thing(request, pk):
     if request.method == "PUT":
         store.update()
     return Response({"id": pk, "version": store.version})
+
+
+@scrudful_api_view(
+    ["GET", "PUT", "DELETE"],
+    etag_func=etag_func,
+    schema_link_or_func=lambda view, request, **kwargs: SCHEMA,
+    context_link_or_func=CONTEXT,
+    error=ERROR,
+)
+@renderer_classes(BROWSABLE)
+def api_described(request, pk):
+    """api_thing's links, without the URL arguments: they can be described."""
+    return Response({"id": pk})
 
 
 @scrudful_api_view()
@@ -728,9 +759,9 @@ def unused_error_schema(view, request, **kwargs):
     raise KeyError("pk")
 
 
-def used_error_schema(view, request, pk):
+def used_error_schema(view, request, **kwargs):
     error_calls.append("used")
-    return f"/schemas/error?pk={pk}"
+    return "/schemas/error"
 
 
 UNUSED_ERROR = dict(
@@ -956,6 +987,7 @@ urlpatterns = [
         NestedViewSet.as_view({"get": "list", "post": "create"}),
     ),
     path("api/<int:pk>/", api_thing),
+    path("api-described/<int:pk>/", api_described),
     path("api-default/", api_default),
     path("api-throttled/", api_throttled),
     path("api-authenticated/", api_authenticated),
@@ -1190,7 +1222,8 @@ def test_explicit_post_validators_are_evaluated(client):
     body = client.options("/post/").json()
     validate_http_schema_resource(body)
     post = body["post"]
-    assert set(post["responses"]) == {"201", "400", "412"}
+    assert set(post["responses"]) == {"201", "400", "412", "default"}
+    assert post["responses"]["default"] == DEFAULT_ERROR
     assert "parameters" not in post
 
 
@@ -1454,7 +1487,7 @@ def test_a_view_rdf_context_link_is_the_one_context_link():
 
 def test_options_json_for_browsable_accept(client):
     """Review Focus 4: the browsable API does not take over OPTIONS."""
-    for path_ in ("/things/1/", "/errors/", "/api-error/7/"):
+    for path_ in ("/things/1/", "/errors/", "/api-described/7/"):
         response = client.options(path_, headers={"Accept": "text/html"})
         assert response.status_code == 200
         assert response["Content-Type"] == "application/json"
@@ -1472,7 +1505,7 @@ def test_options_headers_and_method_order(client):
     assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
     assert response["Allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
     assert response["Link"] == options_links()
-    assert body["options"] == describe_options()
+    assert body["options"] == options_operation()
     assert body["head"] == {
         "responses": {
             key: value
@@ -1481,7 +1514,11 @@ def test_options_headers_and_method_order(client):
         }
         | {"200": {"description": "OK"}}
     }
-    assert link_problems("OPTIONS", 200, dict(response.items()), True, body) == []
+    assert body["head"]["responses"]["default"] == DEFAULT_ERROR
+    assert (
+        link_problems("OPTIONS", 200, dict(response.items()), True, answered_hsr(body))
+        == []
+    )
 
 
 def test_options_write_response_content(client):
@@ -1517,20 +1554,24 @@ def test_options_error_content(client):
     }
     # The create's preconditions are evaluated against the list validators:
     # its 400 and 412 carry the create's (the item) error entity's Links.
-    assert set(listing["post"]["responses"]) == {"201", "400", "412"}
+    assert set(listing["post"]["responses"]) == {"201", "400", "412", "default"}
     error = {
         "application/json": content(f"{BASE}/schemas/error", f"{BASE}/contexts/error")[
             "application/json"
         ]
     }
-    for status in ("400", "412"):
+    for status in ("400", "412", "default"):
         assert listing["post"]["responses"][status]["content"] == error
     # Without them the create is not conditional, but the serializer's 400
     # carries the error entity's Links.
     creates = client.options("/error-creates/").json()
-    assert set(creates["post"]["responses"]) == {"201", "400"}
+    assert set(creates["post"]["responses"]) == {"201", "400", "default"}
     assert creates["post"]["responses"]["400"] == {
         "description": "Bad Request",
+        "content": error,
+    }
+    assert creates["post"]["responses"]["default"] == {
+        "description": "Error.",
         "content": error,
     }
 
@@ -1549,9 +1590,10 @@ def test_options_calls_the_error_callables_only_when_described(client):
     response = client.options("/used-error/1/")
     assert response.status_code == 200
     body = response.json()
+    # Once, for every entry with its content.
     assert error_calls == ["used"]
-    error = content(f"{BASE}/schemas/error?pk=1", CONTEXT)
-    for status in ("400", "412"):
+    error = content(f"{BASE}/schemas/error", CONTEXT)
+    for status in ("400", "412", "default"):
         assert body["get"]["responses"][status]["content"] == error
 
     # No validators, but the serializer's 400 carries the error Links.
@@ -1560,14 +1602,17 @@ def test_options_calls_the_error_callables_only_when_described(client):
     assert response.status_code == 200
     body = response.json()
     assert error_calls == ["used"]
-    assert set(body["put"]["responses"]) == {"200", "400"}
+    assert set(body["put"]["responses"]) == {"200", "400", "default"}
     assert body["put"]["responses"]["400"]["content"] == error
+    assert body["put"]["responses"]["default"]["content"] == error
     error_calls.clear()
 
 
 def test_trace_gets_no_links(client):
     body = client.options("/trace/1/").json()
-    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    assert body["trace"] == {
+        "responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}
+    }
     response = client.generic("TRACE", "/trace/1/")
     assert response.status_code == 200
     assert "Link" not in response
@@ -1586,7 +1631,9 @@ def test_trace_ignores_preconditions(client):
     response = client.get("/conditional-trace/1/", headers={"If-Match": '"nope"'})
     assert response.status_code == 412
     body = client.options("/conditional-trace/1/").json()
-    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    assert body["trace"] == {
+        "responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}
+    }
     assert "412" in body["get"]["responses"]
 
 
@@ -1598,13 +1645,15 @@ def test_options_action_without_links(client):
     assert list(body) == ["get", "put", "options", "head"]
     assert response["Allow"] == allow_header(body) == "GET, PUT, OPTIONS, HEAD"
     assert body["get"]["responses"]["200"]["content"] == content(SCHEMA, CONTEXT)
-    assert body["put"] == {"responses": {"200": {"description": "OK"}}}
+    assert body["put"] == {
+        "responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}
+    }
     plain = client.options("/actions/1/plain/")
     validate_http_schema_resource(plain.json())
     assert plain.json() == {
-        "get": {"responses": {"200": {"description": "OK"}}},
-        "options": describe_options(),
-        "head": {"responses": {"200": {"description": "OK"}}},
+        "get": {"responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}},
+        "options": options_operation(),
+        "head": {"responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}},
     }
     assert plain["Allow"] == "GET, OPTIONS, HEAD"
 
@@ -1617,7 +1666,7 @@ def test_agreement_drf_item(client):
     validate_http_schema_resource(listing)
     write = dict(data={"name": "x"}, format="json")
     checks = [
-        ("OPTIONS", options, hsr),
+        ("OPTIONS", options, answered_hsr(hsr)),
         ("GET", client.get("/errors/1/"), hsr),
         ("HEAD", client.head("/errors/1/"), hsr),
         ("PUT", client.put("/errors/1/", **write, headers={"If-Match": '"v1"'}), hsr),
@@ -1824,8 +1873,11 @@ def test_api_view_honours_policy_decorators(client):
 
 
 def test_api_view_options_metadata(client):
-    """D-I9: the metadata called link callbacks without the URL kwargs."""
-    response = client.options("/api/7/")
+    """The HTTP Schema Resource is built without the URL arguments (D-I9
+    passed them): a link callable that needs one can't be described."""
+    with pytest.raises(ImproperlyConfigured, match=r"func\(view, None\)"):
+        client.options("/api/7/")
+    response = client.options("/api-described/7/")
     assert response.status_code == 200
     metadata = response.json()
     # api_view serves only the listed methods (and OPTIONS): no HEAD.
@@ -1833,7 +1885,7 @@ def test_api_view_options_metadata(client):
     assert response["Allow"] == "GET, PUT, DELETE, OPTIONS"
     assert response["Link"] == options_links()
     validate_http_schema_resource(metadata)
-    item = content(f"{SCHEMA}?pk=7", CONTEXT)
+    item = content(SCHEMA, CONTEXT)
     assert metadata["get"]["responses"]["200"]["content"] == item
     assert metadata["put"]["requestBody"]["content"] == item
     assert metadata["put"]["parameters"] == [
@@ -1868,10 +1920,12 @@ def test_viewset_metadata_detail_and_list(client):
         "200": {
             "description": "OK",
             "content": content("http://example.com/list-schema.json", LIST_CONTEXT),
-        }
+        },
+        "default": DEFAULT_ERROR,
     }
     assert listing["post"]["responses"] == {
-        "201": {"description": "Created", "content": THING_CONTENT}
+        "201": {"description": "Created", "content": THING_CONTENT},
+        "default": DEFAULT_ERROR,
     }
 
 
@@ -1903,10 +1957,10 @@ def test_metadata_for_nested_list_routes(client):
     validate_http_schema_resource(metadata)
     assert list(metadata) == ["get", "post", "options", "head"]
     assert metadata["get"]["responses"]["200"]["content"] == content(
-        f"{SCHEMA}?list=5", f"{CONTEXT}?list=5"
+        f"{SCHEMA}?list", f"{CONTEXT}?list"
     )
     assert metadata["post"]["requestBody"]["content"] == content(
-        f"{SCHEMA}?parent=5", f"{CONTEXT}?parent=5"
+        f"{SCHEMA}?item", f"{CONTEXT}?item"
     )
     response = client.get("/parents/5/children/")
     assert response["ETag"] == '"list-5"'
@@ -1963,7 +2017,9 @@ def test_metadata_describes_non_scrudful_methods(client):
     metadata = response.json()
     validate_http_schema_resource(metadata)
     assert list(metadata) == ["get", "put", "delete", "options", "head", "patch"]
-    assert metadata["put"] == {"responses": {"200": {"description": "OK"}}}
+    assert metadata["put"] == {
+        "responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}
+    }
     # The Links come with the options that scrudful_viewset installs.
     assert "Link" not in response
 
@@ -2211,7 +2267,16 @@ def test_stock_partial_update_is_described_and_handled_as_the_update(client):
 
 def test_a_custom_partial_update_is_not_the_update(client):
     body = client.options("/custom-patch/1/").json()
-    assert body["patch"] == {"responses": {"200": {"description": "OK"}}}
+    # Its errors carry the view-wide entity (see exception_handler).
+    assert body["patch"] == {
+        "responses": {
+            "200": {"description": "OK"},
+            "default": {
+                "description": "Error.",
+                "content": content(f"{BASE}/schemas/error", f"{BASE}/contexts/error"),
+            },
+        }
+    }
     assert "412" in body["put"]["responses"]
     response = client.patch("/custom-patch/1/")
     assert response.status_code == 200
@@ -2348,7 +2413,9 @@ def test_without_the_exception_handler_nothing_is_added_or_described(client):
         listing = client.options("/error-creates/").json()
         detail = client.options("/errors/1/").json()
     validate_http_schema_resource(listing)
-    assert set(listing["post"]["responses"]) == {"201"}
+    # The raised errors carry no Links: no content.
+    assert set(listing["post"]["responses"]) == {"201", "default"}
+    assert listing["post"]["responses"]["default"] == DEFAULT_ERROR
     # Scrudful's own 400 of the conditional PUT is still there.
     assert "400" in detail["put"]["responses"]
 
@@ -2358,14 +2425,14 @@ def test_a_non_conditional_delete_has_no_400_entry(client):
     assert "400" in body["put"]["responses"]
     body = client.options("/error-only/1/").json()
     assert "400" in body["put"]["responses"]
-    assert set(body["delete"]["responses"]) == {"204"}
+    assert set(body["delete"]["responses"]) == {"204", "default"}
     plain = client.options("/problems/1/").json()
     assert "400" in plain["delete"]["responses"]  # conditional: scrudful's own
 
 
 def test_a_serializer_400_is_described_with_the_exception_handler(client):
     listing = client.options("/error-creates/").json()
-    assert set(listing["post"]["responses"]) == {"201", "400"}
+    assert set(listing["post"]["responses"]) == {"201", "400", "default"}
 
 
 def marked_handler(exc, context):
@@ -2408,8 +2475,10 @@ def test_a_delegating_exception_handler_is_known_by_its_marker(
     assert response.status_code == 400
     assert response["Link"] == ERROR_LINKS
     validate_http_schema_resource(listing)
-    expected = {"201", "400"} if described else {"201"}
+    expected = {"201", "400", "default"} if described else {"201", "default"}
     assert set(listing["post"]["responses"]) == expected
+    # The raised errors are described with the error content when they get it.
+    assert ("content" in listing["post"]["responses"]["default"]) is described
 
 
 # --- APIView with class-body @scrudful ----------------------------------------
@@ -2426,7 +2495,8 @@ def test_api_view_class_answers_options_with_the_http_schema_resource(client):
         validate_http_schema_resource(body)
         assert list(body) == ["get", "put", "options", "head"]
         assert response["Allow"] == allow_header(body)
-        assert link_problems("OPTIONS", 200, dict(response.items()), True, body) == []
+        headers = dict(response.items())
+        assert link_problems("OPTIONS", 200, headers, True, answered_hsr(body)) == []
     assert body["get"]["responses"]["200"]["content"] == content(SCHEMA, CONTEXT)
     assert "412" in body["put"]["responses"]
     # The OPTIONS body agrees with the responses.

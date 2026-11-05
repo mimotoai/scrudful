@@ -11,7 +11,9 @@ Callbacks
     view methods and :func:`scrudful_api_view`, ``func(request, **url_kwargs)``
     for function views decorated with :func:`scrudful`. Keyword arguments that
     view methods pass to each other (such as DRF's ``partial=True``) are never
-    passed on.
+    passed on. The link callables of view methods are also called when the
+    HTTP Schema Resource is built, without a request or URL arguments, as
+    ``func(view, None)`` (see :func:`http_schema_resource`).
 
     The validator callbacks run before the view, so before its own lookup
     (``get_object()``) and object permission checks: they must apply the same
@@ -78,9 +80,11 @@ Headers
     relation of the schema link (``describedby`` by default) replaces that
     link, and one with either context relation (JSON-LD or ``rdf-context``,
     one slot) the context link (see :func:`scrudful._adapter.merge_links`).
-    Every link URL is resolved
-    against the request's absolute URI (``request.build_absolute_uri()``),
-    so relative values such as ``"/schemas/item"`` are sent absolute.
+    Every link URL is resolved against the base URL (``base_url``, else
+    ``Meta.base_url``, else ``SCRUDFUL["BASE_URL"]``) when one is set, as in
+    the HTTP Schema Resource, else against the request's absolute URI
+    (``request.build_absolute_uri()``), so relative values such as
+    ``"/schemas/item"`` are sent absolute.
     ``Access-Control-Expose-Headers`` is extended with whichever of ``ETag``,
     ``Link`` and ``Location`` the response carries (django-cors-headers
     replaces that header when ``CORS_EXPOSE_HEADERS`` is set; list the names
@@ -105,13 +109,17 @@ OPTIONS
 
 from __future__ import annotations
 
+import copy
 import functools
 import inspect
 import types
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+from django.core.signals import setting_changed
 from django.http import Http404, HttpRequest, HttpResponseBase
 from django.utils.encoding import iri_to_uri
 from rest_framework.exceptions import (
@@ -131,9 +139,10 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.views import exception_handler as drf_exception_handler
 
+# Re-exported: the link defaults of every adapter (tests/test_adapter.py).
+from scrudful._adapter import DEFAULT_CONTEXT_REL  # noqa: F401
+from scrudful._adapter import DEFAULT_CONTEXT_TYPE  # noqa: F401
 from scrudful._adapter import (
-    DEFAULT_CONTEXT_REL,
-    DEFAULT_CONTEXT_TYPE,
     DEFAULT_SCHEMA_REL,
     DEFAULT_SCHEMA_TYPE,
     METHOD_KEYS,
@@ -142,11 +151,9 @@ from scrudful._adapter import (
     check_error_body_func,
     check_error_media_type,
     check_validators,
-    conditional_header_parameters,
     context_defaults,
     context_link_type,
     describe_content,
-    describe_options,
     describe_read,
     describe_write,
     evaluates_create_preconditions,
@@ -162,9 +169,16 @@ from scrudful._adapter import (
     validator_policy,
     with_error_body,
 )
-from scrudful._django import aware, error_handler, page_url, slice_page
+from scrudful._django import (
+    aware,
+    error_handler,
+    page_url,
+    scrudful_setting,
+    slice_page,
+)
 from scrudful._django import conditional_response as django_conditional_response
 from scrudful._django import precondition_headers as django_precondition_headers
+from scrudful._hsr import HsrConfigError, absolute_for_hsr, options_operation
 from scrudful.conditional import (
     ConditionalResult,
     evaluate_preconditions,
@@ -190,6 +204,7 @@ __all__ = [
     "exception_handler",
     "handler404",
     "handler500",
+    "http_schema_resource",
     "scrudful",
     "scrudful_api_view",
     "scrudful_viewset",
@@ -233,6 +248,8 @@ _CREATED_ATTR = "_scrudful_created"
 # The object ``get_object()`` returned for the request (see ``object_validators``).
 _OBJECT_ATTR = "_scrudful_object"
 _ERROR_OPTIONS = ("error",)
+# In place of the link options (see ``entity``).
+_ENTITY_OPTIONS = ("entity",)
 # What the 400/412/428 bodies are built with (paired with ``error``).
 _ERROR_BODY_OPTIONS = ("error_body_func",)
 # Handler names that never answer a POST: list validators there would never be
@@ -253,8 +270,25 @@ _NEVER_CREATES = frozenset(
         "destroy",
     }
 )
-#: The media type of the content a view's own links describe.
-_VIEW_MEDIA_TYPE = "application/json"
+#: The media type of the content a view's own links describe, without ``entity``.
+_DEFAULT_MEDIA_TYPE = "application/json"
+#: Options a view's handlers share: ``Meta``'s are kept on the class (see
+#: :func:`scrudful_viewset`), for the handlers it doesn't wrap.
+_VIEW_OPTIONS = ("base_url", "statuses", "allowed_func")
+#: The ``Meta`` options of a :func:`scrudful_viewset` class, checked.
+_META_OPTIONS_ATTR = "_scrudful_meta_options"
+#: The description of each method's ``default`` response entry: the errors.
+_DEFAULT_ERROR = "Error."
+#: The errors DRF answers itself, before or around the handler
+#: (authentication and permissions, content negotiation, parsing), whose
+#: bodies get ``SCRUDFUL["ERROR"]`` when it is set, whatever the handler's
+#: ``error`` (see :func:`exception_handler`).
+_FRAMEWORK_ERRORS = {
+    401: "Unauthorized: the request lacks valid authentication credentials.",
+    403: "Forbidden: the requester may not perform this request.",
+    406: "Not Acceptable: no representation matches the request's Accept.",
+    415: "Unsupported Media Type: the request's content type is not accepted.",
+}
 
 
 class ScrudfulViewFunc:
@@ -287,10 +321,12 @@ class ScrudfulViewFunc:
         (``settings.TIME_ZONE``), as Django does. Sub-second precision is
         discarded.
     schema_link_or_func : str or callable, optional
-        URL of the schema of the request and response bodies, resolved
-        against the request's absolute URI (a relative URL such as
-        ``"/schemas/item"`` works). If no value is given, no schema link is
-        sent.
+        URL of the schema of the request and response bodies. A relative URL
+        such as ``"/schemas/item"`` is resolved against the base URL
+        (``base_url``, else ``SCRUDFUL["BASE_URL"]``) when one is set, else,
+        on a response, against the request's absolute URI; the HTTP Schema
+        Resource needs the base URL for it. If no value is given, no schema
+        link is sent.
     schema_rel_or_func : str or callable, optional
         ``rel`` of the schema link. Defaults to ``"describedby"``.
     schema_type_or_func : str or callable, optional
@@ -303,6 +339,29 @@ class ScrudfulViewFunc:
         ``"http://www.w3.org/ns/json-ld#context"``.
     context_type_or_func : str or callable, optional
         ``type`` of the context link. Defaults to ``"application/ld+json"``.
+    entity : Entity, optional
+        The schema and context links and the media type of the content the
+        handler serves (and, for POST, PUT and PATCH, accepts), in place of
+        the six options above (giving both is a ``TypeError``). The HTTP
+        Schema Resource describes the content under its ``media_type``, and
+        the responses get its Links (an RDF context link with the
+        ``rdf-context`` relation for content that is not JSON). Without it,
+        the content is ``application/json`` with the links of the options
+        above.
+    statuses : mapping, optional
+        The success statuses of each method the handler serves, for the HTTP
+        Schema Resource: a mapping of lowercase method names (``"get"``,
+        ``"post"`` ...; HEAD takes GET's unless given) to lists of 2xx
+        status codes, e.g. ``{"post": [200]}`` for a POST action answering
+        200. Each one but 204 is described with the content. A method it
+        doesn't list has DRF's: 201 for POST, 204 for DELETE, else 200.
+    allowed_func : callable, optional
+        ``allowed_func(view, request, method, obj)``, whether the requester
+        may use ``method``, for the ``Allow`` of OPTIONS (stored for it).
+    base_url : str, optional
+        The absolute URL that relative link URLs are resolved against
+        (default ``SCRUDFUL["BASE_URL"]``), in the HTTP Schema Resource and
+        the Link headers alike.
     error : Entity, optional
         The schema and context of the bodies of scrudful's own 400, 412 and
         428 responses, which then carry its Links (a 304 has no body and gets
@@ -404,14 +463,20 @@ class ScrudfulViewFunc:
         If a validator callback isn't callable, ``error`` isn't an
         :class:`Entity`, the view is ``async def``, ``object_validators``
         is set without a validator callback, or a list validator callback
-        is set with a validator callback but without ``creates``. When the
+        is set with a validator callback but without ``creates``; if
+        ``entity`` isn't an :class:`Entity` or is given with a link option,
+        ``statuses`` isn't a mapping of lists of integers, or
+        ``allowed_func`` isn't callable. When the
         class is created, if a list validator callback is set on a
         class-body handler named after a standard non-POST handler (``get``,
         ``head``, ``put``, ``patch``, ``delete``, ``options``, ``trace``,
         ``list``, ``retrieve``, ``update``, ``partial_update`` or
         ``destroy``).
     ValueError
-        If ``error``'s media type is not JSON content.
+        If ``error``'s media type is not JSON content, or ``statuses`` names
+        a method that is not one or a status that is not a 2xx.
+    ImproperlyConfigured
+        If ``base_url`` is not an absolute URL.
     """
 
     def __init__(
@@ -435,7 +500,31 @@ class ScrudfulViewFunc:
         creates: bool = False,
         list_etag_func: Callable[..., Any] | None = None,
         list_last_modified_func: Callable[..., Any] | None = None,
+        entity: Entity | None = None,
+        statuses: Mapping[str, Sequence[int]] | None = None,
+        allowed_func: Callable[..., Any] | None = None,
+        base_url: str | None = None,
     ) -> None:
+        statuses = _check_view_options(
+            entity,
+            statuses,
+            allowed_func,
+            base_url,
+            schema_link_or_func=schema_link_or_func,
+            schema_rel_or_func=schema_rel_or_func,
+            schema_type_or_func=schema_type_or_func,
+            context_link_or_func=context_link_or_func,
+            context_rel_or_func=context_rel_or_func,
+            context_type_or_func=context_type_or_func,
+        )
+        if entity is not None:
+            # The links are the entity's; ``media_type`` comes from it too.
+            schema_link_or_func = entity.schema_link_or_func
+            schema_rel_or_func = entity.schema_rel_or_func
+            schema_type_or_func = entity.schema_type_or_func
+            context_link_or_func = entity.context_link_or_func
+            context_rel_or_func = entity.context_rel_or_func
+            context_type_or_func = entity.context_type_or_func
         check_validators(etag_func, last_modified_func)
         _check_list_validators(
             etag_func,
@@ -477,6 +566,10 @@ class ScrudfulViewFunc:
         self.creates = bool(creates)
         self.list_etag_func = list_etag_func
         self.list_last_modified_func = list_last_modified_func
+        self.entity = entity
+        self.statuses = statuses
+        self.allowed_func = allowed_func
+        self.base_url = base_url
         self._from_viewset = False
 
     def __get__(self, obj: Any, objtype: type | None = None) -> Any:
@@ -505,6 +598,11 @@ class ScrudfulViewFunc:
             _install_metadata(owner)
         else:
             _install_metadata_on_views(owner)
+
+    @property
+    def media_type(self) -> str:
+        """The media type of the content: ``entity``'s, else ``application/json``."""
+        return _DEFAULT_MEDIA_TYPE if self.entity is None else self.entity.media_type
 
     @property
     def has_validators(self) -> bool:
@@ -688,8 +786,9 @@ class ScrudfulViewFunc:
     def schema_link_header(self, *args: Any, **kwargs: Any) -> str | None:
         """Return the schema link-value, or ``None``.
 
-        The URL is resolved against the absolute URI of the request among
-        ``args``.
+        A relative URL is resolved against the base URL (see
+        :meth:`live_base_url`), else against the absolute URI of the request
+        among ``args``.
         """
         return _link_value(
             self.schema_link(*args, **kwargs),
@@ -697,20 +796,37 @@ class ScrudfulViewFunc:
             (DEFAULT_SCHEMA_REL, DEFAULT_SCHEMA_TYPE),
             args,
             kwargs,
+            base=self.live_base_url(args),
         )
 
     def context_link_header(self, *args: Any, **kwargs: Any) -> str | None:
-        """Return the JSON-LD context link-value, or ``None``.
+        """Return the RDF context link-value, or ``None``.
 
-        The URL is resolved like the schema URL.
+        Its defaults depend on :attr:`media_type` (JSON-LD for JSON content;
+        none for in-band RDF, which gets no context link). The URL is
+        resolved like the schema URL.
         """
+        defaults = context_defaults(self.media_type)
+        if defaults == (None, None):
+            return None
         return _link_value(
             self.context_link(*args, **kwargs),
             (self.context_rel_or_func, self.context_type_or_func),
-            (DEFAULT_CONTEXT_REL, DEFAULT_CONTEXT_TYPE),
+            defaults,
             args,
             kwargs,
+            context_of=self.media_type,
+            base=self.live_base_url(args),
         )
+
+    def live_base_url(self, args: Sequence[Any]) -> str | None:
+        """The base URL of the responses: ``base_url``, else the view's
+        ``Meta.base_url`` (``args[0]``, when a view), else
+        ``SCRUDFUL["BASE_URL"]``; ``None`` resolves against the request."""
+        if self.base_url is not None:
+            return self.base_url
+        view = args[0] if args and isinstance(args[0], APIView) else None
+        return _view_base_url(view)
 
     def link_header(self, *args: Any, **kwargs: Any) -> str | None:
         """Return the Link field value of the schema and context links."""
@@ -723,7 +839,9 @@ class ScrudfulViewFunc:
         """Return the Link field value of ``error``'s links, or ``None``."""
         if self.error is None:
             return None
-        return join_links(*_entity_links(self.error, args, kwargs))
+        return join_links(
+            *_entity_links(self.error, args, kwargs, self.live_base_url(args))
+        )
 
 
 def scrudful(
@@ -743,6 +861,10 @@ def scrudful(
     creates: bool = False,
     list_etag_func: Callable[..., Any] | None = None,
     list_last_modified_func: Callable[..., Any] | None = None,
+    entity: Entity | None = None,
+    statuses: Mapping[str, Sequence[int]] | None = None,
+    allowed_func: Callable[..., Any] | None = None,
+    base_url: str | None = None,
 ) -> Callable[[Callable[..., Any]], ScrudfulViewFunc]:
     """Decorate a view method or function view to make it SCRUDful.
 
@@ -787,7 +909,18 @@ def scrudful(
         "creates": creates,
         "list_etag_func": list_etag_func,
         "list_last_modified_func": list_last_modified_func,
+        "entity": entity,
+        "statuses": statuses,
+        "allowed_func": allowed_func,
+        "base_url": base_url,
     }
+    _check_view_options(
+        entity,
+        statuses,
+        allowed_func,
+        base_url,
+        **{name: options[name] for name in _LINK_OPTIONS},
+    )
     check_validators(etag_func, last_modified_func)
     _check_list_validators(
         etag_func, last_modified_func, list_etag_func, list_last_modified_func, creates
@@ -817,6 +950,10 @@ def scrudful_api_view(
     error: Entity | None = None,
     error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
     object_validators: bool = False,
+    entity: Entity | None = None,
+    statuses: Mapping[str, Sequence[int]] | None = None,
+    allowed_func: Callable[..., Any] | None = None,
+    base_url: str | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Like DRF's ``api_view``, for a SCRUDful function view.
 
@@ -865,6 +1002,10 @@ def scrudful_api_view(
         context_type_or_func=context_type_or_func,
         error=error,
         error_body_func=error_body_func,
+        entity=entity,
+        statuses=statuses,
+        allowed_func=allowed_func,
+        base_url=base_url,
     )
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -924,9 +1065,10 @@ def scrudful_viewset(cls: type) -> type:
     .. warning::
 
        The item link callbacks (``schema_link_or_func`` and friends) also run
-       for ``create`` and for OPTIONS and POST on the list route, where there
-       is no ``pk``. Accept ``**kwargs`` (``def schema_url(view, request,
-       **kwargs)``) so they work for both.
+       for ``create`` and POST on the list route, where there is no ``pk``,
+       and, when the HTTP Schema Resource is built, as ``func(view, None)``
+       (see :func:`http_schema_resource`). Accept ``**kwargs`` (``def
+       schema_url(view, request, **kwargs)``) so they work for all of them.
 
     .. warning::
 
@@ -979,6 +1121,20 @@ def scrudful_viewset(cls: type) -> type:
         (whose 400 and 412 carry ``error``).
     list_error_body_func : callable, optional
         As ``error_body_func``, for the ``list`` response's 400 and 412.
+    entity, list_entity : Entity, optional
+        The item's (and the create's) and the list's content, in place of
+        the item and ``list_`` link options (see :class:`ScrudfulViewFunc`).
+    statuses : mapping, optional
+        The success statuses of each method (see :class:`ScrudfulViewFunc`),
+        for every handler of the class, those it doesn't wrap (``@action``
+        methods) included unless they give their own.
+    allowed_func : callable, optional
+        ``allowed_func(view, request, method, obj)``, for the ``Allow`` of
+        OPTIONS (see :class:`ScrudfulViewFunc`).
+    base_url : str, optional
+        The absolute URL relative link URLs are resolved against (see
+        :class:`ScrudfulViewFunc`), for the errors and every handler of the
+        class too.
     href_func : callable, optional
         ``href_func(view, request, obj)``, the URL of an item, for
         :class:`ScrudfulPagination` (required by it; not used by the wrapped
@@ -989,10 +1145,15 @@ def scrudful_viewset(cls: type) -> type:
     def options(prefix: str, names: Sequence[str]) -> dict[str, Any]:
         return {name: getattr(meta, prefix + name, None) for name in names}
 
+    shared = options("", _VIEW_OPTIONS)
+    shared["statuses"] = _check_view_options(None, **shared)
+    # For the handlers it doesn't wrap (an @action's, say), and the errors.
+    setattr(cls, _META_OPTIONS_ATTR, shared)
     item = options(
         "",
         _VALIDATOR_OPTIONS
         + _LINK_OPTIONS
+        + _ENTITY_OPTIONS
         + _ERROR_OPTIONS
         + _ERROR_BODY_OPTIONS
         + _OBJECT_OPTIONS,
@@ -1001,7 +1162,11 @@ def scrudful_viewset(cls: type) -> type:
     # its 400/412 carry the item ``error``, so they get its body too.
     create = options(
         "",
-        _LINK_OPTIONS + _ERROR_OPTIONS + _ERROR_BODY_OPTIONS + _LIST_VALIDATOR_OPTIONS,
+        _LINK_OPTIONS
+        + _ENTITY_OPTIONS
+        + _ERROR_OPTIONS
+        + _ERROR_BODY_OPTIONS
+        + _LIST_VALIDATOR_OPTIONS,
     )
     if item["object_validators"]:
         if not callable(getattr(cls, "get_object", None)):
@@ -1023,10 +1188,15 @@ def scrudful_viewset(cls: type) -> type:
         "destroy": item,
         "list": options(
             "list_",
-            _VALIDATOR_OPTIONS + _LINK_OPTIONS + _ERROR_OPTIONS + _ERROR_BODY_OPTIONS,
+            _VALIDATOR_OPTIONS
+            + _LINK_OPTIONS
+            + _ENTITY_OPTIONS
+            + _ERROR_OPTIONS
+            + _ERROR_BODY_OPTIONS,
         ),
     }
     for name, config in configs.items():
+        config.update(shared)
         method = getattr(cls, name, None)
         if method is None:
             continue
@@ -1207,30 +1377,11 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
 class ScrudfulMetadata(BaseMetadata):
     """OPTIONS metadata: the HTTP Schema Resource (Semantic HTTP 0.1) of a view.
 
-    The body is an OpenAPI Path Item with one operation for each method the
-    view allows (``view.allowed_methods``), in the order ``get``, ``put``,
-    ``post``, ``delete``, ``options``, ``head``, ``patch``, ``trace``:
-
-    - ``get``, ``post``, ``put``, ``patch`` and ``delete``: the request body,
-      the success response (201 for POST, 204 for DELETE, else 200) and, for
-      conditional methods, scrudful's own 304/400/412/428 responses and the
-      precondition header parameters. A request body and a success response
-      (but the 204) have the content of the view's links (``application/json``,
-      a ``schema`` ``$ref`` and an ``x-rdf-context``), and the 400, 412 and
-      428 the content of its ``error`` entity;
-    - ``head``: the same responses as ``get``, without content;
-    - ``options``: this response, whose content is the HTTP Schema Resource;
-    - any other method: a 200.
-
-    The handler of each method is the view's (a viewset's action map routes
-    list, detail, nested and ``@action`` routes each to their own). Link
-    callbacks are called with the same arguments as for the request
-    (``func(view, request, **url_kwargs)``), and every URL is resolved against
-    the request's absolute URI. Those of the ``error`` entity are called only
-    for a method whose description has its content: a conditional one, or a
-    PUT, PATCH or POST whose serializer 400 :func:`exception_handler` gives
-    its Links. Methods that are not SCRUDful are described without content
-    or preconditions.
+    :meth:`determine_metadata` returns :func:`http_schema_resource` of the
+    view function the request was routed to (``request.resolver_match``),
+    built without the request; for a view called without URL resolution
+    (``APIRequestFactory``), the document of the view instance, built the
+    same way (``func(view, None)``, never the request) but not cached.
 
     The Links, ``Allow`` and JSON rendering of the OPTIONS response are added
     by the ``options`` that :func:`scrudful_viewset` and
@@ -1239,122 +1390,378 @@ class ScrudfulMetadata(BaseMetadata):
     """
 
     def determine_metadata(self, request: Request, view: APIView) -> dict[str, Any]:
-        args = (view, request, *getattr(view, "args", ()))
-        kwargs = dict(getattr(view, "kwargs", None) or {})
-        allowed = {method.lower() for method in view.allowed_methods}
-        metadata = {}
-        for method in METHOD_KEYS:
-            if method not in allowed:
-                continue
-            describe = getattr(self, f"determine_metadata_for_{method}", None)
-            if describe is None:
-                metadata[method] = {"responses": {"200": {"description": "OK"}}}
-            else:
-                metadata[method] = describe(_handler(view, method), args, kwargs)
-        return metadata
+        func = getattr(getattr(request, "resolver_match", None), "func", None)
+        if func is not None and getattr(func, "cls", None) is type(view):
+            return http_schema_resource(func)
+        return _describe_view(_describe_mode_copy(view))
 
     def get_method(self, view: APIView, name: str) -> ScrudfulViewFunc | None:
         """Return the :class:`ScrudfulViewFunc` behind ``view.<name>``, if any."""
-        handler = _handler(view, name)
-        return handler if isinstance(handler, ScrudfulViewFunc) else None
+        return _scrudful_handler(view, name)
 
-    def determine_metadata_for_get(
-        self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        conditional = _is_conditional(handler, "get")
-        return describe_read(
-            _content(handler, args, kwargs),
-            conditional,
-            # Only scrudful's 400 and 412 have it: its callables run only then.
-            error_content=(
-                _error_content(handler, args, kwargs) if conditional else None
-            ),
+
+def http_schema_resource(view_func: Callable[..., Any]) -> dict[str, Any]:
+    """The HTTP Schema Resource (an OpenAPI 3.1 Path Item) of a view.
+
+    ``view_func`` is what DRF's ``as_view(...)`` returns (a viewset's, with
+    its action map) or :func:`scrudful_api_view` does: the view function a
+    URL pattern routes to. The document is the same for every requester: it
+    is built without a request, once per ``view_func`` (a change of the
+    ``SCRUDFUL`` or ``REST_FRAMEWORK`` setting discards it), and a copy is
+    returned.
+
+    It is built from a *describe-mode* view instance,
+    ``view_func.cls(**view_func.initkwargs)``, as DRF's view function builds
+    one but without dispatching: ``request`` is ``None``, ``args`` and
+    ``kwargs`` are empty, and a viewset has its ``action_map`` and, for each
+    method described, ``action``. Link callables are called as
+    ``func(view, None)``: they get the view (and so the attributes the
+    route's ``initkwargs`` set) but neither a request nor URL arguments, and
+    must return the same target as on the responses they describe, or the
+    description disagrees with the responses. Relative URLs are resolved
+    against the base URL: the handler's ``base_url``, else the viewset's
+    ``Meta.base_url``, else ``SCRUDFUL["BASE_URL"]``.
+
+    The document has an operation for each method the view allows
+    (``view.allowed_methods``), in the order ``get``, ``put``, ``post``,
+    ``delete``, ``options``, ``head``, ``patch``, ``trace``:
+
+    - ``get``, ``post``, ``put``, ``patch`` and ``delete``: the request body,
+      the success responses (``statuses``, else 201 for POST, 204 for
+      DELETE and 200 for the others) and, for conditional methods,
+      scrudful's own 304/400/412/428 responses and the precondition header
+      parameters. A request body and a success response (but a 204) have
+      the content of the handler's ``entity`` (by default, JSON with the
+      handler's links), and the 400, 412 and 428 the content of its
+      ``error`` entity;
+    - ``head``: the same responses as ``get``, without content;
+    - ``options``: a 204 without content;
+    - any other method: its success responses.
+
+    Each method but OPTIONS gets a ``default`` entry describing the errors
+    :func:`exception_handler` gives the error Links: with the content of the
+    handler's ``error`` (a handler that isn't scrudful has the view-wide
+    one, see :func:`exception_handler`), else of ``SCRUDFUL["ERROR"]``. When
+    ``SCRUDFUL["ERROR"]`` is set and the handler's ``error`` differs from
+    it, the 401, 403, 406 and 415 that DRF answers itself, which carry
+    ``SCRUDFUL["ERROR"]``, have entries of their own with its content.
+    Without scrudful's exception handler the raised errors carry no Links,
+    and ``default`` has no content. HEAD's entries have no content.
+    Methods whose handler is not scrudful are described without content or
+    preconditions.
+
+    Raises
+    ------
+    TypeError
+        If ``view_func`` is not a DRF view function.
+    ImproperlyConfigured
+        If a link URL is relative and there is no base URL, a schema link
+        has no RDF context link (the message of
+        :class:`~scrudful._hsr.HsrConfigError`); a link callable raises when
+        called as ``func(view, None)``; or the ``SCRUDFUL`` setting is
+        invalid.
+    """
+    cls = getattr(view_func, "cls", None)
+    if not (isinstance(cls, type) and issubclass(cls, APIView)):
+        raise TypeError(
+            "http_schema_resource() takes a DRF view function, what as_view() "
+            f"or scrudful_api_view returns, not {view_func!r}"
+        )
+    hsr = _HSRS.get(view_func)
+    if hsr is None:
+        hsr = _HSRS[view_func] = _describe_view(_describe_mode_view(view_func))
+    return copy.deepcopy(hsr)
+
+
+#: The HTTP Schema Resource of each view function (see :func:`http_schema_resource`).
+_HSRS: weakref.WeakKeyDictionary[Callable[..., Any], dict[str, Any]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _forget_hsrs(sender: Any, setting: str, **kwargs: Any) -> None:
+    """Discard the built documents when a setting they depend on changes
+    (``override_settings``, in tests)."""
+    if setting in ("SCRUDFUL", "REST_FRAMEWORK"):
+        _HSRS.clear()
+
+
+setting_changed.connect(_forget_hsrs)
+
+
+def _describe_mode_view(view_func: Callable[..., Any]) -> APIView:
+    """The request-less view instance of ``view_func``, as its view function
+    builds it, without dispatching (see :func:`http_schema_resource`)."""
+    view = view_func.cls(**(getattr(view_func, "initkwargs", None) or {}))
+    actions = getattr(view_func, "actions", None)
+    if actions is not None:
+        # As ViewSetMixin.as_view's view does: HEAD goes to GET's action.
+        action_map = dict(actions)
+        if "get" in action_map and "head" not in action_map:
+            action_map["head"] = action_map["get"]
+        view.action_map = action_map
+        for method, action_name in action_map.items():
+            setattr(view, method, getattr(view, action_name))
+    elif hasattr(view, "get") and not hasattr(view, "head"):
+        # As Django's View.setup does.
+        view.head = view.get
+    view.request = None
+    view.args = ()
+    view.kwargs = {}
+    return view
+
+
+def _describe_mode_copy(view: APIView) -> APIView:
+    """A request-less copy of the live ``view`` (see
+    :meth:`ScrudfulMetadata.determine_metadata`)."""
+    copied = copy.copy(view)
+    copied.request = None
+    copied.args = ()
+    copied.kwargs = {}
+    action_map = getattr(view, "action_map", None)
+    if action_map is not None:
+        copied.action_map = dict(action_map)
+    return copied
+
+
+def _describe_view(view: APIView) -> dict[str, Any]:
+    """The HTTP Schema Resource of the describe-mode ``view``."""
+    action_map = getattr(view, "action_map", None)
+    allowed = {method.lower() for method in view.allowed_methods}
+    api_error = _setting_error() if _is_scrudful_view(view) else None
+    error_links = _gives_error_links(view)
+    body = {}
+    for method in METHOD_KEYS:
+        if method not in allowed:
+            continue
+        if method == "options":
+            body[method] = options_operation()
+            continue
+        if action_map is not None:
+            view.action = action_map.get(method)
+        body[method] = _describe_method(view, method, api_error, error_links)
+    return body
+
+
+class _Describing:
+    """Evaluates link values in describe mode, for one method of a view."""
+
+    def __init__(self, view: APIView, method: str, base_url: str | None) -> None:
+        self.view = view
+        self.base_url = base_url
+        #: Names the method's entries in errors.
+        self.name = f"{type(view).__name__} {method.upper()}"
+        #: The content of each source, by ``(id(source), media_type)``: its
+        #: callables are called once per method, however many entries it has.
+        self._contents: dict[tuple[int, str], dict[str, Any] | None] = {}
+
+    def value(self, value_or_func: Any) -> Any:
+        """``value_or_func``, or what it returns when called as
+        ``func(view, None)``.
+
+        Raises
+        ------
+        ImproperlyConfigured
+            If the callable raises.
+        """
+        if not callable(value_or_func):
+            return value_or_func
+        try:
+            return value_or_func(self.view, None)
+        except Exception as exc:
+            func = getattr(value_or_func, "__qualname__", repr(value_or_func))
+            raise ImproperlyConfigured(
+                f"{func}, a link callable of {self.name}, must work without a "
+                "request when the HTTP Schema Resource is built (called as "
+                f"func(view, None)): {exc!r}"
+            ) from exc
+
+    def content(
+        self, source: ScrudfulViewFunc | Entity | None, media_type: str, where: str
+    ) -> dict[str, Any] | None:
+        """The ``content`` of ``source``'s links: its Media Type Object.
+
+        Built by :func:`scrudful._adapter.describe_content` from the schema
+        and context URLs and types of ``source`` (a handler or an
+        :class:`Entity`), evaluated as for its Links (the context only when
+        ``media_type`` takes one), with relative URLs resolved against the
+        base URL (:func:`scrudful._hsr.absolute_for_hsr`), as the Links of
+        the responses it describes are. ``None`` without a schema URL.
+        ``where`` names the entry, for errors.
+
+        Raises
+        ------
+        ImproperlyConfigured
+            If a URL is relative and there is no base URL, or a schema has no
+            RDF context (:class:`~scrudful._hsr.HsrConfigError`'s message).
+        """
+        if source is None:
+            return None
+        key = (id(source), media_type)
+        if key not in self._contents:
+            self._contents[key] = self._content(source, media_type, where)
+        return copy.deepcopy(self._contents[key])
+
+    def _content(
+        self, source: ScrudfulViewFunc | Entity, media_type: str, where: str
+    ) -> dict[str, Any] | None:
+        """:meth:`content`, uncached."""
+        schema = self.value(source.schema_link_or_func)
+        if not schema:
+            return None
+        schema_type = self.value(source.schema_type_or_func)
+        context = context_type = None
+        rel, default_type = context_defaults(media_type)
+        if rel is not None:  # not in-band RDF
+            context = self.value(source.context_link_or_func)
+        if context:
+            context_type = self.value(source.context_type_or_func) or default_type
+        where = f"{self.name}'s {where}"
+        try:
+            schema_url = absolute_for_hsr(
+                str(schema), self.base_url, f"{where} schema link"
+            )
+            context_url = (
+                absolute_for_hsr(str(context), self.base_url, f"{where} context link")
+                if context
+                else None
+            )
+            try:
+                return describe_content(
+                    media_type,
+                    schema_url,
+                    str(schema_type or DEFAULT_SCHEMA_TYPE),
+                    context_url,
+                    None if context_type is None else str(context_type),
+                )
+            except HsrConfigError as exc:
+                raise HsrConfigError(f"{where}: {exc}") from exc
+        except HsrConfigError as exc:
+            raise ImproperlyConfigured(str(exc)) from exc
+
+
+def _describe_method(
+    view: APIView, method: str, api_error: Entity | None, error_links: bool
+) -> dict[str, Any]:
+    """Describe ``method`` (lowercase, not ``options``) of the describe-mode
+    ``view`` (see :func:`http_schema_resource`)."""
+    handler = _handler(view, method)
+    scrudful_handler = handler if isinstance(handler, ScrudfulViewFunc) else None
+    describing = _Describing(view, method, _handler_base_url(view, handler))
+    statuses = _statuses(view, scrudful_handler, method)
+    conditional = _is_conditional(handler, method)
+    content = None
+    if scrudful_handler is not None and method not in ("head", "trace"):
+        content = describing.content(
+            scrudful_handler, scrudful_handler.media_type, "content"
         )
 
-    def determine_metadata_for_head(
-        self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        return describe_read(None, _is_conditional(handler, "head"))
+    def error_content() -> dict[str, Any] | None:
+        # The error entity's callables run only when its content is described.
+        error = None if scrudful_handler is None else scrudful_handler.error
+        return describing.content(
+            error, error.media_type if error else "", "error response"
+        )
 
-    def determine_metadata_for_options(
-        self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        return describe_options()
-
-    def determine_metadata_for_post(
-        self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        return self._write("post", handler, args, kwargs)
-
-    def determine_metadata_for_put(
-        self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        return self._write("put", handler, args, kwargs)
-
-    def determine_metadata_for_patch(
-        self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        return self._write("patch", handler, args, kwargs)
-
-    def determine_metadata_for_delete(
-        self, handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        return self._write("delete", handler, args, kwargs)
-
-    def _write(
-        self,
-        method: str,
-        handler: Any,
-        args: Sequence[Any],
-        kwargs: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        content = None if method == "delete" else _content(handler, args, kwargs)
-        conditional = _is_conditional(handler, method)
-        view = args[0] if args else None
+    if method in ("get", "head", "trace"):
+        description = describe_read(
+            None,
+            conditional and method != "trace",
+            statuses,
+            # Only scrudful's 400 and 412 of a GET have it.
+            error_content() if conditional and method == "get" else None,
+        )
+    else:
         # The serializer's 400 carries the error Links only through
         # :func:`exception_handler` (or a handler delegating to it, which
         # carries its marker), so only then is it described.
-        serializer_400 = (
-            method != "delete"
-            and getattr(view, "get_exception_handler", None) is not None
-            and getattr(view.get_exception_handler(), "scrudful_error_links", False)
-        )
-        # The error entity's callables run only when its content is described.
-        error_content = (
-            _error_content(handler, args, kwargs)
-            if conditional or serializer_400
-            else None
-        )
-        metadata = describe_write(
+        serializer_400 = method != "delete" and error_links
+        errors = error_content() if conditional or serializer_400 else None
+        description = describe_write(
             method,
-            content,
+            None if method == "delete" else content,
             conditional,
             conditional and handler.etag_func is not None,
             conditional and handler.last_modified_func is not None,
-            response_content=content,
-            error_content=error_content,
+            statuses,
+            error_content=errors,
         )
-        if error_content and serializer_400:
-            metadata["responses"].setdefault(
-                "400",
-                {"description": reason_phrase(400), "content": error_content},
+        if errors and serializer_400:
+            description["responses"].setdefault(
+                "400", {"description": reason_phrase(400), "content": errors}
             )
-        if "parameters" in metadata:
-            # Through the method, so that a subclass overriding it is used.
-            metadata["parameters"] = self.required_conditional_headers(handler)
-        return metadata
+    responses = description["responses"]
+    if content:
+        for key, response in responses.items():
+            if has_default_entity(method, int(key)):
+                response["content"] = copy.deepcopy(content)
+    _add_error_entries(
+        responses, view, method, api_error, error_links, describing, method != "head"
+    )
+    return description
 
-    def required_conditional_headers(
-        self, method: ScrudfulViewFunc
-    ) -> list[dict[str, Any]] | None:
-        """Describe the precondition headers a conditional write accepts.
 
-        One of them is required; a header is marked ``required`` when it is
-        the only one accepted.
-        """
-        return conditional_header_parameters(
-            method.etag_func is not None, method.last_modified_func is not None
-        )
+def _add_error_entries(
+    responses: dict[str, Any],
+    view: APIView,
+    method: str,
+    api_error: Entity | None,
+    error_links: bool,
+    describing: _Describing,
+    with_content: bool,
+) -> None:
+    """Add ``method``'s error entries to ``responses`` (see
+    :func:`http_schema_resource`).
+
+    The ``default`` entry has the content of the entity the raised errors
+    get from :func:`exception_handler` (:func:`_error_entity`, else
+    ``api_error``); when ``api_error`` is set and that entity differs, so do
+    DRF's own 401, 403, 406 and 415, which carry ``api_error``. Without
+    scrudful's exception handler (``error_links``), the errors carry no
+    Links: ``default`` alone, without content. Without ``with_content``
+    (HEAD), the same entries without content.
+    """
+
+    def entry(description: str, entity: Entity | None, key: str) -> dict[str, Any]:
+        described: dict[str, Any] = {"description": description}
+        if with_content and entity is not None:
+            content = describing.content(entity, entity.media_type, f"{key} response")
+            if content:
+                described["content"] = content
+        return described
+
+    if not error_links:
+        responses["default"] = {"description": _DEFAULT_ERROR}
+        return
+    own = _error_entity(view, method)
+    if api_error is not None and own is not None and own != api_error:
+        for status, description in _FRAMEWORK_ERRORS.items():
+            key = str(status)
+            if key not in responses:
+                responses[key] = entry(description, api_error, key)
+    responses["default"] = entry(
+        _DEFAULT_ERROR, api_error if own is None else own, "default"
+    )
+
+
+def _statuses(
+    view: APIView, handler: ScrudfulViewFunc | None, method: str
+) -> tuple[int, ...] | None:
+    """The success statuses of ``method``: the handler's ``statuses``, else
+    the view's ``Meta.statuses``, else ``None`` (DRF's); HEAD takes GET's
+    when not listed."""
+    sources = (
+        None if handler is None else handler.statuses,
+        _meta_options(view).get("statuses"),
+    )
+    for statuses in sources:
+        if not statuses:
+            continue
+        if method in statuses:
+            return statuses[method]
+        if method == "head" and "get" in statuses:
+            return statuses["get"]
+    return None
 
 
 #: Kept for backwards compatibility; :class:`ScrudfulMetadata` now describes
@@ -1488,8 +1895,17 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
     the ``error`` the scrudful handlers of the view's methods share; when
     they have different ones, the GET handler's, else the first one in the
     order ``get``, ``put``, ``post``, ``delete``, ``options``, ``head``,
-    ``patch``, ``trace``. With none, the response is DRF's, unchanged. The
-    entity's callables are called as ``func(view, request, **url_kwargs)``.
+    ``patch``, ``trace``. With none, the response gets the API-wide entity,
+    ``SCRUDFUL["ERROR"]``, on a scrudful view (one decorated by
+    :func:`scrudful_viewset` or with a :class:`ScrudfulViewFunc` handler),
+    and is DRF's, unchanged, without it. When ``SCRUDFUL["ERROR"]`` is set,
+    a 401, 403, 406 or 415 of a scrudful view (the errors DRF answers
+    itself: authentication and permissions, content negotiation, parsing)
+    gets it whatever the handler's ``error``, as the HTTP Schema Resource
+    describes (see :func:`http_schema_resource`). The entity's callables are
+    called as ``func(view, request, **url_kwargs)``, and its relative URLs
+    resolved as the handler's (its ``base_url``, else ``Meta.base_url``,
+    else ``SCRUDFUL["BASE_URL"]``, else the request).
 
     Settings must name it, as the example project does::
 
@@ -1520,11 +1936,16 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
     view, request = context.get("view"), context.get("request")
     if response is None or not isinstance(view, APIView):
         return response
-    error = _error_entity(view, request)
-    if error is None or not isinstance(request, Request):
+    if not isinstance(request, Request):
+        return response
+    error = _raised_error_entity(view, request.method, response.status_code)
+    if error is None:
         return response
     args, kwargs = _callback_arguments((view, request), {}, 1)
-    link = merge_links(response.get("Link"), *_entity_links(error, args, kwargs))
+    base_url = _handler_base_url(view, _request_handler(view, request.method))
+    link = merge_links(
+        response.get("Link"), *_entity_links(error, args, kwargs, base_url)
+    )
     if link is not None:
         response["Link"] = link
     _render_as_json(request, view)
@@ -1555,11 +1976,39 @@ def _render_as_json(request: Request, view: Any) -> None:
     request.accepted_media_type = renderer.media_type
 
 
-def _error_entity(view: APIView, request: Any) -> Entity | None:
-    """The error entity of an error of ``view`` answering ``request``.
+def _raised_error_entity(
+    view: APIView, method: str | None, status: int
+) -> Entity | None:
+    """The error entity of a ``status`` error that :func:`exception_handler`
+    answers for ``view``'s ``method`` (see :func:`http_schema_resource`).
+
+    On a scrudful view (:func:`_is_scrudful_view`), ``SCRUDFUL["ERROR"]``
+    for the 401, 403, 406 and 415 DRF answers itself when it is set;
+    otherwise :func:`_error_entity`'s, else ``SCRUDFUL["ERROR"]``. Not on
+    one, :func:`_error_entity`'s.
+    """
+    api_error = _setting_error() if _is_scrudful_view(view) else None
+    if api_error is not None and status in _FRAMEWORK_ERRORS:
+        return api_error
+    own = _error_entity(view, method)
+    return api_error if own is None else own
+
+
+def _request_handler(view: APIView, method: str | None) -> ScrudfulViewFunc | None:
+    """The :class:`ScrudfulViewFunc` serving ``method``: ``view.action``'s (a
+    viewset's), else the method's; ``None`` if neither is one."""
+    for name in (getattr(view, "action", None), method):
+        handler = _scrudful_handler(view, name.lower()) if name else None
+        if handler is not None:
+            return handler
+    return None
+
+
+def _error_entity(view: APIView, method: str | None) -> Entity | None:
+    """The error entity of an error of ``view`` answering ``method``.
 
     The ``error`` of the request's own handler (``view.action``'s, a
-    viewset's, else the request method's) when it is a
+    viewset's, else the method's) when it is a
     :class:`ScrudfulViewFunc`, even ``None``. Otherwise (an OPTIONS, a 405
     for a method no handler serves, a handler that is not scrudful), the
     view-wide one, from the scrudful handlers of the view's methods (a
@@ -1569,18 +2018,16 @@ def _error_entity(view: APIView, request: Any) -> Entity | None:
     these errors, so any error entity of the view describes them; a body
     with content then always has Links.
     """
-    metadata = ScrudfulMetadata()
-    for name in (getattr(view, "action", None), getattr(request, "method", None)):
-        handler = metadata.get_method(view, name.lower()) if name else None
-        if handler is not None:
-            return handler.error
+    handler = _request_handler(view, method)
+    if handler is not None:
+        return handler.error
     errors: dict[str, Entity] = {}
-    for method in METHOD_KEYS:
-        if method.upper() not in view.allowed_methods:
+    for name in METHOD_KEYS:
+        if name.upper() not in view.allowed_methods:
             continue
-        handler = metadata.get_method(view, method)
+        handler = _scrudful_handler(view, name)
         if handler is not None and handler.error is not None:
-            errors[method] = handler.error
+            errors[name] = handler.error
     distinct = []
     for error in errors.values():
         if error not in distinct:
@@ -1641,8 +2088,11 @@ def _check_error(error: Any) -> None:
     check_error_media_type(error.media_type)
 
 
-def _resolve(url: Any, args: Sequence[Any]) -> str:
-    """``url`` resolved against the absolute URI of the request among ``args``."""
+def _resolve(url: Any, args: Sequence[Any], base_url: str | None = None) -> str:
+    """``url`` resolved against ``base_url`` when given, else against the
+    absolute URI of the request among ``args``."""
+    if base_url is not None:
+        return resolve_uri(url, base_url)
     for arg in args:
         if isinstance(arg, (Request, HttpRequest)):
             return resolve_uri(url, arg.build_absolute_uri())
@@ -1656,11 +2106,14 @@ def _link_value(
     args: Sequence[Any],
     kwargs: Mapping[str, Any],
     context_of: str | None = None,
+    base: str | None = None,
 ) -> str | None:
-    """One link-value; the URL is resolved as in the OPTIONS body.
+    """One link-value; the URL is resolved against ``base`` (else the
+    request), as in the HTTP Schema Resource.
 
     The context link of ``context_of`` content takes its type from
-    :func:`scrudful._adapter.context_link_type`, as the OPTIONS body does.
+    :func:`scrudful._adapter.context_link_type`, as the HTTP Schema Resource
+    does.
     """
     if not url:
         return None
@@ -1669,16 +2122,19 @@ def _link_value(
     if context_of is not None:
         content_type = context_link_type(context_of, content_type)
     content_type = content_type or defaults[1]
-    return link_content(_resolve(url, args), rel, content_type)
+    return link_content(_resolve(url, args, base), rel, content_type)
 
 
 def _entity_links(
-    entity: Entity, args: Sequence[Any], kwargs: Mapping[str, Any]
+    entity: Entity,
+    args: Sequence[Any],
+    kwargs: Mapping[str, Any],
+    base: str | None = None,
 ) -> tuple[str | None, str | None]:
     """The schema and the context link-values of ``entity`` (``None`` if unset).
 
     The context link's defaults come from ``entity.media_type``; in-band RDF
-    has none.
+    has none. Relative URLs resolve against ``base``, else the request.
     """
     schema = _link_value(
         _evaluate(entity.schema_link_or_func, args, kwargs),
@@ -1686,6 +2142,7 @@ def _entity_links(
         (DEFAULT_SCHEMA_REL, DEFAULT_SCHEMA_TYPE),
         args,
         kwargs,
+        base=base,
     )
     context = None
     defaults = context_defaults(entity.media_type)
@@ -1697,62 +2154,153 @@ def _entity_links(
             args,
             kwargs,
             context_of=entity.media_type,
+            base=base,
         )
     return schema, context
 
 
-def _content(
-    handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
-) -> dict[str, Any] | None:
-    """The ``content`` of the view's own links (JSON), or ``None``."""
-    if not isinstance(handler, ScrudfulViewFunc):
-        return None
-    return _media(handler, _VIEW_MEDIA_TYPE, args, kwargs)
+def _scrudful_handler(view: APIView, name: str) -> ScrudfulViewFunc | None:
+    """The :class:`ScrudfulViewFunc` behind ``view.<name>``, if any."""
+    handler = _handler(view, name)
+    return handler if isinstance(handler, ScrudfulViewFunc) else None
 
 
-def _error_content(
-    handler: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
-) -> dict[str, Any] | None:
-    """The ``content`` of the handler's ``error`` entity, or ``None``."""
-    if not isinstance(handler, ScrudfulViewFunc) or handler.error is None:
-        return None
-    return _media(handler.error, handler.error.media_type, args, kwargs)
+def _meta_options(view: Any) -> dict[str, Any]:
+    """The checked :data:`_VIEW_OPTIONS` of ``view``'s
+    :func:`scrudful_viewset` ``Meta`` (empty for another view)."""
+    return getattr(type(view), _META_OPTIONS_ATTR, None) or {}
 
 
-def _media(
-    source: ScrudfulViewFunc | Entity,
-    media_type: str,
-    args: Sequence[Any],
-    kwargs: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """The ``content`` of ``source``'s links: its Media Type Object, or ``None``.
+def _view_base_url(view: Any) -> str | None:
+    """``view``'s ``Meta.base_url``, else ``SCRUDFUL["BASE_URL"]``, else ``None``."""
+    base_url = _meta_options(view).get("base_url")
+    return base_url if base_url is not None else _setting_base_url()
 
-    Built by :func:`scrudful._adapter.describe_content` from the schema and
-    context URLs and types of ``source`` (a view or an :class:`Entity`), which
-    are evaluated as for its Links (the context only when ``media_type`` takes
-    one), and with the URLs resolved the same way, so that the entry agrees
-    with the Links of the responses it describes. ``None`` without a schema
-    URL.
-    """
-    schema = _evaluate(source.schema_link_or_func, args, kwargs)
-    if not schema:
-        return None
-    schema_type = _evaluate(source.schema_type_or_func, args, kwargs)
-    context = context_type = None
-    rel, default_type = context_defaults(media_type)
-    if rel is not None:  # not in-band RDF
-        context = _evaluate(source.context_link_or_func, args, kwargs)
-    if context:
-        context_type = (
-            _evaluate(source.context_type_or_func, args, kwargs) or default_type
-        )
-    return describe_content(
-        media_type,
-        _resolve(schema, args),
-        str(schema_type or DEFAULT_SCHEMA_TYPE),
-        _resolve(context, args) if context else None,
-        None if context_type is None else str(context_type),
+
+def _handler_base_url(view: Any, handler: Any) -> str | None:
+    """The base URL of ``handler``'s links: its ``base_url``, else the view's
+    (:func:`_view_base_url`)."""
+    base_url = getattr(handler, "base_url", None)
+    if isinstance(handler, ScrudfulViewFunc) and base_url is not None:
+        return base_url
+    return _view_base_url(view)
+
+
+def _is_scrudful_view(view: APIView) -> bool:
+    """Whether ``view`` is decorated by :func:`scrudful_viewset` or has a
+    :class:`ScrudfulViewFunc` handler for a method it allows."""
+    if getattr(type(view), _META_OPTIONS_ATTR, None) is not None:
+        return True
+    return any(
+        _scrudful_handler(view, method.lower()) is not None
+        for method in view.allowed_methods
     )
+
+
+def _gives_error_links(view: APIView) -> bool:
+    """Whether ``view``'s exception handler is :func:`exception_handler` (or
+    one carrying its ``scrudful_error_links`` marker)."""
+    get_handler = getattr(view, "get_exception_handler", None)
+    return get_handler is not None and bool(
+        getattr(get_handler(), "scrudful_error_links", False)
+    )
+
+
+def _check_base_url(url: Any, what: str) -> None:
+    """Raise ``ImproperlyConfigured`` unless ``url`` is an absolute URL."""
+    parts = urlsplit(url) if isinstance(url, str) else None
+    if parts is None or not (parts.scheme and parts.netloc):
+        raise ImproperlyConfigured(f"{what} must be an absolute URL, not {url!r}")
+
+
+def _setting_base_url() -> str | None:
+    """``SCRUDFUL["BASE_URL"]``, checked, or ``None``."""
+    base_url = scrudful_setting("BASE_URL", None)
+    if base_url is not None:
+        _check_base_url(base_url, 'SCRUDFUL["BASE_URL"]')
+    return base_url
+
+
+def _setting_error() -> Entity | None:
+    """``SCRUDFUL["ERROR"]``, the API-wide error entity, checked, or ``None``."""
+    error = scrudful_setting("ERROR", None)
+    if error is None:
+        return None
+    if not isinstance(error, Entity):
+        raise ImproperlyConfigured(
+            f'SCRUDFUL["ERROR"] must be an Entity, not {type(error).__name__}'
+        )
+    try:
+        check_error_media_type(error.media_type)
+    except ValueError as exc:
+        raise ImproperlyConfigured(f'SCRUDFUL["ERROR"]: {exc}') from exc
+    return error
+
+
+def _check_view_options(
+    entity: Any,
+    statuses: Any,
+    allowed_func: Any,
+    base_url: Any,
+    **links: Any,
+) -> dict[str, tuple[int, ...]] | None:
+    """Check the ``entity``, ``statuses``, ``allowed_func`` and ``base_url``
+    options (see :class:`ScrudfulViewFunc`); return ``statuses`` checked, as
+    a dict of tuples (or ``None``). ``links`` are the link options given
+    with them, which ``entity`` replaces."""
+    if entity is not None:
+        if not isinstance(entity, Entity):
+            raise TypeError(f"entity must be an Entity, not {type(entity).__name__}")
+        given = [name for name, value in links.items() if value is not None]
+        if given:
+            raise TypeError(
+                f"entity replaces {', '.join(given)}: give the links in the " "Entity"
+            )
+    if allowed_func is not None and not callable(allowed_func):
+        raise TypeError(
+            f"allowed_func must be callable, not {type(allowed_func).__name__}"
+        )
+    if base_url is not None:
+        _check_base_url(base_url, "base_url")
+    return _check_statuses(statuses)
+
+
+def _check_statuses(statuses: Any) -> dict[str, tuple[int, ...]] | None:
+    """``statuses`` (see :class:`ScrudfulViewFunc`) as a dict of tuples."""
+    if statuses is None:
+        return None
+    if not isinstance(statuses, Mapping):
+        raise TypeError(
+            "statuses must map method names to lists of status codes, not "
+            f"{type(statuses).__name__}"
+        )
+    names = [method for method in METHOD_KEYS if method != "options"]
+    checked = {}
+    for method, codes in statuses.items():
+        key = method.lower() if isinstance(method, str) else method
+        if key not in names:
+            raise ValueError(
+                f"statuses: {method!r} is not a method name (one of "
+                f"{', '.join(names)})"
+            )
+        if isinstance(codes, (str, bytes)) or not isinstance(codes, Sequence):
+            raise TypeError(
+                f"statuses[{method!r}] must be a list of status codes, not "
+                f"{type(codes).__name__}"
+            )
+        if not codes:
+            raise ValueError(f"statuses[{method!r}] lists no status")
+        for code in codes:
+            if not isinstance(code, int) or isinstance(code, bool):
+                raise TypeError(
+                    f"statuses[{method!r}] must list integers, not {code!r}"
+                )
+            if not 200 <= code <= 299:
+                raise ValueError(
+                    f"statuses[{method!r}]: {code} is not a success (2xx) status"
+                )
+        checked[key] = tuple(dict.fromkeys(codes))
+    return checked
 
 
 class ScrudfulPagination(BasePagination):
@@ -1838,7 +2386,10 @@ class ScrudfulPagination(BasePagination):
         modified_func = (
             getattr(meta, "last_modified_func", None) if validators else None
         )
-        entity = Entity(**{name: getattr(meta, name, None) for name in _LINK_OPTIONS})
+        entity = getattr(meta, "entity", None) or Entity(
+            **{name: getattr(meta, name, None) for name in _LINK_OPTIONS}
+        )
+        base_url = _view_base_url(view)
         entries = []
         for obj, item in zip(self.objects, data, strict=True):
             href = self.href_func(view, request, obj)
@@ -1859,6 +2410,7 @@ class ScrudfulPagination(BasePagination):
                 entity,
                 (view, request, *getattr(view, "args", ())),
                 self._item_kwargs(obj),
+                base_url,
             )
             entries.append(
                 envelope_entry(

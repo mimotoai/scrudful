@@ -16,6 +16,7 @@ from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient
 
 from scrudful._adapter import allow_header, describe_options, options_links
+from scrudful._hsr import options_operation
 from tests.semantic_http import (
     link_problems,
     parse_links,
@@ -52,6 +53,31 @@ ITEM_CONTENT = {
         },
     }
 }
+
+
+ERROR_CONTENT = {
+    "application/json": {
+        "schema": {"$ref": f"{BASE}/schemas/error.json"},
+        "x-rdf-context": {
+            "href": f"{BASE}/contexts/error.jsonld",
+            "type": "application/ld+json",
+        },
+    }
+}
+
+
+@pytest.fixture(autouse=True)
+def base_url(settings):
+    """The example's ``SCRUDFUL["BASE_URL"]`` for APIClient's host (the
+    suite's settings, ``tests/settings.py``, have no ``SCRUDFUL``)."""
+    settings.SCRUDFUL = {"BASE_URL": f"{BASE}/"}
+
+
+def answered_hsr(body):
+    """``body`` with the ``options`` entry of the 200 OPTIONS response that
+    returned it, for agreement checks of that response: until OPTIONS answers
+    204, the HTTP Schema Resource's own entry (a 204) doesn't describe it."""
+    return {**body, "options": describe_options()}
 
 
 @pytest.fixture
@@ -498,18 +524,31 @@ def test_options_describes_the_detail_route(client, item):
         "description": "OK",
         "content": ITEM_CONTENT,
     }
-    assert set(metadata["get"]["responses"]) == {"200", "304", "400", "412"}
-    assert set(metadata["head"]["responses"]) == {"200", "304", "400", "412"}
+    read = {"200", "304", "400", "412", "default"}
+    assert set(metadata["get"]["responses"]) == read
+    assert set(metadata["head"]["responses"]) == read
+    write = {"200", "400", "412", "428", "default"}
     for method in ("put", "patch"):
         assert metadata[method]["requestBody"]["content"] == ITEM_CONTENT
-        assert set(metadata[method]["responses"]) == {"200", "400", "412", "428"}
+        assert set(metadata[method]["responses"]) == write
     assert metadata["put"]["requestBody"]["description"] == (
         "The new content of the resource."
     )
     assert metadata["patch"]["requestBody"]["description"] == (
         "The changes to apply to the resource."
     )
-    assert set(metadata["delete"]["responses"]) == {"204", "400", "412", "428"}
+    assert set(metadata["delete"]["responses"]) == {
+        "204",
+        "400",
+        "412",
+        "428",
+        "default",
+    }
+    # The errors the exception handler gives the error entity's Links.
+    assert metadata["get"]["responses"]["default"] == {
+        "description": "Error.",
+        "content": ERROR_CONTENT,
+    }
     for method in ("put", "patch", "delete"):
         names = [p["name"] for p in metadata[method]["parameters"]]
         assert names == ["If-Match", "If-Unmodified-Since"]
@@ -525,9 +564,9 @@ def test_options_describes_the_list_route(client):
         "The content for the resource to be created."
     )
     # Its preconditions are evaluated against the list's ETag, never required.
-    assert set(metadata["post"]["responses"]) == {"201", "400", "412"}
+    assert set(metadata["post"]["responses"]) == {"201", "400", "412", "default"}
     assert "parameters" not in metadata["post"]
-    assert set(metadata["get"]["responses"]) == {"200", "304", "400", "412"}
+    assert set(metadata["get"]["responses"]) == {"200", "304", "400", "412", "default"}
 
 
 @pytest.mark.parametrize(
@@ -543,11 +582,12 @@ def test_options_valid_0_1(client, item, path):
     validate_http_schema_resource(body)
     assert response["Link"] == options_links()
     assert response["Allow"] == allow_header(body)
-    assert body["options"] == describe_options()
+    assert body["options"] == options_operation()
     # The body lists exactly the methods the route serves, HEAD included.
     assert ("head" in body) == (client.head(path).status_code != 405)
     assert "head" in body
-    assert link_problems("OPTIONS", 200, dict(response.items()), True, body) == []
+    headers = dict(response.items())
+    assert link_problems("OPTIONS", 200, headers, True, answered_hsr(body)) == []
 
 
 def test_options_write_response_content(client, item):
@@ -661,6 +701,8 @@ def test_example_links_everywhere(client, item, method, path, arguments, status)
     and agrees with the OPTIONS body of its path."""
     path = path.format(pk=item.pk)
     hsr = client.options(path).json()
+    if method == "options":
+        hsr = answered_hsr(hsr)
     response = getattr(client, method)(path, **arguments)
     assert response.status_code == status
     content = method != "head" and bool(response.content)

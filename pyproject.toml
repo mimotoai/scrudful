@@ -65,5 +65,5 @@ source-include = ["CHANGELOG.rst", "tests/**", "examples/**", "scripts/**"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [".", "examples/scrudful_rest_framework"]
-DJANGO_SETTINGS_MODULE = "scrudful_rest_framework.settings"
+DJANGO_SETTINGS_MODULE = "tests.settings"
 filterwarnings = ["error"]

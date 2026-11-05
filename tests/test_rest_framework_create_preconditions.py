@@ -42,6 +42,13 @@ def _reset():
     list_calls.clear()
 
 
+@pytest.fixture(autouse=True)
+def base_url(settings):
+    """The HTTP Schema Resource resolves relative links against the base URL,
+    never the request: APIClient's host, so the URIs are those of 0.9."""
+    settings.SCRUDFUL = {"BASE_URL": "http://testserver/"}
+
+
 def list_etag(view, request, **kwargs):
     list_calls.append("etag")
     return f"n{Item.objects.count()}"
@@ -281,7 +288,7 @@ def test_options_describes_the_412(client):
 
 def test_options_without_list_validators_describes_201_only(client):
     described = client.options("/nolists/").json()["post"]
-    assert list(described["responses"]) == ["201"]
+    assert list(described["responses"]) == ["201", "default"]
 
 
 def test_list_validators_must_be_callable():

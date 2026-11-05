@@ -1391,7 +1391,10 @@ def drf_options(actions: dict[str, str], **kwargs: Any) -> Any:
     comparisons are of the documents, ninja's served by its HSR route."""
     view = ItemViewSet.as_view(actions)
     request = APIRequestFactory().options("/", HTTP_HOST="testlocation")
-    with override_settings(ALLOWED_HOSTS=["testlocation"]):
+    # DRF's is built without the request: against its base URL.
+    with override_settings(
+        ALLOWED_HOSTS=["testlocation"], SCRUDFUL={"BASE_URL": TEST_BASE_URL}
+    ):
         response = view(request, **kwargs)
     assert response.status_code == 200
     body = json.loads(json.dumps(response.data))

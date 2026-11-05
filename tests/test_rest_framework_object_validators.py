@@ -25,6 +25,13 @@ object_checks: list = []
 
 
 @pytest.fixture(autouse=True)
+def base_url(settings):
+    """The HTTP Schema Resource resolves relative links against the base URL,
+    never the request: APIClient's host, so the URIs are those of 0.9."""
+    settings.SCRUDFUL = {"BASE_URL": "http://testserver/"}
+
+
+@pytest.fixture(autouse=True)
 def _reset():
     calls.clear()
     object_checks.clear()
@@ -440,7 +447,7 @@ def test_options_does_not_describe_201_validators(client):
     """As ninja's create: described with its 201 only (describe_write has no
     response-header description), never as a conditional write."""
     post = client.options("/creates/").json()["post"]
-    assert list(post["responses"]) == ["201"]
+    assert list(post["responses"]) == ["201", "default"]
     assert "parameters" not in post
 
 
@@ -451,7 +458,7 @@ def test_create_without_location_func_sends_validators_only(client):
     assert response["ETag"] == f'"v{created.version}"'
     assert "Location" not in response
     post = client.options("/nolocs/").json()["post"]
-    assert list(post["responses"]) == ["201"]
+    assert list(post["responses"]) == ["201", "default"]
     assert "parameters" not in post
 
 
