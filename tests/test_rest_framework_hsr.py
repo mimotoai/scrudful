@@ -259,6 +259,11 @@ urlpatterns = [
         NoErrorViewSet.as_view({"get": "retrieve"}),
         name="no-error",
     ),
+    path(
+        "no-error-items/<str:pk>/",
+        NoErrorViewSet.as_view({"get": "retrieve", "put": "update"}),
+        name="no-error-items",
+    ),
     path("locked/<str:pk>/", LockedViewSet.as_view({"get": "retrieve"}), name="locked"),
     path("a/<str:pk>/", HOST_A, name="a"),
     path("b/<str:pk>/", HOST_B, name="b"),
@@ -837,6 +842,44 @@ def test_the_wire_agrees_with_the_error_entries(client, settings):
     missing = client.get("/no-error/0/")
     assert missing.status_code == 404
     assert missing["Link"].startswith("<https://api.example/schemas/api-error>")
+
+
+#: scrudful's own early responses: ``(method, headers, status)``.
+EARLY = [
+    ("GET", {"HTTP_IF_NONE_MATCH": 'x"'}, 400),
+    ("GET", {"HTTP_IF_MATCH": '"no"'}, 412),
+    ("HEAD", {"HTTP_IF_MATCH": '"no"'}, 412),
+    ("PUT", {}, 428),
+    ("PUT", {"HTTP_IF_MATCH": '"no"'}, 412),
+    ("PUT", {"HTTP_IF_MATCH": "x"}, 400),
+]
+
+
+@pytest.mark.parametrize("method, headers, status", EARLY)
+def test_early_errors_without_error_carry_the_error_setting(
+    client, settings, method, headers, status
+):
+    """A conditional view without ``error``: its own 400, 412 and 428 carry
+    ``SCRUDFUL["ERROR"]``, served as its media type, as its HSR says."""
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL, "ERROR": API_ERROR}
+    hsr = client.get("/_hsr/no-error-items").json()
+    response = client.generic(method, "/no-error-items/1/", **headers)
+    assert response.status_code == status
+    content = method != "HEAD"
+    assert link_problems(method, status, dict(response.items()), content, hsr) == []
+    assert response["Link"].startswith("<https://api.example/schemas/api-error>")
+    if content:
+        assert response["Content-Type"] == "application/json"
+
+
+def test_early_errors_without_any_error_entity_have_no_error_links(client):
+    """Neither ``error`` nor ``SCRUDFUL["ERROR"]``: no error Links, and the
+    HSR's 412 has no content."""
+    hsr = client.get("/_hsr/no-error-items").json()
+    assert "content" not in hsr["put"]["responses"]["412"]
+    response = client.put("/no-error-items/1/", HTTP_IF_MATCH='"no"')
+    assert response.status_code == 412
+    assert "describedby" not in response["Link"]
 
 
 def test_error_setting_must_be_an_entity(settings):

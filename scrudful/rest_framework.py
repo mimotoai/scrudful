@@ -958,19 +958,21 @@ class ScrudfulViewFunc:
     ) -> HttpResponseBase:
         """scrudful's own 304, 400, 412 or 428.
 
-        With ``error``, a 400/412/428 carries its Links and is served as JSON
-        with its media type, whatever renderer DRF's content negotiation
-        picked (see :func:`_render_as_json`), so that it agrees with the
-        HTTP Schema Resource.
+        With an error entity (``error``, else ``SCRUDFUL["ERROR"]``), a
+        400/412/428 carries its Links and is served as JSON with its media
+        type, whatever renderer DRF's content negotiation picked (see
+        :func:`_render_as_json`), so that it agrees with the HTTP Schema
+        Resource.
         """
         result = with_error_body(self.error_body_func, request, result)
-        if result.body is None or self.error is None:
+        error = self.error if self.error is not None else setting_error()
+        if result.body is None or error is None:
             return _conditional_response(result, request)
         return _conditional_response(
             result,
             request,
-            self.error_link_header(*args, **kwargs),
-            self.error.media_type,
+            join_links(*_entity_links(error, args, kwargs, self.live_base_url(args))),
+            error.media_type,
         )
 
     def _validators(
@@ -3192,7 +3194,11 @@ def _describe_method(
 
     def error_content() -> dict[str, Any] | None:
         # The error entity's callables run only when its content is described.
+        # Without the handler's own, scrudful's 400, 412 and 428 carry the
+        # API-wide entity, as the errors exception_handler answers do.
         error = None if scrudful_handler is None else scrudful_handler.error
+        if error is None and scrudful_handler is not None:
+            error = api_error
         return describing.content(
             error, error.media_type if error else "", "error response"
         )
