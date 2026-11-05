@@ -189,8 +189,11 @@ Behaviour change (ninja)
   operation's error answers the OPTIONS; another exception still
   propagates), so authorization in a method's ``load`` shapes ``Allow``; it
   runs only once the method's ``auth=`` and ``before`` passed. A method whose
-  path parameters don't validate (its request would be a 422) is left out of
-  ``Allow``, and its ``load`` doesn't run. Bad credentials make the
+  path parameters don't validate (its request would be a 422), or whose path
+  validation raises an ``HttpError``, ``Http404`` or ``PermissionDenied``, is
+  left out of ``Allow``, and its ``load`` doesn't run. That check is best
+  effort: a path scrudful can't validate as ninja does (a custom path model)
+  or a validator's other error skips it. Bad credentials make the
   requester anonymous (ninja's auth callbacks return ``None``), so they get
   the anonymous ``Allow``. A raised ``HttpError`` 401, 403 or 404,
   ``Http404`` or ``PermissionDenied`` from ``auth=`` or ``before`` refuses a

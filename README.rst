@@ -1162,8 +1162,10 @@ this release, also need the 0.9.0 changes in the changelog):
       once its ``auth=`` and ``before=`` pass, unless it is the very call the
       loading operation made: any ``HttpError``, ``Http404`` or
       ``PermissionDenied`` it raises leaves out only that method. A method
-      whose path parameters don't validate (its request would be a 422) is
-      left out. Keep every ``load`` free of side effects;
+      whose path parameters don't validate (its request would be a 422), or
+      whose path validation raises one of those, is left out; a path
+      scrudful can't validate (a custom path model) isn't checked. Keep every
+      ``load`` free of side effects;
     * django-ninja, with ``add_error_links``: a 401, 403, 422 or 429 of a
       scrudful operation (ninja's own, or one the operation, its ``load``,
       ``before=`` or ``after_throttles=`` raises) carries the API-wide

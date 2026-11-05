@@ -7,7 +7,7 @@ import re
 import types
 import uuid
 import warnings
-from typing import Any, List
+from typing import Annotated, Any, List
 
 import ninja.operation
 import ninja.params.models
@@ -16,7 +16,11 @@ import ninja.testing.client
 import pytest
 from asgiref.sync import async_to_sync
 from django.core.cache import cache
-from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+from django.core.exceptions import (
+    ImproperlyConfigured,
+    ObjectDoesNotExist,
+    PermissionDenied,
+)
 from django.http import Http404, HttpResponseForbidden
 from django.test import Client, override_settings
 from ninja import NinjaAPI, Router, Schema, Status
@@ -31,6 +35,7 @@ from ninja.security import APIKeyHeader, django_auth
 from ninja.throttling import AnonRateThrottle, BaseThrottle
 from django.urls import path, register_converter
 from ninja.testing import TestAsyncClient, TestClient
+from pydantic import BeforeValidator
 
 from scrudful._django import scrudful_setting
 from scrudful._hsr import hsr_etag, serialize_hsr
@@ -3145,6 +3150,137 @@ def test_a_method_whose_path_parameters_dont_validate_is_left_out(own_load):
     valid = options(client, "/1")
     assert valid.headers["Allow"] == "GET, PUT, DELETE, OPTIONS"
     assert calls == ([1] if own_load else [])
+
+
+def lookup_raising(error: Exception) -> Any:
+    """A path validator letting ``1`` through, and raising ``error`` for any
+    other value: a lookup done while the path parameters are validated."""
+
+    def lookup(value):
+        if str(value) != "1":
+            raise error
+        return int(value)
+
+    return lookup
+
+
+def loading_get_router() -> ScrudfulRouter:
+    """A router with a ``@scrudful`` GET on ``"/{pk}"`` that loads any ``pk``
+    (a ``str``)."""
+
+    def any_item(request, pk, **params):
+        return {"id": 1, "name": str(pk), "version": 1}
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(load=any_item, **LINKS)
+    def get_item(request, pk: str, obj):
+        return obj
+
+    return router
+
+
+@pytest.mark.parametrize(
+    "error",
+    [Http404("none"), HttpError(404, "none"), PermissionDenied("not yours")],
+    ids=["Http404", "HttpError404", "PermissionDenied"],
+)
+def test_a_denial_of_a_methods_path_validation_leaves_only_it_out(error):
+    """A denial a method's path validation raises (a lookup validator's 404,
+    say) refuses that method only, as its own ``load``'s would: only the
+    loading operation's error answers the OPTIONS."""
+    router = loading_get_router()
+    lookup = lookup_raising(error)
+
+    @router.delete("/{pk}", response={204: None})
+    @described(Entity(**LINKS))
+    def delete_item(request, pk: Annotated[int, BeforeValidator(lookup)]):
+        return 204, None  # pragma: no cover
+
+    client = TestClient(mount(router))
+    assert options(client, "/1").headers["Allow"] == "GET, DELETE, OPTIONS"
+    response = options(client, "/2")
+    assert response.status_code == 204
+    assert response.headers["Allow"] == "GET, OPTIONS"
+    assert client.get("/2").status_code == 200
+
+
+class LowerPathModel(ninja.params.models.PathModel):
+    """A path model reading the path parameters otherwise than ninja's."""
+
+    @classmethod
+    def get_request_data(cls, request, api, path_params):
+        return {key: str(value).lower() for key, value in path_params.items()}
+
+
+#: A path parameter with that model (ninja takes the source from the class
+#: name, so it is called ``Path``).
+LowerPath = type("Path", (ninja.params.models.Path,), {"_model": LowerPathModel})
+
+
+def test_a_path_options_cant_validate_is_left_to_the_method():
+    """A path scrudful can't validate as ninja does (a custom path model) is
+    not checked: the method is decided without it, and no ``ConfigError``
+    is raised for an operation without a ``load``."""
+    router = loading_get_router()
+
+    @router.delete("/{pk}")
+    @described(Entity(**LINKS))
+    def delete_item(request, pk: str = LowerPath(...)):
+        return {"pk": pk}
+
+    client = TestClient(mount(router))
+    response = options(client, "/ABC")
+    assert response.status_code == 204
+    assert response.headers["Allow"] == "GET, DELETE, OPTIONS"
+    assert client.delete("/ABC").json() == {"pk": "abc"}
+
+
+def test_a_custom_path_model_still_fails_a_methods_own_load():
+    """A method whose own ``load`` must run on such a path still gets the
+    ``ConfigError``: its ``load`` can't be given the path parameters as the
+    operation would give them."""
+    router = loading_get_router()
+
+    def owned(request, pk, **params):
+        return {"id": 1, "name": pk, "version": 1}  # pragma: no cover
+
+    @router.delete("/{pk}")
+    @scrudful(load=owned, **LINKS)
+    def delete_item(request, pk: str = LowerPath(...), obj=None):
+        return {"pk": pk}  # pragma: no cover
+
+    client = TestClient(mount(router))
+    with pytest.raises(ConfigError, match="doesn.t resolve as ninja 1.7 does"):
+        options(client, "/ABC")
+
+
+@pytest.mark.parametrize("get_load", [True, False], ids=["loader", "no-loader"])
+def test_another_exception_of_a_methods_path_validation_skips_the_check(get_load):
+    """Anything else a method's path validation raises (a lookup's
+    ``ObjectDoesNotExist``) skips the check: the method, without a ``load``
+    of its own, is decided without it, as its request answers that."""
+    if get_load:
+        router = loading_get_router()
+    else:
+        router = ScrudfulRouter(base_url=BASE_URL)
+
+        @router.get("/{pk}", response=ItemOut)
+        @scrudful(**LINKS)
+        def get_item(request, pk: int):
+            return {"id": pk, "name": "x", "version": 1}  # pragma: no cover
+
+    lookup = lookup_raising(ObjectDoesNotExist("none"))
+
+    @router.delete("/{pk}", response={204: None})
+    @described(Entity(**LINKS))
+    def delete_item(request, pk: Annotated[int, BeforeValidator(lookup)]):
+        return 204, None  # pragma: no cover
+
+    response = options(TestClient(mount(router)), "/2")
+    assert response.status_code == 204
+    assert response.headers["Allow"] == "GET, DELETE, OPTIONS"
 
 
 #: What PUT's own ``load`` saw of each request reaching it: ``request.method``

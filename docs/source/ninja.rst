@@ -849,11 +849,11 @@ an API-wide entity, none of them has an entry of its own: those of an
 operation with an ``error``, ninja's own included, carry that ``error``, as
 its ``default`` entry describes. **An error status the operation declares
 in** ``responses=`` **has an entry of its own** with that entity's content,
-which wins over all of these: every response with that status carries it, those ninja answers
-before the operation (its authentication's 401, its validation's 422, the
-latter as problem details for a problem-details entity) included. ``head``
-(where an operation routes it) is described like ``get``, without content, and
-``options`` is exactly ``{"responses": {"204": {"description": "No
+which wins over all of these: every response with that status carries it,
+those ninja answers before the operation (its authentication's 401, its
+validation's 422, the latter as problem details for a problem-details
+entity) included. ``head`` (where an operation routes it) is described like
+``get``, without content, and ``options`` is exactly ``{"responses": {"204": {"description": "No
 Content"}}}``.
 
 * It is built once per path template, without a request: on the first GET of
@@ -1022,8 +1022,12 @@ for a preflight too. In this order:
    * without one, the method is allowed when the operation's ``auth=``
      callbacks authenticate the requester, its ``before`` (if any) returns
      ``None``, its path parameters validate (a method whose request would be
-     a 422 is left out), and then, for a ``@scrudful`` item operation with a
-     ``load``, that ``load`` (called as in step 3, on the copy) returns,
+     a 422 is left out, and so is one whose path validation raises an
+     ``HttpError``, ``Http404`` or ``PermissionDenied``; the check is best
+     effort, skipped for a path scrudful can't validate as ninja does, such
+     as one with a custom path model, or a validator raising anything else),
+     and then, for a ``@scrudful`` item operation with a ``load``, that
+     ``load`` (called as in step 3, on the copy) returns,
      whatever it returns. So a ``load`` that authorizes (an owner-only PUT
      raising ``HttpError(403)`` for anyone else) leaves its method out of
      that requester's ``Allow``, the OPTIONS still answering 204, and it

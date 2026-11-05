@@ -402,9 +402,13 @@ OPTIONS
        otherwise. Without one, the method is allowed when the operation's
        ``auth=`` callbacks authenticate the requester, its ``before`` (if
        any) returns ``None``, its path parameters validate (a method whose
-       request would be a 422 is left out), and then, for a :func:`scrudful`
-       item operation with a ``load``, that ``load`` (called as in step 3,
-       on the copy) returns, whatever it returns: so
+       request would be a 422 is left out, and so is one whose path
+       validation raises an ``HttpError``, ``Http404`` or
+       ``PermissionDenied``; the check is best effort, skipped for a path
+       scrudful can't validate as ninja does, such as one with a custom path
+       model, or a validator raising anything else), and then, for a
+       :func:`scrudful` item operation with a ``load``, that ``load``
+       (called as in step 3, on the copy) returns, whatever it returns: so
        authorization in a method's own ``load`` shapes ``Allow``, and
        nothing loads for a method its ``auth=`` or ``before`` refused. Any
        ``HttpError`` that ``load`` raises (whatever its status), ``Http404``
@@ -6470,8 +6474,14 @@ def _may_use(
     operation's ``before`` allows it (see :func:`_authenticated` and
     :func:`_before_allows`), its path parameters validate (else its request
     is a 422: see :func:`_path_values`) and then its own ``load`` allows it
-    (:func:`_own_load_allows`). Neither throttles nor ``after_throttles``
-    run.
+    (:func:`_own_load_allows`). That path check is best effort: an
+    ``HttpError``, ``Http404`` or ``PermissionDenied`` its validation raises
+    refuses the method, and anything else (a ``ConfigError`` for a path
+    model scrudful can't validate as ninja does, a validator's other error)
+    skips it, unless the method's own ``load`` must run (see
+    :func:`_load_must_run`): then it propagates, as that ``load`` can't be
+    called without the path parameters. Neither throttles nor
+    ``after_throttles`` run.
 
     Raises
     ------
@@ -6497,10 +6507,31 @@ def _may_use(
         return result
     if not authenticated or not _before_allows(config, bound, requester, url_params):
         return False
-    values = _path_values(requester, api, bound, url_params)
+    try:
+        values = _path_values(requester, api, bound, url_params)
+    except (HttpError, Http404, PermissionDenied):
+        # Refused by its path validation (a lookup validator's 404, say):
+        # that method only, as by its own load.
+        return False
+    except Exception:
+        # A path scrudful can't validate (a custom path model's ConfigError)
+        # or a validator's other error: the check is best effort, skipped,
+        # unless the method's own load must run, which needs those values.
+        if _load_must_run(config, loaded):
+            raise
+        return True
     if values is None:
         return False
     return _own_load_allows(config, requester, values, loaded)
+
+
+def _load_must_run(config: _Config | None, loaded: _Loaded | None) -> bool:
+    """Whether an item operation's own ``load`` is to run on OPTIONS, before
+    its path parameters are known: it has one, and it isn't the function
+    ``loaded`` called."""
+    if config is None or config.kind != "item" or config.load is None:
+        return False
+    return loaded is None or config.load != loaded.load
 
 
 def _own_load_allows(
