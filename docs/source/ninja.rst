@@ -462,7 +462,9 @@ another decorator goes decides what it runs before:
   (e.g. an unauthorized ``If-None-Match`` would get a 304 with the real
   entity-tag).
 * **Per-operation authorization** goes in ``load`` (fetch-if-allowed),
-  ``before=`` or ninja's ``auth=``: OPTIONS's ``Allow`` sees the last two.
+  ``before=`` or ninja's ``auth=``: OPTIONS's ``Allow`` sees all three (a
+  ``load`` it loads the object with, the GET operation's, answers the
+  OPTIONS with its error instead; see `OPTIONS`_).
 * **A decorator for every operation of a router or the API**:
   ``router.add_decorator(decorator, mode="operation")`` (or the API's). It
   wraps ``view_func``, so it runs inside ``Operation.run``, after ninja's
@@ -1045,15 +1047,20 @@ Things to know:
   with ``Allow: OPTIONS``, not a 401. Bad credentials make the requester
   anonymous (ninja's auth callbacks return ``None`` for them, without telling
   them from missing ones), so they get the anonymous ``Allow``, not a 401.
-* ``Allow`` sees only ``auth=``, ``before=`` and ``allowed=``: authorization
-  done in an ``add_decorator`` decorator, in ``after_throttles`` or in the
-  handler doesn't show in it (OPTIONS can list a GET that then answers 403).
-  Give the router or operation ``allowed=`` for such checks.
+* ``Allow`` sees only ``auth=``, ``before=``, ``load`` and ``allowed=``:
+  authorization done in an ``add_decorator`` decorator, in
+  ``after_throttles`` or in the handler doesn't show in it (OPTIONS can list
+  a GET that then answers 403). Give the router or operation ``allowed=``
+  for such checks.
 * The ``auth=`` callbacks are those of the mount the request came through: a
   router mounted twice with different ``auth`` gets each mount's ``Allow``,
   and its responses link to the HSR route of the request's mount.
 * An error answering OPTIONS (the 404 of ``load``, a 429) has no entry of its
   own in the HSR, whose ``options`` entry is exactly the 204's.
+* ``load`` runs on OPTIONS: step 3's, and each other item operation's own in
+  step 4. Keep it free of side effects (no writes, no audit records): an
+  OPTIONS calls it as that method's request would, without the handler that
+  follows it there.
 
 CORS
 ~~~~

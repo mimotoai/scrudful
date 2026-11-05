@@ -317,11 +317,13 @@ Behaviour change (DRF)
   ``TypeError``) is ``E005``; for such an exception, or one the view or
   scrudful itself raises, the ``E005`` hint names the frame that raised it
   (one inside scrudful labelled as what may be its internal error), and the
-  ``scrudful.rest_framework`` logger logs its traceback at ``ERROR``. The errors fail ``manage.py check`` and the
-  commands that run it (``runserver``, ``migrate``, Django's test runner).
-  The ``hsr_urls()`` pattern runs the check in Django's URL check; ``E003``
-  needs ``scrudful.rest_framework`` imported before the checks start, which
-  registers the check (an ``AppConfig.ready()``).
+  ``scrudful.rest_framework`` logger logs its traceback at ``ERROR``. The
+  errors fail ``manage.py check`` and the commands that run it
+  (``runserver``, ``migrate``, Django's test runner). The ``hsr_urls()``
+  pattern runs the checks in Django's URL check; without the include, they
+  run only when ``scrudful.rest_framework`` was imported before the checks
+  started, which registers them (in an ``AppConfig.ready()``): otherwise
+  none is reported, ``E003`` included.
 * OPTIONS is no longer gated by the view's permissions (DRF's ``initial()``
   checked them for OPTIONS too); authentication and throttles still run. Its
   ``Allow`` runs each method's ``check_permissions`` and, with the object,

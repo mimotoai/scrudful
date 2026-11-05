@@ -106,10 +106,12 @@ standing. Any other exception a callable raises is ``scrudful.E005``.
 
 The check builds each view's HSR as the route does (without a request; link
 callables are called) and keeps none. With the include, it runs in Django's own
-URL check, which loads the URLconf. ``scrudful.E003`` (the include missing) is
-reported only when ``scrudful.rest_framework`` was imported before the checks
-started, which registers the check: import it in an ``AppConfig.ready()`` of
-yours for ``manage.py check`` to report it too.
+URL check, which loads the URLconf. Without the include (a project serving
+its HSRs elsewhere, with ``SCRUDFUL["HSR_URL"]`` or ``Meta.hsr_url``, or one
+that forgot it), the checks run only when ``scrudful.rest_framework`` was
+imported before they started, which registers them: import it in an
+``AppConfig.ready()`` of yours, or ``manage.py check`` reports none of them,
+``scrudful.E003`` included.
 
 ``scrudful_viewset``, ``scrudful_api_view`` and a ``@scrudful`` method in the
 body of an ``APIView`` (or viewset) class install scrudful's OPTIONS and HSR
@@ -288,7 +290,11 @@ permission check or throttle, is CSRF-exempt, and is public under Django's
   name make a GET of that name's ``/_hsr/`` raise it. Either breaks only its
   own requests: the other names are served (``manage.py check`` reports both).
 * The ``_hsr`` segment is the route's: don't put a route of yours under
-  ``/_hsr/``.
+  ``/_hsr/``. Place the include before any catch-all pattern (a single-page
+  app's ``re_path(r"^.*$", ...)`` fallback, a ``<path:slug>`` page view):
+  Django tries the URLconf's patterns in order, so one placed before the
+  include that matches ``/_hsr/<name>`` shadows the route, and the HSR link
+  targets that view instead. The system checks don't detect it.
 * **Serving it elsewhere.** Turn the route off for a view
   (``Meta.hsr_route = False``, or ``SCRUDFUL["HSR_ROUTE"] = False`` for all,
   with ``Meta.hsr_route = True`` to keep one), say where the document is

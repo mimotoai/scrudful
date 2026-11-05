@@ -401,6 +401,12 @@ the settings give the base URL:
     # settings.py
     SCRUDFUL = {"BASE_URL": "https://api.example.com/"}
 
+Place the include before any catch-all pattern (a single-page app's
+``re_path(r"^.*$", ...)`` fallback, a ``<path:slug>`` page view): Django
+tries the patterns in order, so one placed before it that matches
+``/_hsr/<name>`` answers the HSR link with something else, and the system
+checks don't detect it.
+
 A viewset:
 
 .. code-block:: python
