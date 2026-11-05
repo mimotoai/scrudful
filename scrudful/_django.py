@@ -45,6 +45,7 @@ __all__ = [
     "hsr_not_allowed",
     "hsr_response",
     "json_response",
+    "no_content",
     "page_url",
     "precondition_headers",
     "scrudful_setting",
@@ -169,6 +170,13 @@ def hsr_not_allowed() -> HttpResponseBase:
     ``Allow: GET, HEAD``, with the expose headers."""
     response = HttpResponseNotAllowed(["GET", "HEAD"])
     _adapter.expose_headers(response)
+    return response
+
+
+def no_content() -> HttpResponse:
+    """A 204 without content or ``Content-Type`` (a CORS preflight's answer)."""
+    response = HttpResponse(status=204)
+    del response["Content-Type"]
     return response
 
 

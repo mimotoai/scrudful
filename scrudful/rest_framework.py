@@ -97,24 +97,65 @@ OPTIONS
     With :class:`ScrudfulMetadata` (installed in place of DRF's default
     metadata class by :func:`scrudful_viewset`, :func:`scrudful_api_view` and
     a class-body :func:`scrudful` method, but not by :func:`scrudful` below
-    ``@api_view``), OPTIONS is answered with a Semantic HTTP 0.1 HTTP Schema
-    Resource: a JSON body describing each method the view allows, the Links
-    of the HTTP Schema Resource's own schema and JSON-LD context, and an
-    ``Allow`` listing exactly the body's methods. It is ``application/json``
-    whatever renderer DRF's content negotiation picked, the browsable API's
-    included. An ``Accept`` that none of the view's renderers serves (e.g.
-    ``text/html`` on a view without the browsable API) still gets DRF's 406,
-    raised before OPTIONS is handled.
+    ``@api_view``), OPTIONS is answered as Semantic HTTP 0.1 has it, in this
+    order:
+
+    1. A CORS preflight (an OPTIONS with ``Origin`` and
+       ``Access-Control-Request-Method``) is answered 204, without content,
+       ``Content-Type`` or Links, before DRF's ``dispatch``: no content
+       negotiation, authentication (so no CSRF check), permission check,
+       throttle or loading runs for it. Django middleware runs first, so a
+       CORS middleware adds its headers (or answers the preflight itself).
+    2. The request is authenticated and throttled as DRF does in
+       ``initial()``, but OPTIONS itself is not gated by the permission
+       checks: an anonymous requester of a resource it may not use gets a
+       204 with ``Allow: OPTIONS``. Bad credentials are answered as DRF
+       answers them (a 401, or a 403 when the first authenticator has no
+       ``WWW-Authenticate``), a refused throttle with DRF's 429.
+    3. On a detail route (one whose ``lookup_url_kwarg``, else
+       ``lookup_field``, is in the URL kwargs), the object is loaded with
+       ``get_object()``, its ``check_object_permissions`` suppressed. A
+       ``get_object()`` that raises (``Http404`` for a missing object, or the
+       404 of an object the requester may not read) is answered with that
+       error, through the view's exception handler (:func:`exception_handler`
+       gives it the error Links), and the HTTP Schema Resource link.
+    4. ``Allow`` lists exactly the methods this requester may use: OPTIONS,
+       and each method the view serves for which the method's
+       ``allowed_func(view, request, method, obj)`` (its handler's, else
+       ``Meta.allowed_func``) returns ``True``; without one, for which
+       ``check_permissions`` and, with an object, ``check_object_permissions``
+       pass a request of that method (``rest_framework.request.clone_request``,
+       also the view's ``request``, and the method's action as a viewset's
+       ``action``, meanwhile). DRF's ``PermissionDenied`` or
+       ``NotAuthenticated`` (or Django's ``PermissionDenied``) means not
+       allowed; anything else raised propagates (answered as in step 3). No
+       throttle runs per method. HEAD, which DRF dispatches to the GET
+       handler, is listed when the view serves it and GET is allowed.
+    5. The answer is a 204 without content or ``Content-Type`` (whatever
+       renderer DRF's content negotiation picked, the browsable API's
+       included), with ``Allow``, one HTTP Schema Resource link (to its
+       :func:`hsr_urls` route, else ``hsr_url``'s URL) and
+       ``Access-Control-Expose-Headers``.
+
+    A 405 keeps DRF's ``Allow``, every method the view serves. An ``Accept``
+    that none of the view's renderers serves (e.g. ``text/html`` on a view
+    without the browsable API) still gets DRF's 406, raised before OPTIONS
+    is handled. The HTTP Schema Resource itself is served by GET, by
+    :func:`hsr_urls` (or :func:`http_schema_resource_view`): a view's OPTIONS
+    raises ``ImproperlyConfigured`` without either (see :func:`_hsr_target`).
+    With ``metadata_class = None`` OPTIONS is DRF's 405; with a metadata
+    class that isn't a :class:`ScrudfulMetadata`, DRF's 200 with its body.
 """
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import inspect
 import types
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -140,16 +181,18 @@ from django.views.decorators.csrf import csrf_exempt
 from rest_framework.exceptions import (
     APIException,
     ErrorDetail,
+    NotAuthenticated,
     NotFound,
     ValidationError,
 )
+from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
 from rest_framework.decorators import api_view
 from rest_framework.fields import IntegerField
 from rest_framework.metadata import BaseMetadata, SimpleMetadata
 from rest_framework.mixins import UpdateModelMixin
 from rest_framework.pagination import BasePagination
 from rest_framework.renderers import JSONRenderer
-from rest_framework.request import Request
+from rest_framework.request import Request, clone_request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.views import exception_handler as drf_exception_handler
@@ -161,7 +204,6 @@ from scrudful._adapter import (
     DEFAULT_SCHEMA_REL,
     DEFAULT_SCHEMA_TYPE,
     METHOD_KEYS,
-    allow_header,
     check_callables,
     check_error_body_func,
     check_error_media_type,
@@ -177,7 +219,6 @@ from scrudful._adapter import (
     has_default_entity,
     is_json,
     merge_links,
-    options_links,
     parse_query_int,
     reason_phrase,
     set_validator_headers,
@@ -189,6 +230,7 @@ from scrudful._django import (
     error_handler,
     hsr_not_allowed,
     hsr_response,
+    no_content,
     page_url,
     scrudful_setting,
     slice_page,
@@ -199,6 +241,9 @@ from scrudful._hsr import (
     DEFAULT_HSR_CACHE_CONTROL,
     HsrConfigError,
     absolute_for_hsr,
+    allow_value,
+    hsr_link,
+    is_preflight,
     options_operation,
 )
 from scrudful.conditional import (
@@ -385,7 +430,12 @@ class ScrudfulViewFunc:
         doesn't list has DRF's: 201 for POST, 204 for DELETE, else 200.
     allowed_func : callable, optional
         ``allowed_func(view, request, method, obj)``, whether the requester
-        may use ``method``, for the ``Allow`` of OPTIONS (stored for it).
+        may use ``method`` (on ``obj``, the loaded object, else ``None``),
+        for the ``Allow`` of OPTIONS: when given, it alone decides (see
+        "OPTIONS" in the module docstring). ``request`` is a request of
+        ``method``; it must return a ``bool`` (else ``TypeError``), and may
+        raise DRF's ``PermissionDenied`` or ``NotAuthenticated`` for
+        ``False``.
     base_url : str, optional
         The absolute URL that relative link URLs are resolved against
         (default ``SCRUDFUL["BASE_URL"]``), in the HTTP Schema Resource and
@@ -780,7 +830,7 @@ class ScrudfulViewFunc:
         With ``error``, a 400/412/428 carries its Links and is served as JSON
         with its media type, whatever renderer DRF's content negotiation
         picked (see :func:`_render_as_json`), so that it agrees with the
-        OPTIONS body.
+        HTTP Schema Resource.
         """
         result = with_error_body(self.error_body_func, request, result)
         if result.body is None or self.error is None:
@@ -917,9 +967,9 @@ def scrudful(
     also makes the class answer OPTIONS with :class:`ScrudfulMetadata`, as
     :func:`scrudful_viewset` does: DRF's stock ``SimpleMetadata`` and
     ``options`` are replaced, a class's own are kept. Below ``@api_view``
-    there is no class yet, and the view keeps DRF's ``SimpleMetadata``, so
-    its OPTIONS is no HTTP Schema Resource: use :func:`scrudful_api_view`
-    in place of ``@api_view`` + ``@scrudful`` for one.
+    there is no class yet, and the view keeps DRF's ``SimpleMetadata`` and
+    OPTIONS: use :func:`scrudful_api_view` in place of ``@api_view`` +
+    ``@scrudful`` for scrudful's.
     """
     options = {
         "etag_func": etag_func,
@@ -997,8 +1047,8 @@ def scrudful_api_view(
     ``metadata_class`` attribute of the function, or ``DEFAULT_METADATA_CLASS``)
     is something other than DRF's default ``SimpleMetadata``; a custom class
     (or ``None``) is kept, so subclass :class:`ScrudfulMetadata` to combine them.
-    With :class:`ScrudfulMetadata` (or a subclass) the OPTIONS response is an
-    HTTP Schema Resource (see :class:`ScrudfulMetadata`). DRF's ``api_view``
+    With :class:`ScrudfulMetadata` (or a subclass), OPTIONS is scrudful's 204
+    (see "OPTIONS" in the module docstring). DRF's ``api_view``
     serves only the listed methods: list ``"HEAD"`` too for HEAD requests.
     ::
 
@@ -1080,9 +1130,8 @@ def scrudful_viewset(cls: type) -> type:
     value (``None``, or a class set on the viewset, a base class or
     ``DEFAULT_METADATA_CLASS``) is kept, so subclass or mix in
     :class:`ScrudfulMetadata` to combine it with a custom metadata class. With
-    :class:`ScrudfulMetadata` (or a subclass) the OPTIONS response is an HTTP
-    Schema Resource (see :class:`ScrudfulMetadata`). A user-defined
-    ``options`` is kept.
+    :class:`ScrudfulMetadata` (or a subclass), OPTIONS is scrudful's 204 (see
+    "OPTIONS" in the module docstring). A user-defined ``options`` is kept.
 
     Decorating a subclass of a decorated viewset again re-wraps the original
     methods with the subclass's configuration.
@@ -1341,17 +1390,40 @@ def _load_object(view: Any, fresh: bool = False) -> Any:
 
 
 def _install_metadata(cls: type) -> None:
-    """Make OPTIONS use :class:`ScrudfulMetadata` unless the class chose another.
+    """Give the view class scrudful's OPTIONS, unless it chose its own.
 
-    Only DRF's stock default, ``SimpleMetadata``, is replaced: ``None`` and any
-    other class (set on the class, a base class or ``DEFAULT_METADATA_CLASS``)
-    are the project's choice and are kept. DRF's stock ``APIView.options`` is
-    replaced by :func:`_options`; an ``options`` the class defines is kept.
+    Only DRF's stock default metadata class, ``SimpleMetadata``, is replaced
+    by :class:`ScrudfulMetadata`: ``None`` and any other class (set on the
+    class, a base class or ``DEFAULT_METADATA_CLASS``) are the project's
+    choice and are kept. DRF's stock ``APIView.options`` is replaced by
+    :func:`_options`; an ``options`` the class defines is kept. The class's
+    ``dispatch`` and ``initial`` are wrapped (:func:`_preflight_dispatch`,
+    :func:`_options_initial`), once; the wrappers act only when scrudful
+    answers the request's OPTIONS (:func:`_answers_options`).
     """
     if getattr(cls, "metadata_class", None) is SimpleMetadata:
         cls.metadata_class = ScrudfulMetadata  # type: ignore[attr-defined]
     if getattr(cls, "options", None) is APIView.options:
         cls.options = _options  # type: ignore[attr-defined]
+    _wrap_once(cls, "dispatch", _preflight_dispatch)
+    _wrap_once(cls, "initial", _options_initial)
+
+
+#: Marks the ``dispatch`` and ``initial`` wrappers of :func:`_install_metadata`.
+_OPTIONS_WRAPPER = "_scrudful_options_wrapper"
+
+
+def _wrap_once(
+    cls: type, name: str, wrap: Callable[[Callable[..., Any]], Callable[..., Any]]
+) -> None:
+    """Set ``cls.<name>`` to ``wrap(cls.<name>)``, unless it is a wrapper
+    already (a base class's, which ``cls`` inherits)."""
+    current = getattr(cls, name)
+    if getattr(current, _OPTIONS_WRAPPER, False):
+        return
+    wrapper = wrap(current)
+    setattr(wrapper, _OPTIONS_WRAPPER, True)
+    setattr(cls, name, wrapper)
 
 
 #: Set on a class whose ``APIView`` subclasses :func:`_install_metadata` sets up.
@@ -1386,36 +1458,258 @@ def _install_metadata_on_views(mixin: type) -> None:
 
 
 def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
-    """``APIView.options``, answering with an HTTP Schema Resource.
+    """``APIView.options``: a 204 with the requester's ``Allow`` and the HTTP
+    Schema Resource link (see "OPTIONS" in the module docstring).
 
-    When the view's metadata class is :class:`ScrudfulMetadata` (or a
-    subclass), the 200 is rendered by DRF's ``JSONRenderer`` whatever renderer
-    DRF's content negotiation picked (the browsable API's included), and
-    carries the HTTP Schema Resource's own Links and an ``Allow`` listing the
-    body's methods. Other responses, and those of any other metadata class,
-    are DRF's (``metadata_class = None`` gives a 405; an ``Accept`` none of
-    the view's renderers serves, DRF's 406, raised before this runs).
+    When scrudful answers the view's OPTIONS (:func:`_answers_options`), and
+    after :func:`_options_initial` authenticated and throttled the request
+    (a CORS preflight never gets here: :func:`_preflight_dispatch`):
+
+    1. the HSR link's target is resolved (:func:`_hsr_target`; its
+       ``ImproperlyConfigured`` propagates);
+    2. the object is loaded (:func:`_options_object`);
+    3. each method the view serves is checked for this requester
+       (:func:`_allowed_methods`);
+    4. the answer is a 204 without content or ``Content-Type`` (rendered by
+       DRF's ``JSONRenderer``, whatever renderer DRF's content negotiation
+       picked), ``Allow: allow_value(...)`` (also set in ``view.headers``,
+       which DRF's ``finalize_response`` writes over the response's), the HSR
+       link and the expose headers.
+
+    An exception of step 2 or 3 (the ``Http404`` of a missing object, the
+    404 scoped-rbac gives an object the requester may not read, a check's
+    unexpected error) is answered by the view's ``handle_exception``, as DRF
+    answers a handler's: with the error Links of :func:`exception_handler`
+    and the HSR link; one the exception handler doesn't answer propagates.
+
+    Otherwise (``metadata_class = None`` or a metadata class that isn't a
+    :class:`ScrudfulMetadata`), this is DRF's ``APIView.options``: a 405, or
+    a 200 with the metadata class's body. An ``Accept`` none of the view's
+    renderers serves still gets DRF's 406, raised before this runs.
     """
-    response = APIView.options(self, request, *args, **kwargs)
-    metadata_class = self.metadata_class
-    if not (
-        isinstance(metadata_class, type)
-        and issubclass(metadata_class, ScrudfulMetadata)
-        and response.status_code == 200
-    ):
+    if not _answers_options(self):
+        return APIView.options(self, request, *args, **kwargs)
+    target = _hsr_target(request)
+    try:
+        obj = _options_object(self)
+        allowed = _allowed_methods(self, request, obj)
+    except Exception as exc:
+        response = self.handle_exception(exc)
+        link = merge_links(response.get("Link"), None, None, hsr_link(target))
+        if link is not None:
+            response["Link"] = link
+        expose_headers(response)
         return response
+    allow = allow_value(allowed)
     request.accepted_renderer = JSONRenderer()
     request.accepted_media_type = JSONRenderer.media_type
-    # A fresh Response: there is no Link of the view's to keep.
-    response["Link"] = options_links()
-    allow = allow_header(response.data)
+    # No data: JSONRenderer renders b"", and DRF drops the Content-Type.
+    response = Response(status=204)
     response["Allow"] = allow
     # DRF's finalize_response sets the view's own headers, Allow among them.
     headers = getattr(self, "headers", None)
     if isinstance(headers, dict):
         headers["Allow"] = allow
+    response["Link"] = hsr_link(target)
     expose_headers(response)
     return response
+
+
+def _answers_options(view: APIView) -> bool:
+    """Whether scrudful answers ``view``'s OPTIONS: its ``options`` is
+    :func:`_options` (as :func:`_install_metadata` installs it), its
+    metadata class is :class:`ScrudfulMetadata` (or a subclass), and it
+    serves OPTIONS (``"options"`` is in its ``http_method_names``)."""
+    options = getattr(getattr(view, "options", None), "__func__", None)
+    metadata_class = getattr(view, "metadata_class", None)
+    return (
+        options is _options
+        and isinstance(metadata_class, type)
+        and issubclass(metadata_class, ScrudfulMetadata)
+        and "options" in getattr(view, "http_method_names", ())
+    )
+
+
+def _preflight_dispatch(dispatch: Callable[..., Any]) -> Callable[..., Any]:
+    """The ``dispatch`` of a view class with scrudful's OPTIONS: a CORS
+    preflight (:func:`scrudful._hsr.is_preflight`) that scrudful answers
+    (:func:`_answers_options`) gets a 204 without content, ``Content-Type``
+    or Links, before DRF's ``dispatch``. So before ``initialize_request`` and
+    ``initial()``: no content negotiation, authentication (and so no CSRF
+    check, which DRF's ``SessionAuthentication`` makes), permission check,
+    throttle or loading runs for it, and no scrudful handler is called.
+
+    Django middleware runs first: CORS middleware (django-cors-headers, say)
+    adds its headers to this response, or answers the preflight itself.
+    """
+
+    @functools.wraps(dispatch)
+    def scrudful_dispatch(
+        self: APIView, request: HttpRequest, *args: Any, **kwargs: Any
+    ) -> Any:
+        if is_preflight(request.method or "", request.headers.get) and (
+            _answers_options(self)
+        ):
+            return no_content()
+        return dispatch(self, request, *args, **kwargs)
+
+    return scrudful_dispatch
+
+
+def _options_initial(initial: Callable[..., Any]) -> Callable[..., Any]:
+    """The ``initial`` of a view class with scrudful's OPTIONS: for an
+    OPTIONS that scrudful answers (:func:`_answers_options`), DRF's
+    ``initial()`` without ``check_permissions``. Content negotiation,
+    versioning, authentication (``perform_authentication``: bad credentials
+    are DRF's 401) and throttles (``check_throttles``, once, as DRF throttles
+    the view) run; the permission checks don't gate OPTIONS itself, as they
+    are what its ``Allow`` reports (:func:`_allowed_methods`).
+    """
+
+    @functools.wraps(initial)
+    def scrudful_initial(
+        self: APIView, request: Request, *args: Any, **kwargs: Any
+    ) -> Any:
+        if request.method != "OPTIONS" or not _answers_options(self):
+            return initial(self, request, *args, **kwargs)
+        with _instance_attributes(self, check_permissions=_no_check):
+            return initial(self, request, *args, **kwargs)
+
+    return scrudful_initial
+
+
+def _no_check(*args: Any) -> None:
+    """In place of ``check_permissions`` / ``check_object_permissions``."""
+
+
+def _options_object(view: APIView) -> Any:
+    """The object an OPTIONS of ``view`` is about, for the object-level checks
+    of its ``Allow``: ``view.get_object()`` on a detail route (one whose
+    ``lookup_url_kwarg``, else ``lookup_field``, is in the URL kwargs), with
+    ``check_object_permissions`` suppressed (the checks of each method are
+    :func:`_allowed_methods`'s); ``None`` on any other route (a collection)
+    or for a view without ``get_object``. What ``get_object()`` raises
+    propagates (``Http404`` for a missing object).
+    """
+    get_object = getattr(view, "get_object", None)
+    lookup = getattr(view, "lookup_url_kwarg", None) or getattr(
+        view, "lookup_field", None
+    )
+    kwargs = getattr(view, "kwargs", None) or {}
+    if not callable(get_object) or lookup is None or lookup not in kwargs:
+        return None
+    with _instance_attributes(view, check_object_permissions=_no_check):
+        return get_object()
+
+
+#: What a per-method check of OPTIONS raises for "not allowed".
+_DENIALS = (DRFPermissionDenied, NotAuthenticated, PermissionDenied)
+
+
+def _allowed_methods(view: APIView, request: Request, obj: Any) -> list[str]:
+    """The methods of ``view.allowed_methods`` (those it serves) that the
+    requester of the OPTIONS ``request`` may use on ``obj``
+    (:func:`_may_use`), but OPTIONS, which ``allow_value`` always adds.
+    HEAD, which DRF dispatches to the GET handler, is GET's answer; it is
+    listed only when the view serves it (a ``scrudful_api_view(["GET"])``
+    doesn't)."""
+    served = [method.upper() for method in view.allowed_methods]
+    allowed: dict[str, bool] = {}
+    for method in served:
+        if method == "OPTIONS" or (method == "HEAD" and "GET" in served):
+            continue
+        allowed[method] = _may_use(view, request, method, obj)
+    if "HEAD" in served and "GET" in served:
+        allowed["HEAD"] = allowed["GET"]
+    return [method for method, may in allowed.items() if may]
+
+
+def _may_use(view: APIView, request: Request, method: str, obj: Any) -> bool:
+    """Whether the requester of ``request`` may use ``method`` on ``obj``.
+
+    The checks get ``clone_request(request, method)`` (DRF's; with its own
+    parser context, see :func:`_clone_request`), which is also ``view.request``
+    meanwhile, and a viewset has the method's action as ``view.action``, as
+    when DRF dispatches ``method``; both are put back after. The method's
+    ``allowed_func`` (its handler's, else ``Meta.allowed_func``), when there
+    is one, alone decides: ``allowed_func(view, clone, method, obj)``, which
+    must return a ``bool``. Otherwise ``view.check_permissions(clone)`` and,
+    when ``obj`` is not ``None``, ``view.check_object_permissions(clone,
+    obj)``. DRF's ``PermissionDenied`` or ``NotAuthenticated``, or Django's
+    ``PermissionDenied``, means not allowed; anything else raised
+    propagates. No throttle runs.
+
+    Raises
+    ------
+    TypeError
+        If ``allowed_func`` returns something other than a ``bool``.
+    """
+    clone = _clone_request(request, method)
+    values: dict[str, Any] = {"request": clone}
+    action_map = getattr(view, "action_map", None)
+    if isinstance(action_map, dict):
+        values["action"] = action_map.get(method.lower())
+    allowed_func = _allowed_func(view, method)
+    with _instance_attributes(view, **values):
+        try:
+            if allowed_func is not None:
+                result = allowed_func(view, clone, method, obj)
+                if not isinstance(result, bool):
+                    raise TypeError(
+                        "allowed_func must return a bool, not "
+                        f"{type(result).__name__}"
+                    )
+                return result
+            view.check_permissions(clone)
+            if obj is not None:
+                view.check_object_permissions(clone, obj)
+        except _DENIALS:
+            return False
+    return True
+
+
+def _allowed_func(view: APIView, method: str) -> Callable[..., Any] | None:
+    """The ``allowed_func`` of ``view``'s ``method``: its
+    :class:`ScrudfulViewFunc` handler's, else the viewset's
+    ``Meta.allowed_func``, else ``None``."""
+    handler = _scrudful_handler(view, method.lower())
+    if handler is not None and handler.allowed_func is not None:
+        return handler.allowed_func
+    return _meta_options(view).get("allowed_func")
+
+
+def _clone_request(request: Request, method: str) -> Request:
+    """DRF's ``clone_request(request, method)``, leaving ``request`` as it was.
+
+    ``Request()`` points the parser context it is given at itself, and
+    ``clone_request`` gives the clone ``request``'s: the clone gets a copy,
+    and ``request``'s points at ``request`` again. The clone shares the
+    underlying ``HttpRequest`` (whose ``method`` it doesn't change), the
+    authenticators and the authenticated user.
+    """
+    context = request.parser_context
+    clone = clone_request(request, method)
+    clone.parser_context = {**context, "request": clone}
+    context["request"] = request
+    return clone
+
+
+@contextlib.contextmanager
+def _instance_attributes(obj: Any, **values: Any) -> Iterator[None]:
+    """Set these attributes of ``obj``'s, and put back what it had after
+    (removing those it didn't have, so that the class's show again)."""
+    own = vars(obj)
+    saved = {name: own[name] for name in values if name in own}
+    for name, value in values.items():
+        setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        for name in values:
+            if name in saved:
+                setattr(obj, name, saved[name])
+            else:
+                own.pop(name, None)
 
 
 #: The ``ScrudfulMetadata`` hooks of 0.9, removed in 0.10 (see
@@ -1436,10 +1730,14 @@ class ScrudfulMetadata(BaseMetadata):
     (``APIRequestFactory``), the document of the view instance, built the
     same way (``func(view, None)``, never the request) but not cached.
 
-    The Links, ``Allow`` and JSON rendering of the OPTIONS response are added
-    by the ``options`` that :func:`scrudful_viewset` and
-    :func:`scrudful_api_view` install; a view that only sets
-    ``metadata_class = ScrudfulMetadata`` gets the body alone.
+    On a view with the ``options`` that :func:`scrudful_viewset`,
+    :func:`scrudful_api_view` and a class-body :func:`scrudful` method
+    install, this class (or a subclass) is what makes OPTIONS scrudful's
+    204 without content (see "OPTIONS" in the module docstring), which
+    doesn't call :meth:`determine_metadata`: the document is served by GET
+    (:func:`hsr_urls`), built by :func:`http_schema_resource`. A view that
+    only sets ``metadata_class = ScrudfulMetadata``, keeping DRF's
+    ``options``, answers OPTIONS with this document as DRF's 200 body.
 
     Raises
     ------

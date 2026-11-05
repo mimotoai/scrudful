@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 from django.http import Http404
-from django.urls import include, path
+from django.urls import include, path, resolve
 from rest_framework import generics, serializers, viewsets
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
@@ -17,6 +17,7 @@ from scrudful.rest_framework import (
     _NEVER_CREATES,
     Entity,
     ScrudfulViewFunc,
+    http_schema_resource,
     scrudful,
     scrudful_viewset,
 )
@@ -280,14 +281,14 @@ def test_without_list_validators_preconditions_are_ignored(client):
 
 
 def test_options_describes_the_412(client):
-    described = client.options("/objects/").json()["post"]
+    described = http_schema_resource(resolve("/objects/").func)["post"]
     assert {"201", "400", "412"} <= set(described["responses"])
     assert "428" not in described["responses"]
     assert "parameters" not in described
 
 
 def test_options_without_list_validators_describes_201_only(client):
-    described = client.options("/nolists/").json()["post"]
+    described = http_schema_resource(resolve("/nolists/").func)["post"]
     assert list(described["responses"]) == ["201", "default"]
 
 

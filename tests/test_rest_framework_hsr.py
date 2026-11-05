@@ -9,16 +9,16 @@ import json
 from urllib.parse import urlsplit
 
 import pytest
-from django.contrib.auth.models import User
+from django.contrib.auth.models import Group, User
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from django.test import Client, RequestFactory
-from django.urls import include, path, resolve, reverse
+from django.urls import ResolverMatch, include, path, resolve, reverse
 from rest_framework import viewsets
 from rest_framework.authentication import BasicAuthentication
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.test import APIClient, APIRequestFactory
@@ -43,7 +43,13 @@ from scrudful.rest_framework import (
     scrudful_viewset,
 )
 from tests import drf_hsr_urls
-from tests.semantic_http import hsr_get_problems, validate_http_schema_resource
+from tests.semantic_http import (
+    hsr_get_problems,
+    hsr_link_problems,
+    link_problems,
+    options_204_problems,
+    validate_http_schema_resource,
+)
 
 pytestmark = [pytest.mark.urls(__name__), pytest.mark.django_db]
 
@@ -258,28 +264,45 @@ def test_hsr_independent_of_request(settings):
     }
 
 
+class HostsURLconf:
+    urlpatterns = [
+        path("a/<str:pk>/", HOST_A, name="a"),
+        path("b/<str:pk>/", HOST_B, name="b"),
+        path("", include(hsr_urls())),
+    ]
+
+
 def test_hsr_is_identical_across_hosts_and_requesters(client, settings):
     """Relative links, two hosts and two requesters, each route building its
-    own document on its first request: a request-based build would differ."""
+    own document on its first request (a GET of its HSR): a request-based
+    build would differ."""
     settings.ALLOWED_HOSTS = ["a.example", "b.example"]
-    a = client.options("/a/1/", HTTP_HOST="a.example")
+    settings.ROOT_URLCONF = HostsURLconf
+    a = client.get("/_hsr/a", HTTP_HOST="a.example")
     other = APIClient()
-    other.force_authenticate(User.objects.create(username="bob"))
-    b = other.options("/b/1/", HTTP_HOST="b.example")
+    other.force_login(User.objects.create(username="bob"))
+    b = other.get("/_hsr/b", HTTP_HOST="b.example")
     assert b.wsgi_request.user.username == "bob"
     assert a.status_code == b.status_code == 200
     assert a.json() == b.json() == http_schema_resource(HOST_A)
     assert http_schema_resource(HOST_B) == http_schema_resource(HOST_A)
     assert "https://api.example/schemas/item" in json.dumps(a.json())
     assert "a.example" not in json.dumps(a.json())
+    # The OPTIONS of either host links to the HSR at the base URL.
+    a_options = client.options("/a/1/", HTTP_HOST="a.example")
+    b_options = other.options("/a/1/", HTTP_HOST="b.example")
+    for response in (a_options, b_options):
+        headers = dict(response.items())
+        assert hsr_link_problems(headers, "https://api.example/_hsr/a") == []
 
 
-def test_determine_metadata_returns_the_resolved_views_document(client):
-    response = client.options("/items/1/")
-    assert response.status_code == 200
-    func = response.wsgi_request.resolver_match.func
-    assert response.json() == http_schema_resource(func)
-    assert response.json()["options"] == OPTIONS_204
+def test_determine_metadata_returns_the_resolved_views_document():
+    request = APIRequestFactory().options("/items/1/")
+    request.resolver_match = resolve("/items/1/")
+    func = request.resolver_match.func
+    body = ScrudfulMetadata().determine_metadata(Request(request), func.cls())
+    assert body == http_schema_resource(func)
+    assert body["options"] == OPTIONS_204
 
 
 def test_http_schema_resource_returns_a_copy():
@@ -772,7 +795,7 @@ def test_a_subclass_defining_a_removed_hook_is_a_type_error(name):
     assert "0.10.0 changelog" in message
 
 
-def test_a_subclass_without_removed_hooks_still_works():
+def test_a_subclass_without_removed_hooks_still_works(settings, client):
     class Extended(ScrudfulMetadata):
         def determine_metadata(self, request, view):
             return {**super().determine_metadata(request, view), "x-extra": True}
@@ -782,10 +805,23 @@ def test_a_subclass_without_removed_hooks_still_works():
         metadata_class = Extended
 
     func = V.as_view({"get": "retrieve"})
-    response = func(APIRequestFactory().options("/"), pk="1")
-    assert response.status_code == 200
-    assert response.data["x-extra"] is True
-    assert response.data["options"] == OPTIONS_204
+    request = APIRequestFactory().options("/v/1/")
+    request.resolver_match = ResolverMatch(func, (), {"pk": "1"})
+    body = Extended().determine_metadata(Request(request), func.cls())
+    assert body["x-extra"] is True
+    assert body["options"] == OPTIONS_204
+    assert body["get"] == http_schema_resource(func)["get"]
+
+    # A ScrudfulMetadata subclass keeps scrudful's OPTIONS.
+    class URLconf:
+        urlpatterns = [
+            path("v/<str:pk>/", func, name="v"),
+            path("", include(hsr_urls())),
+        ]
+
+    settings.ROOT_URLCONF = URLconf
+    r = client.options("/v/1/")
+    assert options_204_problems(r.status_code, dict(r.items()), r.content) == []
 
 
 # --- hsr_urls() ----------------------------------------------------------------
@@ -1219,3 +1255,313 @@ def test_http_schema_resource_view_answers_other_methods_405(urls, method):
 def test_http_schema_resource_view_of_no_scrudful_view_is_a_type_error(view_func):
     with pytest.raises(TypeError, match="scrudful view"):
         http_schema_resource_view(view_func)
+
+
+# --- OPTIONS: 204, Allow per requester, the HSR link -----------------------------
+
+
+@pytest.fixture
+def options_urls(settings, throttle_cache):
+    """``tests/drf_hsr_urls.py``, without a base URL (links resolve against
+    ``http://testserver``), its users, and its call log cleared."""
+    settings.ROOT_URLCONF = "tests.drf_hsr_urls"
+    settings.SCRUDFUL = None
+    writers = Group.objects.create(name="writers")
+    User.objects.create_user("reader")
+    User.objects.create_user("writer").groups.add(writers)
+    drf_hsr_urls.CALLS.clear()
+    yield
+    drf_hsr_urls.CALLS.clear()
+
+
+@pytest.fixture
+def api_client(options_urls):
+    return APIClient()
+
+
+def calls(kind):
+    """The logged calls of ``kind`` (see ``drf_hsr_urls.CALLS``)."""
+    return [call[1:] for call in drf_hsr_urls.CALLS if call[0] == kind]
+
+
+def as_user(api_client, username):
+    if username is not None:
+        api_client.force_authenticate(User.objects.get(username=username))
+    return api_client
+
+
+PREFLIGHT = {
+    "HTTP_ORIGIN": "https://app.example",
+    "HTTP_ACCESS_CONTROL_REQUEST_METHOD": "PUT",
+}
+
+
+def test_options_204(api_client):
+    r = api_client.options("/items/1/")
+    assert options_204_problems(r.status_code, dict(r.items()), r.content) == []
+    target = "http://testserver/_hsr/item-detail"
+    assert hsr_link_problems(dict(r.items()), target) == []
+    exposed = {name.strip() for name in r["Access-Control-Expose-Headers"].split(",")}
+    assert {"Allow", "Link"} <= exposed
+
+
+def test_options_204_links_against_the_base_url(api_client, settings):
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL}
+    r = api_client.options("/x/perm-items/1/")
+    assert options_204_problems(r.status_code, dict(r.items()), r.content) == []
+    target = f"{BASE_URL}_hsr/perm-item-detail"
+    assert hsr_link_problems(dict(r.items()), target) == []
+
+
+@pytest.mark.parametrize(
+    "user, allow",
+    [
+        (None, "GET, OPTIONS, HEAD"),
+        ("reader", "GET, OPTIONS, HEAD"),
+        ("writer", "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"),
+    ],
+)
+def test_allow_per_requester(api_client, user, allow):
+    # /x/perm-items/1/: IsAuthenticatedOrReadOnly, writes for the writers
+    # group, and object writes for the owner (writer).
+    r = as_user(api_client, user).options("/x/perm-items/1/")
+    assert r.status_code == 204
+    assert r.headers["Allow"] == allow
+
+
+@pytest.mark.parametrize(
+    "user, allow",
+    [
+        (None, "GET, OPTIONS, HEAD"),
+        ("reader", "GET, OPTIONS, HEAD"),
+        ("writer", "GET, POST, OPTIONS, HEAD"),
+    ],
+)
+def test_allow_of_a_collection_loads_nothing(api_client, user, allow):
+    r = as_user(api_client, user).options("/x/perm-items/")
+    assert r.status_code == 204
+    assert r.headers["Allow"] == allow
+    assert calls("load") == []
+    assert calls("object") == []
+
+
+def test_object_level_denial_excluded(api_client):
+    # The writer may write, but object 2 is someone else's.
+    r = as_user(api_client, "writer").options("/x/perm-items/2/")
+    assert r.status_code == 204
+    assert r.headers["Allow"] == "GET, OPTIONS, HEAD"
+
+
+def test_options_itself_is_not_gated(api_client):
+    """Authenticate, don't gate: neither check_permissions nor (in loading)
+    check_object_permissions runs for OPTIONS; each method is checked once,
+    HEAD by GET's check."""
+    as_user(api_client, "writer").options("/x/perm-items/2/")
+    assert calls("load") == [("2",)]
+    methods = ["GET", "PUT", "PATCH", "DELETE"]
+    assert [call[0] for call in calls("view")] == methods
+    assert calls("object") == [(method, "2") for method in methods]
+
+
+def test_per_method_checks_see_the_method_and_leak_nothing(api_client):
+    r = as_user(api_client, "writer").options("/x/perm-items/1/")
+    # The permission gets a request of the method, and the view has it as
+    # its request and the method's action, as DRF dispatches that method.
+    assert calls("view") == [
+        ("GET", "GET", "retrieve"),
+        ("PUT", "PUT", "update"),
+        ("PATCH", "PATCH", "partial_update"),
+        ("DELETE", "DELETE", "destroy"),
+    ]
+    # The real request, and the view, are as DRF left them for OPTIONS.
+    request, view = r.renderer_context["request"], r.renderer_context["view"]
+    assert request.method == "OPTIONS"
+    assert request._request.method == "OPTIONS"
+    assert view.request is request
+    assert view.action == "metadata"
+    assert request.parser_context["request"] is request
+    assert request.user.username == "writer"
+
+
+def test_anonymous_on_locked_resource_gets_204_allow_options(api_client):
+    # IsAdminUser view
+    r = api_client.options("/x/admin-items/1/")
+    assert r.status_code == 204 and r.headers["Allow"] == "OPTIONS"
+    assert options_204_problems(r.status_code, dict(r.items()), r.content) == []
+
+
+@pytest.mark.parametrize("url", ["/x/admin-items/1/", "/x/perm-items/1/"])
+def test_bad_credentials_are_answered_as_drf_does(api_client, url):
+    bad = {"HTTP_AUTHORIZATION": "Basic Ym9ndXM6Ym9ndXM="}  # bogus:bogus
+    r = api_client.options(url, **bad)
+    # AuthenticationFailed: a 401 with BasicAuthentication first
+    # (admin-items), a 403 with DRF's default SessionAuthentication first,
+    # which has no WWW-Authenticate (perm-items), as for a GET.
+    get = api_client.get(url, **bad)
+    assert r.status_code == get.status_code
+    assert r.json() == get.json() == {"detail": "Invalid username/password."}
+    assert r.get("WWW-Authenticate") == get.get("WWW-Authenticate")
+    if "admin" in url:
+        assert r.status_code == 401
+        assert r["WWW-Authenticate"].startswith("Basic")
+    else:
+        assert r.status_code == 403
+    assert calls("load") == []
+
+
+def test_options_is_throttled_once_as_drf_throttles_the_view(api_client):
+    # CountingThrottle records each check; OncePerDay allows one a day.
+    assert api_client.options("/x/admin-items/1/").status_code == 204
+    assert calls("throttle") == [("OPTIONS",)]
+    assert api_client.options("/x/admin-items/1/").status_code == 429
+
+
+def test_missing_object_is_404_with_error_links(api_client):
+    r = as_user(api_client, "writer").options("/x/perm-items/99/")
+    assert r.status_code == 404
+    headers = dict(r.items())
+    assert link_problems("OPTIONS", 404, headers, True) == []
+    assert "<https://api.example/schemas/error>" in r["Link"]
+    target = "http://testserver/_hsr/perm-item-detail"
+    assert hsr_link_problems(headers, target) == []
+    # No method was checked; Allow is DRF's (every served method).
+    assert calls("view") == []
+    assert r["Allow"] == "GET, PUT, PATCH, DELETE, HEAD, OPTIONS"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {},
+        {"HTTP_COOKIE": "sessionid=x"},
+        {"HTTP_AUTHORIZATION": "Basic Ym9ndXM6Ym9ndXM="},
+        {"HTTP_ACCEPT": "application/xml"},
+    ],
+)
+def test_preflight_runs_nothing(api_client, extra):
+    # Admins only, once a day: three preflights, before authentication,
+    # negotiation, permissions, throttles and loading.
+    for _ in range(3):
+        r = api_client.options("/x/admin-items/1/", **PREFLIGHT, **extra)
+        assert r.status_code == 204
+        assert r.content == b""
+        assert "Content-Type" not in r
+        assert "Link" not in r
+    assert drf_hsr_urls.CALLS == []
+    # The day's one request is still there.
+    assert api_client.options("/x/admin-items/1/").status_code == 204
+
+
+def test_preflight_needs_both_headers(api_client):
+    r = api_client.options("/x/admin-items/1/", HTTP_ORIGIN="https://app.example")
+    assert r.status_code == 204 and r["Allow"] == "OPTIONS"
+    assert hsr_link_problems(dict(r.items())) == []
+
+
+def test_preflight_with_a_session_and_csrf_checks(options_urls):
+    client = APIClient(enforce_csrf_checks=True)
+    client.force_login(User.objects.get(username="writer"))
+    r = client.options("/x/perm-items/1/", **PREFLIGHT)
+    assert r.status_code == 204 and drf_hsr_urls.CALLS == []
+
+
+@pytest.mark.parametrize(
+    "user, url, allow",
+    [
+        (None, "/x/hook-items/1/", "GET, OPTIONS, HEAD"),
+        ("writer", "/x/hook-items/1/", "GET, PUT, OPTIONS, HEAD"),
+        ("writer", "/x/hook-items/", "GET, OPTIONS, HEAD"),
+    ],
+)
+def test_allowed_func_overrides(api_client, user, url, allow):
+    # Every permission denies; allowed_func alone decides (PATCH raises
+    # PermissionDenied: not allowed).
+    r = as_user(api_client, user).options(url)
+    assert r.status_code == 204
+    assert r["Allow"] == allow
+    assert calls("view") == []
+    hooked = calls("hook")
+    assert hooked
+    # The hook gets the method, a request of it, and the object (None for
+    # the collection); HEAD is GET's answer.
+    assert all(method == request_method for method, request_method, _ in hooked)
+    assert "HEAD" not in [method for method, _, _ in hooked]
+    pk = "1" if url.endswith("1/") else None
+    assert {obj for _, _, obj in hooked} == {pk}
+
+
+def test_head_only_when_served(api_client):
+    # scrudful_api_view(["GET"]) doesn't serve HEAD.
+    assert api_client.options("/stats").headers["Allow"] == "GET, OPTIONS"
+    assert api_client.head("/stats").status_code == 405
+
+
+def test_405_keeps_drfs_allow(api_client):
+    r = as_user(api_client, "writer").post("/x/perm-items/1/")
+    assert r.status_code == 405
+    assert r["Allow"] == "GET, PUT, PATCH, DELETE, HEAD, OPTIONS"
+
+
+def test_options_without_the_hsr_urls_include_is_improperly_configured(settings):
+    settings.ROOT_URLCONF = NoIncludeURLconf
+    client = APIClient()
+    with pytest.raises(ImproperlyConfigured) as info:
+        client.options("/items/1/")
+    assert str(info.value) == NO_INCLUDE
+    settings.SCRUDFUL = {
+        "BASE_URL": BASE_URL,
+        "HSR_URL": lambda view_name: f"https://schemas.example/{view_name}",
+    }
+    r = client.options("/items/1/")
+    target = "https://schemas.example/item-detail"
+    assert hsr_link_problems(dict(r.items()), target) == []
+
+
+def not_a_bool(view, request, method, obj):
+    return "yes"
+
+
+class Broken(BasePermission):
+    def has_permission(self, request, view):
+        if request.method == "PUT":
+            raise ValueError("broken")
+        return True
+
+
+@scrudful_viewset
+class NotABoolViewSet(drf_hsr_urls.ItemViewSetBase):
+    class Meta:
+        allowed_func = not_a_bool
+
+
+@scrudful_viewset
+class BrokenViewSet(drf_hsr_urls.ItemViewSetBase):
+    permission_classes = [Broken]
+
+
+class CheckURLconf:
+    urlpatterns = [
+        path(
+            "not-a-bool/<str:pk>/",
+            NotABoolViewSet.as_view({"get": "retrieve"}),
+            name="not-a-bool",
+        ),
+        path(
+            "broken/<str:pk>/",
+            BrokenViewSet.as_view({"get": "retrieve", "put": "update"}),
+            name="broken",
+        ),
+        path("", include(hsr_urls())),
+    ]
+
+
+def test_allowed_func_must_return_a_bool(settings, client):
+    settings.ROOT_URLCONF = CheckURLconf
+    with pytest.raises(TypeError, match="allowed_func.*bool.*str"):
+        client.options("/not-a-bool/1/")
+
+
+def test_another_exception_of_a_check_propagates(settings, client):
+    settings.ROOT_URLCONF = CheckURLconf
+    with pytest.raises(ValueError, match="broken"):
+        client.options("/broken/1/")

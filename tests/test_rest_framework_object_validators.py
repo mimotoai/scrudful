@@ -1,7 +1,7 @@
 """``object_validators``: validators computed from ``get_object()``."""
 
 import pytest
-from django.urls import include, path
+from django.urls import include, path, resolve
 from rest_framework import generics, serializers, viewsets
 from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
@@ -13,6 +13,7 @@ from scrudful.problem import PROBLEM_JSON, problem_details
 from scrudful.rest_framework import (
     Entity,
     exception_handler,
+    http_schema_resource,
     scrudful,
     scrudful_api_view,
     scrudful_viewset,
@@ -446,7 +447,7 @@ def test_create_without_object_validators_is_unchanged(client):
 def test_options_does_not_describe_201_validators(client):
     """As ninja's create: described with its 201 only (describe_write has no
     response-header description), never as a conditional write."""
-    post = client.options("/creates/").json()["post"]
+    post = http_schema_resource(resolve("/creates/").func)["post"]
     assert list(post["responses"]) == ["201", "default"]
     assert "parameters" not in post
 
@@ -457,7 +458,7 @@ def test_create_without_location_func_sends_validators_only(client):
     created = Item.objects.get(name="new")
     assert response["ETag"] == f'"v{created.version}"'
     assert "Location" not in response
-    post = client.options("/nolocs/").json()["post"]
+    post = http_schema_resource(resolve("/nolocs/").func)["post"]
     assert list(post["responses"]) == ["201", "default"]
     assert "parameters" not in post
 

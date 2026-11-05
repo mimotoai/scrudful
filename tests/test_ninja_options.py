@@ -15,7 +15,6 @@ from ninja.errors import HttpError
 from ninja.testing import TestAsyncClient, TestClient
 from rest_framework import viewsets
 from rest_framework.response import Response
-from rest_framework.test import APIRequestFactory
 
 from scrudful._adapter import SCHEMA_REL
 from scrudful._hsr import hsr_link, hsr_route_name, options_operation
@@ -29,6 +28,7 @@ from scrudful.ninja import (
     scrudful_create,
     scrudful_list,
 )
+from scrudful.rest_framework import http_schema_resource as drf_http_schema_resource
 from scrudful.rest_framework import scrudful_viewset
 from tests.test_ninja_adapter import (
     ALICE,
@@ -1385,19 +1385,16 @@ class ItemViewSet(viewsets.ViewSet):
         return Response(status=204)
 
 
-def drf_options(actions: dict[str, str], **kwargs: Any) -> Any:
-    """DRF's HTTP Schema Resource, with its links resolved against ``BASE``:
-    the body of its OPTIONS, until DRF answers OPTIONS with a 204 too. The
-    comparisons are of the documents, ninja's served by its HSR route."""
+def drf_hsr(actions: dict[str, str]) -> Any:
+    """DRF's HTTP Schema Resource of ``ItemViewSet.as_view(actions)``, with
+    its links resolved against ``BASE``, as DRF's builder
+    (``http_schema_resource``, which its ``hsr_urls()`` route serves) builds
+    it. The comparisons are of the documents, ninja's served by its HSR
+    route."""
     view = ItemViewSet.as_view(actions)
-    request = APIRequestFactory().options("/", HTTP_HOST="testlocation")
-    # DRF's is built without the request: against its base URL.
-    with override_settings(
-        ALLOWED_HOSTS=["testlocation"], SCRUDFUL={"BASE_URL": TEST_BASE_URL}
-    ):
-        response = view(request, **kwargs)
-    assert response.status_code == 200
-    body = json.loads(json.dumps(response.data))
+    # DRF's is built without a request: against its base URL.
+    with override_settings(SCRUDFUL={"BASE_URL": TEST_BASE_URL}):
+        body = json.loads(json.dumps(drf_http_schema_resource(view)))
     validate_http_schema_resource(body)
     return body
 
@@ -1426,39 +1423,34 @@ def without_head(drf: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in drf.items() if key != "head"}
 
 
-def without_options(drf: dict[str, Any]) -> dict[str, Any]:
-    """``drf`` with ninja's ``options`` entry (the 204), which DRF's 200
-    OPTIONS doesn't have yet (it answers with the HSR as its body)."""
-    return {**drf, "options": options_operation()}
-
-
 def test_options_superset_of_drf(store):
     router = item_router(store, methods=("GET", "PUT", "PATCH", "DELETE"))
     list_router(store, router)
     client = TestClient(router)
 
-    detail = drf_options(
+    detail = drf_hsr(
         {
             "get": "retrieve",
             "put": "update",
             "patch": "partial_update",
             "delete": "destroy",
-        },
-        pk="1",
+        }
     )
     ninja_detail = hsr_get(client, "/items/{pk}")
-    detail = without_options(without_head(detail))
+    # Both describe OPTIONS as the 204 they answer.
+    assert detail["options"] == ninja_detail["options"] == options_operation()
+    detail = without_head(detail)
     assert list(ninja_detail) == list(detail)
     assert_superset(detail, ninja_detail)
-    assert ninja_detail["options"] == options_operation()
     assert detail["put"]["responses"]["200"]["content"] == ITEM_CONTENT
     # The superset: the statuses ninja's operations declare.
     assert "409" in ninja_detail["put"]["responses"]
     assert "409" not in detail["put"]["responses"]
 
-    listing = drf_options({"get": "list", "post": "create"})
+    listing = drf_hsr({"get": "list", "post": "create"})
     ninja_listing = hsr_get(client, "/items")
-    listing = without_options(without_head(listing))
+    assert listing["options"] == ninja_listing["options"] == options_operation()
+    listing = without_head(listing)
     assert list(ninja_listing) == list(listing)
     assert_superset(listing, ninja_listing)
     assert listing["get"]["responses"]["200"]["content"] == LIST_CONTENT

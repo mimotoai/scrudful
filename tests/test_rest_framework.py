@@ -13,7 +13,7 @@ import pytest
 from django.core.exceptions import ImproperlyConfigured
 from django.http import HttpResponse
 from django.test import override_settings
-from django.urls import include, path
+from django.urls import ResolverMatch, include, path, resolve
 from rest_framework import views as drf_views
 from rest_framework import serializers, viewsets
 from rest_framework.authentication import BasicAuthentication
@@ -30,24 +30,28 @@ from rest_framework.exceptions import NotFound
 from rest_framework.mixins import UpdateModelMixin
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.renderers import BrowsableAPIRenderer, JSONRenderer
+from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient, APIRequestFactory
 from rest_framework.throttling import BaseThrottle
 
-from scrudful._adapter import allow_header, describe_options, options_links
-from scrudful._hsr import options_operation
+from scrudful._hsr import allow_value, options_operation
 from scrudful.rest_framework import (
     Entity,
     ScrudfulMetadata,
     ScrudfulViewFunc,
     exception_handler,
+    hsr_urls,
+    http_schema_resource,
     scrudful,
     scrudful_api_view,
     scrudful_viewset,
 )
 from tests.semantic_http import (
+    hsr_link_problems,
     link_problems,
+    options_204_problems,
     parse_links,
     validate_http_schema_resource,
 )
@@ -88,13 +92,6 @@ def content(schema, context=None, context_type="application/ld+json"):
 THING_CONTENT = content(SCHEMA, CONTEXT, "application/x-context")
 #: The ``default`` entry of a method whose errors carry no error entity.
 DEFAULT_ERROR = {"description": "Error."}
-
-
-def answered_hsr(body):
-    """``body`` with the ``options`` entry of the 200 OPTIONS response that
-    returned it, for agreement checks of that response: until OPTIONS answers
-    204, the HTTP Schema Resource's own entry (a 204) doesn't describe it."""
-    return {**body, "options": describe_options()}
 
 
 class Store:
@@ -840,7 +837,8 @@ class ConditionalTraceAPIView(drf_views.APIView):
 
 
 class DenyAll(BasePermission):
-    """Refuses every request, OPTIONS included."""
+    """Refuses every request (but OPTIONS, which permissions don't gate: its
+    ``Allow`` is ``OPTIONS``)."""
 
     def has_permission(self, request, view):
         return False
@@ -980,37 +978,83 @@ for prefix, viewset in [
 ]:
     router.register(prefix, viewset, basename=prefix)
 
+#: Each route is named after its path, as its HTTP Schema Resource is served
+#: (and OPTIONS links to it) by name, at ``/_hsr/<name>``.
 urlpatterns = [
     path("", include(router.urls)),
     path(
         "parents/<int:parent_pk>/children/",
         NestedViewSet.as_view({"get": "list", "post": "create"}),
+        name="children",
     ),
-    path("api/<int:pk>/", api_thing),
-    path("api-described/<int:pk>/", api_described),
-    path("api-default/", api_default),
-    path("api-throttled/", api_throttled),
-    path("api-authenticated/", api_authenticated),
-    path("api-html-only/", api_html_only),
-    path("api-own-metadata/", api_own_metadata),
-    path("function/<int:pk>/", function_view),
-    path("django/", django_view),
-    path("api-error/<int:pk>/", api_error),
-    path("api-raising/<int:pk>/", api_raising),
-    path("plain-api-raising/<int:pk>/", plain_api_raising),
-    path("django-error/", django_error_view),
-    path("apiview/<int:pk>/", ThingAPIView.as_view()),
-    path("unused-error/<int:pk>/", UnusedErrorAPIView.as_view()),
-    path("used-error/<int:pk>/", UsedErrorAPIView.as_view()),
-    path("trace/<int:pk>/", TraceAPIView.as_view()),
-    path("denied-apiview/<int:pk>/", DeniedAPIView.as_view()),
-    path("disagreeing-apiview/<int:pk>/", DisagreeingAPIView.as_view()),
-    path("disagreeing-no-get/<int:pk>/", DisagreeingNoGetAPIView.as_view()),
-    path("plain-post/<int:pk>/", PlainPostAPIView.as_view()),
-    path("conditional-trace/<int:pk>/", ConditionalTraceAPIView.as_view()),
-    path("serializer-error/<int:pk>/", SerializerErrorAPIView.as_view()),
-    path("custom-renderer-function/<int:pk>/", custom_renderer_function),
+    path("api/<int:pk>/", api_thing, name="api"),
+    path("api-described/<int:pk>/", api_described, name="api-described"),
+    path("api-default/", api_default, name="api-default"),
+    path("api-throttled/", api_throttled, name="api-throttled"),
+    path("api-authenticated/", api_authenticated, name="api-authenticated"),
+    path("api-html-only/", api_html_only, name="api-html-only"),
+    path("api-own-metadata/", api_own_metadata, name="api-own-metadata"),
+    path("function/<int:pk>/", function_view, name="function"),
+    path("django/", django_view, name="django"),
+    path("api-error/<int:pk>/", api_error, name="api-error"),
+    path("api-raising/<int:pk>/", api_raising, name="api-raising"),
+    path("plain-api-raising/<int:pk>/", plain_api_raising, name="plain-api-raising"),
+    path("django-error/", django_error_view, name="django-error"),
+    path("apiview/<int:pk>/", ThingAPIView.as_view(), name="apiview"),
+    path("unused-error/<int:pk>/", UnusedErrorAPIView.as_view(), name="unused-error"),
+    path("used-error/<int:pk>/", UsedErrorAPIView.as_view(), name="used-error"),
+    path("trace/<int:pk>/", TraceAPIView.as_view(), name="trace"),
+    path("denied-apiview/<int:pk>/", DeniedAPIView.as_view(), name="denied-apiview"),
+    path(
+        "disagreeing-apiview/<int:pk>/",
+        DisagreeingAPIView.as_view(),
+        name="disagreeing-apiview",
+    ),
+    path(
+        "disagreeing-no-get/<int:pk>/",
+        DisagreeingNoGetAPIView.as_view(),
+        name="disagreeing-no-get",
+    ),
+    path("plain-post/<int:pk>/", PlainPostAPIView.as_view(), name="plain-post"),
+    path(
+        "conditional-trace/<int:pk>/",
+        ConditionalTraceAPIView.as_view(),
+        name="conditional-trace",
+    ),
+    path(
+        "serializer-error/<int:pk>/",
+        SerializerErrorAPIView.as_view(),
+        name="serializer-error",
+    ),
+    path(
+        "custom-renderer-function/<int:pk>/",
+        custom_renderer_function,
+        name="custom-renderer-function",
+    ),
+    path("", include(hsr_urls())),
 ]
+
+
+def hsr_of(client, url):
+    """The HTTP Schema Resource of the route of ``url``, as a GET of its
+    ``hsr_urls()`` route serves it (OPTIONS links to it)."""
+    response = client.get(f"/_hsr/{resolve(url).view_name}")
+    assert response.status_code == 200, response.content
+    assert response["Content-Type"] == "application/json"
+    return response.json()
+
+
+def options_problems(response, url, allow=None):
+    """How the OPTIONS ``response`` of ``url`` breaks the rules: a 204
+    without content, with ``Allow`` (listing the methods of ``allow``, an
+    ``Allow`` value, when given) and one HTTP Schema Resource link, to the
+    route of ``url``'s."""
+    headers = dict(response.items())
+    expected = None if allow is None else {m.strip() for m in allow.split(",")}
+    target = f"{BASE}/_hsr/{resolve(url).view_name}"
+    return options_204_problems(
+        response.status_code, headers, response.content, expected
+    ) + hsr_link_problems(headers, target)
 
 
 # --- Conditional GET ----------------------------------------------------------
@@ -1219,7 +1263,7 @@ def test_explicit_post_validators_are_evaluated(client):
     response = client.post("/post/", headers={"If-Match": '"v1"'})
     assert response.status_code == 201
     assert "ETag" not in response
-    body = client.options("/post/").json()
+    body = hsr_of(client, "/post/")
     validate_http_schema_resource(body)
     post = body["post"]
     assert set(post["responses"]) == {"201", "400", "412", "default"}
@@ -1333,7 +1377,7 @@ def test_error_links_on_412_428_400(client):
 
 
 def test_error_bodies_are_served_as_the_error_media_type(client):
-    hsr = client.options("/problems/1/").json()
+    hsr = hsr_of(client, "/problems/1/")
     validate_http_schema_resource(hsr)
     write = dict(data={"name": "x"}, format="json")
     for accept in ("application/json", "text/html"):
@@ -1486,25 +1530,25 @@ def test_a_view_rdf_context_link_is_the_one_context_link():
 
 
 def test_options_json_for_browsable_accept(client):
-    """Review Focus 4: the browsable API does not take over OPTIONS."""
+    """Review Focus 4: the browsable API does not take over OPTIONS: a 204
+    without content, whatever the Accept."""
     for path_ in ("/things/1/", "/errors/", "/api-described/7/"):
         response = client.options(path_, headers={"Accept": "text/html"})
-        assert response.status_code == 200
-        assert response["Content-Type"] == "application/json"
-        assert response["Link"] == options_links()
-        body = response.json()
+        body = hsr_of(client, path_)
         validate_http_schema_resource(body)
-        assert response["Allow"] == allow_header(body)
+        # No permission classes: every method the HSR describes is allowed.
+        assert options_problems(response, path_, allow_value(body)) == []
+        assert response["Allow"] == allow_value(body)
         assert response["Access-Control-Expose-Headers"] == "Link, Allow"
 
 
 def test_options_headers_and_method_order(client):
     response = client.options("/things/1/")
-    body = response.json()
+    body = hsr_of(client, "/things/1/")
     validate_http_schema_resource(body)
     assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
     assert response["Allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
-    assert response["Link"] == options_links()
+    assert options_problems(response, "/things/1/", allow_value(body)) == []
     assert body["options"] == options_operation()
     assert body["head"] == {
         "responses": {
@@ -1515,27 +1559,23 @@ def test_options_headers_and_method_order(client):
         | {"200": {"description": "OK"}}
     }
     assert body["head"]["responses"]["default"] == DEFAULT_ERROR
-    assert (
-        link_problems("OPTIONS", 200, dict(response.items()), True, answered_hsr(body))
-        == []
-    )
 
 
 def test_options_write_response_content(client):
-    detail = client.options("/things/1/").json()
+    detail = hsr_of(client, "/things/1/")
     validate_http_schema_resource(detail)
     for method in ("put", "patch"):
         assert detail[method]["requestBody"]["content"] == THING_CONTENT
         assert detail[method]["responses"]["200"]["content"] == THING_CONTENT
     assert "content" not in detail["delete"]["responses"]["204"]
-    listing = client.options("/things/").json()
+    listing = hsr_of(client, "/things/")
     validate_http_schema_resource(listing)
     assert listing["post"]["responses"]["201"]["content"] == THING_CONTENT
 
 
 def test_options_error_content(client):
     error = content(f"{BASE}/schemas/error", f"{BASE}/contexts/error")
-    detail = client.options("/errors/1/").json()
+    detail = hsr_of(client, "/errors/1/")
     validate_http_schema_resource(detail)
     for status in ("400", "412"):
         assert detail["get"]["responses"][status]["content"] == error
@@ -1545,7 +1585,7 @@ def test_options_error_content(client):
             assert detail[method]["responses"][status]["content"] == error
     for response in detail["head"]["responses"].values():
         assert "content" not in response
-    listing = client.options("/errors/").json()
+    listing = hsr_of(client, "/errors/")
     validate_http_schema_resource(listing)
     assert listing["get"]["responses"]["400"]["content"] == {
         "application/problem+json": content(
@@ -1564,7 +1604,7 @@ def test_options_error_content(client):
         assert listing["post"]["responses"][status]["content"] == error
     # Without them the create is not conditional, but the serializer's 400
     # carries the error entity's Links.
-    creates = client.options("/error-creates/").json()
+    creates = hsr_of(client, "/error-creates/")
     assert set(creates["post"]["responses"]) == {"201", "400", "default"}
     assert creates["post"]["responses"]["400"] == {
         "description": "Bad Request",
@@ -1578,29 +1618,27 @@ def test_options_error_content(client):
 
 def test_options_calls_the_error_callables_only_when_described(client):
     error_calls.clear()
-    response = client.options("/unused-error/1/")
-    assert response.status_code == 200
-    body = response.json()
+    body = hsr_of(client, "/unused-error/1/")
     validate_http_schema_resource(body)
     assert error_calls == []
     for description in body.values():
         for status in ("400", "412", "428"):
             assert status not in description["responses"]
 
-    response = client.options("/used-error/1/")
-    assert response.status_code == 200
-    body = response.json()
+    body = hsr_of(client, "/used-error/1/")
     # Once, for every entry with its content.
     assert error_calls == ["used"]
     error = content(f"{BASE}/schemas/error", CONTEXT)
     for status in ("400", "412", "default"):
         assert body["get"]["responses"][status]["content"] == error
+    # OPTIONS describes nothing: it calls none.
+    error_calls.clear()
+    response = client.options("/used-error/1/")
+    assert options_problems(response, "/used-error/1/") == []
+    assert error_calls == []
 
     # No validators, but the serializer's 400 carries the error Links.
-    error_calls.clear()
-    response = client.options("/serializer-error/1/")
-    assert response.status_code == 200
-    body = response.json()
+    body = hsr_of(client, "/serializer-error/1/")
     assert error_calls == ["used"]
     assert set(body["put"]["responses"]) == {"200", "400", "default"}
     assert body["put"]["responses"]["400"]["content"] == error
@@ -1609,7 +1647,7 @@ def test_options_calls_the_error_callables_only_when_described(client):
 
 
 def test_trace_gets_no_links(client):
-    body = client.options("/trace/1/").json()
+    body = hsr_of(client, "/trace/1/")
     assert body["trace"] == {
         "responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}
     }
@@ -1630,7 +1668,7 @@ def test_trace_ignores_preconditions(client):
     assert store.calls == []
     response = client.get("/conditional-trace/1/", headers={"If-Match": '"nope"'})
     assert response.status_code == 412
-    body = client.options("/conditional-trace/1/").json()
+    body = hsr_of(client, "/conditional-trace/1/")
     assert body["trace"] == {
         "responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}
     }
@@ -1640,33 +1678,36 @@ def test_trace_ignores_preconditions(client):
 def test_options_action_without_links(client):
     """Review Focus 5: a route mixing scrudful and plain methods."""
     response = client.options("/mixed-actions/1/mixed/")
-    body = response.json()
+    body = hsr_of(client, "/mixed-actions/1/mixed/")
     validate_http_schema_resource(body)
     assert list(body) == ["get", "put", "options", "head"]
-    assert response["Allow"] == allow_header(body) == "GET, PUT, OPTIONS, HEAD"
+    assert response["Allow"] == allow_value(body) == "GET, PUT, OPTIONS, HEAD"
+    assert options_problems(response, "/mixed-actions/1/mixed/") == []
     assert body["get"]["responses"]["200"]["content"] == content(SCHEMA, CONTEXT)
     assert body["put"] == {
         "responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}
     }
     plain = client.options("/actions/1/plain/")
-    validate_http_schema_resource(plain.json())
-    assert plain.json() == {
+    plain_body = hsr_of(client, "/actions/1/plain/")
+    validate_http_schema_resource(plain_body)
+    assert plain_body == {
         "get": {"responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}},
         "options": options_operation(),
         "head": {"responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}},
     }
     assert plain["Allow"] == "GET, OPTIONS, HEAD"
+    assert options_problems(plain, "/actions/1/plain/") == []
 
 
 def test_agreement_drf_item(client):
     options = client.options("/errors/1/")
-    hsr = options.json()
-    listing = client.options("/errors/").json()
+    hsr = hsr_of(client, "/errors/1/")
+    listing = hsr_of(client, "/errors/")
     validate_http_schema_resource(hsr)
     validate_http_schema_resource(listing)
+    assert options_problems(options, "/errors/1/", allow_value(hsr)) == []
     write = dict(data={"name": "x"}, format="json")
     checks = [
-        ("OPTIONS", options, answered_hsr(hsr)),
         ("GET", client.get("/errors/1/"), hsr),
         ("HEAD", client.head("/errors/1/"), hsr),
         ("PUT", client.put("/errors/1/", **write, headers={"If-Match": '"v1"'}), hsr),
@@ -1681,7 +1722,7 @@ def test_agreement_drf_item(client):
         ("POST", client.post("/errors/", **write), listing),
     ]
     statuses = [response.status_code for _, response, _ in checks]
-    assert statuses == [200, 200, 200, 200, 200, 412, 428, 400, 201]
+    assert statuses == [200, 200, 200, 200, 412, 428, 400, 201]
     for method, response, body in checks:
         has_content = bool(response.content)
         assert has_content == (method != "HEAD")
@@ -1876,14 +1917,15 @@ def test_api_view_options_metadata(client):
     """The HTTP Schema Resource is built without the URL arguments (D-I9
     passed them): a link callable that needs one can't be described."""
     with pytest.raises(ImproperlyConfigured, match=r"func\(view, None\)"):
-        client.options("/api/7/")
+        hsr_of(client, "/api/7/")
+    # OPTIONS builds no document: it only links to it.
+    assert options_problems(client.options("/api/7/"), "/api/7/") == []
     response = client.options("/api-described/7/")
-    assert response.status_code == 200
-    metadata = response.json()
+    assert options_problems(response, "/api-described/7/") == []
+    metadata = hsr_of(client, "/api-described/7/")
     # api_view serves only the listed methods (and OPTIONS): no HEAD.
     assert list(metadata) == ["get", "put", "delete", "options"]
     assert response["Allow"] == "GET, PUT, DELETE, OPTIONS"
-    assert response["Link"] == options_links()
     validate_http_schema_resource(metadata)
     item = content(SCHEMA, CONTEXT)
     assert metadata["get"]["responses"]["200"]["content"] == item
@@ -1909,11 +1951,11 @@ def test_api_view_metadata_class_can_be_overridden(client):
 
 
 def test_viewset_metadata_detail_and_list(client):
-    detail = client.options("/things/1/").json()
+    detail = hsr_of(client, "/things/1/")
     validate_http_schema_resource(detail)
     assert list(detail) == ["get", "put", "delete", "options", "head", "patch"]
     assert detail["get"]["responses"]["200"]["content"] == THING_CONTENT
-    listing = client.options("/things/").json()
+    listing = hsr_of(client, "/things/")
     validate_http_schema_resource(listing)
     assert list(listing) == ["get", "post", "options", "head"]
     assert listing["get"]["responses"] == {
@@ -1930,7 +1972,7 @@ def test_viewset_metadata_detail_and_list(client):
 
 
 def test_metadata_parameters_for_a_single_validator(client):
-    body = client.options("/lm-only/1/").json()
+    body = hsr_of(client, "/lm-only/1/")
     validate_http_schema_resource(body)
     put = body["put"]
     assert put["parameters"] == [
@@ -1942,7 +1984,7 @@ def test_metadata_parameters_for_a_single_validator(client):
             "description": "The Last-Modified date of the current representation.",
         }
     ]
-    both = client.options("/things/1/").json()["put"]["parameters"]
+    both = hsr_of(client, "/things/1/")["put"]["parameters"]
     assert [p["description"] for p in both] == [
         "The entity-tag of the current representation. "
         "Either If-Match or If-Unmodified-Since is required.",
@@ -1953,7 +1995,7 @@ def test_metadata_parameters_for_a_single_validator(client):
 
 def test_metadata_for_nested_list_routes(client):
     """D-Minor: any URL kwarg used to mean "detail"."""
-    metadata = client.options("/parents/5/children/").json()
+    metadata = hsr_of(client, "/parents/5/children/")
     validate_http_schema_resource(metadata)
     assert list(metadata) == ["get", "post", "options", "head"]
     assert metadata["get"]["responses"]["200"]["content"] == content(
@@ -1975,7 +2017,7 @@ def test_nested_create_evaluates_the_preconditions_of_its_collection(client):
 
 
 def test_metadata_for_action_routes(client):
-    metadata = client.options("/actions/1/below/").json()
+    metadata = hsr_of(client, "/actions/1/below/")
     validate_http_schema_resource(metadata)
     assert list(metadata) == ["get", "put", "options", "head"]
     assert metadata["get"]["responses"]["200"]["content"] == content(SCHEMA, CONTEXT)
@@ -2006,10 +2048,15 @@ def test_scrudful_metadata_subclass_gets_the_options_response():
 
     response = _options(Sub)
     response.render()
-    assert response["Content-Type"] == "application/json"
-    assert response["Link"] == options_links()
+    assert response.status_code == 204
+    assert response.content == b""
+    assert "Content-Type" not in response
+    assert hsr_link_problems(dict(response.items()), f"{BASE}/_hsr/dynamic") == []
     assert response["Allow"] == "GET, OPTIONS, HEAD"
-    assert response.data["x-extra"] is True
+    # The subclass's document is still its own.
+    view = _live_view(Sub.as_view({"get": "retrieve"}), "/dynamic/1/", pk="1")
+    request = Request(APIRequestFactory().options("/dynamic/1/"))
+    assert Extended().determine_metadata(request, view)["x-extra"] is True
 
 
 def test_metadata_describes_non_scrudful_methods(client):
@@ -2033,18 +2080,27 @@ def test_get_method_finds_only_scrudful_handlers():
 
 
 def test_metadata_can_be_called_directly():
+    """Without URL resolution, ScrudfulMetadata describes the view instance."""
     view = ThingViewSet.as_view({"get": "retrieve", "put": "update"})
-    request = APIRequestFactory().options("/things/3/")
-    response = view(request, pk="3")
-    validate_http_schema_resource(response.data)
-    assert list(response.data) == ["get", "put", "options", "head"]
+    request = Request(APIRequestFactory().options("/things/3/"))
+    data = ScrudfulMetadata().determine_metadata(
+        request, _live_view(view, "/things/3/", pk="3")
+    )
+    validate_http_schema_resource(data)
+    assert list(data) == ["get", "put", "options", "head"]
+    assert data == http_schema_resource(view)
+    # And the OPTIONS of that view, routed, lists those methods.
+    response = view(_routed(APIRequestFactory().options("/things/3/"), view), pk="3")
+    assert response.status_code == 204
     assert response["Allow"] == "GET, PUT, OPTIONS, HEAD"
 
 
 def test_metadata_output_does_not_share_the_module_dictionaries():
     def describe():
         view = ThingViewSet.as_view({"get": "retrieve", "put": "update"})
-        return view(APIRequestFactory().options("/things/3/"), pk="3").data
+        request = Request(APIRequestFactory().options("/things/3/"))
+        live = _live_view(view, "/things/3/", pk="3")
+        return ScrudfulMetadata().determine_metadata(request, live)
 
     first = describe()
     for operation in first.values():
@@ -2136,8 +2192,24 @@ def test_user_defined_partial_update_keeps_the_meta_configuration(client):
 
 
 def _options(view_or_cls):
-    factory = APIRequestFactory()
-    return view_or_cls.as_view({"get": "retrieve"})(factory.options("/"), pk="1")
+    """The OPTIONS response of ``view_or_cls``'s ``{"get": "retrieve"}`` view,
+    routed as ``dynamic`` (its HSR link is to ``/_hsr/dynamic``)."""
+    view = view_or_cls.as_view({"get": "retrieve"})
+    return view(_routed(APIRequestFactory().options("/dynamic/1/"), view), pk="1")
+
+
+def _routed(request, view, name="dynamic"):
+    """``request``, as the URLconf would route it to ``view`` named ``name``."""
+    request.resolver_match = ResolverMatch(
+        view, (), {"pk": "1"}, url_name=name, route=f"{name}/<pk>/"
+    )
+    return request
+
+
+def _live_view(view, url, **kwargs):
+    """The view instance of ``view`` that served a GET of ``url``."""
+    response = view(APIRequestFactory().get(url), **kwargs)
+    return response.renderer_context["view"]
 
 
 class DefaultMetadataViewSet(ThingViewSetBase):
@@ -2153,7 +2225,11 @@ def test_default_metadata_class_is_replaced():
         pass
 
     assert Default.metadata_class is ScrudfulMetadata
-    assert _options(Default).status_code == 200
+    response = _options(Default)
+    response.render()
+    assert response.status_code == 204
+    assert response.content == b""
+    assert hsr_link_problems(dict(response.items()), f"{BASE}/_hsr/dynamic") == []
 
 
 def test_metadata_class_none_is_kept():
@@ -2237,7 +2313,7 @@ def test_exception_handler_adds_error_links(client):
 
 def test_stock_partial_update_is_described_and_handled_as_the_update(client):
     """PATCH through DRF's stock partial_update is the decorated update's."""
-    body = client.options("/stock-patch-error/1/").json()
+    body = hsr_of(client, "/stock-patch-error/1/")
     validate_http_schema_resource(body)
     for key in ("responses", "parameters"):
         assert body["patch"][key] == body["put"][key], key
@@ -2266,7 +2342,7 @@ def test_stock_partial_update_is_described_and_handled_as_the_update(client):
 
 
 def test_a_custom_partial_update_is_not_the_update(client):
-    body = client.options("/custom-patch/1/").json()
+    body = hsr_of(client, "/custom-patch/1/")
     # Its errors carry the view-wide entity (see exception_handler).
     assert body["patch"] == {
         "responses": {
@@ -2296,10 +2372,18 @@ def test_exception_handler_405_uses_the_view_wide_error_entity(client):
     assert response["Content-Type"] == "application/problem+json"
 
 
+#: An Accept none of the views' renderers (JSON only) serves: DRF's 406, an
+#: error answering OPTIONS (whose permissions don't gate it).
+UNACCEPTABLE = {"Accept": "application/xml"}
+
+
 @pytest.mark.parametrize("url", ["/denied/1/", "/denied-apiview/1/"])
 def test_an_error_answering_options_gets_the_view_wide_error_links(client, url):
+    # DenyAll refuses every method, but not OPTIONS itself.
     response = client.options(url)
-    assert response.status_code == 403
+    assert options_problems(response, url, "OPTIONS") == []
+    response = client.options(url, headers=UNACCEPTABLE)
+    assert response.status_code == 406
     assert response["Link"] == ERROR_LINKS
     assert response["Content-Type"] == "application/json"
     assert response["Access-Control-Expose-Headers"] == "Link, Allow"
@@ -2310,8 +2394,8 @@ def test_an_error_answering_options_gets_the_view_wide_error_links(client, url):
 
 
 def test_disagreeing_error_entities_fall_back_to_the_get_handler(client):
-    response = client.options("/disagreeing-apiview/1/")
-    assert response.status_code == 403
+    response = client.options("/disagreeing-apiview/1/", headers=UNACCEPTABLE)
+    assert response.status_code == 406
     assert response["Link"] == ERROR_LINKS
     assert response["Content-Type"] == "application/json"
     # Each method's own error still gets its handler's entity.
@@ -2321,8 +2405,8 @@ def test_disagreeing_error_entities_fall_back_to_the_get_handler(client):
 
 def test_without_a_get_error_the_first_in_method_order(client):
     """No scrudful GET with an error: the first of put, post ... with one."""
-    response = client.options("/disagreeing-no-get/1/")
-    assert response.status_code == 403
+    response = client.options("/disagreeing-no-get/1/", headers=UNACCEPTABLE)
+    assert response.status_code == 406
     assert response["Link"] == PROBLEM_LINKS
     assert response["Content-Type"] == "application/problem+json"
 
@@ -2375,7 +2459,7 @@ def test_exception_handler_leaves_other_exceptions_alone():
 
 def test_exception_handler_serves_the_error_media_type(client):
     """The HSR lists the statuses under the error entity's media type."""
-    hsr = client.options("/problems/1/").json()
+    hsr = hsr_of(client, "/problems/1/")
     validate_http_schema_resource(hsr)
     for accept in ("application/json", "text/html"):
         response = client.put(
@@ -2410,8 +2494,8 @@ def test_without_the_exception_handler_nothing_is_added_or_described(client):
         )
         assert response.status_code == 400
         assert "Link" not in response
-        listing = client.options("/error-creates/").json()
-        detail = client.options("/errors/1/").json()
+        listing = hsr_of(client, "/error-creates/")
+        detail = hsr_of(client, "/errors/1/")
     validate_http_schema_resource(listing)
     # The raised errors carry no Links: no content.
     assert set(listing["post"]["responses"]) == {"201", "default"}
@@ -2421,17 +2505,17 @@ def test_without_the_exception_handler_nothing_is_added_or_described(client):
 
 
 def test_a_non_conditional_delete_has_no_400_entry(client):
-    body = client.options("/errors/1/").json()
+    body = hsr_of(client, "/errors/1/")
     assert "400" in body["put"]["responses"]
-    body = client.options("/error-only/1/").json()
+    body = hsr_of(client, "/error-only/1/")
     assert "400" in body["put"]["responses"]
     assert set(body["delete"]["responses"]) == {"204", "default"}
-    plain = client.options("/problems/1/").json()
+    plain = hsr_of(client, "/problems/1/")
     assert "400" in plain["delete"]["responses"]  # conditional: scrudful's own
 
 
 def test_a_serializer_400_is_described_with_the_exception_handler(client):
-    listing = client.options("/error-creates/").json()
+    listing = hsr_of(client, "/error-creates/")
     assert set(listing["post"]["responses"]) == {"201", "400", "default"}
 
 
@@ -2470,7 +2554,7 @@ def test_a_delegating_exception_handler_is_known_by_its_marker(
         response = client.put(
             "/errors/1/", {"raise": True}, format="json", headers=IF_MATCH
         )
-        listing = client.options("/error-creates/").json()
+        listing = hsr_of(client, "/error-creates/")
     # Each delegates: the serializer's 400 carries the error Links.
     assert response.status_code == 400
     assert response["Link"] == ERROR_LINKS
@@ -2486,20 +2570,16 @@ def test_a_delegating_exception_handler_is_known_by_its_marker(
 
 def test_api_view_class_answers_options_with_the_http_schema_resource(client):
     assert ThingAPIView.metadata_class is ScrudfulMetadata
+    body = hsr_of(client, "/apiview/1/")
+    validate_http_schema_resource(body)
+    assert list(body) == ["get", "put", "options", "head"]
     for accept in ("application/json", "text/html"):
         response = client.options("/apiview/1/", headers={"Accept": accept})
-        assert response.status_code == 200
-        assert response["Content-Type"] == "application/json"
-        assert response["Link"] == options_links()
-        body = response.json()
-        validate_http_schema_resource(body)
-        assert list(body) == ["get", "put", "options", "head"]
-        assert response["Allow"] == allow_header(body)
-        headers = dict(response.items())
-        assert link_problems("OPTIONS", 200, headers, True, answered_hsr(body)) == []
+        assert options_problems(response, "/apiview/1/", allow_value(body)) == []
+        assert response["Allow"] == allow_value(body)
     assert body["get"]["responses"]["200"]["content"] == content(SCHEMA, CONTEXT)
     assert "412" in body["put"]["responses"]
-    # The OPTIONS body agrees with the responses.
+    # The HTTP Schema Resource agrees with the responses.
     response = client.put("/apiview/1/")
     assert response.status_code == 428
     assert response["Link"] == ERROR_LINKS
@@ -2559,9 +2639,21 @@ def test_scrudful_method_of_a_class_that_is_not_a_view():
 
 
 def _hsr(view_class, **kwargs):
-    """The OPTIONS response of ``view_class`` for ``/``."""
+    """The OPTIONS response of ``view_class``'s view, routed as ``dynamic``,
+    and the view's HTTP Schema Resource."""
     view = view_class.as_view(**kwargs)
-    return view(APIRequestFactory().options("/"), pk="1")
+    request = _routed(APIRequestFactory().options("/dynamic/1/"), view)
+    return view(request, pk="1"), http_schema_resource(view)
+
+
+def _options_204(response):
+    """How ``_hsr``'s OPTIONS ``response`` breaks the rules (see
+    ``options_problems``)."""
+    response.render()
+    headers = dict(response.items())
+    return options_204_problems(
+        response.status_code, headers, response.content
+    ) + hsr_link_problems(headers, f"{BASE}/_hsr/dynamic")
 
 
 def test_scrudful_methods_of_a_mixin_give_its_views_the_options():
@@ -2584,14 +2676,12 @@ def test_scrudful_methods_of_a_mixin_give_its_views_the_options():
         pass
 
     assert ItemView.metadata_class is ScrudfulMetadata
-    response = _hsr(ItemView)
-    assert response.status_code == 200
-    assert response["Link"] == options_links()
-    body = response.data
+    response, body = _hsr(ItemView)
+    assert _options_204(response) == []
     validate_http_schema_resource(body)
     assert list(body) == ["get", "put", "options", "head"]
     assert "412" in body["put"]["responses"]
-    assert response["Allow"] == allow_header(body)
+    assert response["Allow"] == allow_value(body)
 
     # A subclass of the view, or of a view set: the same.
     class SubView(ItemView):
@@ -2602,8 +2692,13 @@ def test_scrudful_methods_of_a_mixin_give_its_views_the_options():
 
     assert SubView.metadata_class is ScrudfulMetadata
     assert ItemViewSet.metadata_class is ScrudfulMetadata
-    response = _hsr(ItemViewSet, actions={"get": "get", "put": "put"})
-    assert list(response.data) == ["get", "put", "options", "head"]
+    response, body = _hsr(ItemViewSet, actions={"get": "get", "put": "put"})
+    assert _options_204(response) == []
+    assert list(body) == ["get", "put", "options", "head"]
+    assert response["Allow"] == allow_value(body)
+    response, body = _hsr(SubView)
+    assert _options_204(response) == []
+    assert response["Allow"] == allow_value(body)
 
     # A class that is no view is unaffected.
     class Helper(ItemMixin):
@@ -2635,7 +2730,7 @@ def test_a_mixin_view_keeps_what_it_chose():
     assert OwnMetadata.metadata_class is CustomMetadata
     assert Inherited.metadata_class is None
     assert OwnOptions.metadata_class is ScrudfulMetadata
-    assert _hsr(OwnOptions).data == {"own": True}
+    assert _hsr(OwnOptions)[0].data == {"own": True}
 
 
 def test_a_mixin_keeps_its_own_init_subclass():
@@ -2670,7 +2765,7 @@ def test_a_mixin_keeps_its_own_init_subclass():
 
 
 def test_bypassed_negotiation_uses_the_view_json_renderer(client):
-    hsr = client.options("/custom-renderer/1/").json()
+    hsr = hsr_of(client, "/custom-renderer/1/")
     validate_http_schema_resource(hsr)
     write = dict(data={"raise": True}, format="json")
     for accept in ("application/json", "text/html"):

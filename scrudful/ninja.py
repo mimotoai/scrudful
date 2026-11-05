@@ -622,6 +622,7 @@ from scrudful._django import (
     error_handler,
     hsr_not_allowed,
     hsr_response,
+    no_content,
     page_url,
     precondition_headers,
     scrudful_setting,
@@ -5037,7 +5038,7 @@ def _options_answer(
     ninja's ``Operation.run`` answers it (re-raised without a handler).
     """
     if is_preflight(request.method or "", request.headers.get):
-        return _no_content()
+        return no_content()
     api = _operation_api(operation)
     # As ninja's _run_checks marks the request of a CSRF-exempt operation.
     request._ninja_csrf_exempt = True  # type: ignore[attr-defined]
@@ -5068,7 +5069,7 @@ def _options_answer(
         ]
     except Exception as exc:
         return api.on_exception(request, exc)  # type: ignore[no-any-return]
-    response = _no_content()
+    response = no_content()
     response["Allow"] = allow_value(allowed)
     response["Link"] = hsr_link(target)
     expose_headers(response)
@@ -5124,13 +5125,6 @@ def _options_throttled(
     if operation.throttle_objects:
         return operation._check_throttles(request)  # type: ignore[no-any-return]
     return None
-
-
-def _no_content() -> HttpResponse:
-    """A 204 without content or ``Content-Type``."""
-    response = HttpResponse(status=204)
-    del response["Content-Type"]
-    return response
 
 
 #: What the per-method checks of OPTIONS (:func:`_may_use`) and loading

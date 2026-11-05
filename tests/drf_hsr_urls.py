@@ -2,18 +2,30 @@
 
 Used by ``tests/test_rest_framework_hsr.py``: a ``DefaultRouter``, a
 hand-mounted ``path()``, a :func:`scrudful_api_view`, a namespaced
-``include()`` and the include of :func:`hsr_urls`.
+``include()`` and the include of :func:`hsr_urls`; and, under ``x/``, the
+views whose OPTIONS ``Allow`` depends on the requester (``perm-items``,
+``admin-items``, ``hook-items``).
 """
 
-from django.http import JsonResponse
+from types import SimpleNamespace
+
+from django.http import Http404, JsonResponse
 from django.urls import include, path, reverse
 from rest_framework import viewsets
-from rest_framework.permissions import IsAdminUser
+from rest_framework.authentication import BasicAuthentication, SessionAuthentication
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import (
+    SAFE_METHODS,
+    BasePermission,
+    IsAdminUser,
+    IsAuthenticatedOrReadOnly,
+)
 from rest_framework.response import Response
 from rest_framework.routers import DefaultRouter, SimpleRouter
-from rest_framework.throttling import SimpleRateThrottle
+from rest_framework.throttling import BaseThrottle, SimpleRateThrottle
 from rest_framework.views import APIView
 
+from scrudful.entity import Entity
 from scrudful.rest_framework import (
     hsr_urls,
     http_schema_resource_view,
@@ -146,6 +158,133 @@ def schema(request):
     return JsonResponse({})
 
 
+# --- OPTIONS: Allow per requester (``x/``) --------------------------------------
+
+#: The error entity of the ``x/`` views.
+X_ERROR = Entity(
+    schema_link_or_func="https://api.example/schemas/error",
+    context_link_or_func="https://api.example/contexts/error",
+)
+#: The objects of the ``x/`` views, by ``pk``: ``"1"`` is the writer's.
+X_OBJECTS = {
+    "1": SimpleNamespace(pk="1", owner="writer"),
+    "2": SimpleNamespace(pk="2", owner="other"),
+}
+#: What the ``x/`` views' permissions, throttles and hook were called for,
+#: in order (the tests clear it).
+CALLS = []
+
+
+class IsWriterOrReadOnly(BasePermission):
+    """Writes for the ``writers`` group only."""
+
+    def has_permission(self, request, view):
+        CALLS.append(("view", request.method, view.request.method, view.action))
+        if request.method in SAFE_METHODS:
+            return True
+        return request.user.groups.filter(name="writers").exists()
+
+
+class IsOwnerOrReadOnly(BasePermission):
+    """Writes to an object for its owner only."""
+
+    def has_object_permission(self, request, view, obj):
+        CALLS.append(("object", request.method, obj.pk))
+        return request.method in SAFE_METHODS or obj.owner == request.user.username
+
+
+class CountingThrottle(BaseThrottle):
+    """Allows every request, recording the check."""
+
+    def allow_request(self, request, view):
+        CALLS.append(("throttle", request.method))
+        return True
+
+
+class XViewSetBase(viewsets.GenericViewSet):
+    """A generic viewset over :data:`X_OBJECTS`, without a model."""
+
+    def get_object(self):
+        CALLS.append(("load", self.kwargs["pk"]))
+        obj = X_OBJECTS.get(self.kwargs["pk"])
+        if obj is None:
+            raise Http404
+        self.check_object_permissions(self.request, obj)
+        return obj
+
+    def list(self, request):
+        return Response([])
+
+    def create(self, request):
+        return Response({"pk": "3"}, status=201)
+
+    def retrieve(self, request, pk):
+        return Response({"pk": self.get_object().pk})
+
+    def update(self, request, pk):
+        return Response({"pk": self.get_object().pk})
+
+    def partial_update(self, request, pk):
+        return Response({"pk": self.get_object().pk})
+
+    def destroy(self, request, pk):
+        self.get_object()
+        return Response(status=204)
+
+
+@scrudful_viewset
+class PermItemViewSet(XViewSetBase):
+    permission_classes = [
+        IsAuthenticatedOrReadOnly,
+        IsWriterOrReadOnly,
+        IsOwnerOrReadOnly,
+    ]
+    throttle_classes = [CountingThrottle]
+
+    class Meta:
+        error = X_ERROR
+
+
+@scrudful_viewset
+class AdminItemViewSet(XViewSetBase):
+    """Admins only, and once a day; bad credentials are a 401."""
+
+    authentication_classes = [BasicAuthentication, SessionAuthentication]
+    permission_classes = [IsAdminUser]
+    throttle_classes = [CountingThrottle, OncePerDay]
+
+    class Meta:
+        error = X_ERROR
+
+
+class DenyAll(BasePermission):
+    def has_permission(self, request, view):
+        CALLS.append(("view", request.method, view.request.method, view.action))
+        return False
+
+
+def hook(view, request, method, obj):
+    """The ``allowed_func`` of ``hook-items``: reads for anyone, PUT for
+    ``writer``, PATCH refused by raising, DELETE never."""
+    CALLS.append(("hook", method, request.method, obj and obj.pk))
+    if method == "PATCH":
+        raise PermissionDenied
+    if method == "PUT":
+        return request.user.username == "writer"
+    return method in ("GET", "HEAD")
+
+
+@scrudful_viewset
+class HookItemViewSet(XViewSetBase):
+    """Every permission check denies: ``Meta.allowed_func`` alone decides."""
+
+    permission_classes = [DenyAll]
+
+    class Meta:
+        allowed_func = hook
+        error = X_ERROR
+
+
 router = DefaultRouter()
 router.register("items", ItemViewSet, basename="item")
 # The same viewset again: a second view function, with a document of its own.
@@ -153,6 +292,11 @@ router.register("other-items", ItemViewSet, basename="other-item")
 router.register("plain", PlainViewSet, basename="plain")
 router.register("locked", LockedViewSet, basename="locked")
 router.register("elsewhere", ElsewhereViewSet, basename="elsewhere")
+
+x_router = SimpleRouter()
+x_router.register("perm-items", PermItemViewSet, basename="perm-item")
+x_router.register("admin-items", AdminItemViewSet, basename="admin-item")
+x_router.register("hook-items", HookItemViewSet, basename="hook-item")
 
 thing_router = SimpleRouter()
 thing_router.register("things", ThingViewSet, basename="thing")
@@ -173,5 +317,6 @@ urlpatterns = [
     path("report", report, name="report"),
     path("schemas/stats", schema, name="stats-schema"),
     path("api/", include((thing_router.urls, "api"))),
+    path("x/", include(x_router.urls)),
     path("", include(hsr_urls())),
 ]
