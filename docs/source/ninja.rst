@@ -912,7 +912,13 @@ your operations included, are not: that middleware gates them.)
   ``ScrudfulRouter`` before that router (move the API's own operations to a
   router added after it), or serve the documents elsewhere with
   ``hsr_route=False`` and ``hsr_url=``. A pattern of your URLconf placed
-  before the API's include is yours to order.
+  before the API's include is yours to order. The check tries, for each
+  parameter of the router's prefix, a word, a number and a UUID (each its
+  converter accepts), so a path capturing only numeric values of it
+  (``"/orgs/{int:n}/{a}/{b}"`` before a router at ``"/orgs/{org}"``) is
+  caught; one capturing a single literal value (``"/orgs/acme/{a}/{b}"``) is
+  not. A prefix converter accepting none of these (nor a short run of one
+  character) leaves the route unchecked, with a ``RuntimeWarning``.
 * **The** ``add_decorator`` **decorators still wrap it.** ninja applies the
   API's and routers' ``add_decorator`` decorators (either mode) to every
   operation, the HSR route included: a gate added that way (a permission

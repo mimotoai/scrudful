@@ -28,7 +28,7 @@ from ninja.errors import (
 from ninja.renderers import JSONRenderer
 from ninja.security import APIKeyHeader, django_auth
 from ninja.throttling import AnonRateThrottle
-from django.urls import path
+from django.urls import path, register_converter
 from ninja.testing import TestAsyncClient, TestClient
 
 from scrudful._django import scrudful_setting
@@ -1294,6 +1294,102 @@ def test_routes_of_other_shapes_dont_shadow_the_hsr_route():
     r = client.get("/orgs/acme/_hsr/pk")
     assert hsr_get_problems(r.status_code, dict(r.headers), r.content) == []
     assert json.loads(r.content) == http_schema_resource(router, "/{pk}")
+
+
+def prefixed_router_api(earlier: str, view: Any, prefix: str) -> NinjaAPI:
+    """An API whose own ``earlier`` path (served by ``view``) comes before a
+    ``ScrudfulRouter`` ``"/{pk}"`` mounted at ``prefix``, whose one
+    parameter is ``x``."""
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    api.get(earlier)(view)
+    router = ScrudfulRouter(base_url=BASE_URL)
+    _, _, item = split_options({})
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def get_item(request, x: Any, pk: int, obj):
+        return obj  # pragma: no cover
+
+    api.add_router(prefix, router)
+    return api
+
+
+def test_a_shadow_of_some_prefix_values_is_a_config_error():
+    """``/orgs/{int:n}/{a}/{b}`` captures ``/orgs/5/_hsr/pk`` but not
+    ``/orgs/acme/_hsr/pk``: every value class of the prefix is tried."""
+
+    def numbered(request, n: int, a: str, b: str):
+        return {"shadow": True}  # pragma: no cover
+
+    api = prefixed_router_api("/orgs/{int:n}/{a}/{b}", numbered, "/orgs/{x}")
+    with pytest.raises(ConfigError, match=r"shadowed by GET 'orgs/<int:n>/<a>/<b>'"):
+        api.urls
+
+
+class FourDigits:
+    regex = "[0-9]{4}"
+
+    def to_python(self, value):
+        return int(value)
+
+    def to_url(self, value):
+        return str(value)
+
+
+class Hexish:
+    regex = "[a-f]{3}x"
+
+    def to_python(self, value):
+        return value
+
+    def to_url(self, value):
+        return value
+
+
+register_converter(FourDigits, "scrudful_test_year")
+register_converter(Hexish, "scrudful_test_hexish")
+
+
+def test_a_custom_converter_of_the_prefix_gets_a_sample():
+    def yearly(request, y: int, a: str, b: str):
+        return {"shadow": True}  # pragma: no cover
+
+    api = prefixed_router_api(
+        "/y/{scrudful_test_year:y}/{a}/{b}", yearly, "/y/{scrudful_test_year:x}"
+    )
+    with pytest.raises(ConfigError, match="shadowed by GET"):
+        api.urls
+
+
+def test_a_prefix_without_a_sample_warns_that_it_is_unchecked():
+    def anything(request, h: str, a: str, b: str):
+        return {}  # pragma: no cover
+
+    api = prefixed_router_api("/h/{h}/{a}/{b}", anything, "/h/{scrudful_test_hexish:x}")
+    with pytest.warns(
+        RuntimeWarning, match=r"can't check.*'h/<scrudful_test_hexish:x>/_hsr/pk'"
+    ):
+        api.urls
+
+
+def test_a_router_mounted_twice_at_one_prefix_names_its_earlier_mount():
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    router = ScrudfulRouter(base_url=BASE_URL)
+    _, _, item = split_options({})
+    router.get("/{pk}", response=ItemOut)(scrudful(**item)(pk_handler))
+    api.add_router("", router, url_name_prefix="a")
+    api.add_router("", router, url_name_prefix="b")
+    with pytest.raises(ConfigError, match="of an earlier mount of this ScrudfulRouter"):
+        api.urls
+
+
+def test_the_shadow_check_needs_ninjas_url_order(monkeypatch, fresh_ninja_code):
+    """It assumes ``NinjaAPI._get_urls``'s order: an API whose ``_get_urls``
+    differs is refused rather than checked against the wrong order."""
+    monkeypatch.setattr(NinjaAPI, "_get_urls", wrapping(NinjaAPI._get_urls))
+    api, _ = make_api()
+    with pytest.raises(ConfigError, match=r"relies on ninja's NinjaAPI\._get_urls"):
+        api.urls
 
 
 def test_described_only_path_gets_an_hsr_route():

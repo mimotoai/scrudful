@@ -3868,7 +3868,9 @@ def _raised_links_run(
 #: with its digest before Python 3.12 and from it on. And those the
 #: per-requester ``Allow`` of OPTIONS relies on (:func:`_served_operations`,
 #: :func:`_authenticated`, :func:`_path_values`): ``NinjaAPI._get_bound_routers``
-#: (the operations of the mount serving the request), the
+#: (the operations of the mount serving the request; with
+#: ``NinjaAPI._get_urls``, the order of an API's patterns, which
+#: :func:`_check_hsr_route_reachable` relies on), the
 #: ``_run_authentication`` of ``Operation`` (which differs between ninja
 #: 1.7.0 and 1.7.1) and ``AsyncOperation`` (what scrudful runs as they run
 #: the ``auth`` callbacks), ``ParamModel.resolve`` and
@@ -3886,6 +3888,9 @@ _NINJA_SOURCES = {
     ),
     "NinjaAPI._get_bound_routers": frozenset(
         {"41498c0b58d36097dc76dc36d81d0b0bfcb177d303339a2bd53260f5962012de"}
+    ),
+    "NinjaAPI._get_urls": frozenset(
+        {"5326f1f8197ffeae637c278614d4096275d1aedfe5e26b6f0362e87f0e218f96"}
     ),
     "Operation._run_authentication": frozenset(
         {
@@ -4065,6 +4070,19 @@ _NINJA_CODE: dict[str, Any] = {
             2,
         )
         for names in (("durations", "duration"), ("duration", "durations"))
+    ),
+    "NinjaAPI._get_urls": (
+        (
+            "get_openapi_urls",
+            "_get_bound_routers",
+            "extend",
+            "urls_paths",
+            "prefix",
+            "append",
+            "get_root_url",
+        ),
+        ("self", "result", "bound_router"),
+        1,
     ),
     # Before Python 3.12, then from it on, when the comprehensions' names are
     # the function's (PEP 709).
@@ -5594,10 +5612,21 @@ class _ScrudfulPathView(PathView):
         return response  # type: ignore[no-any-return]
 
 
-#: Values tried, in order, for a parameter of an HSR route's prefix (one each
-#: converter's regex accepts), to build a URL the route serves; unlikely to
-#: be a literal segment of another route.
+#: The values tried for a parameter of an HSR route's prefix, to build the
+#: URLs the route serves (:func:`_sample_urls`): each one its converter's
+#: regex accepts is used, one per class of value Django's converters tell
+#: apart (a word, a number, a UUID); the word is unlikely to be a literal
+#: segment of another route.
 _SAMPLE_VALUES = ("scrudful-sample", "0", "00000000-0000-0000-0000-000000000000")
+#: Tried, in order, for a converter (a custom one) accepting none of
+#: :data:`_SAMPLE_VALUES`: the first one it accepts is used.
+_FALLBACK_SAMPLES = tuple(char * size for size in range(1, 9) for char in "0aA-_")
+#: The most URLs checked per HSR route: at most 3**k for a prefix of k
+#: parameters (k <= 5 is checked in full), each matched against every path
+#: before the route in its API, once, when the API's URL patterns are built.
+_MAX_SAMPLE_URLS = 3**5
+#: The HSR routes already warned about (see :func:`_check_hsr_route_reachable`).
+_UNCHECKED_ROUTES: set[tuple[int, str]] = set()
 
 
 def _route(prefix: str, path: str) -> str:
@@ -5610,20 +5639,40 @@ def _route(prefix: str, path: str) -> str:
     return ninja_router.normalize_path(route).lstrip("/")  # type: ignore[no-any-return]
 
 
-def _sample_url(route: str) -> str | None:
-    """A URL path that the Django ``route`` matches (its parameters replaced
-    by :data:`_SAMPLE_VALUES`), or ``None`` if a converter accepts none."""
+def _sample_urls(route: str) -> tuple[list[str], str | None]:
+    """URL paths that the Django ``route`` matches, and the name of a
+    parameter it couldn't fill (``None`` when every one was).
+
+    Each parameter takes every :data:`_SAMPLE_VALUES` its converter accepts,
+    else the first :data:`_FALLBACK_SAMPLES` one; the URLs are their product
+    (in order, at most :data:`_MAX_SAMPLE_URLS`), less those the route itself
+    refuses (its converters' ``to_python``). So a shadow of some values of a
+    parameter only (an ``int`` segment where the prefix takes any ``str``)
+    is found; a shadow of one literal value (``"/orgs/acme/{a}/{b}"``) isn't.
+    """
     pattern = RoutePattern(route, is_endpoint=True)
-    values: dict[str, str] = {}
+    names: list[str] = []
+    choices: list[list[str]] = []
     for name, converter in pattern.converters.items():
-        value = next(
-            (v for v in _SAMPLE_VALUES if re.fullmatch(converter.regex, v)), None
+        values = [v for v in _SAMPLE_VALUES if re.fullmatch(converter.regex, v)]
+        if not values:
+            values = [v for v in _FALLBACK_SAMPLES if re.fullmatch(converter.regex, v)][
+                :1
+            ]
+        if not values:
+            return [], name
+        names.append(name)
+        choices.append(values)
+    urls = []
+    combinations = itertools.product(*choices)
+    for combination in itertools.islice(combinations, _MAX_SAMPLE_URLS):
+        values = dict(zip(names, combination, strict=True))
+        url = re.sub(
+            r"<(?:[^>:]+:)?([^>]+)>", lambda match: values[match.group(1)], route
         )
-        if value is None:
-            return None
-        values[name] = value
-    url = re.sub(r"<(?:[^>:]+:)?([^>]+)>", lambda match: values[match.group(1)], route)
-    return url if pattern.match(url) is not None else None
+        if pattern.match(url) is not None:
+            urls.append(url)
+    return urls, None
 
 
 def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
@@ -5639,26 +5688,31 @@ def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
     route does: the HSR link would target something that isn't the HSR.
     ninja gives scrudful no way to place its routes ahead of the API's other
     patterns, so the route is checked when the API's URL patterns are built,
-    by matching a URL it serves (:func:`_sample_url`) against each earlier
-    path of the API's mounts. Nothing is checked for a clone without an API
-    (not bound yet) or a prefix whose converters accept no sample value.
+    by matching the URLs it serves (:func:`_sample_urls`) against each
+    earlier path of the API's mounts: at most :data:`_MAX_SAMPLE_URLS` URLs
+    times the number of earlier paths, once per route and mount. Nothing is
+    checked for a clone without an API (not bound yet). A prefix parameter
+    whose converter accepts no sample value leaves the route unchecked,
+    which a ``RuntimeWarning`` says, once per route.
 
     Raises
     ------
     ninja.errors.ConfigError
         If an earlier path of the API matches the route; or if the installed
-        ninja's ``NinjaAPI._get_bound_routers`` differs from ninja 1.7.0's
-        and 1.7.1's, or its bound routers don't hold the route.
+        ninja's ``NinjaAPI._get_urls`` (the order of the patterns) or
+        ``NinjaAPI._get_bound_routers`` differs from ninja 1.7.0's and
+        1.7.1's, or its bound routers don't hold the route.
     """
     api = getattr(next(iter(path_view.operations), None), "api", None)
     if not isinstance(api, NinjaAPI):
         return
-    _check_ninja_internal(
-        type(api),
-        "NinjaAPI",
-        "_get_bound_routers",
-        "scrudful's check of the HTTP Schema Resource routes",
-    )
+    for method in ("_get_urls", "_get_bound_routers"):
+        _check_ninja_internal(
+            type(api),
+            "NinjaAPI",
+            method,
+            "scrudful's check of the HTTP Schema Resource routes",
+        )
     earlier: list[tuple[str, Any]] = []
     route = None
     for bound_router in api._get_bound_routers():
@@ -5674,16 +5728,31 @@ def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
             break
     if route is None:
         raise _bound_path_error()
-    url = _sample_url(route)
-    if url is None:
+    urls, unfilled = _sample_urls(route)
+    if unfilled is not None:
+        key = (path_view._scrudful_router._scrudful_serial, route)
+        if key not in _UNCHECKED_ROUTES:
+            _UNCHECKED_ROUTES.add(key)
+            warnings.warn(
+                f"scrudful can't check that no earlier path of the API shadows "
+                f"the HTTP Schema Resource route {route!r} of "
+                f"{_described_path(path_view)!r}: no sample value fits the "
+                f"converter of its prefix's {unfilled!r}. Make sure no router "
+                "added to the API before this ScrudfulRouter (nor the API "
+                "itself) has a path matching it.",
+                RuntimeWarning,
+            )
         return
     for other, view in earlier:
-        if RoutePattern(other, is_endpoint=True).match(url) is None:
+        pattern = RoutePattern(other, is_endpoint=True)
+        url = next((url for url in urls if pattern.match(url) is not None), None)
+        if url is None:
             continue
+        label = _route_label(other, view, path_view._scrudful_router)
         raise ConfigError(
             f"the HTTP Schema Resource route {route!r} of "
             f"{_described_path(path_view)!r} "
-            f"(a ScrudfulRouter's) is shadowed by {_route_label(other, view)}, "
+            f"(a ScrudfulRouter's) is shadowed by {label}, "
             "which an earlier router of the API (or the API itself) mounts "
             f"and which Django tries first, so a GET of {url!r} (below the "
             "API's root) wouldn't reach "
@@ -5709,12 +5778,18 @@ def _described_path(path_view: _ScrudfulPathView) -> str:
     )
 
 
-def _route_label(route: str, path_view: Any) -> str:
-    """``path_view``'s operations at ``route``, for an error."""
+def _route_label(route: str, path_view: Any, router: ScrudfulRouter) -> str:
+    """``path_view``'s operations at ``route``, for an error about an HSR
+    route of ``router``."""
     if getattr(path_view, "_scrudful_hsr_route", False):
+        owner = (
+            "an earlier mount of this ScrudfulRouter"
+            if path_view._scrudful_router is router
+            else "another ScrudfulRouter"
+        )
         return (
             f"the HTTP Schema Resource route {route!r} of "
-            f"{_described_path(path_view)!r} of another ScrudfulRouter"
+            f"{_described_path(path_view)!r} of {owner}"
         )
     labels = []
     for operation in getattr(path_view, "operations", ()):
