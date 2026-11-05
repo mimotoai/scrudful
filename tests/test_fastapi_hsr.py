@@ -43,6 +43,7 @@ from scrudful.fastapi import (
     http_schema_resource_endpoint,
     scrudful,
 )
+from tests import fastapi_security_annotations as security_annotations
 from tests.semantic_http import (
     HSR_DOCUMENT_REL,
     hsr_get_problems,
@@ -3194,6 +3195,100 @@ def test_a_route_added_later_whose_security_needs_the_body_is_announced(
     with pytest.warns(RuntimeWarning, match=r"PUT '/notes/\{id\}'"):
         options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
     options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
+
+
+def test_security_is_read_annotation_by_annotation(make_client):
+    """Under ``from __future__ import annotations``, an annotation that can't
+    be evaluated (a name imported only under ``TYPE_CHECKING``) doesn't hide
+    the ``Security(...)`` of another parameter of the same function, of the
+    endpoint or of a dependency: it is resolved, and refuses whom it refuses.
+    Nothing is announced (the suite runs with warnings as errors)."""
+    security_annotations.CALLS.clear()
+    client = make_client(security_annotations.readable_app())
+    assert client.put("/notes/1").status_code == 403
+    assert client.post("/notes/1").status_code == 403
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
+    options_204(
+        client,
+        "/notes/1",
+        "GET, PUT, POST, OPTIONS",
+        NOTE_TARGET,
+        headers=security_annotations.WRITER,
+    )
+    # The check alone ran, not the plain dependency beside it.
+    assert "get_db" not in security_annotations.CALLS
+
+
+def test_a_security_annotation_that_cant_be_evaluated_refuses_its_method(
+    make_client,
+):
+    """A ``Security(...)`` in an annotation that can't be evaluated, of the
+    endpoint or of a dependency, can't be told apart from a plain one: its
+    method is not allowed, for every requester (fail closed), and a
+    ``RuntimeWarning`` names each such route, once."""
+    security_annotations.CALLS.clear()
+    app = security_annotations.unreadable_app()
+    with pytest.warns(RuntimeWarning) as caught:
+        add_options(app, base_url=BASE)
+    messages = sorted(str(warning.message) for warning in caught)
+    assert len(messages) == 2, messages
+    for method, endpoint in (("PATCH", "patch"), ("PUT", "write")):
+        assert any(
+            f"{method} '/notes/{{id}}'" in message
+            and endpoint in message
+            and "can't be evaluated" in message
+            and "allowed=" in message
+            for message in messages
+        ), (method, messages)
+    client = make_client(app)
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
+    options_204(
+        client,
+        "/notes/1",
+        "GET, OPTIONS",
+        NOTE_TARGET,
+        headers=security_annotations.WRITER,
+    )
+    assert security_annotations.CALLS == []
+
+
+def test_an_allowed_hook_decides_a_method_whose_security_cant_be_read(
+    make_client,
+):
+    """With ``allowed``, the hook decides: nothing is announced."""
+    app = security_annotations.unreadable_app()
+    add_options(app, base_url=BASE, allowed=lambda request, method, obj: True)
+    options_204(make_client(app), "/notes/1", "GET, PUT, OPTIONS, PATCH")
+
+
+def test_a_dependency_whose_signature_cant_be_read_refuses_its_method(
+    make_client,
+):
+    """A dependency whose signature can't be read (here, a bad
+    ``__signature__`` set after the route was built) can't be told apart
+    from a security one: its method is not allowed, and the route is
+    announced, once."""
+
+    def lookup(q: str = "") -> str:
+        return q
+
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {}
+
+    @app.put("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def write(id: int, found: str = Depends(lookup)):
+        return {}
+
+    lookup.__signature__ = "not a signature"  # type: ignore[attr-defined]
+    with pytest.warns(RuntimeWarning, match=r"PUT '/notes/\{id\}'.*signature"):
+        add_options(app, base_url=BASE)
+    client = make_client(app)
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET, headers=ADMIN)
 
 
 def test_a_check_s_404_refuses_only_its_method(make_client):

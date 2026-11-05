@@ -79,6 +79,7 @@ from scrudful._adapter import (
     essence,
     evaluated_signature,
     evaluates_preconditions,
+    resolved_signature,
     expose_headers,
     has_default_entity,
     is_json,
@@ -1168,7 +1169,14 @@ def add_options(
        for every requester (it fails closed), and a ``RuntimeWarning``
        names the route, once, when the routes are indexed (by this call,
        or by a request after routes were added); give ``allowed`` to
-       decide such a method. ``HEAD``
+       decide such a method. The same holds when OPTIONS can't tell
+       whether a parameter declares a security dependency: its annotation
+       can't be evaluated (a name imported only under ``TYPE_CHECKING``,
+       with ``from __future__ import annotations``) and names
+       ``Security(`` or ``Depends(``, or a signature (of the endpoint or of
+       a dependency) can't be read. Each annotation is evaluated on its
+       own, so one that can't be doesn't hide the ``Security(...)`` of
+       another. ``HEAD``
        is listed only when a route serves it (FastAPI's GET route doesn't;
        list ``"HEAD"`` in its methods, as ``@app.head`` does), with that
        route's checks.
@@ -1757,7 +1765,7 @@ def _paths_index(owner: FastAPI | APIRouter) -> _PathsIndex:
         options.index = index
     if options.explicit:
         _forget_removed(owner, options)
-        _announce_bodies(options, paths)
+        _announce_unchecked_routes(options, paths)
         if not isinstance(owner, FastAPI):
             _announce_unserved(owner, options, paths)
     return index
@@ -3033,24 +3041,42 @@ async def _may_use(found: tuple[Any, Scope]) -> bool:
     (:func:`_resolves`). A route without dependencies (a Starlette
     ``Route``) has none: allowed. One with a security dependency that needs
     the request's body, which OPTIONS doesn't have, can't be checked: not
-    allowed, for every requester (announced, see :func:`_announce_body`)."""
+    allowed, for every requester, and so is one whose security dependencies
+    can't be told (:class:`_Unchecked`); either is announced (see
+    :func:`_announce_unchecked`)."""
     route, scope = found
     dependant = getattr(route, "dependant", None)
     if dependant is None:
         return True
-    checks, body = _security_dependencies(route, dependant)
-    if body:
-        _announce_body(route)
+    checks, unchecked = _security_dependencies(route, dependant)
+    if unchecked is not None:
+        _announce_unchecked(route, unchecked)
         return False
     if not checks:
         return True
     return await _resolves(route, checks, scope)
 
 
-def _security_dependencies(route: Any, dependant: Any) -> tuple[list[Any], bool]:
+class _Unchecked(Exception):
+    """Why the per-method checks of OPTIONS can't tell a route's security
+    dependencies (its message, the end of a sentence naming the route): the
+    route's method is then refused for every requester (it fails closed)."""
+
+
+#: Why a route's method is refused: one of its security dependencies needs
+#: the request's body.
+_NEEDS_BODY = (
+    "has a security dependency that needs the request's body, which OPTIONS "
+    "doesn't have"
+)
+
+
+def _security_dependencies(route: Any, dependant: Any) -> tuple[list[Any], str | None]:
     """The sub-dependants of ``route``'s ``dependant`` that the per-method
-    checks of OPTIONS resolve, and whether one of them needs the request's
-    body.
+    checks of OPTIONS resolve, and why they can't be (``None``: they can):
+    one of them needs the request's body (:data:`_NEEDS_BODY`), or a
+    signature doesn't tell which are security dependencies
+    (:class:`_Unchecked`).
 
     The security dependencies, wherever they are declared (a parameter of
     the endpoint, or ``dependencies=`` of the route, its routers,
@@ -3061,7 +3087,14 @@ def _security_dependencies(route: Any, dependant: Any) -> tuple[list[Any], bool]
     ``Security(...)``: the ``Depends(get_current_user)`` of a user resolved
     from a token (:func:`_uses_security`). One that needs the request's body
     (a body, form or file parameter anywhere below it) can't be resolved
-    without it: the caller refuses the method (it fails closed). No other
+    without it: the caller refuses the method (it fails closed). So does a
+    parameter whose annotation can't be evaluated (a name imported only under
+    ``TYPE_CHECKING``) and names ``Security(`` or ``Depends(``, or a
+    signature that can't be read, of the endpoint or of a dependency whose
+    subtree has no security scheme: whether it declares a security
+    dependency can't be told. Each annotation is evaluated on its own
+    (:func:`~scrudful._adapter.resolved_signature`), so one that can't be
+    hides nothing else. No other
     dependency of the route (a plain ``Depends`` without a scheme below it,
     even in ``dependencies=``: a throttle, a database write) and never the
     endpoint is resolved. A security dependency is resolved whole, though,
@@ -3074,56 +3107,78 @@ def _security_dependencies(route: Any, dependant: Any) -> tuple[list[Any], bool]
     RuntimeError
         As :func:`_parameterless_security`.
     """
-    declared = _declared_security(getattr(dependant, "call", None))
     parameterless = _parameterless_security(route, dependant)
+    subs = list(getattr(dependant, "dependencies", None) or ())
+    try:
+        declared, unread = _declared_security(getattr(dependant, "call", None))
+    except _Unchecked as exc:
+        return [], str(exc)
     checks = []
-    body = False
-    for sub in getattr(dependant, "dependencies", None) or ():
+    unchecked: str | None = None
+    for sub in subs:
         name = getattr(sub, "name", None)
         secured = (
             any(sub is marked for marked in parameterless)
             if name is None
             else name in declared
         )
-        if secured or _uses_security(sub):
+        try:
+            secured = secured or _uses_security(sub)
+        except _Unchecked as exc:
+            unchecked = unchecked or str(exc)
+            continue
+        if secured:
             if _needs_body(sub):
-                body = True
+                unchecked = unchecked or _NEEDS_BODY
             else:
                 checks.append(sub)
-    return checks, body
+        elif name in unread:
+            unchecked = unchecked or unread[name]
+    named = {getattr(sub, "name", None) for sub in subs}
+    for name, why in unread.items():
+        if name not in named:
+            unchecked = unchecked or why
+    return checks, unchecked
 
 
-#: The attribute of a route marking that :func:`_announce_body` announced it.
-_BODY_ANNOUNCED_ATTRIBUTE = "_scrudful_body_announced"
+#: The attribute of a route marking that :func:`_announce_unchecked`
+#: announced it.
+_UNCHECKED_ANNOUNCED_ATTRIBUTE = "_scrudful_unchecked_announced"
 
 
-def _announce_body(route: Any) -> None:
-    """Warn, once per route, that ``route`` has a security dependency that
-    needs the request's body, so that OPTIONS leaves its methods out of
-    ``Allow`` for every requester (see :func:`_may_use`)."""
+def _announce_unchecked(route: Any, why: str) -> None:
+    """Warn, once per route, that OPTIONS leaves ``route``'s methods out of
+    ``Allow`` for every requester, because its security dependencies can't
+    be checked: ``why`` (see :func:`_security_dependencies`)."""
     original = getattr(route, "original_route", route)
-    if getattr(original, _BODY_ANNOUNCED_ATTRIBUTE, False):
+    if getattr(original, _UNCHECKED_ANNOUNCED_ATTRIBUTE, False):
         return
     with contextlib.suppress(AttributeError, TypeError):
-        setattr(original, _BODY_ANNOUNCED_ATTRIBUTE, True)
+        setattr(original, _UNCHECKED_ANNOUNCED_ATTRIBUTE, True)
     methods = ", ".join(sorted(getattr(route, "methods", None) or ()))
     endpoint = _endpoint_name(getattr(route, "endpoint", None))
+    remedy = (
+        "declare the dependency without the body"
+        if why == _NEEDS_BODY
+        else "make the annotation evaluable at runtime (import its names "
+        "outside TYPE_CHECKING)"
+    )
     warnings.warn(
-        f"{methods} {getattr(route, 'path', route)!r} ({endpoint}) has a "
-        "security dependency that needs the request's body, which OPTIONS "
-        "doesn't have: Allow leaves the method out for every requester. "
-        "Give add_options allowed= to decide it, or declare the dependency "
-        "without the body",
+        f"{methods} {getattr(route, 'path', route)!r} ({endpoint}) {why}: "
+        "Allow leaves the method out for every requester. Give add_options "
+        f"allowed= to decide it, or {remedy}",
         RuntimeWarning,
         stacklevel=2,
     )
 
 
-def _announce_bodies(options: _HsrOptions, paths: Mapping[str, _Resource]) -> None:
-    """:func:`_announce_body` of the routes of ``paths`` whose security
-    dependencies need the body, when they decide ``Allow`` (no ``allowed``
-    hook). A route whose dependencies can't be read is left to OPTIONS,
-    which raises its ``RuntimeError``."""
+def _announce_unchecked_routes(
+    options: _HsrOptions, paths: Mapping[str, _Resource]
+) -> None:
+    """:func:`_announce_unchecked` of the routes of ``paths`` whose security
+    dependencies can't be checked, when they decide ``Allow`` (no
+    ``allowed`` hook). A route whose ``dependencies=`` can't be read is left
+    to OPTIONS, which raises its ``RuntimeError``."""
     if options.allowed is not None:
         return
     for resource in paths.values():
@@ -3132,11 +3187,11 @@ def _announce_bodies(options: _HsrOptions, paths: Mapping[str, _Resource]) -> No
             if dependant is None:
                 continue
             try:
-                _, body = _security_dependencies(route, dependant)
+                _, unchecked = _security_dependencies(route, dependant)
             except RuntimeError:
                 continue
-            if body:
-                _announce_body(route)
+            if unchecked is not None:
+                _announce_unchecked(route, unchecked)
 
 
 def _parameterless_security(route: Any, dependant: Any) -> list[Any]:
@@ -3188,7 +3243,15 @@ def _parameterless_security(route: Any, dependant: Any) -> list[Any]:
 
 def _uses_security(dependant: Any) -> bool:
     """Whether ``dependant`` is, or depends on (at any depth), a security
-    scheme or a ``Security(...)`` dependency."""
+    scheme or a ``Security(...)`` dependency.
+
+    Raises
+    ------
+    _Unchecked
+        If it can't be told, and nothing below ``dependant`` is one: a
+        signature of the subtree can't be read, or an annotation that can't
+        be evaluated may declare one (:func:`_declared_security`).
+    """
     call = getattr(dependant, "call", None)
     scheme = call
     while isinstance(scheme, functools.partial):
@@ -3201,30 +3264,80 @@ def _uses_security(dependant: Any) -> bool:
         dependant, "security_requirements", None
     ):
         return True
-    declared = _declared_security(call)
-    return any(
-        getattr(sub, "name", None) in declared or _uses_security(sub)
-        for sub in getattr(dependant, "dependencies", None) or ()
-    )
-
-
-def _declared_security(call: Any) -> frozenset[str]:
-    """The names of ``call``'s parameters declared with ``Security(...)`` (as
-    their default, or in their ``Annotated`` metadata)."""
-    if call is None:
-        return frozenset()
+    subs = list(getattr(dependant, "dependencies", None) or ())
+    doubt: _Unchecked | None = None
     try:
-        signature = evaluated_signature(call)
-    except (TypeError, ValueError):
-        return frozenset()
+        declared, unread = _declared_security(call)
+    except _Unchecked as exc:
+        # No name can be told: only a scheme below can still decide.
+        declared, unread, doubt = frozenset(), {}, exc
+    for sub in subs:
+        name = getattr(sub, "name", None)
+        if name in declared:
+            return True
+        try:
+            if _uses_security(sub):
+                return True
+        except _Unchecked as exc:
+            doubt = doubt or exc
+            continue
+        if name in unread:
+            doubt = doubt or _Unchecked(unread[name])
+    named = {getattr(sub, "name", None) for sub in subs}
+    for name, why in unread.items():
+        if name not in named:
+            doubt = doubt or _Unchecked(why)
+    if doubt is not None:
+        raise doubt
+    return False
+
+
+#: What an annotation that can't be evaluated names when it may declare a
+#: dependency.
+_DECLARES_DEPENDENCY = re.compile(r"\b(?:Security|Depends)\s*\(")
+
+
+def _declared_security(call: Any) -> tuple[frozenset[str], dict[str, str]]:
+    """The names of ``call``'s parameters declared with ``Security(...)`` (as
+    their default, or in their ``Annotated`` metadata), and those whose
+    annotation can't be evaluated but names ``Security(`` or ``Depends(``,
+    each with why it can't be told (:class:`_Unchecked`'s message). Each
+    annotation is evaluated on its own
+    (:func:`~scrudful._adapter.resolved_signature`).
+
+    Raises
+    ------
+    _Unchecked
+        If ``call``'s signature can't be read.
+    """
+    if call is None:
+        return frozenset(), {}
+    try:
+        signature = resolved_signature(call)
+    except (TypeError, ValueError, NameError) as exc:
+        raise _Unchecked(
+            f"has a dependency, {_endpoint_name(call)}, whose signature can't "
+            f"be read ({exc}), so OPTIONS can't tell whether it declares a "
+            "security dependency"
+        ) from exc
     names = set()
+    unread = {}
     for parameter in signature.parameters.values():
         marks = [parameter.default]
-        if get_origin(parameter.annotation) is Annotated:
-            marks += get_args(parameter.annotation)[1:]
+        annotation = parameter.annotation
+        if get_origin(annotation) is Annotated:
+            marks += get_args(annotation)[1:]
         if any(isinstance(mark, fastapi_params.Security) for mark in marks):
             names.add(parameter.name)
-    return frozenset(names)
+            continue
+        text = getattr(annotation, "__forward_arg__", annotation)
+        if isinstance(text, str) and _DECLARES_DEPENDENCY.search(text):
+            unread[parameter.name] = (
+                f"has a dependency, {_endpoint_name(call)}, whose annotation "
+                f"{text!r} of {parameter.name!r} can't be evaluated, so "
+                "OPTIONS can't tell whether it declares a security dependency"
+            )
+    return frozenset(names), unread
 
 
 def _needs_body(dependant: Any) -> bool:
@@ -4521,8 +4634,11 @@ def _wrapper_signature(
     the endpoint itself receives them.
     """
     # FastAPI < 0.124 evaluates string annotations (``from __future__ import
-    # annotations``) in the wrapper's globals (this module's).
-    signature = evaluated_signature(endpoint)
+    # annotations``) in the wrapper's globals (this module's). Each is
+    # evaluated on its own: one naming something imported only under
+    # TYPE_CHECKING stays a string, and leaves the others (a Security(...) in
+    # an Annotated) evaluated.
+    signature = resolved_signature(endpoint)
     params = list(signature.parameters.values())
     globalns = getattr(inspect.unwrap(endpoint), "__globals__", {})
     names = {param.name for param in params}

@@ -277,13 +277,17 @@ def test_future_annotations_are_evaluated_in_the_endpoint_module(make_client):
     assert response.headers["etag"] == '"v3"'
 
 
-def test_unresolvable_annotations_fall_back_to_the_unevaluated_signature():
+def test_an_unresolvable_annotation_stays_a_string_and_the_others_are_evaluated():
+    """Each annotation is evaluated on its own: one that can't be stays as
+    it is, and doesn't leave the others unevaluated (a FastAPI evaluating
+    them in the wrapper's globals would miss the endpoint's names)."""
+
     @scrudful()
     async def endpoint(item_id: "int", thing: "Undefined" = None):  # noqa: F821
         pass
 
     params = inspect.signature(endpoint).parameters
-    assert params["item_id"].annotation == "int"
+    assert params["item_id"].annotation is int
     assert params["thing"].annotation == "Undefined"
 
 

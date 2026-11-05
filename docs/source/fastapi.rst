@@ -304,6 +304,15 @@ Things to know:
   method its check never ran for), and a ``RuntimeWarning`` names the route,
   once, when the routes are indexed (by ``add_options``, or by a request
   after routes were added). Give ``allowed`` to decide such a method.
+* **An annotation OPTIONS can't read fails closed too.** Each annotation is
+  evaluated on its own, so under ``from __future__ import annotations`` a name
+  imported only under ``TYPE_CHECKING`` doesn't hide the ``Security(...)`` of
+  another parameter. But a parameter whose own annotation can't be evaluated
+  and names ``Security(`` or ``Depends(`` may declare a security dependency
+  that can't be told, and so may a signature (of the endpoint or of a
+  dependency) that can't be read: its method is **not allowed**, for every
+  requester, and a ``RuntimeWarning`` names the route, once, as above. Import
+  the annotation's names outside ``TYPE_CHECKING``, or give ``allowed``.
 * **Object-level rules need** ``allowed`` (and ``load``): the security
   dependencies have no object. With ``allowed``, every requester passes step 2,
   so the object is loaded for each: ``load`` should then hide (``None``, or a

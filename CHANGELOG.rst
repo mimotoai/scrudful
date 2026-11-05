@@ -372,6 +372,16 @@ Behaviour change (FastAPI)
   parameter, at any depth) refuses its method in ``Allow``, for every
   requester, unless ``add_options(allowed=)`` decides; a ``RuntimeWarning``
   names each such route, once, when the routes are indexed.
+* ``Allow`` reads the endpoint's and the dependencies' annotations one by
+  one: under ``from __future__ import annotations``, a name imported only
+  under ``TYPE_CHECKING`` no longer hides the ``Security(...)`` of another
+  parameter (OPTIONS listed the method to everyone). A parameter whose own
+  annotation can't be evaluated and names ``Security(`` or ``Depends(``, or a
+  signature that can't be read, refuses its method for every requester
+  (fails closed), unless ``add_options(allowed=)`` decides, with a
+  ``RuntimeWarning`` naming the route, once. The scrudful endpoint wrapper's
+  signature is evaluated the same way, so a FastAPI that evaluates it in the
+  wrapper's globals (before 0.124) sees the other annotations evaluated.
 * The FastAPI internals the ``Allow`` checks rely on (``solve_dependencies``,
   and how a route's ``dependencies=`` map onto its dependant) are checked by
   ``add_options``, at startup, when a route has security dependencies to
