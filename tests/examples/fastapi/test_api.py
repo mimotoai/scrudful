@@ -552,7 +552,7 @@ NO_ENTRY = {304, 405}
 )
 def test_example_links_everywhere(client, method, path, arguments, status):
     """Every response, a HEAD included, follows the Semantic HTTP 0.1 Link rules
-    and agrees with the OPTIONS body of its path."""
+    and agrees with the HTTP Schema Resource of its path."""
     route = HSR_ROUTES.get("/users/" if path.startswith("/users/") else path)
     hsr = None if route is None else client.get(route).json()
     response = client.request(method.upper(), path, **arguments)
@@ -670,7 +670,7 @@ def test_wire_options_and_hsr(client, path, allow):
 )
 def test_wire_no_undescribed_content(accept, method, path):
     """No error is content the HSR doesn't describe, for an absent ``Accept``
-    or ``Accept: application/json``."""
+    or ``Accept: application/json``, and each follows the Link rules."""
     with TestClient(api.app) as client:
         del client.headers["accept"]
         hsr = client.get("/_hsr/users.user_id").json()
@@ -679,3 +679,6 @@ def test_wire_no_undescribed_content(accept, method, path):
     assert response.status_code >= 400
     headers = wire.headers_of(response)
     assert undescribed_problems(accept, headers, hsr) == []
+    content = bool(response.content)
+    status = response.status_code
+    assert link_problems(method, status, headers, content) == []

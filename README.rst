@@ -218,16 +218,33 @@ order:
    ``Access-Control-Request-Method``) is answered 204 without content or
    Links, before any authentication, throttle, hook, permission check or
    load.
-2. The requester is authenticated, and the request throttled, as the framework
-   would for the path. OPTIONS itself is not gated: an anonymous requester of a
-   locked resource gets a 204 with ``Allow: OPTIONS``, not a 401.
-3. On an item URL, the object is loaded with the view's own loader (ninja's
-   ``load``, DRF's ``get_object()``, FastAPI's ``add_options(load=...)``), once
-   at least one method passes its checks that don't need the object, so that
-   a requester refused everything can't tell which objects exist. A loader
-   returning ``None`` gives no object (the object-level checks are skipped);
-   a 404 it raises is the answer, with the error entity's Links and the HSR
-   link.
+2. OPTIONS itself is not gated: an anonymous requester of a locked resource
+   gets a 204 with ``Allow: OPTIONS``, not a 401. What runs for it depends on
+   the adapter:
+
+   * DRF authenticates the requester and throttles the request as its
+     ``initial()`` does, so bad credentials get DRF's 401 (or 403);
+   * django-ninja throttles the request once, as ninja would throttle the
+     operation, but runs no authentication of its own: each method's
+     ``auth=`` callbacks run in step 4, and bad credentials make the requester
+     anonymous;
+   * FastAPI runs no dependency for OPTIONS itself: only the per-method
+     security checks of step 4.
+3. On an item URL, the object is loaded with the view's own loader, only once
+   a check allows the requester, so that a requester refused everything can't
+   tell which objects exist:
+
+   * DRF: ``get_object()``, once at least one method passes its view-level
+     permissions (a method with an ``allowed_func`` always passes);
+   * django-ninja: the ``load`` of the GET operation (else of the first with
+     one), once that operation's own ``auth=`` and ``before=`` allow the
+     requester, with or without an ``allowed=`` hook;
+   * FastAPI: ``add_options(load=...)``, once at least one method passes its
+     security dependencies (every method does with ``allowed=``).
+
+   Without an object (a collection, a loader returning ``None``, or a gate
+   that refused) the object-level checks get ``obj=None``; a 404 the loader
+   raises is the answer, with the error entity's Links and the HSR link.
 4. Each method the path serves is checked for this requester, on a copy of
    the request with that method. A hook, when given, alone decides; without
    one, the framework's own declared authorization does:
@@ -951,10 +968,13 @@ between spec commits ``bcc338e`` and ``37ec1ce``. For a project on 0.9
    ``ScrudfulRouter(allowed=...)`` (or ``allowed=`` on a decorator),
    ``allowed(request, method, obj) -> bool``. Check the requester's permission
    for ``method`` (``http.<METHOD>``) against the policy, and its conditions
-   against ``obj`` (``None`` for a collection). With a hook, OPTIONS loads the
-   object for every requester, so ``get_object()`` (or ``load``) must hide,
-   with a 404, the objects a requester may not see. Without one, the
-   permission classes (DRF) or ``auth=`` and ``before=`` (ninja) decide.
+   against ``obj`` when there is one. ``obj`` is ``None`` for a collection,
+   and, under django-ninja, also on an item URL when the GET operation's
+   ``auth=`` or ``before=`` refused the requester (the object is then not
+   loaded). Under DRF, a hook makes OPTIONS load the object for every
+   requester, so ``get_object()`` must hide, with a 404, the objects a
+   requester may not see. Without a hook, the permission classes (DRF) or
+   ``auth=`` and ``before=`` (ninja) decide.
 6. **Update the tests that assert the 200 OPTIONS body.** OPTIONS is now a 204
    without content, ``Allow`` depends on the requester, and the document is
    at the target of the response's HTTP Schema Resource link: GET it there. It
@@ -970,6 +990,21 @@ between spec commits ``bcc338e`` and ``37ec1ce``. For a project on 0.9
    and ``allow_header`` are gone.
 8. **Install** ``handler404`` / ``handler500`` (Django), and configure the CORS
    middleware (``EXPOSE_HEADERS``, ``OPTIONS``, the ``/_hsr/`` routes).
+9. **Also check what now fails at startup or on configuration:**
+
+   * a schema link without a context link (for a non-in-band media type, such
+     as JSON) is refused: an ``Entity`` (or a ninja decorator) given a plain
+     one raises ``HsrConfigError``, a ``ValueError``, when created, and a
+     callable one, or DRF's and FastAPI's link options, raise the adapter's
+     configuration error when the HSR is built. Give every schema link its
+     ``context_link_or_func`` (0.9's README DRF snippet had a schema only);
+   * django-ninja: every plain (not scrudful) operation on a
+     ``ScrudfulRouter`` needs ``@described(Entity(...))`` (or
+     ``scrudful_entity=``), or adding it raises ``ConfigError``;
+   * django-ninja: the API's and routers' ``add_decorator`` decorators now
+     also wrap the public HSR route, so a gate added that way makes it
+     non-public; and ``add_decorator(mode="operation")`` gates no longer gate
+     OPTIONS, nor show in its ``Allow`` (give ``allowed=``).
 
 The changelog lists every change.
 

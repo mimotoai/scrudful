@@ -35,8 +35,11 @@ Behaviour change (all adapters)
   where a route serves it.
 * On an item URL, OPTIONS loads the object with the view's own loader (ninja
   ``load``, DRF ``get_object()``, FastAPI ``add_options(load=)``), only once a
-  method passes its object-free checks, so a requester refused everything
-  can't tell which objects exist. A 404 the loader raises is the OPTIONS's
+  check allows the requester, so a requester refused everything can't tell
+  which objects exist: for DRF and FastAPI, once a method passes its
+  object-free checks (every method does with a hook); for ninja, once the
+  loading operation's own ``auth=`` and ``before`` allow the requester, hook
+  or not (else the hook gets ``obj=None``). A 404 the loader raises is the OPTIONS's
   answer, with the error Links and the HSR link; ``None`` is no object.
 * A CORS preflight (an OPTIONS with ``Origin`` and
   ``Access-Control-Request-Method``) that reaches scrudful is answered 204
@@ -135,7 +138,7 @@ Behaviour change (ninja)
   ``text/html`` 405). It relies on ninja 1.7's ``PathView`` internals
   (``ConfigError`` when the installed ninja's differ).
 * The HSR is compact JSON written by scrudful, whatever the API's renderer
-  (0.7.0 had the OPTIONS body written by the renderer); OPTIONS has no body.
+  (0.7–0.9 had the OPTIONS body written by the renderer); OPTIONS has no body.
 * A path whose HSR link can't be computed (the route off without
   ``hsr_url``, a route that can't be reversed) raises ``ConfigError`` on
   every response of the path.

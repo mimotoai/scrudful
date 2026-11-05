@@ -397,8 +397,9 @@ created. A ``list_load`` returning ``None`` means there is no collection (e.g.
 its parent is missing): no precondition can fail and the handler answers, as
 with ``load``, though a malformed header is still a 400. A create without a
 precondition proceeds without calling ``list_load``: never a 428. The HTTP
-Schema Resource lists the 400 and 412. The list validators are evaluated for a POST only, so an
-operation without POST raises ``ConfigError`` when it is built. ``list_load``
+Schema Resource lists the 400 and 412. The list validators are evaluated for a
+POST only, so an operation without POST raises ``ConfigError`` when it is
+built. ``list_load``
 must apply the list operation's authorization: the check runs before the
 handler, so before any authorization the handler decides from the body.
 
