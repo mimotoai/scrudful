@@ -209,6 +209,12 @@ it is not in the OpenAPI document.
   adds at once, also on a router already included and serving (where FastAPI
   includes routers lazily; older versions copy a router's routes when it is
   included).
+* **An app's HSR route removed.** An app has one HSR route for all its
+  resources. Removed from (or replaced in) ``app.router.routes`` after
+  ``add_options(app)``, by a project filtering its routes say, it leaves every
+  resource without the HSR link, on its responses and on OPTIONS, until
+  ``add_options`` is called again; a ``RuntimeWarning`` says so, once, on the
+  next request.
 * **Copies of a router.** The route-adding methods are wrapped on the router
   instance: a ``copy.copy`` of a router given ``add_options`` shares them, so
   a route added to the copy goes to the original (and only it is
