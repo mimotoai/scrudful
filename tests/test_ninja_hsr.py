@@ -32,6 +32,7 @@ from ninja.testing import TestAsyncClient, TestClient
 
 from scrudful._django import scrudful_setting
 from scrudful._hsr import hsr_etag, serialize_hsr
+from scrudful.entity import HsrConfigError
 from scrudful.ninja import (
     Entity,
     ScrudfulRouter,
@@ -569,6 +570,36 @@ def test_hsr_with_error_entries_validates_against_spec_schema():
     api, router = make_api(error=OP_ERROR)
     add_error_links(api, API_ERROR)
     validate_http_schema_resource(http_schema_resource(router, "/{pk}"))
+
+
+SCHEMA_ALONE = "https://api.example/schemas/item"
+
+
+@pytest.mark.parametrize(
+    "decorate",
+    [
+        lambda: scrudful(schema_link_or_func=SCHEMA_ALONE),
+        lambda: scrudful_create(
+            location_func=lambda request, obj: "/1",
+            schema_link_or_func=SCHEMA_ALONE,
+        ),
+        lambda: scrudful_list(
+            href_func=lambda request, item: "/1", schema_link_or_func=SCHEMA_ALONE
+        ),
+        lambda: scrudful_list(
+            href_func=lambda request, item: "/1",
+            list_schema_link_or_func=SCHEMA_ALONE,
+        ),
+    ],
+    ids=["scrudful", "scrudful_create", "scrudful_list item", "scrudful_list"],
+)
+def test_a_schema_link_without_a_context_link_is_refused_when_decorating(decorate):
+    """The decorators build their entities, so the HSR's missing
+    x-rdf-context is refused before any operation is built, as ninja's
+    configuration error, chained to the shared ``HsrConfigError``."""
+    with pytest.raises(ConfigError, match="no RDF context link") as raised:
+        decorate()
+    assert isinstance(raised.value.__cause__, HsrConfigError)
 
 
 # --- configuration -------------------------------------------------------------

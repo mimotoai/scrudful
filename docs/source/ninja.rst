@@ -809,9 +809,10 @@ Content"}}}``.
   relative URL is a ``ConfigError`` when the HSR is built.
 * A schema link without an RDF context link, for a non-in-band media type,
   would give a Media Type Object without ``x-rdf-context``, which the spec's
-  JSON Schema rejects: ``Entity(...)`` and the decorators raise
-  ``scrudful._hsr.HsrConfigError`` (a ``ValueError``) for a plain value, and
-  building the HSR raises ``ConfigError`` for a callable one.
+  JSON Schema rejects. For a plain value, ``Entity(...)`` raises
+  ``scrudful.entity.HsrConfigError`` (a ``ValueError``), and the decorators
+  (for their link arguments) raise ``ConfigError`` chained to it, when
+  decorating; for a callable one, building the HSR raises ``ConfigError``.
 * The reason phrases of extra statuses are ``http.HTTPStatus(code).phrase``,
   which can differ between Python versions (e.g. for 422).
 * A path whose HSR link can't be computed (no route and no ``hsr_url``, a

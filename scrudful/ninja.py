@@ -888,12 +888,7 @@ class _Config:
     @property
     def entity(self) -> Entity:
         """The item entity (see the class docstring)."""
-        return Entity(
-            **{
-                entity_field.name: getattr(self, entity_field.name)
-                for entity_field in fields(Entity)
-            }
-        )
+        return Entity(**_entity_values(self))
 
     @property
     def default_status(self) -> int | None:
@@ -1155,6 +1150,9 @@ def scrudful(
         callback contributed below the decorator, or a decorator between it
         and the operation decorator (see "Placement" in the module
         docstring). Also with a hook, as for :func:`scrudful_list`.
+        Also when decorating, if a schema link has no RDF context link (for a
+        media type that isn't in-band RDF), chained to the
+        :class:`~scrudful.entity.HsrConfigError` of the entity.
     """
     check_validators(etag_func, last_modified_func)
     _check_entity("request", request)
@@ -1188,7 +1186,7 @@ def scrudful(
             "etag_func and last_modified_func require load: the validators are "
             "computed from the object load returns"
         )
-
+    _link_entity("@scrudful", **_entity_values(config))
     return _decorator(config, "@scrudful")
 
 
@@ -1375,6 +1373,9 @@ def scrudful_create(
         and the operation decorator (see "Placement" in the module
         docstring). Also with a hook, as for :func:`scrudful_list`, and with
         list validators on an operation without POST.
+        Also when decorating, if a schema link has no RDF context link (for a
+        media type that isn't in-band RDF), chained to the
+        :class:`~scrudful.entity.HsrConfigError` of the entity.
     """
     if not callable(location_func):
         raise TypeError(
@@ -1402,7 +1403,8 @@ def scrudful_create(
         )
     if list_load is not None and not has_list_validators:
         raise TypeError("list_load needs list_etag_func or list_last_modified_func")
-    item = Entity(
+    item = _link_entity(
+        "@scrudful_create",
         schema_link_or_func=schema_link_or_func,
         schema_rel_or_func=schema_rel_or_func,
         schema_type_or_func=schema_type_or_func,
@@ -1662,7 +1664,10 @@ def scrudful_list(
         install them), if the
         installed ninja's per-operation checks, or the ``Operation.run``
         calling them, differ from ninja 1.7.0's and 1.7.1's, or if an
-        ``Operation`` subclass overrides either.
+        ``Operation`` subclass overrides either. Also when decorating, if a
+        schema link (the item's or the collection's) has no RDF context
+        link, chained to the :class:`~scrudful.entity.HsrConfigError` of
+        the entity.
     """
     if not callable(href_func):
         raise TypeError(f"href_func must be callable, not {type(href_func).__name__}")
@@ -1700,7 +1705,8 @@ def scrudful_list(
         error_body_func=error_body_func,
         list_etag_func=list_etag_func,
         list_last_modified_func=list_last_modified_func,
-        collection=Entity(
+        collection=_link_entity(
+            "@scrudful_list",
             schema_link_or_func=list_schema_link_or_func,
             schema_rel_or_func=list_schema_rel_or_func,
             schema_type_or_func=list_schema_type_or_func,
@@ -1714,6 +1720,7 @@ def scrudful_list(
         after_throttles=after_throttles,
         allowed=allowed,
     )
+    _link_entity("@scrudful_list", **_entity_values(config))
     return _decorator(config, "@scrudful_list")
 
 
@@ -4612,6 +4619,33 @@ def _check_entity(name: str, entity: Any) -> None:
     """Raise ``TypeError`` unless ``entity`` is ``None`` or an :class:`Entity`."""
     if entity is not None and not isinstance(entity, Entity):
         raise TypeError(f"{name} must be an Entity, not {type(entity).__name__}")
+
+
+def _link_entity(name: str, **values: Any) -> Entity:
+    """The :class:`Entity` of a decorator's link arguments.
+
+    Built when decorating, so that a schema link without an RDF context link
+    (the HTTP Schema Resource's ``x-rdf-context`` would be missing) is
+    refused before the operation is built.
+
+    Raises
+    ------
+    ConfigError
+        Chained to the :class:`~scrudful.entity.HsrConfigError` the entity
+        raises; ``name`` is the decorator's.
+    """
+    try:
+        return Entity(**values)
+    except HsrConfigError as exc:
+        raise ConfigError(f"{name}: {exc}") from exc
+
+
+def _entity_values(config: _Config) -> dict[str, Any]:
+    """The item entity's values of ``config`` (see :attr:`_Config.entity`)."""
+    return {
+        entity_field.name: getattr(config, entity_field.name)
+        for entity_field in fields(Entity)
+    }
 
 
 def _check_error(error: Any) -> None:
