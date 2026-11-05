@@ -93,6 +93,16 @@ def load(request: Any, pk: int, **kwargs: Any) -> Any:
     return {"id": pk}
 
 
+class Throttle(BaseThrottle):
+    """Refuses a request sending ``X-Throttle: yes``."""
+
+    def allow_request(self, request: Any) -> bool:
+        return request.headers.get("X-Throttle") != "yes"
+
+    def wait(self) -> None:
+        return None
+
+
 router = ScrudfulRouter(base_url=BASE_URL)
 
 
@@ -118,6 +128,7 @@ router.add_api_operation(
     )(get_thing),
     response=Thing,
     auth=Key(),
+    throttle=[Throttle()],
 )
 
 
@@ -130,16 +141,6 @@ def post_thing(request: Any, pk: int, obj: Any) -> Any:
 api = NinjaAPI(urls_namespace="auth-errors")
 api.add_router("/things", router)
 add_error_links(api, API_WIDE)
-
-
-class Throttle(BaseThrottle):
-    """Refuses a request sending ``X-Throttle: yes``."""
-
-    def allow_request(self, request: Any) -> bool:
-        return request.headers.get("X-Throttle") != "yes"
-
-    def wait(self) -> None:
-        return None
 
 
 #: The same operations without an API-wide entity: every 401, 403, 422 and
@@ -354,6 +355,26 @@ def test_a_raised_422_or_429_carries_the_api_wide_entity(url, headers, status):
         headers={key: value.format(**values) for key, value in headers.items()},
     )
     assert response.status_code == status
+    assert link_problems("GET", status, dict(response.items()), True, hsr) == []
+    assert schema_links(response) == [API_WIDE.schema_link_or_func]
+
+
+@pytest.mark.parametrize(
+    "url, headers, status",
+    [
+        ("/p/things/abc", {"X-Key": "ok"}, 422),
+        ("/p/things/1", {"X-Key": "ok", "X-Throttle": "yes"}, 429),
+    ],
+    ids=["validation", "throttle"],
+)
+def test_ninjas_own_422_and_429_carry_the_api_wide_entity(url, headers, status):
+    """ninja's own 422 (validation) and 429 (throttling), which it answers
+    before the operation runs, carry the API-wide entity too."""
+    client = Client()
+    hsr = hsr_of(client, "/p/things/_hsr/pk")
+    response = client.get(url, headers=headers)
+    assert response.status_code == status
+    assert status_entry_problems("GET", status, hsr) == []
     assert link_problems("GET", status, dict(response.items()), True, hsr) == []
     assert schema_links(response) == [API_WIDE.schema_link_or_func]
 

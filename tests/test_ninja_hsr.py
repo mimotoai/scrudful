@@ -484,6 +484,60 @@ def test_a_declared_problem_details_422_reshapes_ninjas_validation_body(
     assert link_problems("GET", 422, dict(response.headers), True, hsr) == []
 
 
+#: A problem-details error entity, and a plain JSON one for a 422.
+PROBLEM_ERROR = Entity(
+    "https://api.example/schemas/problem",
+    context_link_or_func="https://api.example/contexts/problem",
+    media_type=PROBLEM_JSON,
+)
+PLAIN_INVALID = Entity(
+    schema_link_or_func="https://api.example/schemas/plain-invalid",
+    context_link_or_func="https://api.example/contexts/plain-invalid",
+)
+
+
+@pytest.mark.parametrize(
+    "where, entity",
+    [("api-wide", API_ERROR), ("declared", PLAIN_INVALID)],
+)
+def test_a_plain_422_entity_keeps_ninjas_validation_body_plain(where, entity):
+    """ninja's own 422 of an operation whose ``error`` is problem details,
+    when the HSR describes it otherwise (the API-wide entity, or a plain
+    entity ``responses=`` declares for 422): its body stays ninja's plain
+    JSON, as its entry and Links say."""
+    if where == "declared":
+        api, router = make_api(error=PROBLEM_ERROR, responses={422: entity})
+    else:
+        api, router = make_api(error=PROBLEM_ERROR)
+        add_error_links(api, entity)
+    hsr = http_schema_resource(router, "/{pk}")
+    assert hsr["get"]["responses"]["422"]["content"] == entity_content(entity)
+    response = TestClient(api).get("/not-a-number")
+    assert response.status_code == 422
+    assert response.headers["Content-Type"] == "application/json; charset=utf-8"
+    assert isinstance(response.json()["detail"], list)
+    assert link_problems("GET", 422, dict(response.headers), True, hsr) == []
+    assert f"<{entity.schema_link_or_func}>" in response.headers["Link"]
+
+
+def test_an_error_response_the_handler_returns_gets_no_error_links():
+    """A response the handler returns itself (an ``HttpResponse`` with a 403)
+    is its own to describe: the operation's ``error`` Links aren't added."""
+    store = Store()
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(load=store.load, error=OP_ERROR, **LINKS)
+    def get_item(request, pk: int, obj):
+        return HttpResponseForbidden(
+            b'{"detail": "no"}', content_type="application/json"
+        )
+
+    response = TestClient(mount(router)).get("/1")
+    assert response.status_code == 403
+    assert OP_ERROR.schema_link_or_func not in response.headers.get("Link", "")
+
+
 def test_default_error_entry_is_the_api_wide_entity():
     api, router = make_api()
     add_error_links(api, API_ERROR)
