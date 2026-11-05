@@ -2050,7 +2050,7 @@ class ScrudfulRouter(Router):
                 )
         super().add_api_operation(path, methods, view_func, **kwargs)
         path_view = _path_view(self, view_func)
-        _adopt_path_view(self, path, path_view)
+        _ScrudfulPathView.adopt(path_view, self, path)
         operation = view_func._ninja_operation
         operation._scrudful_entity = entity
         # ninja re-applies them to the clone of each mount, in this order.
@@ -2135,9 +2135,7 @@ class ScrudfulRouter(Router):
             include_in_schema=False,
             url_name=url_name,
         )
-        hsr_path_view = _path_view(self, view)
-        _adopt_path_view(self, route, hsr_path_view)
-        hsr_path_view._scrudful_hsr_route = True
+        _ScrudfulPathView.adopt(_path_view(self, view), self, route, hsr_route=True)
         self._scrudful_hsr_url_names[path] = url_name
         self._scrudful_hsr_names[name] = path
         hsr_routes = {f"/{HSR_ROUTE_SEGMENT}/{n}" for n in self._scrudful_hsr_names}
@@ -5113,15 +5111,47 @@ class _ScrudfulPathView(PathView):
     #: Whether the path is an HTTP Schema Resource route
     #: (:meth:`ScrudfulRouter._add_hsr_route`).
     _scrudful_hsr_route: bool = False
+    #: What :meth:`adopt` sets, and :meth:`clone` copies.
+    _SCRUDFUL_ATTRIBUTES = ("_scrudful_router", "_scrudful_path", "_scrudful_hsr_route")
+
+    @classmethod
+    def adopt(
+        cls,
+        path_view: Any,
+        router: ScrudfulRouter,
+        path: str,
+        *,
+        hsr_route: bool = False,
+    ) -> None:
+        """Make ``path_view``, the ``PathView`` ninja made for ``router``'s
+        ``path``, one of these (once); ``hsr_route`` marks an HTTP Schema
+        Resource route's.
+
+        Raises
+        ------
+        ConfigError
+            If ninja made something else than its own ``PathView``.
+        """
+        if isinstance(path_view, cls):
+            return
+        if type(path_view) is not PathView:
+            raise ConfigError(
+                "scrudful's JSON 405 replaces ninja's PathView of each path of a "
+                "ScrudfulRouter, but the installed ninja made a "
+                f"{type(path_view).__qualname__}, where ninja 1.7.0 and 1.7.1 "
+                "make a PathView: upgrade scrudful, or keep ninja at one of "
+                "those releases"
+            )
+        path_view.__class__ = cls
+        values = (router, path, hsr_route)
+        for name, value in zip(cls._SCRUDFUL_ATTRIBUTES, values, strict=True):
+            setattr(path_view, name, value)
 
     def clone(self) -> PathView:
         cloned = super().clone()
         cloned.__class__ = type(self)
-        cloned._scrudful_router = self._scrudful_router  # type: ignore[attr-defined]
-        cloned._scrudful_path = self._scrudful_path  # type: ignore[attr-defined]
-        cloned._scrudful_hsr_route = (  # type: ignore[attr-defined]
-            self._scrudful_hsr_route
-        )
+        for name in self._SCRUDFUL_ATTRIBUTES:
+            setattr(cloned, name, getattr(self, name))
         return cloned
 
     def get_view(self) -> Callable[..., Any]:
@@ -5151,29 +5181,6 @@ class _ScrudfulPathView(PathView):
             return await run(request, *a, **kw)  # type: ignore[no-any-return]
         response = await sync_to_async(run)(request, *a, **kw)
         return response  # type: ignore[no-any-return]
-
-
-def _adopt_path_view(router: ScrudfulRouter, path: str, path_view: Any) -> None:
-    """Make ``path_view``, the ``PathView`` ninja made for ``router``'s
-    ``path``, a :class:`_ScrudfulPathView` (once).
-
-    Raises
-    ------
-    ConfigError
-        If ninja made something else than its own ``PathView``.
-    """
-    if isinstance(path_view, _ScrudfulPathView):
-        return
-    if type(path_view) is not PathView:
-        raise ConfigError(
-            "scrudful's JSON 405 replaces ninja's PathView of each path of a "
-            "ScrudfulRouter, but the installed ninja made a "
-            f"{type(path_view).__qualname__}, where ninja 1.7.0 and 1.7.1 make "
-            "a PathView: upgrade scrudful, or keep ninja at one of those releases"
-        )
-    path_view.__class__ = _ScrudfulPathView
-    path_view._scrudful_router = router
-    path_view._scrudful_path = path
 
 
 def _method_not_allowed(

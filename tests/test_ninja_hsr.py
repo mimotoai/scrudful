@@ -881,6 +881,24 @@ def test_hsr_route_ignores_router_auth_and_throttles(clear_cache):
     assert [client.get("/_hsr/pk").status_code for _ in range(3)] == [200, 200, 200]
 
 
+def test_each_mount_keeps_the_path_views_scrudful_state():
+    """ninja clones each path's ``PathView`` per mount: the clone of a path
+    and of an HSR route keep what scrudful set on the router's."""
+    from scrudful.ninja import _ScrudfulPathView
+
+    api, router = make_api()
+    expected = {
+        "/{pk}": (router, "/{pk}", False),
+        "/_hsr/pk": (router, "/_hsr/pk", True),
+    }
+    [bound] = [b for b in api._get_bound_routers() if b.template is router]
+    for key, values in expected.items():
+        for path_view in (router.path_operations[key], bound.path_operations[key]):
+            assert isinstance(path_view, _ScrudfulPathView)
+            attributes = _ScrudfulPathView._SCRUDFUL_ATTRIBUTES
+            assert tuple(getattr(path_view, name) for name in attributes) == values
+
+
 def test_hsr_route_is_csrf_exempt_and_not_in_openapi():
     api, router = make_api()
     [operation] = router.path_operations["/_hsr/pk"].operations
