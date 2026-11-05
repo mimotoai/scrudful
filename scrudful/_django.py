@@ -10,7 +10,7 @@ import math
 import warnings
 from collections.abc import Callable, Mapping
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from django.conf import settings
@@ -32,8 +32,10 @@ from django.views import defaults
 
 from scrudful import _adapter
 from scrudful._hsr import (
+    DEFAULT_HSR_CACHE_CONTROL,
     HsrConfigError,
     check_base_url,
+    check_hsr_cache_control,
     hsr_etag,
     hsr_response_links,
     serialize_hsr,
@@ -45,6 +47,8 @@ from scrudful.problem import PROBLEM_JSON, problem_from_errors
 from scrudful.utils import join_links, link_content, resolve_uri
 
 __all__ = [
+    "SETTING_ACCESSORS",
+    "ScrudfulSettings",
     "aware",
     "conditional_response",
     "error_handler",
@@ -55,21 +59,53 @@ __all__ = [
     "page_url",
     "precondition_headers",
     "scrudful_setting",
+    "setting_base_url",
+    "setting_error",
+    "setting_hsr_cache_control",
+    "setting_hsr_route",
+    "setting_hsr_url",
     "slice_page",
 ]
 
+
+class ScrudfulSettings(TypedDict, total=False):
+    """The shape of the optional ``SCRUDFUL`` Django setting.
+
+    Each key's value is checked when it is read, by its accessor below
+    (``ImproperlyConfigured`` when it is invalid). The per-router and
+    per-viewset arguments override them.
+    """
+
+    #: The absolute URL relative link URLs resolve against
+    #: (:func:`setting_base_url`).
+    BASE_URL: str
+    #: The API-wide error entity, of a JSON media type
+    #: (:func:`setting_error`). DRF only: django-ninja accepts the key and
+    #: ignores it (``add_error_links`` is its API-wide entity).
+    ERROR: Entity
+    #: The ``Cache-Control`` of the HTTP Schema Resource routes
+    #: (:func:`setting_hsr_cache_control`).
+    HSR_CACHE_CONTROL: str
+    #: Whether scrudful serves the HTTP Schema Resource routes
+    #: (:func:`setting_hsr_route`).
+    HSR_ROUTE: bool
+    #: Where the HTTP Schema Resources are served instead
+    #: (:func:`setting_hsr_url`); each adapter says what it is called with.
+    HSR_URL: Callable[[str], str]
+
+
 #: The keys of the ``SCRUDFUL`` setting.
-SETTING_KEYS = frozenset(
-    {"BASE_URL", "ERROR", "HSR_CACHE_CONTROL", "HSR_ROUTE", "HSR_URL"}
-)
+SETTING_KEYS = frozenset(ScrudfulSettings.__annotations__)
 
 
 def scrudful_setting(name: str, default: Any) -> Any:
-    """``settings.SCRUDFUL[name]``, or ``default`` when unset.
+    """``settings.SCRUDFUL[name]``, or ``default`` when unset, unchecked.
 
-    ``SCRUDFUL`` is an optional dict of the keys :data:`SETTING_KEYS`; the
-    per-router and per-viewset arguments override it. It is read on every
-    call, so ``override_settings`` applies.
+    ``SCRUDFUL`` is an optional dict of the keys :data:`SETTING_KEYS` (see
+    :class:`ScrudfulSettings`); the per-router and per-viewset arguments
+    override it. It is read on every call, so ``override_settings`` applies.
+    The accessors below (:func:`setting_base_url` ...) read one key each and
+    check its value.
 
     Raises
     ------
@@ -90,6 +126,103 @@ def scrudful_setting(name: str, default: Any) -> Any:
             f"{sorted(SETTING_KEYS)}"
         )
     return values.get(name, default)
+
+
+def setting_base_url() -> str | None:
+    """``SCRUDFUL["BASE_URL"]``, an absolute URL, or ``None`` when unset.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If it is not an absolute URL (a ``str`` with a scheme and a host).
+    """
+    value = scrudful_setting("BASE_URL", None)
+    if value is not None:
+        try:
+            check_base_url(value, 'SCRUDFUL["BASE_URL"]')
+        except HsrConfigError as exc:
+            raise ImproperlyConfigured(str(exc)) from exc
+    return value
+
+
+def setting_hsr_route() -> bool:
+    """``SCRUDFUL["HSR_ROUTE"]``, else ``True``.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If it is not a ``bool``.
+    """
+    value = scrudful_setting("HSR_ROUTE", True)
+    if not isinstance(value, bool):
+        raise ImproperlyConfigured(
+            f'SCRUDFUL["HSR_ROUTE"] must be a bool, not {type(value).__name__}'
+        )
+    return value
+
+
+def setting_hsr_url() -> Callable[[str], str] | None:
+    """``SCRUDFUL["HSR_URL"]``, else ``None``.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If it is not callable.
+    """
+    value = scrudful_setting("HSR_URL", None)
+    if value is not None and not callable(value):
+        raise ImproperlyConfigured(
+            'SCRUDFUL["HSR_URL"] must be a callable returning the HTTP Schema '
+            f"Resource's URL, not {type(value).__name__}"
+        )
+    return value
+
+
+def setting_hsr_cache_control() -> str:
+    """``SCRUDFUL["HSR_CACHE_CONTROL"]``, else ``public, max-age=300``.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If it is not a non-empty ``str``.
+    """
+    value = scrudful_setting("HSR_CACHE_CONTROL", DEFAULT_HSR_CACHE_CONTROL)
+    try:
+        return check_hsr_cache_control(value, 'SCRUDFUL["HSR_CACHE_CONTROL"]')
+    except HsrConfigError as exc:
+        raise ImproperlyConfigured(str(exc)) from exc
+
+
+def setting_error() -> Entity | None:
+    """``SCRUDFUL["ERROR"]``, the API-wide error entity (DRF only), or ``None``.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If it is not an :class:`~scrudful.entity.Entity` of a JSON media type.
+    """
+    value = scrudful_setting("ERROR", None)
+    if value is None:
+        return None
+    if not isinstance(value, Entity):
+        raise ImproperlyConfigured(
+            f'SCRUDFUL["ERROR"] must be an Entity, not {type(value).__name__}'
+        )
+    try:
+        _adapter.check_error_media_type(value.media_type)
+    except ValueError as exc:
+        raise ImproperlyConfigured(f'SCRUDFUL["ERROR"]: {exc}') from exc
+    return value
+
+
+#: The accessor of each key of the ``SCRUDFUL`` setting.
+SETTING_ACCESSORS: Mapping[str, Callable[[], Any]] = {
+    "BASE_URL": setting_base_url,
+    "ERROR": setting_error,
+    "HSR_CACHE_CONTROL": setting_hsr_cache_control,
+    "HSR_ROUTE": setting_hsr_route,
+    "HSR_URL": setting_hsr_url,
+}
 
 
 def precondition_headers(request: HttpRequest) -> dict[str, str]:
@@ -212,14 +345,9 @@ def _plain_links(entity: Entity, request: HttpRequest) -> str | None:
     ImproperlyConfigured
         If ``SCRUDFUL["BASE_URL"]`` is not an absolute URL.
     """
-    base = scrudful_setting("BASE_URL", None)
+    base = setting_base_url()
     if base is None:
         base = request.build_absolute_uri()
-    else:
-        try:
-            check_base_url(base, 'SCRUDFUL["BASE_URL"]')
-        except HsrConfigError as exc:
-            raise ImproperlyConfigured(str(exc)) from exc
     candidates = [
         (
             entity.schema_link_or_func,

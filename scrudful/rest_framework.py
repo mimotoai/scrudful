@@ -303,13 +303,16 @@ from scrudful._django import (
     hsr_response,
     no_content,
     page_url,
-    scrudful_setting,
+    setting_base_url,
+    setting_error,
+    setting_hsr_cache_control,
+    setting_hsr_route,
+    setting_hsr_url,
     slice_page,
 )
 from scrudful._django import conditional_response as django_conditional_response
 from scrudful._django import precondition_headers as django_precondition_headers
 from scrudful._hsr import (
-    DEFAULT_HSR_CACHE_CONTROL,
     HsrConfigError,
     absolute_for_hsr,
     allow_value,
@@ -2576,7 +2579,7 @@ def _hsr_base_url(view_func: Callable[..., Any]) -> str | None:
         handler_bases = {handler.base_url for handler in _view_func_handlers(view_func)}
         if len(handler_bases) == 1 and None not in handler_bases:
             return handler_bases.pop()
-    return _setting_base_url()
+    return setting_base_url()
 
 
 def _hsr_route_on(cls: Any) -> bool:
@@ -2585,12 +2588,7 @@ def _hsr_route_on(cls: Any) -> bool:
     value = _class_meta_options(cls).get("hsr_route")
     if value is not None:
         return value
-    value = scrudful_setting("HSR_ROUTE", True)
-    if not isinstance(value, bool):
-        raise ImproperlyConfigured(
-            f"SCRUDFUL['HSR_ROUTE'] must be a bool, not {type(value).__name__}"
-        )
-    return value
+    return setting_hsr_route()
 
 
 def _hsr_url(cls: Any) -> Callable[[str], str] | None:
@@ -2599,13 +2597,7 @@ def _hsr_url(cls: Any) -> Callable[[str], str] | None:
     value = _class_meta_options(cls).get("hsr_url")
     if value is not None:
         return value
-    value = scrudful_setting("HSR_URL", None)
-    if value is not None and not callable(value):
-        raise ImproperlyConfigured(
-            "SCRUDFUL['HSR_URL'] must be a callable, hsr_url(view_name), not "
-            f"{type(value).__name__}"
-        )
-    return value
+    return setting_hsr_url()
 
 
 def _hsr_cache_control(cls: Any) -> str:
@@ -2614,11 +2606,7 @@ def _hsr_cache_control(cls: Any) -> str:
     value = _class_meta_options(cls).get("hsr_cache_control")
     if value is not None:
         return value
-    value = scrudful_setting("HSR_CACHE_CONTROL", DEFAULT_HSR_CACHE_CONTROL)
-    try:
-        return check_hsr_cache_control(value, "SCRUDFUL['HSR_CACHE_CONTROL']")
-    except HsrConfigError as exc:
-        raise ImproperlyConfigured(str(exc)) from exc
+    return setting_hsr_cache_control()
 
 
 def _check_hsr_options(hsr_route: Any, hsr_url: Any, hsr_cache_control: Any) -> None:
@@ -2680,7 +2668,7 @@ def _describe_view(view: APIView) -> dict[str, Any]:
     """The HTTP Schema Resource of the describe-mode ``view``."""
     action_map = getattr(view, "action_map", None)
     allowed = {method.lower() for method in view.allowed_methods}
-    api_error = _setting_error() if _is_scrudful_view(view) else None
+    api_error = setting_error() if _is_scrudful_view(view) else None
     error_links = _gives_error_links(view)
     body = {}
     for method in METHOD_KEYS:
@@ -3161,7 +3149,7 @@ def _raised_error_entity(
     otherwise :func:`_error_entity`'s, else ``SCRUDFUL["ERROR"]``. Not on
     one, :func:`_error_entity`'s.
     """
-    api_error = _setting_error() if _is_scrudful_view(view) else None
+    api_error = setting_error() if _is_scrudful_view(view) else None
     if api_error is not None and status in _FRAMEWORK_ERRORS:
         return api_error
     own = _error_entity(view, method)
@@ -3353,7 +3341,7 @@ def _class_meta_options(cls: Any) -> dict[str, Any]:
 def _view_base_url(view: Any) -> str | None:
     """``view``'s ``Meta.base_url``, else ``SCRUDFUL["BASE_URL"]``, else ``None``."""
     base_url = _meta_options(view).get("base_url")
-    return base_url if base_url is not None else _setting_base_url()
+    return base_url if base_url is not None else setting_base_url()
 
 
 def _handler_base_url(view: Any, handler: Any) -> str | None:
@@ -3391,30 +3379,6 @@ def _check_base_url(url: Any, what: str) -> None:
         check_base_url(url, what)
     except HsrConfigError as exc:
         raise ImproperlyConfigured(str(exc)) from exc
-
-
-def _setting_base_url() -> str | None:
-    """``SCRUDFUL["BASE_URL"]``, checked, or ``None``."""
-    base_url = scrudful_setting("BASE_URL", None)
-    if base_url is not None:
-        _check_base_url(base_url, 'SCRUDFUL["BASE_URL"]')
-    return base_url
-
-
-def _setting_error() -> Entity | None:
-    """``SCRUDFUL["ERROR"]``, the API-wide error entity, checked, or ``None``."""
-    error = scrudful_setting("ERROR", None)
-    if error is None:
-        return None
-    if not isinstance(error, Entity):
-        raise ImproperlyConfigured(
-            f'SCRUDFUL["ERROR"] must be an Entity, not {type(error).__name__}'
-        )
-    try:
-        check_error_media_type(error.media_type)
-    except ValueError as exc:
-        raise ImproperlyConfigured(f'SCRUDFUL["ERROR"]: {exc}') from exc
-    return error
 
 
 def _check_view_options(

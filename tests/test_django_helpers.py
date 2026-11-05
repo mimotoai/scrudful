@@ -7,6 +7,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.http import Http404
 from django.test import RequestFactory
 
+from scrudful import _django
 from scrudful._adapter import prefers_html
 from scrudful._django import (
     aware,
@@ -149,3 +150,61 @@ def test_handler_rejects_callable_links():
         error_handler(
             404, Entity(schema_link_or_func=lambda *a: "s", context_link_or_func="c")
         )
+
+
+# --- The SCRUDFUL setting's keys --------------------------------------------------
+
+
+def test_setting_keys_are_the_typed_dicts():
+    keys = {"BASE_URL", "ERROR", "HSR_CACHE_CONTROL", "HSR_ROUTE", "HSR_URL"}
+    assert _django.SETTING_KEYS == keys
+    assert set(_django.ScrudfulSettings.__annotations__) == keys
+
+
+def test_setting_accessors_give_the_defaults(settings):
+    settings.SCRUDFUL = None
+    assert _django.setting_base_url() is None
+    assert _django.setting_hsr_route() is True
+    assert _django.setting_hsr_url() is None
+    assert _django.setting_hsr_cache_control() == "public, max-age=300"
+    assert _django.setting_error() is None
+
+
+def test_setting_accessors_give_the_values(settings):
+    def hsr_url(name):
+        return f"https://x.example/{name}"
+
+    error = Entity("https://x.example/e", context_link_or_func="https://x.example/c")
+    settings.SCRUDFUL = {
+        "BASE_URL": "https://api.example/",
+        "HSR_ROUTE": False,
+        "HSR_URL": hsr_url,
+        "HSR_CACHE_CONTROL": "no-cache",
+        "ERROR": error,
+    }
+    assert _django.setting_base_url() == "https://api.example/"
+    assert _django.setting_hsr_route() is False
+    assert _django.setting_hsr_url() is hsr_url
+    assert _django.setting_hsr_cache_control() == "no-cache"
+    assert _django.setting_error() is error
+
+
+@pytest.mark.parametrize(
+    "accessor, key, value, match",
+    [
+        ("setting_base_url", "BASE_URL", "/v1/", "BASE_URL.*absolute URL"),
+        ("setting_base_url", "BASE_URL", 3, "BASE_URL"),
+        ("setting_hsr_route", "HSR_ROUTE", "no", "HSR_ROUTE.*bool, not str"),
+        ("setting_hsr_url", "HSR_URL", "https://x/", "HSR_URL.*callable.*not str"),
+        ("setting_hsr_cache_control", "HSR_CACHE_CONTROL", 300, "HSR_CACHE_CONTROL"),
+        ("setting_hsr_cache_control", "HSR_CACHE_CONTROL", " ", "HSR_CACHE_CONTROL"),
+        ("setting_error", "ERROR", "oops", "ERROR.*Entity, not str"),
+        ("setting_error", "ERROR", Entity(media_type="text/csv"), "ERROR.*JSON"),
+    ],
+)
+def test_setting_accessors_raise_improperly_configured(
+    settings, accessor, key, value, match
+):
+    settings.SCRUDFUL = {key: value}
+    with pytest.raises(ImproperlyConfigured, match=match):
+        getattr(_django, accessor)()
