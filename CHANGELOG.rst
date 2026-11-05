@@ -220,6 +220,8 @@ Behaviour change (DRF)
 * The view class's ``finalize_response`` adds the HSR link to every response
   of a routed scrudful view, OPTIONS's 401, 406 and 429 included; a view with
   a renderer that isn't JSON (the browsable API) also sends ``Vary: Accept``.
+  The link is resolved in ``initial()``, before the handler runs: a link that
+  can't be resolved fails the request before the handler writes anything.
 * ``exception_handler``: with ``SCRUDFUL["ERROR"]`` set, a scrudful view's
   401, 403, 406 and 415 get that entity whatever the handler's ``error``, and
   the other errors of a view without an ``error`` get it too (unchanged from

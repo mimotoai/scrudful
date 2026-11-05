@@ -2054,6 +2054,85 @@ def test_405_keeps_drfs_allow(api_client):
     assert r["Allow"] == "GET, PUT, PATCH, DELETE, HEAD, OPTIONS"
 
 
+#: What the ``writes`` view wrote.
+WRITES = []
+
+
+class WritingView(APIView):
+    @scrudful(
+        schema_link_or_func="https://api.example/schemas/write",
+        context_link_or_func="https://api.example/contexts/write",
+    )
+    def post(self, request):
+        WRITES.append("written")
+        return Response({"written": True}, status=201)
+
+
+class WritingURLconf:
+    urlpatterns = [
+        path("writes", WritingView.as_view(), name="writes"),
+        path("", include(hsr_urls())),
+    ]
+
+
+class WritingNoIncludeURLconf:
+    urlpatterns = WritingURLconf.urlpatterns[:1]
+
+
+def lookup_failing(view_name):
+    raise LookupError(f"no HSR for {view_name}")
+
+
+@pytest.mark.parametrize(
+    "urlconf, hsr_url, error",
+    [
+        (WritingNoIncludeURLconf, None, ImproperlyConfigured),
+        (WritingURLconf, lookup_failing, LookupError),
+        (WritingURLconf, lambda view_name: "/relative", ImproperlyConfigured),
+    ],
+)
+def test_an_hsr_link_that_cant_be_resolved_fails_before_the_handler(
+    settings, client, urlconf, hsr_url, error
+):
+    """The link is resolved before the handler runs, so a misconfigured one
+    never turns a write that happened into a 500."""
+    settings.ROOT_URLCONF = urlconf
+    if hsr_url is not None:
+        settings.SCRUDFUL = {"BASE_URL": BASE_URL, "HSR_URL": hsr_url}
+    WRITES.clear()
+    with pytest.raises(error):
+        client.post("/writes", {}, format="json")
+    assert WRITES == []
+
+
+def test_the_hsr_link_is_resolved_once_per_request(settings, client):
+    calls = []
+
+    def hsr_url(view_name):
+        calls.append(view_name)
+        return f"https://schemas.example/{view_name}"
+
+    settings.ROOT_URLCONF = WritingURLconf
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL, "HSR_URL": hsr_url}
+    WRITES.clear()
+    response = client.post("/writes", {}, format="json")
+    assert response.status_code == 201 and WRITES == ["written"]
+    assert (
+        hsr_link_problems(dict(response.items()), "https://schemas.example/writes")
+        == []
+    )
+    assert calls == ["writes"]
+    # An error of initial() gets it too.
+    calls.clear()
+    response = client.post("/writes", HTTP_ACCEPT="application/xml")
+    assert response.status_code == 406 and WRITES == ["written"]
+    assert (
+        hsr_link_problems(dict(response.items()), "https://schemas.example/writes")
+        == []
+    )
+    assert calls == ["writes"]
+
+
 def test_options_without_the_hsr_urls_include_is_improperly_configured(settings):
     settings.ROOT_URLCONF = NoIncludeURLconf
     client = APIClient()

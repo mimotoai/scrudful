@@ -97,16 +97,18 @@ Headers
     (``scrudful._hsr.HSR_LINK_REL``) and ``type="application/json"`` to the
     :func:`hsr_urls` route (else ``hsr_url``'s URL), appended to the Link (a
     Link with that relation the view sets wins). The view class's
+    ``initial()`` resolves it, before the handler runs, so that a link that
+    can't be resolved fails the request before anything is written, and its
     ``finalize_response`` adds it, as scrudful sets the class up with its
     OPTIONS (see :func:`_install_metadata`).
     A request that came through no URL (a view called directly, as with
     ``APIRequestFactory``) gets none, nor does a CORS preflight or a view
     whose routed function serves no HTTP Schema Resource (``@api_view`` +
     ``@scrudful``); a routed request of a scrudful view without the
-    :func:`hsr_urls` include raises ``ImproperlyConfigured`` (see
-    :func:`_response_hsr_link`). When one of the view's ``renderer_classes``
-    renders something other than JSON (the browsable API), its responses
-    also send ``Vary: Accept``.
+    :func:`hsr_urls` include raises ``ImproperlyConfigured`` before its
+    handler runs (see :func:`_response_hsr_link`). When one of the view's
+    ``renderer_classes`` renders something other than JSON (the browsable
+    API), its responses also send ``Vary: Accept``.
     ``Access-Control-Expose-Headers`` is extended with ``Link`` and ``Allow``,
     and whichever of ``ETag`` and ``Location`` the response carries
     (django-cors-headers replaces that header when ``CORS_EXPOSE_HEADERS`` is
@@ -1577,9 +1579,9 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
     after :func:`_options_initial` authenticated and throttled the request
     (a CORS preflight never gets here: :func:`_preflight_dispatch`):
 
-    1. the HSR link is resolved (:func:`_response_hsr_link`, before anything
-       is loaded; its ``ImproperlyConfigured`` propagates; an unrouted
-       request has none);
+    1. the HSR link :func:`_options_initial` resolved, before anything was
+       loaded (its ``ImproperlyConfigured`` propagated; an unrouted request
+       has none), is taken (:func:`_request_hsr_link`);
     2. each method the view serves is checked for this requester, with its
        view-level permissions, then the object is loaded only if one of them
        passed (a method with an ``allowed_func`` always does), then the
@@ -1606,7 +1608,7 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
     """
     if not _answers_options(self):
         return APIView.options(self, request, *args, **kwargs)
-    hsr = _response_hsr_link(self, request)
+    hsr = _request_hsr_link(self, request)
     try:
         allowed = _allowed_methods(self, request)
     except Exception as exc:
@@ -1670,19 +1672,28 @@ def _preflight_dispatch(dispatch: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def _options_initial(initial: Callable[..., Any]) -> Callable[..., Any]:
-    """The ``initial`` of a view class with scrudful's OPTIONS: for an
-    OPTIONS that scrudful answers (:func:`_answers_options`), DRF's
-    ``initial()`` without ``check_permissions``. Content negotiation,
+    """The ``initial`` of a view class with scrudful's OPTIONS.
+
+    First, for every request, the HTTP Schema Resource link of its responses
+    is resolved (:func:`_resolve_hsr_link`): before the handler runs, so
+    that a link that can't be resolved (the :func:`hsr_urls` include
+    missing, an ``hsr_url`` that raises) fails the request before anything
+    is written, not after.
+
+    Then, for an OPTIONS that scrudful answers (:func:`_answers_options`),
+    DRF's ``initial()`` without ``check_permissions``. Content negotiation,
     versioning, authentication (``perform_authentication``: bad credentials
     are DRF's 401) and throttles (``check_throttles``, once, as DRF throttles
     the view) run; the permission checks don't gate OPTIONS itself, as they
-    are what its ``Allow`` reports (:func:`_allowed_methods`).
+    are what its ``Allow`` reports (:func:`_allowed_methods`). Any other
+    request gets DRF's ``initial()``.
     """
 
     @functools.wraps(initial)
     def scrudful_initial(
         self: APIView, request: Request, *args: Any, **kwargs: Any
     ) -> Any:
+        _resolve_hsr_link(self, request)
         if request.method != "OPTIONS" or not _answers_options(self):
             return initial(self, request, *args, **kwargs)
         with _instance_attributes(self, check_permissions=_no_check):
@@ -1701,7 +1712,8 @@ def _finalize_response(finalize: Callable[..., Any]) -> Callable[..., Any]:
     answers, those of ``initial()`` (401, 403, 406, 429 ...) and of OPTIONS
     included, whatever the project's ``EXCEPTION_HANDLER``. Each gets:
 
-    - the HTTP Schema Resource link (:func:`_response_hsr_link`), merged
+    - the HTTP Schema Resource link (:func:`_request_hsr_link`: the one
+      ``initial()`` resolved before the handler ran), merged
       into the response's Link (a Link with the HSR relation the handler
       set wins, see :func:`scrudful._adapter.merge_links`);
     - ``Vary: Accept`` when one of the view's ``renderer_classes`` renders
@@ -1725,7 +1737,7 @@ def _finalize_response(finalize: Callable[..., Any]) -> Callable[..., Any]:
         response = finalize(self, request, response, *args, **kwargs)
         if not _is_scrudful_view(self):
             return response
-        hsr = _response_hsr_link(self, request)
+        hsr = _request_hsr_link(self, request)
         if hsr is not None:
             link = merge_links(response.get("Link"), None, None, hsr)
             if link is not None:
@@ -2626,8 +2638,9 @@ def _response_hsr_link(view: APIView, request: HttpRequest | Request) -> str | N
     - A CORS preflight gets none (it carries no Links).
     - Otherwise the link targets :func:`_hsr_target`, whose
       ``ImproperlyConfigured`` propagates: a routed request of a scrudful
-      view without the :func:`hsr_urls` include (or ``hsr_url``) raises, on
-      every response.
+      view without the :func:`hsr_urls` include (or ``hsr_url``) raises,
+      before its handler runs (:func:`_options_initial` resolves the link
+      first).
     """
     match = getattr(request, "resolver_match", None)
     if match is None:
@@ -2640,6 +2653,28 @@ def _response_hsr_link(view: APIView, request: HttpRequest | Request) -> str | N
     if is_preflight(request.method or "", request.headers.get):
         return None
     return hsr_link(_hsr_target(request))
+
+
+#: Where :func:`_resolve_hsr_link` keeps the HTTP Schema Resource link of
+#: the responses to a DRF ``Request``.
+_HSR_LINK_ATTR = "_scrudful_hsr_link"
+
+
+def _resolve_hsr_link(view: APIView, request: Request) -> None:
+    """Resolve the HTTP Schema Resource link of ``view``'s responses to
+    ``request`` (:func:`_response_hsr_link`; what it raises propagates) and
+    keep it on the request, for :func:`_request_hsr_link`."""
+    setattr(request, _HSR_LINK_ATTR, _response_hsr_link(view, request))
+
+
+def _request_hsr_link(view: APIView, request: Request) -> str | None:
+    """The HTTP Schema Resource link :func:`_resolve_hsr_link` resolved for
+    ``request`` before the handler ran; resolved now if it wasn't (a
+    response finalized without ``initial()``)."""
+    try:
+        return vars(request)[_HSR_LINK_ATTR]
+    except KeyError:
+        return _response_hsr_link(view, request)
 
 
 def _hsr_target(request: HttpRequest | Request) -> str:

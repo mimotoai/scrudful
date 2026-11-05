@@ -43,7 +43,10 @@ handlers make Django's own error pages JSON too:
 Every response of a scrudful view routed through the URLconf links its HSR, so
 **the include is required**: without it (or ``SCRUDFUL["HSR_URL"]``), every
 routed request of a scrudful view, not only an OPTIONS, raises
-``ImproperlyConfigured``, which names the line to add. A request that comes
+``ImproperlyConfigured``, which names the line to add. The link is resolved in
+the view's ``initial()``, before the handler runs, so a link that can't be
+resolved (the include missing, an ``hsr_url`` that raises or returns a relative
+URL) fails the request before anything is written. A request that comes
 through no URL (a view called directly, with ``APIRequestFactory``) gets no
 HSR link.
 
