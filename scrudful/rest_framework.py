@@ -224,7 +224,6 @@ import types
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple
-from urllib.parse import urlsplit
 
 from django.conf import settings
 from django.core import checks
@@ -314,6 +313,9 @@ from scrudful._hsr import (
     HsrConfigError,
     absolute_for_hsr,
     allow_value,
+    check_base_url,
+    check_hsr_cache_control,
+    check_hsr_url_result,
     hsr_link,
     is_preflight,
     options_operation,
@@ -2544,7 +2546,12 @@ def _hsr_target(request: HttpRequest | Request) -> str:
     cls = getattr(view_func, "cls", None)
     hsr_url = _hsr_url(cls)
     if hsr_url is not None:
-        return hsr_url(match.view_name)
+        try:
+            return check_hsr_url_result(
+                hsr_url(match.view_name), f"hsr_url({match.view_name!r})"
+            )
+        except HsrConfigError as exc:
+            raise ImproperlyConfigured(str(exc)) from exc
     if not _hsr_route_on(cls):
         raise ImproperlyConfigured(_ROUTE_OFF)
     if match.url_name is None:
@@ -2608,12 +2615,10 @@ def _hsr_cache_control(cls: Any) -> str:
     if value is not None:
         return value
     value = scrudful_setting("HSR_CACHE_CONTROL", DEFAULT_HSR_CACHE_CONTROL)
-    if not isinstance(value, str):
-        raise ImproperlyConfigured(
-            "SCRUDFUL['HSR_CACHE_CONTROL'] must be a str, not "
-            f"{type(value).__name__}"
-        )
-    return value
+    try:
+        return check_hsr_cache_control(value, "SCRUDFUL['HSR_CACHE_CONTROL']")
+    except HsrConfigError as exc:
+        raise ImproperlyConfigured(str(exc)) from exc
 
 
 def _check_hsr_options(hsr_route: Any, hsr_url: Any, hsr_cache_control: Any) -> None:
@@ -2632,6 +2637,8 @@ def _check_hsr_options(hsr_route: Any, hsr_url: Any, hsr_cache_control: Any) -> 
             "Meta.hsr_cache_control must be a str, not "
             f"{type(hsr_cache_control).__name__}"
         )
+    if hsr_cache_control is not None:
+        check_hsr_cache_control(hsr_cache_control, "Meta.hsr_cache_control")
 
 
 def _describe_mode_view(view_func: Callable[..., Any]) -> APIView:
@@ -3380,9 +3387,10 @@ def _gives_error_links(view: APIView) -> bool:
 
 def _check_base_url(url: Any, what: str) -> None:
     """Raise ``ImproperlyConfigured`` unless ``url`` is an absolute URL."""
-    parts = urlsplit(url) if isinstance(url, str) else None
-    if parts is None or not (parts.scheme and parts.netloc):
-        raise ImproperlyConfigured(f"{what} must be an absolute URL, not {url!r}")
+    try:
+        check_base_url(url, what)
+    except HsrConfigError as exc:
+        raise ImproperlyConfigured(str(exc)) from exc
 
 
 def _setting_base_url() -> str | None:

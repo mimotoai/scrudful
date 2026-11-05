@@ -16,7 +16,7 @@ from scrudful._adapter import (
     media_type_key,
 )
 
-__all__ = ["Entity"]
+__all__ = ["Entity", "HsrConfigError"]
 
 
 @dataclass(frozen=True)

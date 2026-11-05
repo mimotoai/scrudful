@@ -26,7 +26,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass, field
 from typing import Annotated, Any, TypeVar, get_args, get_origin
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi import params as fastapi_params
@@ -95,6 +95,9 @@ from scrudful._hsr import (
     HsrConfigError,
     absolute_for_hsr,
     allow_value,
+    check_base_url,
+    check_hsr_cache_control,
+    check_hsr_url_result,
     hsr_etag,
     hsr_link,
     hsr_response_links,
@@ -1323,24 +1326,19 @@ def _check_hsr_options(
     load: Any,
 ) -> _HsrOptions:
     """The :func:`add_options` options, checked."""
-    for name, value, kind in (
-        ("base_url", base_url, str),
-        ("hsr_cache_control", hsr_cache_control, str),
-    ):
-        if value is not None and not isinstance(value, kind):
-            raise TypeError(f"{name} must be a str, not {type(value).__name__}")
+    if hsr_cache_control is not None and not isinstance(hsr_cache_control, str):
+        raise TypeError(
+            f"hsr_cache_control must be a str, not {type(hsr_cache_control).__name__}"
+        )
     if not isinstance(hsr_route, bool):
         raise TypeError(f"hsr_route must be a bool, not {type(hsr_route).__name__}")
     for name, value in (("hsr_url", hsr_url), ("allowed", allowed), ("load", load)):
         if value is not None and not callable(value):
             raise TypeError(f"{name} must be callable, not {type(value).__name__}")
     if base_url is not None:
-        parts = urlsplit(base_url)
-        if not (parts.scheme and parts.netloc):
-            raise ValueError(
-                f"base_url must be an absolute URL (with a scheme and a host), "
-                f"not {base_url!r}"
-            )
+        check_base_url(base_url, "base_url")
+    if hsr_cache_control is not None:
+        check_hsr_cache_control(hsr_cache_control, "hsr_cache_control")
     if not hsr_route and hsr_url is None:
         raise ValueError(
             "hsr_route=False needs hsr_url=, hsr_url(path): the URL each "
@@ -3168,7 +3166,9 @@ def _hsr_target(
         paths = _scrudful_paths(owner)
     resource = _resource(owner, paths, path)
     if options.hsr_url is not None:
-        return options.hsr_url(resource.template)
+        return check_hsr_url_result(
+            options.hsr_url(resource.template), f"hsr_url({resource.template!r})"
+        )
     if not options.hsr_route:
         raise ValueError("hsr_route=False needs hsr_url=")
     _, name_of = _owner_hsr_names(owner, paths)

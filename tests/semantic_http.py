@@ -170,9 +170,7 @@ def link_problems(
     if method == "OPTIONS" and status < 400:
         # options_204_problems only tests whether the body is empty: a
         # stand-in body says whether the response had content.
-        problems += options_204_problems(
-            status, headers, b"x" if has_content else b""
-        )
+        problems += options_204_problems(status, headers, b"x" if has_content else b"")
     if hsr is not None and (has_content or method == "HEAD"):
         problems += _agreement_problems(
             method, status, content_type, schemas, contexts, hsr
@@ -302,9 +300,7 @@ def options_204_problems(
     return problems + hsr_link_problems(headers)
 
 
-def hsr_get_problems(
-    status: int, headers: Mapping[str, str], body: bytes
-) -> list[str]:
+def hsr_get_problems(status: int, headers: Mapping[str, str], body: bytes) -> list[str]:
     """How a GET of the HTTP Schema Resource breaks the rules."""
     problems = []
     if status != 200:

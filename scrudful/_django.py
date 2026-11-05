@@ -31,7 +31,13 @@ from django.utils.cache import patch_vary_headers
 from django.views import defaults
 
 from scrudful import _adapter
-from scrudful._hsr import hsr_etag, hsr_response_links, serialize_hsr
+from scrudful._hsr import (
+    HsrConfigError,
+    check_base_url,
+    hsr_etag,
+    hsr_response_links,
+    serialize_hsr,
+)
 from scrudful.collection import InvalidPage
 from scrudful.conditional import ConditionalResult, evaluate_preconditions
 from scrudful.entity import Entity
@@ -210,11 +216,10 @@ def _plain_links(entity: Entity, request: HttpRequest) -> str | None:
     if base is None:
         base = request.build_absolute_uri()
     else:
-        parts = urlsplit(base) if isinstance(base, str) else None
-        if parts is None or not (parts.scheme and parts.netloc):
-            raise ImproperlyConfigured(
-                f'SCRUDFUL["BASE_URL"] must be an absolute URL, not {base!r}'
-            )
+        try:
+            check_base_url(base, 'SCRUDFUL["BASE_URL"]')
+        except HsrConfigError as exc:
+            raise ImproperlyConfigured(str(exc)) from exc
     candidates = [
         (
             entity.schema_link_or_func,

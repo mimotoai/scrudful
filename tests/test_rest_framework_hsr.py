@@ -1377,6 +1377,23 @@ def test_hsr_meta_options_are_checked(name, value, match):
         scrudful_viewset(type("V", (drf_hsr_urls.ItemViewSetBase,), {"Meta": meta}))
 
 
+@pytest.mark.parametrize("value", ["", "  "])
+def test_empty_hsr_cache_control_is_rejected(urls, client, settings, value):
+    meta = type("Meta", (), {"hsr_cache_control": value})
+    with pytest.raises(ValueError, match="hsr_cache_control"):
+        scrudful_viewset(type("V", (drf_hsr_urls.ItemViewSetBase,), {"Meta": meta}))
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL, "HSR_CACHE_CONTROL": value}
+    with pytest.raises(ImproperlyConfigured, match="HSR_CACHE_CONTROL"):
+        client.get("/_hsr/item-detail")
+
+
+@pytest.mark.parametrize("returned", [None, "", "/hsr/item-detail", 3])
+def test_hsr_url_must_return_an_absolute_url(urls, client, settings, returned):
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL, "HSR_URL": lambda view_name: returned}
+    with pytest.raises(ImproperlyConfigured, match="must return an absolute URL"):
+        client.get("/items/1/")
+
+
 class MovedURLconf:
     urlpatterns = [
         path("stats", drf_hsr_urls.stats, name="stats"),

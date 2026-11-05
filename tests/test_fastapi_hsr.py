@@ -728,8 +728,25 @@ def test_add_options_stores_its_options():
     ],
 )
 def test_add_options_checks_its_options(name, value):
-    with pytest.raises(TypeError, match=name):
+    # A non-str base_url is refused like a relative one (a ValueError).
+    error = ValueError if name == "base_url" else TypeError
+    with pytest.raises(error, match=name):
         add_options(FastAPI(), **{name: value})
+
+
+@pytest.mark.parametrize("value", ["", "  "])
+def test_add_options_rejects_an_empty_hsr_cache_control(value):
+    with pytest.raises(ValueError, match="hsr_cache_control"):
+        add_options(FastAPI(), hsr_cache_control=value)
+
+
+@pytest.mark.parametrize("returned", [None, "", "/hsr/users/{id}", 3])
+def test_hsr_url_must_return_an_absolute_url(make_client, returned):
+    app = target_app(hsr_url=lambda path: returned)
+    client = make_client(app, raise_server_exceptions=False)
+    assert client.get("/users/1").status_code == 500
+    with pytest.raises(ValueError, match="must return an absolute URL"):
+        make_client(app).get("/users/1")
 
 
 # --- describe mode -----------------------------------------------------------------

@@ -593,12 +593,28 @@ def test_router_base_url_overrides_the_setting(settings):
 def test_relative_base_url_is_rejected(settings):
     with pytest.raises(ConfigError, match="base_url"):
         ScrudfulRouter(base_url="/relative/")
-    with pytest.raises(TypeError, match="base_url"):
+    with pytest.raises(ConfigError, match="base_url"):  # not a str: as relative
         ScrudfulRouter(base_url=1)
     settings.SCRUDFUL = {"BASE_URL": "relative/"}
     _, router = make_api(base_url=None)
     with pytest.raises(ConfigError, match="BASE_URL"):
         http_schema_resource(router, "/{pk}")
+
+
+@pytest.mark.parametrize("value", ["", "  "])
+def test_empty_hsr_cache_control_is_rejected(settings, value):
+    with pytest.raises(ConfigError, match="hsr_cache_control"):
+        ScrudfulRouter(hsr_cache_control=value)
+    settings.SCRUDFUL = {"HSR_CACHE_CONTROL": value}
+    with pytest.raises(ConfigError, match="HSR_CACHE_CONTROL"):
+        TestClient(make_api()[0]).get("/_hsr/pk")
+
+
+@pytest.mark.parametrize("returned", [None, "", "/hsr/{pk}", 3])
+def test_hsr_url_must_return_an_absolute_url(rf, returned):
+    router = target_router("a", hsr_route=False, hsr_url=lambda path: returned)
+    with pytest.raises(ConfigError, match="must return an absolute URL"):
+        _hsr_target(rf.get("/1/target"), router, "/{pk}")
 
 
 def test_router_stores_its_hsr_options():

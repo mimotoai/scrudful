@@ -38,6 +38,9 @@ __all__ = [
     "HsrConfigError",
     "absolute_for_hsr",
     "allow_value",
+    "check_base_url",
+    "check_hsr_cache_control",
+    "check_hsr_url_result",
     "hsr_etag",
     "hsr_link",
     "hsr_response_links",
@@ -125,12 +128,20 @@ def absolute_for_hsr(url: str, base_url: str | None, what: str) -> str:
     Raises
     ------
     HsrConfigError
-        If ``url`` is relative and there is no ``base_url``.
+        If ``url`` is relative and there is no ``base_url``, or the result is
+        not absolute (a ``base_url`` that is itself relative).
     """
     if urlsplit(url).scheme:
         return url
     if base_url:
-        return resolve_uri(url, base_url)
+        resolved = resolve_uri(url, base_url)
+        if not urlsplit(resolved).scheme:
+            raise HsrConfigError(
+                f"{what} is the relative URL {url!r} and the base URL "
+                f"{base_url!r} does not make it absolute: the result "
+                f"{resolved!r} is not absolute"
+            )
+        return resolved
     raise HsrConfigError(
         f"{what} is the relative URL {url!r}; set a base URL "
         "(base_url=, or SCRUDFUL['BASE_URL'] for Django): the HTTP Schema "
@@ -152,3 +163,57 @@ def hsr_route_name(path_template: str) -> str:
         if segment
     ]
     return ".".join(segments) or "_root"
+
+
+def check_base_url(url: Any, what: str) -> None:
+    """Check that ``url`` is an absolute URL with a host, as a base URL must be.
+
+    The one check behind every base URL (``base_url=`` and
+    ``SCRUDFUL["BASE_URL"]``). A value that is not a ``str`` is refused like a
+    relative one. Each adapter calls this and re-raises the error as its own
+    configuration error.
+
+    Raises
+    ------
+    HsrConfigError
+        If ``url`` is not a ``str`` with a scheme and a host.
+    """
+    parts = urlsplit(url) if isinstance(url, str) else None
+    if parts is None or not (parts.scheme and parts.netloc):
+        raise HsrConfigError(f"{what} must be an absolute URL, not {url!r}")
+
+
+def check_hsr_url_result(value: Any, what: str) -> str:
+    """``value``, what an ``hsr_url(...)`` callable returned, if it is usable.
+
+    The HTTP Schema Resource link must point at an absolute URL: a non-empty
+    ``str`` with a scheme. Anything else would be sent as a broken link.
+
+    Raises
+    ------
+    HsrConfigError
+        If ``value`` is not a non-empty absolute ``str``.
+    """
+    if not (isinstance(value, str) and value and urlsplit(value).scheme):
+        raise HsrConfigError(
+            f"{what} must return an absolute URL (a str with a scheme), "
+            f"not {value!r}"
+        )
+    return value
+
+
+def check_hsr_cache_control(value: Any, what: str) -> str:
+    """``value``, a ``Cache-Control`` value for the HTTP Schema Resource.
+
+    Raises
+    ------
+    HsrConfigError
+        If ``value`` is not a ``str``, or is empty (an empty ``Cache-Control``
+        field says nothing).
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise HsrConfigError(
+            f"{what} must be a non-empty str of Cache-Control directives, "
+            f"not {value!r}"
+        )
+    return value

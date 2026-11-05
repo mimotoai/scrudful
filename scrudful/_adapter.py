@@ -688,9 +688,7 @@ def _accept_ranges(accept: str) -> list[tuple[str, float]]:
     return ranges
 
 
-def _accept_rank(
-    ranges: list[tuple[str, float]], media_type: str
-) -> tuple[float, int]:
+def _accept_rank(ranges: list[tuple[str, float]], media_type: str) -> tuple[float, int]:
     """``(q, specificity)`` of ``media_type`` for the Accept ``ranges``.
 
     The most specific matching range decides (RFC 9110 section 12.5.1);

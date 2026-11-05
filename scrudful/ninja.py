@@ -561,7 +561,6 @@ from typing import (
     get_args,
     get_origin,
 )
-from urllib.parse import urlsplit
 
 import pydantic
 from asgiref.sync import async_to_sync, sync_to_async
@@ -638,6 +637,9 @@ from scrudful._hsr import (
     HSR_ROUTE_SEGMENT,
     absolute_for_hsr,
     allow_value,
+    check_base_url,
+    check_hsr_cache_control,
+    check_hsr_url_result,
     hsr_link,
     hsr_route_name,
     is_preflight,
@@ -1856,7 +1858,6 @@ class ScrudfulRouter(Router):
     ) -> None:
         super().__init__(*args, **kwargs)
         for name, value, kind, accepted in (
-            ("base_url", base_url, "a str", str),
             ("hsr_route", hsr_route, "a bool", bool),
             ("hsr_cache_control", hsr_cache_control, "a str", str),
         ):
@@ -1871,6 +1872,8 @@ class ScrudfulRouter(Router):
                 )
         if base_url is not None:
             _check_base_url(base_url, "base_url")
+        if hsr_cache_control is not None:
+            _check_hsr_cache_control(hsr_cache_control, "hsr_cache_control")
         self.base_url = base_url
         self.hsr_route = hsr_route
         self.hsr_url = hsr_url
@@ -2070,12 +2073,7 @@ class ScrudfulRouter(Router):
         if self.hsr_cache_control is not None:
             return self.hsr_cache_control
         value = scrudful_setting("HSR_CACHE_CONTROL", DEFAULT_HSR_CACHE_CONTROL)
-        if not isinstance(value, str):
-            raise ConfigError(
-                'SCRUDFUL["HSR_CACHE_CONTROL"] must be a str, not '
-                f"{type(value).__name__}"
-            )
-        return value
+        return _check_hsr_cache_control(value, 'SCRUDFUL["HSR_CACHE_CONTROL"]')
 
     def _hsr(self, path: str) -> dict[str, Any]:
         """The HTTP Schema Resource of ``path``, built once (not a copy)."""
@@ -2141,9 +2139,18 @@ _API_RESOLVERS: weakref.WeakKeyDictionary[NinjaAPI, URLResolver] = (
 
 def _check_base_url(url: Any, what: str) -> None:
     """Raise ``ConfigError`` unless ``url`` is an absolute URL (a str)."""
-    parts = urlsplit(url) if isinstance(url, str) else None
-    if parts is None or not (parts.scheme and parts.netloc):
-        raise ConfigError(f"{what} must be an absolute URL, not {url!r}")
+    try:
+        check_base_url(url, what)
+    except HsrConfigError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _check_hsr_cache_control(value: Any, what: str) -> str:
+    """``value`` if it is a usable ``Cache-Control`` value, else ``ConfigError``."""
+    try:
+        return check_hsr_cache_control(value, what)
+    except HsrConfigError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _setting_base_url() -> str | None:
@@ -2384,7 +2391,10 @@ def _hsr_target(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
     """
     hsr_url = router._hsr_url()
     if hsr_url is not None:
-        return hsr_url(path)
+        try:
+            return check_hsr_url_result(hsr_url(path), f"hsr_url({path!r})")
+        except HsrConfigError as exc:
+            raise ConfigError(str(exc)) from exc
     if not router._hsr_route_on():
         raise ConfigError("hsr_route=False needs hsr_url=")
     route = _hsr_route_path(request, router, path)
