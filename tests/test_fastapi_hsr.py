@@ -1235,6 +1235,22 @@ def test_hsr_route_serves_document(make_client):
     assert head_304.status_code == 304
 
 
+def test_hsr_etag_follows_the_document(make_client):
+    """After the document changes, the old ETag is stale: a 200 with the new
+    document and a new ETag, not a 304."""
+    app = make_app()
+    client = make_client(app)
+    before = client.get("/_hsr/users.id")
+    add_options(app, base_url="https://changed.example/")
+    after = client.get(
+        "/_hsr/users.id", headers={"If-None-Match": before.headers["etag"]}
+    )
+    assert after.status_code == 200
+    assert after.content != before.content
+    assert after.headers["etag"] != before.headers["etag"]
+    assert after.headers["etag"] == hsr_etag(after.content)
+
+
 @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 def test_hsr_route_answers_other_methods_405(make_client, method):
     response = make_client(make_app()).request(method, "/_hsr/users.id")

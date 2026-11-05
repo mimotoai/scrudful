@@ -730,6 +730,22 @@ def test_hsr_body_is_the_bytes_the_etag_hashes():
     assert r.headers["ETag"] == hsr_etag(r.content)
 
 
+def test_hsr_etag_follows_the_document():
+    """After the document changes, the old ETag is stale: a 200 with the new
+    document and a new ETag, not a 304."""
+    api, _ = make_api()
+    client = TestClient(api)
+    before = client.get("/_hsr/pk")
+    add_error_links(api, API_ERROR)
+    after = client.get("/_hsr/pk", headers={"If-None-Match": before.headers["ETag"]})
+    assert after.status_code == 200
+    assert after.content != before.content
+    assert after.headers["ETag"] != before.headers["ETag"]
+    assert after.headers["ETag"] == hsr_etag(after.content)
+    again = client.get("/_hsr/pk", headers={"If-None-Match": after.headers["ETag"]})
+    assert again.status_code == 304
+
+
 @pytest.fixture
 def clear_cache():
     cache.clear()

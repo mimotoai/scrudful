@@ -994,6 +994,18 @@ def test_hsr_identical_across_hosts_and_requesters(urls, settings):
     assert again.content == a.content
 
 
+def test_hsr_etag_follows_the_document(urls, client, settings):
+    """After the document changes, the old ETag is stale: a 200 with the new
+    document and a new ETag, not a 304."""
+    before = client.get("/_hsr/item-detail")
+    settings.SCRUDFUL = {"BASE_URL": "https://changed.example/"}
+    after = client.get("/_hsr/item-detail", HTTP_IF_NONE_MATCH=before["ETag"])
+    assert after.status_code == 200
+    assert after.content != before.content
+    assert after["ETag"] != before["ETag"]
+    assert after["ETag"] == hsr_etag(after.content)
+
+
 def test_hsr_get_answers_if_none_match_with_304_and_serves_head(urls, client):
     etag = client.get("/_hsr/item-detail")["ETag"]
     assert etag.startswith('"')  # strong
