@@ -167,8 +167,11 @@ def hsr_response(
 
 def hsr_not_allowed() -> HttpResponseBase:
     """The 405 of an HTTP Schema Resource view to a method but GET and HEAD:
-    ``Allow: GET, HEAD``, with the expose headers."""
+    ``Allow: GET, HEAD``, with the expose headers, and neither content nor
+    ``Content-Type`` (Django's ``text/html`` would label empty content as
+    a media type no HTTP Schema Resource describes)."""
     response = HttpResponseNotAllowed(["GET", "HEAD"])
+    del response["Content-Type"]
     _adapter.expose_headers(response)
     return response
 

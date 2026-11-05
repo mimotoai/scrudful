@@ -996,6 +996,9 @@ def test_hsr_route_answers_other_methods_405(urls, method):
     response = getattr(client, method)("/_hsr/item-detail")
     assert response.status_code == 405
     assert response["Allow"] == "GET, HEAD"
+    # No content, so no media type to describe.
+    assert response.content == b""
+    assert "Content-Type" not in response
 
 
 @pytest.fixture
