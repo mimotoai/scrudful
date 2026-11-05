@@ -1784,11 +1784,13 @@ def _forget_removed(owner: FastAPI | APIRouter, options: _HsrOptions) -> None:
     """Forget the HSR routes of ``owner`` that are no longer among its routes
     (one replaced, ``router.routes[i] = ...``, or removed): reversing them
     would fail, so the resources they served are taken as having none (no
-    HSR link, see :func:`_response_hsr_link`; OPTIONS answers without it),
-    and :func:`_announce_unserved` warns of them. A router's next completion
-    then walks it whole (as one whose routes seen changed otherwise), which
-    gives them their routes again, as calling :func:`add_options` again
-    does."""
+    HSR link, see :func:`_response_hsr_link`; OPTIONS answers without it).
+    For a router, :func:`_announce_unserved` warns of them, and its next
+    completion walks it whole (as one whose routes seen changed otherwise),
+    which gives them their routes again, as calling :func:`add_options`
+    again does. For an app, whose one HSR route serves all its resources,
+    this warns (once for each route forgotten): only :func:`add_options`
+    adds it again."""
     routes = owner.router.routes if isinstance(owner, FastAPI) else owner.routes
     present = {id(route) for route in routes}
     hsr = getattr(owner, _HSR_ROUTE_ATTRIBUTE, None)
@@ -1796,6 +1798,16 @@ def _forget_removed(owner: FastAPI | APIRouter, options: _HsrOptions) -> None:
     if isinstance(hsr, Route) and id(hsr) not in present:
         delattr(owner, _HSR_ROUTE_ATTRIBUTE)
         gone = True
+        if options.hsr_route and options.hsr_url is None:
+            warnings.warn(
+                f"the HTTP Schema Resource route of this FastAPI app "
+                f"('/{HSR_ROUTE_SEGMENT}/{{name}}') was removed from its routes, "
+                "or replaced, after add_options(app), so none of its resources "
+                "is described: their responses get no HSR link, and OPTIONS "
+                "answers without one; call add_options on the app again",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     elif isinstance(hsr, dict):
         for key in [key for key, route in hsr.items() if id(route) not in present]:
             del hsr[key]
@@ -3871,7 +3883,9 @@ def _response_hsr_link(request: Request) -> str | None:
       appended to the router's ``routes`` after its :func:`add_options`, and
       before calling it again; :func:`_announce_unserved` warns of it): the
       router serves neither its document nor its OPTIONS, so it is not
-      described, and a link would lead to a 404. Failing each of its
+      described, and a link would lead to a 404. As does every resource of
+      an app whose HSR route was removed or replaced since
+      (:func:`_forget_removed` warns of it). Failing each of its
       responses instead would turn a call made too early into an outage of
       the resource.
     - Otherwise the link targets :func:`_hsr_target`, whose ``ValueError``

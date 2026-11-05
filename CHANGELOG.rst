@@ -423,6 +423,10 @@ Behaviour change (FastAPI)
   already included and serving serves the routes it adds at once, where
   FastAPI includes routers lazily. A copy of such a router (``copy.copy``)
   shares the wrapped methods, and ``copy.deepcopy`` fails.
+* An app's HSR route removed from (or replaced in) ``app.router.routes`` after
+  ``add_options(app)`` leaves every resource of the app without the HSR link,
+  on its responses and on OPTIONS, until ``add_options`` is called again; a
+  ``RuntimeWarning`` says so, once, on the next request.
 
 New
 ---

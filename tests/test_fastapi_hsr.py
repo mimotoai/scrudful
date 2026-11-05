@@ -908,6 +908,44 @@ def test_an_unhashable_error_entity_is_described_and_served(make_client, mode):
     assert client.get("/_hsr/items.iid").json() == hsr
 
 
+def test_an_app_whose_hsr_route_was_removed_warns_once(make_client):
+    """An app's HSR route removed from its routes (a project filtering them)
+    leaves every resource undescribed: no HSR link on a response or on
+    OPTIONS. It isn't silent: a ``RuntimeWarning`` says so, once, and
+    calling ``add_options`` again restores the route."""
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {"id": id}
+
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    assert hsr_link_problems(dict(client.get("/notes/1").headers), NOTE_TARGET) == []
+    app.router.routes[:] = [
+        route
+        for route in app.router.routes
+        if not getattr(route, "path", "").startswith("/_hsr/")
+    ]
+    with pytest.warns(RuntimeWarning) as caught:
+        response = client.get("/notes/1")
+    assert [str(warning.message) for warning in caught] == [
+        "the HTTP Schema Resource route of this FastAPI app ('/_hsr/{name}') "
+        "was removed from its routes, or replaced, after add_options(app), so "
+        "none of its resources is described: their responses get no HSR link, "
+        "and OPTIONS answers without one; call add_options on the app again"
+    ]
+    assert HSR_DOCUMENT_REL not in (response.headers.get("link") or "")
+    # Once (the suite runs with warnings as errors).
+    options = client.options("/notes/1")
+    assert (options.status_code, options.headers.get("link")) == (204, None)
+    assert client.get(NOTE_TARGET).status_code == 404
+    add_options(app, base_url=BASE)
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
+    assert client.get(NOTE_TARGET).status_code == 200
+
+
 def test_router_hsr_per_app_has_its_own_etag(make_client):
     """The served bytes, and so the ``ETag``, are each app's."""
     _, apps = router_in_three_apps()
