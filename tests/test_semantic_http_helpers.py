@@ -382,8 +382,7 @@ def test_hsr_get_problems_person_fixture():
 
 
 def test_hsr_get_problems_wants_a_strong_etag():
-    """The HSR's ETag is strong (Semantic HTTP 0.1): a weak one is a problem
-    (the final review's M3)."""
+    """The HSR's ETag is strong (Semantic HTTP 0.1): a weak one is a problem."""
     body = (FIXTURES / "person.http-schema-resource.json").read_bytes()
     h = {
         "Content-Type": "application/json",

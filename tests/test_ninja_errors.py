@@ -728,7 +728,7 @@ def test_add_error_links_media_type_must_be_json(store, media_type):
 # --- The HTTP Schema Resource link on every response ----------------------------
 
 #: The base URL of ``hsr_api``'s router, and its path's HSR link target
-#: (Ruling R6: resolved against the base URL, not the request).
+#: (resolved against the base URL, never the request).
 HSR_BASE = "https://api.example/"
 HSR_TARGET = "https://api.example/_hsr/pk"
 HSR_REL = "https://w3id.org/semantic-http/ns#http-schema-resource-document"
@@ -892,7 +892,7 @@ def test_raised_error_without_entity_on_a_plain_router_exposes_link_and_allow():
     assert expose(response) == {"Link", "Allow"}
 
 
-# --- @described operations send their Links (Ruling R4) -------------------------
+# --- @described operations send their Links (they agree with the HSR) ----------
 
 PLAIN = Entity(
     schema_link_or_func="/schemas/plain", context_link_or_func="/contexts/plain"
@@ -1024,7 +1024,8 @@ def test_unrouted_method_is_json_405():
 
 
 def test_405_allow_lists_head_only_when_routed():
-    """Ruling R9: make_api's path routes no HEAD."""
+    """``Allow`` lists HEAD only where it is routed; make_api's path routes
+    none."""
     from tests.test_ninja_hsr import PK_TARGET
     from tests.test_ninja_hsr import make_api as make_hsr_api
 

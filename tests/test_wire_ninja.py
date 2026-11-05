@@ -660,7 +660,7 @@ def test_allow_per_requester(client, world, label, url, headers, allow):
 
 
 def test_allow_of_a_hidden_object_is_the_loaders_404(client, world):
-    """Ruling R11: the loader's 404 (scoped-rbac's unreadable object) is the
+    """The loader's 404 (scoped-rbac's unreadable object) is the
     answer, with the error Links and the HSR link, not an object-less
     Allow."""
     url, kind, headers = "/wire/secured/9", "secured", READER

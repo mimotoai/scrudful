@@ -1787,7 +1787,7 @@ EARLY_ERRORS = [
 def test_dependency_content_links_are_dropped_on_early_errors(
     make_client, store, method, headers, status
 ):
-    """Ruling R27: a dependency's ``describedby`` and RDF context links
+    """A dependency's ``describedby`` and RDF context links
     describe the success representation, not the early error's body: they
     are dropped from the 400/412/428, which carry the error entity's (and
     agree with the HSR's entry). Its other Links and its cookies are kept."""
@@ -2718,7 +2718,7 @@ def test_add_options_link_callables_are_called_in_describe_mode(make_client, sto
 def test_add_options_needs_no_credentials(make_client, security):
     """OPTIONS isn't gated by the app's, a router's or ``include_router``'s
     dependencies, and the document it links to is served without
-    credentials. Its ``Allow`` runs only security dependencies (R25): a
+    credentials. Its ``Allow`` runs only security dependencies: a
     plain ``Depends(deny)`` isn't run, so GET is listed; a ``Security(deny)``
     refuses everything but OPTIONS."""
 
@@ -3077,7 +3077,7 @@ def test_add_options_path_split_across_routers(make_client):
 
 def test_add_options_differently_named_parameters(make_client):
     """Starlette routes ``/items/5`` GET to ``/items/{id}`` and PUT to
-    ``/items/{item_id}``: one resource (R20), whose document has both, under
+    ``/items/{item_id}``: one resource, whose document has both, under
     either template, and whose ``Allow`` lists both."""
     received = []
 
@@ -3126,7 +3126,7 @@ def test_add_options_on_a_router_groups_differently_named_parameters(make_client
     async def write(item_id: int):
         return {}
 
-    # Another convertor matches other URLs: another resource (R20a).
+    # Another convertor matches other URLs: another resource.
     @router.delete("/things/{n:int}", status_code=204)
     @scrudful()
     async def remove(n: int):

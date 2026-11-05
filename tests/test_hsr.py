@@ -152,7 +152,7 @@ def test_hsr_config_error_is_public():
 
 def test_absolute_for_hsr_takes_any_uri_with_a_scheme():
     """An absolute URI has a scheme (RFC 3986 section 4.3), an authority or
-    not: ``urn:`` and ``tag:`` URIs are absolute (the final review's M2)."""
+    not: ``urn:`` and ``tag:`` URIs are absolute."""
     for url in ("urn:example:schema", "tag:example.com,2026:schema", "file:///s"):
         assert absolute_for_hsr(url, None, "schema") == url
         assert absolute_for_hsr(url, "https://api.example/", "schema") == url

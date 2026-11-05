@@ -335,7 +335,7 @@ def test_list_trace_ignores_preconditions(items):
 
 
 def test_list_early_responses_keep_handler_headers(items):
-    """R12: the 304 keeps the handler's headers but Content-*; the 400 and 412
+    """The 304 keeps the handler's headers but Content-*; the 400 and 412
     keep only its cookies. The error entity's Links go on the error bodies."""
     router = Router()
 

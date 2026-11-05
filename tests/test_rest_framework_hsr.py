@@ -884,7 +884,7 @@ def test_a_subclass_defining_a_removed_hook_is_a_type_error(name):
 )
 def test_a_mixin_defining_a_removed_hook_is_a_type_error(name):
     """A metadata mixin before ScrudfulMetadata in the MRO would win as a
-    subclass's hook does (the final review's M6)."""
+    subclass's hook does."""
     mixin = type("OldHooks", (), {name: lambda self, *args: {}})
     with pytest.raises(TypeError) as info:
         type("Custom", (mixin, ScrudfulMetadata), {})
@@ -895,7 +895,7 @@ def test_a_mixin_defining_a_removed_hook_is_a_type_error(name):
 
 
 def test_determine_metadata_served_nowhere_is_a_type_error():
-    """R18: OPTIONS has no body and the HSR route builds the document
+    """OPTIONS has no body and the HSR route builds the document
     itself, so an override would silently do nothing, mixed in too."""
 
     class Own(BaseMetadata):
@@ -1169,7 +1169,7 @@ class UnnamedAPIViewURLconf:
 
 def test_unnamed_scrudful_view_is_improperly_configured(settings, client):
     """A request of the unnamed route raises; the HSR route has no name of it
-    to serve, so any name it is asked for is a 404 (R28)."""
+    to serve, so any name it is asked for is a 404."""
     settings.ROOT_URLCONF = UnnamedURLconf
     with pytest.raises(ImproperlyConfigured, match="'v1/notes/<int:pk>'") as info:
         target("/v1/notes/1")
@@ -1196,7 +1196,7 @@ def test_one_name_for_two_scrudful_views_is_improperly_configured(settings, clie
         client.get("/_hsr/clash")
     assert "'notes/<int:pk>'" in str(info.value)
     assert "'stats'" in str(info.value)
-    # The other names are served (R28).
+    # The other names are served.
     response = client.get("/_hsr/report")
     assert response.status_code == 200
     assert get_problems(response) == []
@@ -1214,7 +1214,7 @@ class OneBadRouteURLconf:
 
 
 def test_one_bad_route_leaves_the_others_hsrs_served(settings, client):
-    """An unnamed scrudful route breaks only its own requests (R28)."""
+    """An unnamed scrudful route breaks only its own requests."""
     settings.ROOT_URLCONF = OneBadRouteURLconf
     response = client.get("/_hsr/thing")
     assert response.status_code == 200
@@ -2116,7 +2116,7 @@ def test_per_method_checks_see_the_method_and_leak_nothing(api_client):
 @pytest.mark.parametrize("pk", ["1", "99"])
 def test_anonymous_on_locked_resource_gets_204_allow_options(api_client, pk):
     # IsAdminUser view. Refused every method, the requester can't tell an
-    # existing object (1) from a missing one (99), as with a GET (R17): the
+    # existing object (1) from a missing one (99), as with a GET: the
     # object is not loaded.
     r = api_client.options(f"/x/admin-items/{pk}/")
     assert r.status_code == 204 and r.headers["Allow"] == "OPTIONS"
@@ -2127,7 +2127,7 @@ def test_anonymous_on_locked_resource_gets_204_allow_options(api_client, pk):
 
 
 def test_options_is_no_existence_oracle(api_client):
-    """R17: the same answer for an existing and a missing object when every
+    """The same answer for an existing and a missing object when every
     method is refused, as a GET gives the same refusal for both."""
     answers = []
     for pk in ("1", "99"):
@@ -2190,7 +2190,7 @@ def test_missing_object_is_404_with_error_links(api_client, user):
 
 @pytest.mark.parametrize("user", [None, "reader"])
 def test_an_object_check_raising_http404_is_that_404(api_client, user):
-    """R16: an object permission that hides the object (``Http404``, as
+    """An object permission that hides the object (``Http404``, as
     DjangoObjectPermissions for an unreadable object) answers the OPTIONS
     with that 404, as a GET, not with a per-method denial."""
     r = as_user(api_client, user).options("/x/hidden-items/1/")

@@ -20,8 +20,8 @@ asserts that its problem list is empty. One test per rule family:
 - ``test_allow_per_requester``: ``Allow`` lists what this requester may use
   (anonymous, reader, writer, admin, an object-level denial through
   ``allowed``), a requester refused every method can't tell a missing object
-  from an existing one (ruling R17), and a throttle in ``dependencies=`` uses
-  no quota (ruling R25);
+  from an existing one (nothing is loaded), and a throttle in
+  ``dependencies=`` uses no quota (OPTIONS runs only security dependencies);
 - ``test_preflight``: a CORS preflight is a 2xx without Links, running no
   auth, throttle, hook or load, answered by scrudful (204, no content) or by
   Starlette's ``CORSMiddleware`` in front;
@@ -838,7 +838,7 @@ def test_allow_per_requester(clients, label, kind, url, headers, allow):
 def test_allow_is_no_existence_oracle_for_a_requester_refused_everything(
     clients, headers
 ):
-    """Ruling R17: the admin-only path refuses this requester every method,
+    """The admin-only path refuses this requester every method,
     so OPTIONS loads nothing, and a missing note answers as an existing one
     does."""
     answers = []
@@ -856,7 +856,7 @@ def test_allow_is_no_existence_oracle_for_a_requester_refused_everything(
 
 
 def test_allow_of_a_missing_object_is_its_404(clients):
-    """Ruling R11: a requester who may use a method gets the 404 of a
+    """A requester who may use a method gets the 404 of a
     missing note (``load``'s), with the error Links and the HSR link."""
     response = clients["wire"].options("/notes/999", headers=WRITER)
     assert response.status_code == 404
@@ -867,7 +867,7 @@ def test_allow_of_a_missing_object_is_its_404(clients):
 
 
 def test_allow_with_an_allowed_hook_loads_the_object_for_anyone(clients):
-    """Ruling R17a, documented: with ``allowed`` every method needs the
+    """A documented exposure: with ``allowed`` every method needs the
     object, for every requester, so OPTIONS of a missing item is its 404
     whoever asks. Only a ``load`` hiding the objects keeps them secret."""
     response = clients["hooked"].options("/h/items/999")
@@ -878,7 +878,7 @@ def test_allow_with_an_allowed_hook_loads_the_object_for_anyone(clients):
 
 
 def test_a_throttle_in_dependencies_uses_no_quota(clients):
-    """Ruling R25: OPTIONS runs only the security dependencies, so a throttle
+    """OPTIONS runs only the security dependencies, so a throttle
     in ``dependencies=`` isn't run (``Allow`` lists the GET it would refuse),
     and its quota is untouched; the GET itself is throttled, with Links."""
     for _ in range(3):
@@ -1123,7 +1123,7 @@ def test_a_dependency_link_is_kept(clients, method, headers, status):
 def test_a_dependency_s_success_links_leave_the_early_errors(
     clients, method, headers, status
 ):
-    """Ruling R27: a dependency setting the success representation's schema
+    """A dependency setting the success representation's schema
     and context links doesn't relabel the early 400/412/428, whose problem
     details body the error entity's Links describe (agreeing with the HSR);
     its author link stays."""

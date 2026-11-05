@@ -427,7 +427,7 @@ def test_a_path_without_a_scrudful_endpoint_has_no_hsr():
 def test_parameter_names_are_one_resource_convertors_are_distinct(make_client):
     """Templates that match the same URLs are one resource whatever their
     parameters' names (``str`` is no convertor); another convertor matches
-    other URLs, so it is another resource (R20a)."""
+    other URLs, so it is another resource."""
     links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
     reads, writes = APIRouter(), APIRouter()
 
@@ -464,7 +464,7 @@ def test_parameter_names_are_one_resource_convertors_are_distinct(make_client):
     assert options_hsr(client, "/items/abc") == hsr
     options_204(client, "/items/abc", "GET, PUT, OPTIONS, PATCH")
     assert client.delete("/items/abc").status_code == 405  # not this resource's
-    # Each resource has its own HSR route (R22).
+    # Each resource has its own HSR route.
     assert client.get("/_hsr/items.id").json() == hsr
     assert client.get("/_hsr/items.id-int").json() == http_schema_resource(
         app, "/items/{id:int}"
@@ -1112,7 +1112,7 @@ def test_responses_statuses_and_media_types():
             },
         }
     }
-    # Only the entity's media type is described (R21): a declared PNG or CSV
+    # Only the entity's media type is described: a declared PNG or CSV
     # is undescribed content, not a JSON-LD-described entry.
     assert responses["200"] == {"description": "OK", "content": item}
     assert responses["203"] == {"description": "From a cache", "content": item}
@@ -1601,7 +1601,7 @@ def test_reserved_segment(make_client):
 
 
 def test_hsr_route_name_encodes_convertors(make_client):
-    """Each convertor but ``str`` is joined to its parameter's name (R22)."""
+    """Each convertor but ``str`` is joined to its parameter's name."""
     app = FastAPI()
 
     @app.get("/items/{id:int}/{rest:path}")
@@ -1626,7 +1626,7 @@ def test_hsr_route_name_encodes_convertors(make_client):
 def test_hsr_route_name_clash(make_client):
     """``/a.b`` and ``/a/b`` are two resources with one route name, ``a.b``:
     the naming loses the difference. ``/items/{id}`` beside
-    ``/items/{id:int}`` doesn't clash (R22)."""
+    ``/items/{id:int}`` doesn't clash."""
     links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
 
     def clashing(owner: Any) -> Any:
@@ -2558,7 +2558,7 @@ def test_allow_per_requester(make_client):
 
 def test_head_is_listed_only_when_routed(make_client):
     """FastAPI's GET route doesn't serve HEAD (a 405): ``Allow`` lists HEAD
-    only for a route that does (R9)."""
+    only for a route that does."""
     client = make_client(note_app(head=False))
     assert client.head("/notes/1", headers=ADMIN).status_code == 405
     options_204(client, "/notes/1", "GET, PUT, OPTIONS", NOTE_TARGET, headers=ADMIN)
@@ -2588,7 +2588,7 @@ def test_load_and_allowed_hook_get_object(make_client):
     options_204(
         client, "/notes/7", "GET, PUT, OPTIONS, HEAD", NOTE_TARGET, headers=alice
     )
-    # A path without parameters has no object: load isn't called (R26).
+    # A path without parameters has no object: load isn't called.
     loaded.clear()
     seen.clear()
     options_204(client, "/notes", "OPTIONS", "https://api.example/_hsr/notes")
@@ -2598,7 +2598,7 @@ def test_load_and_allowed_hook_get_object(make_client):
 
 def test_load_is_not_called_without_path_parameters(make_client):
     """A ``load(request, id)`` that can't take a collection's (no)
-    parameters: the collection's OPTIONS is still a 204 (R26)."""
+    parameters: the collection's OPTIONS is still a 204."""
     loaded = []
 
     def load(request: Request, id: str) -> Any:
@@ -2654,7 +2654,7 @@ def test_missing_object_204_without_load_result(make_client):
 @pytest.mark.parametrize("status", [404, 403, 410])
 def test_load_http_exception_answered_with_error_links(make_client, status):
     """An ``HTTPException`` from ``load`` is the app's exception handlers'
-    answer, with the error entity's Links and the HSR link (R11)."""
+    answer, with the error entity's Links and the HSR link."""
 
     async def load(request: Request, id: str) -> Any:
         raise HTTPException(status_code=status, detail="No such note")
@@ -2691,7 +2691,7 @@ def test_load_http_exception_through_a_custom_handler(make_client):
 
 @pytest.mark.parametrize("status", [401, 403])
 def test_a_denial_an_allowed_hook_raises_means_not_allowed(make_client, status):
-    """R30: an ``HTTPException`` 401 or 403 from the hook refuses the method,
+    """An ``HTTPException`` 401 or 403 from the hook refuses the method,
     as DRF's allowed_func and ninja's allowed= do."""
 
     def allowed(request: Request, method: str, obj: Any) -> bool:
@@ -2708,7 +2708,7 @@ def test_a_denial_an_allowed_hook_raises_means_not_allowed(make_client, status):
 
 @pytest.mark.parametrize("status", [404, 409])
 def test_another_allowed_hook_http_exception_is_answered(make_client, status):
-    """A 404 (R16) or another status the hook raises is the OPTIONS's
+    """A 404 or another status the hook raises is the OPTIONS's
     answer, by the app's handlers."""
 
     def allowed(request: Request, method: str, obj: Any) -> bool:
@@ -2760,7 +2760,7 @@ def test_a_check_setting_request_state_leaves_the_others_alone(make_client):
 def test_no_existence_oracle(make_client):
     """A requester whom every method's security dependencies refuse gets 204
     ``Allow: OPTIONS`` for a missing and an existing id alike: nothing is
-    loaded (R17)."""
+    loaded."""
     loads = []
 
     def load(request: Request, id: str) -> Any:
@@ -2780,7 +2780,7 @@ def test_no_existence_oracle(make_client):
 
 
 def test_an_allowed_hook_counts_as_passing_before_the_load(make_client):
-    """A hook needs the object, so it gets it, for every requester (R17a)."""
+    """A hook needs the object, so it gets it, for every requester."""
     loads = []
 
     def load(request: Request, id: str) -> Any:
@@ -2833,7 +2833,7 @@ def test_preflight_runs_nothing(make_client, extra):
 
 
 def test_checks_run_only_security_dependencies(make_client):
-    """The per-method checks run only the security dependencies (R25):
+    """The per-method checks run only the security dependencies:
     those declared with ``Security(...)`` (a scope-less one too) and a plain
     ``Depends`` that relies on a security scheme, wherever they are declared
     (the endpoint's parameters, ``dependencies=`` of the route, a router,
@@ -3308,7 +3308,7 @@ def test_another_http_exception_from_a_check_is_answered(make_client):
 
 def test_options_consumes_no_throttle_quota(make_client):
     """A throttle in ``dependencies=`` (no security scheme below it) isn't run
-    by the checks: OPTIONS consumes none of its quota (R25)."""
+    by the checks: OPTIONS consumes none of its quota."""
     quota = {"left": 1}
 
     def throttle() -> None:

@@ -71,7 +71,8 @@ API_ERROR = Entity(
 )
 
 #: ``make_api`` keys for ``ScrudfulRouter(...)`` and for ``NinjaAPI(...)``
-#: (Ruling R2); every other key goes to the ``@scrudful`` decorators.
+#: (the router- and API-level options); every other key goes to the
+#: ``@scrudful`` decorators.
 ROUTER_KEYS = frozenset(
     {"base_url", "hsr_route", "hsr_url", "hsr_cache_control", "allowed"}
 )
@@ -1708,7 +1709,8 @@ def test_target_needs_the_operations_api():
 
 # --- OPTIONS: a 204 with a per-requester Allow ---------------------------------
 
-#: The HSR link target of ``make_api``'s ``"/{pk}"`` (Ruling R6).
+#: The HSR link target of ``make_api``'s ``"/{pk}"`` (absolute against its
+#: base URL, never the request).
 PK_TARGET = "https://api.example/_hsr/pk"
 
 
@@ -2030,7 +2032,8 @@ def test_denials_of_a_check(error, where):
     ids=["401", "403", "AuthenticationError", "AuthorizationError", "PermissionDenied"],
 )
 def test_a_denial_an_allowed_hook_raises_means_not_allowed(error):
-    """R30: as DRF's allowed_func and FastAPI's allowed= do."""
+    """A 401, 403 or ``PermissionDenied`` the hook raises refuses the method,
+    as DRF's allowed_func and FastAPI's allowed= do."""
 
     def allowed(request, method, obj):
         if method == "PUT":

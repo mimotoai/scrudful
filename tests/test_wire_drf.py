@@ -21,7 +21,7 @@ empty. One test per rule family:
 - ``test_allow_per_requester``: ``Allow`` lists what this requester may use
   (anonymous, reader, writer, admin, an object-level denial, an
   ``allowed_func``), and a requester refused every method can't tell a
-  missing object from an existing one (ruling R17);
+  missing object from an existing one (nothing is loaded);
 - ``test_preflight``: a CORS preflight is a 204 without content or Links,
   running no auth, throttle or load, a missing object's included;
 - ``test_undescribed``: no undescribed content for an absent ``Accept`` or
@@ -783,7 +783,7 @@ def test_allow_per_requester(client, world, label, url, headers, allow):
 def test_allow_is_no_existence_oracle_for_a_requester_refused_everything(
     client, world, headers
 ):
-    """Ruling R17: the admin-only view refuses this requester every method,
+    """The admin-only view refuses this requester every method,
     so OPTIONS loads nothing, and a missing object answers as an existing one
     does."""
     answers = []
@@ -800,7 +800,7 @@ def test_allow_is_no_existence_oracle_for_a_requester_refused_everything(
 
 
 def test_allow_of_a_missing_object_is_its_404(client, world):
-    """Ruling R11: a requester who may use a method gets the 404 of a
+    """A requester who may use a method gets the 404 of a
     missing object, with the error Links and the HSR link, not an
     object-less Allow."""
     response = client.options(world.format("/x/perm-items/{missing}/"))
@@ -812,7 +812,7 @@ def test_allow_of_a_missing_object_is_its_404(client, world):
 
 
 def test_allow_with_an_allowed_func_loads_the_object_for_anyone(client, world):
-    """Ruling R17a, documented: a method with an ``allowed_func`` needs the
+    """A documented exposure: a method with an ``allowed_func`` needs the
     object for every requester, so OPTIONS of a missing object is its 404
     whoever asks. Only a queryset hiding the objects keeps them secret."""
     response = client.options(world.format("/x/hooked-items/{missing}/"))

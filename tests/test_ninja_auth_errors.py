@@ -1,4 +1,4 @@
-"""ninja's 401 and 403 agree with the HTTP Schema Resource (R29).
+"""ninja's 401 and 403 agree with the HTTP Schema Resource.
 
 An operation's ``error`` differs from the API-wide :func:`add_error_links`
 entity: every 401 and 403 answered for the operation, whether ninja's
@@ -206,8 +206,8 @@ def test_without_an_api_wide_entity_the_operations_entity_stays():
     client = Client()
     hsr = hsr_of(client, "/q/things/_hsr/pk")
     responses = hsr["get"]["responses"]
-    # As before R29: ninja's own 401, 422 and 429, without content, and the
-    # operation's 403 under default.
+    # Without an API-wide entity: ninja's own 401, 422 and 429, without
+    # content, and the operation's 403 under default.
     assert {"401", "422", "429"} <= responses.keys()
     assert "403" not in responses
     response = client.get("/q/things/1")
