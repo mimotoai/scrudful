@@ -3,9 +3,10 @@
 An operation's ``error`` differs from the API-wide :func:`add_error_links`
 entity: every 401 and 403 answered for the operation, whether ninja's
 authentication answers it before the operation runs (a CSRF failure, an
-``AuthorizationError``, an ``HttpError`` of an auth callback) or ``before=``
-or the operation raises it, carries the API-wide entity, which the HSR's
-explicit 401 and 403 entries describe. The module is its own URLconf.
+``AuthorizationError``, an ``HttpError`` of an auth callback) or ``before=``,
+``after_throttles=`` or the operation raises it, carries the API-wide entity,
+which the HSR's explicit 401 and 403 entries describe. The module is its own
+URLconf.
 """
 
 import json
@@ -69,11 +70,22 @@ def before(request: Any, **kwargs: Any) -> None:
         raise HttpError(403, "before says no")
 
 
+def after_throttles(request: Any, **kwargs: Any) -> None:
+    if request.headers.get("X-After") == "deny":
+        raise HttpError(403, "after_throttles says no")
+
+
 router = ScrudfulRouter(base_url=BASE_URL)
 
 
 @router.get("/{pk}", response=Thing, auth=Key())
-@scrudful(load=lambda request, pk, **kw: {"id": pk}, error=OWN, before=before, **LINKS)
+@scrudful(
+    load=lambda request, pk, **kw: {"id": pk},
+    error=OWN,
+    before=before,
+    after_throttles=after_throttles,
+    **LINKS,
+)
 def get_thing(request: Any, pk: int, obj: Any) -> Any:
     if pk == 401:
         raise HttpError(401, "who are you")
@@ -145,11 +157,21 @@ def test_the_hsr_lists_403_with_the_api_wide_entity():
         ("/p/things/1", {}, 401),
         # before= raises it.
         ("/p/things/1", {"X-Key": "ok", "X-Before": "deny"}, 403),
+        # after_throttles= raises it.
+        ("/p/things/1", {"X-Key": "ok", "X-After": "deny"}, 403),
         # The operation raises it.
         ("/p/things/403", {"X-Key": "ok"}, 403),
         ("/p/things/401", {"X-Key": "ok"}, 401),
     ],
-    ids=["auth-error", "AuthorizationError", "no-key", "before", "op-403", "op-401"],
+    ids=[
+        "auth-error",
+        "AuthorizationError",
+        "no-key",
+        "before",
+        "after_throttles",
+        "op-403",
+        "op-401",
+    ],
 )
 def test_401_and_403_carry_the_api_wide_entity(url, headers, status):
     client = Client()

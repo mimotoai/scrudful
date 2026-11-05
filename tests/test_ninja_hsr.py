@@ -2254,6 +2254,96 @@ def test_router_mounted_twice_uses_each_mounts_auth():
     assert alice.headers["Allow"] == "GET, OPTIONS"
 
 
+@pytest.mark.parametrize("parent_class", [Router, ScrudfulRouter])
+def test_a_parent_routers_auth_decides_a_nested_routers_allow(parent_class):
+    """The ``auth=`` a nested router's operations inherit from a parent router
+    (not the API) is the one their OPTIONS checks."""
+    _, child = make_api()
+    parent = parent_class(auth=KeyAuth())
+    parent.add_router("/items", child)
+    client = TestClient(mount(parent))
+    anonymous = options(client, "/items/1")
+    assert anonymous.status_code == 204 and anonymous.headers["Allow"] == "OPTIONS"
+    alice = options(client, "/items/1", headers={"X-API-Key": ALICE})
+    assert alice.headers["Allow"] == "GET, PUT, OPTIONS"
+    assert client.get("/items/1").status_code == 401
+
+
+def test_options_awaits_an_async_load():
+    """The object an ``async def`` loader returns reaches the hook, and its
+    404 answers the OPTIONS."""
+    store, seen = Store(), []
+
+    async def load(request, pk, **params):
+        return store.load(request, pk, **params)
+
+    async def allowed(request, method, obj):
+        seen.append(obj)
+        return True
+
+    api, _ = make_async_api(load=load, allowed=allowed)
+    add_error_links(api, API_ERROR)
+    r = async_options(api, "/1")
+    assert r.status_code == 204 and r.headers["Allow"] == "GET, PUT, OPTIONS"
+    assert seen == [store.items[1]] * 2
+    r = async_options(api, "/99")
+    assert r.status_code == 404
+    assert link_problems("OPTIONS", 404, dict(r.headers), True) == []
+    assert hsr_link_problems(dict(r.headers), PK_TARGET) == []
+
+
+@pytest.mark.parametrize("hook", ["before", "after_throttles"])
+def test_options_never_runs_after_throttles(hook):
+    """``after_throttles`` (a quota, an audit log) never runs for OPTIONS, nor
+    shapes its ``Allow``; ``before`` does."""
+    calls = []
+
+    def refuse(request, **params):
+        calls.append(request.method)
+        raise HttpError(403, "no")
+
+    api, _ = make_api(**{hook: refuse})
+    client = TestClient(api)
+    r = options(client, "/1")
+    assert r.status_code == 204
+    if hook == "after_throttles":
+        assert r.headers["Allow"] == "GET, PUT, OPTIONS" and calls == []
+        assert client.get("/1").status_code == 403
+        assert calls == ["GET"]
+    else:
+        assert r.headers["Allow"] == "OPTIONS" and calls
+
+
+@pytest.mark.parametrize("where", ["before", "auth"])
+def test_a_per_method_check_raising_a_404_refuses_the_method(where):
+    """ninja's choice (FastAPI's too; DRF answers the OPTIONS with it): a 404
+    of a per-method check refuses that method, it doesn't answer the
+    OPTIONS; the loader still runs for the method allowed."""
+
+    def check(request, **params):
+        if request.method == "PUT":
+            raise HttpError(404, "Not Found")
+        return "someone"
+
+    calls = []
+    store = Store()
+
+    def load(request, pk, **params):
+        calls.append(request.method)
+        return store.load(request, pk, **params)
+
+    if where == "before":
+        api, _ = make_api(
+            load=load, before=lambda request, **kw: check(request) and None
+        )
+    else:
+        api, _ = make_api(load=load, auth=check)
+    r = options(TestClient(api), "/1")
+    assert r.status_code == 204
+    assert r.headers["Allow"] == "GET, OPTIONS"
+    assert calls == ["GET"]
+
+
 SESSION_API, _ = make_api(auth=django_auth)
 urlpatterns += [path("session/", SESSION_API.urls)]
 
