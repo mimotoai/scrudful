@@ -171,9 +171,16 @@ callbacks); with any storage, make the write conditional, for example
 ``get_object()``, django-ninja's ``load``; step 3 below), on a request whose
 ``method`` is the method checked: a lock taken there is held until the
 OPTIONS response ends. Lock only for the write: test
-``request.META.get("REQUEST_METHOD") != "OPTIONS"`` (the request line's
-method), or, with django-ninja, decide the method with an ``allowed`` hook
-(DRF loads for every method with an ``allowed_func``). Without a transaction,
+``request.META.get("REQUEST_METHOD") != "OPTIONS"``, the request line's
+method, which stays ``"OPTIONS"`` on the per-method requests. DRF and
+django-ninja set it to ``"OPTIONS"`` on an OPTIONS whose ``META`` lacks it
+(ninja's ``TestClient`` builds such requests, and so may a request built by
+hand), so the test holds in tests too; a test that passes one ``META`` dict
+to several requests gets that key on all of them, so give each request a
+fresh one. An ``allowed`` hook doesn't avoid the lock: with django-ninja it
+runs no method's own ``load``, but the loading operation's still runs, with
+that operation's method (GET's, else the first item operation's), and DRF
+loads for every method with an ``allowed_func``. Without a transaction,
 ``select_for_update()`` raises ``TransactionManagementError`` for the write as
 well: a misconfiguration, not an OPTIONS matter.
 
@@ -250,17 +257,23 @@ order:
      first, when GET passed), as that action loads it, so a ``get_queryset``
      scoped by ``self.action`` is checked per action; a view that isn't a
      viewset loads once for each method that passed. The first load's 404
-     is the answer; a 401, 403 or 404 from another method's load, object
-     permission or ``allowed_func`` leaves out only that method. An item
-     OPTIONS of a ``ModelViewSet`` may so run four ``get_object()`` calls;
+     is the answer; a 401, 403 or 404 from another load leaves out only the
+     methods it was loaded for (its action's, on a viewset), and one from
+     another method's object permission or ``allowed_func`` only that
+     method. An item OPTIONS of a ``ModelViewSet`` may so run four
+     ``get_object()`` calls;
    * django-ninja: the ``load`` of the GET operation (else of the first with
      one), once that operation's own ``auth=`` and ``before=`` allow the
-     requester, with or without an ``allowed=`` hook. Without a hook, each
-     other item operation with a ``load`` also runs it in step 4, once its
-     ``auth=`` and ``before=`` pass, as a check of its own method, unless it
-     is the very call the loading operation made (the same function, path
-     parameters and ``request.auth``): any ``HttpError``, ``Http404`` or
-     ``PermissionDenied`` it raises leaves out only that method;
+     requester and its path parameters validate, with or without an
+     ``allowed=`` hook. Without a hook, each other item operation with a
+     ``load`` also runs it in step 4, once its ``auth=`` and ``before=``
+     pass, as a check of its own method, unless it is the very call the
+     loading operation made (the same function, method, a HEAD counting as a
+     GET, path parameters and ``request.auth``), so a ``load`` shared with
+     the loading operation runs again for each other method: any
+     ``HttpError``, ``Http404`` or ``PermissionDenied`` it raises leaves out
+     only that method (an ``HttpError`` other than a 401, 403 or 404, a 5xx
+     say, is logged on the ``scrudful.ninja`` logger);
    * FastAPI: ``add_options(load=...)``, once at least one method passes its
      security dependencies (every method does with ``allowed=``).
 
@@ -294,7 +307,8 @@ order:
    ``auth=`` callbacks, ``before`` and own ``load``, DRF's permission classes
    (and ``get_object()`` per action) and, for FastAPI, each security
    dependency whole, with the plain dependencies nested inside it (a
-   database session, a throttle a ``get_current_user`` depends on). Whatever they write, they write for each method checked.
+   database session, a throttle a ``get_current_user`` depends on).
+   Whatever they write, they write for each method checked.
 5. ``Allow`` lists the allowed methods and ``OPTIONS``; ``HEAD`` only when the
    path serves it. A 405 keeps RFC 9110's ``Allow`` for django-ninja and DRF:
    every method the path serves, whoever asks (FastAPI's 405 is
@@ -916,11 +930,17 @@ The application must still:
 * **Install the 404 and 500 handlers (Django):** in the root URLconf,
   ``handler404 = scrudful.ninja.handler404(PAGE_ERROR)`` and ``handler500 =
   scrudful.ninja.handler500(PAGE_ERROR)`` (or ``scrudful.rest_framework``'s),
-  with ``PAGE_ERROR`` an ``Entity`` of plain link values. Django's 404 for a
-  URL no pattern matches and its 500 page are then JSON (problem details for
-  an ``application/problem+json`` entity) with the entity's Links, unless
-  ``Accept`` prefers ``text/html``, always with ``Vary: Accept``. They apply
-  with ``DEBUG`` off. FastAPI's ``add_error_links`` installs a JSON 500 itself.
+  with ``PAGE_ERROR`` an ``Entity`` of plain link values (a link URL that
+  can't be parsed is ``ImproperlyConfigured`` when the handler is made).
+  Django's 404 for a URL no pattern matches and its 500 page are then JSON
+  (problem details for an ``application/problem+json`` entity) with the
+  entity's Links, unless ``Accept`` prefers ``text/html``, always with
+  ``Vary: Accept``. They apply with ``DEBUG`` off. They never raise for their
+  Links: a Link they can't build, whatever the cause (an invalid
+  ``SCRUDFUL["BASE_URL"]``, a ``reverse_lazy`` URL that doesn't reverse), is
+  logged on the ``scrudful._django`` logger, with its traceback and the
+  request's path, and the error served without the Links. FastAPI's
+  ``add_error_links`` installs a JSON 500 itself.
 * **Raise errors, don't return them:** a 4xx or 5xx your view returns gets
   no error Links from scrudful (the view's links describe its 2xx content
   only), just the HTTP Schema Resource link, unless an entity is declared for
@@ -1025,8 +1045,10 @@ this release, also need the 0.9.0 changes in the changelog):
    ...), on ``obj`` when there is one (for django-scoped-rbac, its
    ``http.<METHOD>`` permission against the policy).
    ``obj`` is ``None`` for a collection, and, under django-ninja, also on an
-   item URL when the GET operation's ``auth=`` or ``before=`` refused the
-   requester (the object is then not loaded). Under DRF and FastAPI, a hook
+   item URL when the loading operation's (the GET operation's, else the
+   first item operation's with a ``load``) ``auth=`` or ``before=`` refused
+   the requester, or its path parameters don't validate (the object is then
+   not loaded). Under DRF and FastAPI, a hook
    makes OPTIONS load the object for every requester, so ``get_object()``
    (DRF) or ``load`` (FastAPI) must hide, with a 404 or ``None``, the objects
    a requester may not see. A denial the hook raises (a 401 or 403) refuses
@@ -1137,8 +1159,10 @@ this release, also need the 0.9.0 changes in the changelog):
       each other distinct action of the methods that passed (on a view that
       isn't a viewset, for each other method that passed, so a
       ``get_queryset`` scoped by ``self.request.method`` is checked per
-      method): a 401, 403 or 404 that load raises, or a 404 from that
-      method's object permissions or ``allowed_func``, leaves out only that
+      method): a 401, 403 or 404 that load raises leaves out only the
+      methods it was loaded for (its action's, so both of an
+      ``@action(detail=True, methods=["put", "patch"])``), and a 404 from
+      another method's object permissions or ``allowed_func`` only that
       method. An item OPTIONS of a ``ModelViewSet`` may so call
       ``get_object()`` four times: keep it free of side effects. A
       ``get_object`` of the view's own is called on a viewset's item action,
@@ -1158,14 +1182,32 @@ this release, also need the 0.9.0 changes in the changelog):
       ``http_schema_resource`` and ``http_schema_resource_view`` for a router
       mounted on several APIs;
     * django-ninja: OPTIONS runs, besides the loading operation's ``load``,
-      each other item operation's own ``load`` as a check of that method,
-      once its ``auth=`` and ``before=`` pass, unless it is the very call the
-      loading operation made: any ``HttpError``, ``Http404`` or
-      ``PermissionDenied`` it raises leaves out only that method. A method
-      whose path parameters don't validate (its request would be a 422), or
-      whose path validation raises one of those, is left out; a path
-      scrudful can't validate (a custom path model) isn't checked. Keep every
-      ``load`` free of side effects;
+      each other item operation's own ``load`` as a check of that method, on
+      a request of that method, once its ``auth=`` and ``before=`` pass,
+      unless it is the very call the loading operation made (the same
+      function, method, a HEAD counting as a GET, path parameters and
+      ``request.auth``), so a ``load`` the GET and PUT operations share runs
+      again for the PUT: any ``HttpError``, ``Http404`` or
+      ``PermissionDenied`` it raises leaves out only that method, and an
+      ``HttpError`` other than a 401, 403 or 404 (a 5xx, say) is logged on
+      the ``scrudful.ninja`` logger. A method whose path parameters don't
+      validate (its request would be a 422), or whose path validation raises
+      anything, is left out (anything but an ``HttpError``, ``Http404`` or
+      ``PermissionDenied`` logged there, once per route). A path scrudful
+      can't validate (a custom path model) keeps its method listed without
+      that check, with a ``RuntimeWarning`` once per route, unless the method
+      has its own ``load`` to run, which needs the path parameters: it is
+      then left out. The loading operation's path follows the same rules,
+      and when it fails OPTIONS loads no object. OPTIONS
+      never answers a 500 or raises ``ConfigError`` for a path it can't
+      check. Keep every ``load`` free of side effects;
+    * django-ninja: a ``@scrudful`` handler with ``before=`` or
+      ``after_throttles=`` called directly from inside another operation,
+      from inside itself while it runs, or after its operation's run ended
+      (from a task or thread it left running) raises ``RuntimeError``: its
+      hooks didn't run for that call (0.9 ran such a call when the request's
+      hooks had run, for another operation or other path values). Move the
+      shared code into a plain function and call that;
     * django-ninja, with ``add_error_links``: a 401, 403, 422 or 429 of a
       scrudful operation (ninja's own, or one the operation, its ``load``,
       ``before=`` or ``after_throttles=`` raises) carries the API-wide
