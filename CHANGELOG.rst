@@ -12,9 +12,7 @@ Resource (HSR) served by GET, the HSR must be the same for every requester,
 ``Allow`` lists the methods available to *this* requester, and every response
 should link the HSR. All three adapters now follow it. Clients and tests that
 read the OPTIONS body must GET the HSR instead; the README's "Migrating from
-0.9" lists the steps (django-scoped-rbac and scrud-django pin
-``scrudful>=0.8,<0.9``, so this release doesn't reach them until they move the
-pin to ``>=0.10,<0.11``).
+0.9" lists the steps.
 
 Behaviour change (all adapters)
 -------------------------------
@@ -39,8 +37,9 @@ Behaviour change (all adapters)
   which objects exist: for DRF and FastAPI, once a method passes its
   object-free checks (every method does with a hook); for ninja, once the
   loading operation's own ``auth=`` and ``before`` allow the requester, hook
-  or not (else the hook gets ``obj=None``). A 404 the loader raises is the OPTIONS's
-  answer, with the error Links and the HSR link; ``None`` is no object.
+  or not (else the hook gets ``obj=None``). A 404 the loader raises is the
+  OPTIONS's answer, with the error Links and the HSR link; ``None`` is no
+  object.
 * A denial an ``Allow`` hook raises refuses that method, in every adapter:
   DRF's ``PermissionDenied`` or ``NotAuthenticated``, any other 401 or 403
   ``APIException`` (``AuthenticationFailed``, a project's own), or Django's
@@ -85,9 +84,11 @@ Behaviour change (all adapters)
   of the error entity its raised errors get (the operation's ``error``, else
   the API-wide one: ninja and FastAPI ``add_error_links``, DRF
   ``SCRUDFUL["ERROR"]``); without an error helper it has no content. Where the
-  API-wide entity differs from the operation's, the errors the framework
-  answers before the operation (ninja 401, 403, 422 and 429; DRF 401, 403, 406
-  and 415) have explicit entries with its content.
+  operation's error entity differs from the API-wide one, the errors the
+  framework answers before the operation have explicit entries with the
+  API-wide entity's content: ninja's 401, 422 and 429 (without content when
+  there is no API-wide entity) and its 403 when there is one; DRF's 401, 403,
+  406 and 415 when ``SCRUDFUL["ERROR"]`` is set.
 * Every response of a described path carries the **HSR link**: the 2xx, 304
   and HEAD responses, scrudful's early 400, 412 and 428, a 204 or an error the
   view returns, and the errors the framework answers through scrudful's error
@@ -103,16 +104,17 @@ Behaviour change (all adapters)
   ``Location`` still only when present.
 * A schema link without an RDF context link, for a non-in-band media type, is
   refused (its Media Type Object would fail the spec's JSON Schema): an
-  ``Entity`` with a plain schema link raises ``scrudful.entity.HsrConfigError``,
-  a ``ValueError``, when created, and so do the DRF decorators given one
-  (``scrudful``, ``scrudful_api_view``, ``ScrudfulViewFunc``, and
-  ``scrudful_viewset`` for ``Meta``'s item and ``list_`` links, whatever
-  methods the class has) and FastAPI's ``scrudful`` for its link options
-  (it accepted one, whose HSR route then answered 500); the ninja decorators (``scrudful``,
-  ``scrudful_create``, ``scrudful_list``, for the item's and the collection's
-  links) raise ``ConfigError`` chained to it (``scrudful`` and the item links
-  of ``scrudful_list`` accepted one); a callable one raises the
-  adapter's configuration error when the HSR is built (was accepted).
+  ``Entity`` with a plain schema link raises
+  ``scrudful.entity.HsrConfigError``, a ``ValueError``, when created, and so
+  do the DRF decorators given one (``scrudful``, ``scrudful_api_view``,
+  ``ScrudfulViewFunc``, and ``scrudful_viewset`` for ``Meta``'s item and
+  ``list_`` links, whatever methods the class has) and FastAPI's
+  ``scrudful`` for its link options (it accepted one, whose HSR route then
+  answered 500); the ninja decorators (``scrudful``, ``scrudful_create``,
+  ``scrudful_list``, for the item's and the collection's links) raise
+  ``ConfigError`` chained to it (``scrudful`` and the item links of
+  ``scrudful_list`` accepted one); a callable one raises the adapter's
+  configuration error when the HSR is built (was accepted).
   ``ScrudfulPagination`` names the view's ``Meta`` in an
   ``ImproperlyConfigured`` for an undecorated view's.
 * Problem details: with an ``application/problem+json`` error entity, the
@@ -152,8 +154,10 @@ Behaviour change (ninja)
   ``auth=`` and ``before`` (or ``allowed``). Bad credentials make the
   requester anonymous (ninja's auth callbacks return ``None``), so they get
   the anonymous ``Allow``. A raised ``HttpError`` 401, 403 or 404,
-  ``Http404`` or ``PermissionDenied`` refuses a method; anything else raised
-  is answered by the API's exception handler.
+  ``Http404`` or ``PermissionDenied`` from ``auth=`` or ``before`` refuses a
+  method; from ``allowed``, a 401, 403 or ``PermissionDenied`` refuses it and
+  a 404 is the OPTIONS's answer; anything else raised is answered by the
+  API's exception handler.
 * OPTIONS is answered by an ``Operation.run`` decorator, so the API's and
   routers' ``add_decorator(mode="operation")`` decorators no longer gate it
   (they did in 0.9); ``mode="view"`` ones still run first. A non-preflight
@@ -257,18 +261,19 @@ Behaviour change (DRF)
   off without ``hsr_url``), ``E005`` (an HSR that can't be built: a relative
   link without a base URL, a schema without a context, a non-JSON context
   without a type, or whatever else its build raises, so that one view never
-  stops the check) and ``E006`` (an invalid ``SCRUDFUL`` setting: one
-  error for each invalid key, ``HSR_CACHE_CONTROL`` and ``ERROR`` included,
-  reported beside the routes' errors), ``E007`` (an action of a
+  stops the check), ``E006`` (an invalid ``SCRUDFUL`` setting: one error for
+  each invalid key, ``HSR_CACHE_CONTROL`` and ``ERROR`` included, reported
+  beside the routes' errors) and ``E007`` (an action of a
   ``scrudful_viewset`` class without ``@scrudful``); and, as the warning
   ``scrudful.W001``, what may depend on the data: a link callable raising a
   ``django.db.DatabaseError`` when called as ``func(view, None)``, or
   returning nothing for a context link or its type, so that ``migrate``
   runs on a fresh database whose tables a callable reads. Any other
   exception a callable raises (``NoReverseMatch``, a signature's
-  ``TypeError``) is ``E005``. The ``hsr_urls()`` pattern runs the check in
-  Django's URL check; ``E003`` needs
-  ``scrudful.rest_framework`` imported before the checks start, which
+  ``TypeError``) is ``E005``. The errors fail ``manage.py check`` and the
+  commands that run it (``runserver``, ``migrate``, Django's test runner).
+  The ``hsr_urls()`` pattern runs the check in Django's URL check; ``E003``
+  needs ``scrudful.rest_framework`` imported before the checks start, which
   registers the check (an ``AppConfig.ready()``).
 * OPTIONS is no longer gated by the view's permissions (DRF's ``initial()``
   checked them for OPTIONS too); authentication and throttles still run. Its
@@ -377,9 +382,9 @@ Behaviour change (FastAPI)
   details with a problem-details entity) with the Links, in place of
   Starlette's ``text/plain`` one (only with ``debug`` off; the exception is
   raised again once the response is sent). Its handlers' responses on a
-  described path also get the HSR link. A Link of that 500 failing to build (a link
-  callable or ``hsr_url`` raising, as the endpoint did) is logged on the
-  ``scrudful.fastapi`` logger and the 500 sent without it (the link's
+  described path also get the HSR link. A Link of that 500 failing to build
+  (a link callable or ``hsr_url`` raising, as the endpoint did) is logged on
+  the ``scrudful.fastapi`` logger and the 500 sent without it (the link's
   exception replaced the endpoint's, and the server sent its bare 500).
 * scrudful's early 400, 412 and 428 keep the Links a dependency set on the
   injected ``Response``, merged by relation, except those with the
@@ -409,6 +414,9 @@ Behaviour change (FastAPI)
 * ``add_options`` called again on a router already included and serving
   serves the HSR routes it adds at once, where FastAPI includes routers
   lazily (it kept serving the routes it had).
+* A route replaced in place in a ``routes`` list, or routes reordered in
+  it, are seen: the HSR and ``Allow`` follow the routes now there (a list
+  that kept its length was taken as unchanged).
 * A custom path convertor whose ``convert`` raises something other than
   ``ValueError`` or ``TypeError`` while the HSR link of a router's resource is
   built makes the request fail with it (it was taken as a refusal, and the
