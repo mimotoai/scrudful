@@ -6365,10 +6365,9 @@ def _error_entries(
     explicit entries with its content (Agreement picks an exact status
     before ``default``), unless the operation declares them (in
     ``response=`` or ``responses=``, whose entries ``responses`` already
-    has); so has the 403
-    when ``api_error`` is set (every 401 and 403 answered for the operation
-    then carries it, see :func:`_raised_entity`). Without ``with_content``
-    (HEAD), the same entries without content.
+    has); so has the 403 when ``api_error`` is set (every 401 and 403
+    answered for the operation then carries it, see :func:`_raised_entity`).
+    Without ``with_content`` (HEAD), the same entries without content.
     """
 
     def entry(description: str, entity: Entity | None, key: str) -> _Flow[Any]:
