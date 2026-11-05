@@ -3267,11 +3267,17 @@ def _early_response(
 ) -> _Flow[HttpResponseBase]:
     """scrudful's own response to a failed or short-circuited precondition.
 
-    The 400, 412 and 428 bodies get the Links of ``config.error``, whose link
-    callables get ``obj``, and its media type as their Content-Type. The
-    serving API's renderer writes them (see :func:`_render`).
+    The 400, 412 and 428 bodies get the Links of the entity the HTTP Schema
+    Resource describes them with (:func:`_early_entity`): ``config.error``
+    (or the status's ``responses=`` entity), whose link callables get
+    ``obj``, else the serving API's :func:`add_error_links` entity, whose
+    link callables get ``None`` (as for the errors its handlers answer); and
+    its media type as their Content-Type. The serving API's renderer writes
+    them (see :func:`_render`).
     """
-    error = config.error
+    api = _SERVING_API.get()
+    api_error = _API_ERRORS.get(api) if isinstance(api, NinjaAPI) else None
+    error = _early_entity(config, result.status, api_error)
     result = with_error_body(config.error_body_func, request, result)
     early = conditional_response(
         result,
@@ -3279,7 +3285,8 @@ def _early_response(
         render=_render(request),
     )
     if result.body is not None and error is not None:
-        yield from _add_links(early, error, request, obj)
+        own = error is config.error or error is config.responses.get(result.status)
+        yield from _add_links(early, error, request, obj if own else None)
         expose_headers(early)
     return early
 
@@ -4604,7 +4611,8 @@ def _raised_entity(
     """
     if status < 400:
         return None
-    entity = _described_entity(config, method, status, _is_conditional(config, method))
+    conditional = _is_conditional(config, method)
+    entity = _described_entity(config, method, status, conditional, api_error)
     if entity is not None:
         return entity
     if (
@@ -6318,7 +6326,7 @@ def _describe_operation(
         for key, response in responses.items():
             if key in ("204", "304"):
                 continue  # no content
-            entity = _described_entity(config, method, int(key), conditional)
+            entity = _described_entity(config, method, int(key), conditional, api_error)
             content = yield from _media(entity, base_url, f"{name}'s {key} response")
             if content:
                 response["content"] = content
@@ -6331,7 +6339,9 @@ def _describe_operation(
                 continue
             entry: dict[str, Any] = {"description": reason_phrase(status)}
             if method != "head":
-                entity = _described_entity(config, method, status, conditional)
+                entity = _described_entity(
+                    config, method, status, conditional, api_error
+                )
                 where = f"{name}'s {key} response"
                 content = yield from _media(entity, base_url, where)
                 if content:
@@ -6420,18 +6430,36 @@ def _answered_statuses(operation: Any, config: _Config | None) -> list[int]:
 
 
 def _described_entity(
-    config: _Config, method: str, status: int, conditional: bool
+    config: _Config,
+    method: str,
+    status: int,
+    conditional: bool,
+    api_error: Entity | None,
 ) -> Any:
     """The entity of the ``method`` responses with ``status``, for the HSR.
 
-    scrudful's own early responses (listed when ``conditional``) get the
-    ``error`` entity, if declared; the others the declared entity.
+    scrudful's own early responses (listed when ``conditional``) get
+    :func:`_early_entity`'s (``error``, else ``responses[status]``, else the
+    API-wide ``api_error``); the others the declared entity.
     """
     if conditional and status in _EARLY_STATUSES:
-        return (
-            config.error if config.error is not None else config.responses.get(status)
-        )
+        return _early_entity(config, status, api_error)
     return config.response_entity(method, status)
+
+
+def _early_entity(
+    config: _Config, status: int, api_error: Entity | None
+) -> Entity | None:
+    """The entity of scrudful's own 400, 412 or 428 (``status``) response.
+
+    The operation's ``error``, else the entity ``responses=`` declares for
+    ``status``, else the API-wide entity ``api_error``
+    (:func:`add_error_links`), as the errors its handlers answer carry.
+    """
+    if config.error is not None:
+        return config.error
+    declared = config.responses.get(status)
+    return declared if declared is not None else api_error
 
 
 def _media(entity: Entity | None, base_url: str | None, where: str) -> _Flow[Any]:

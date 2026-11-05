@@ -266,10 +266,36 @@ def boom(request: Any) -> Any:
     raise RuntimeError("boom")
 
 
+def item_router() -> ScrudfulRouter:
+    """A conditional item without ``error=``: scrudful's own 400, 412 and
+    428 carry the API-wide ``add_error_links`` entity, as its HSR says."""
+    router = ScrudfulRouter(base_url=f"{BASE}/")
+    links = dict(
+        load=STORE.load,
+        etag_func=version,
+        schema_link_or_func=THING.schema_link_or_func,
+        context_link_or_func=THING.context_link_or_func,
+    )
+
+    @router.api_operation(["GET", "HEAD"], "/{pk}", response=Thing)
+    @scrudful(**links)
+    def get_item(request: Any, pk: int, obj: dict[str, Any]) -> Any:
+        return obj
+
+    @router.put("/{pk}", response=Thing)
+    @scrudful(**links)
+    def put_item(request: Any, pk: int, payload: ThingIn, obj: dict[str, Any]) -> Any:
+        obj.update(name=payload.name, version=obj["version"] + 1)
+        return obj
+
+    return router
+
+
 WIRE_API = NinjaAPI(urls_namespace="wire")
 WIRE_API.add_router("/secured", secured)
 WIRE_API.add_router("/throttled", throttled)
 WIRE_API.add_router("/media", media)
+WIRE_API.add_router("/fallback", item_router())
 add_error_links(WIRE_API, PROBLEM)
 
 #: The error entity of Django's 404 and 500 (plain links): the example's
@@ -297,6 +323,7 @@ HSR_ROUTES = {
     "turtle": "/wire/media/_hsr/turtle.pk",
     "own": "/wire/media/_hsr/own.pk",
     "boom": "/wire/media/_hsr/boom",
+    "fallback": "/wire/fallback/_hsr/pk",
 }
 if EXAMPLE:
     HSR_ROUTES.update(
@@ -346,6 +373,30 @@ def on(kind: str, default_url: str) -> Callable[..., Exchange]:
     return exchange
 
 
+def item_exchanges(kind: str, base: str) -> list[Exchange]:
+    """The exchanges of an :func:`item_router` mounted at ``base``."""
+    item = on(kind, f"{base}/1")
+    fresh = {"If-None-Match": '"v1"'}
+    stale = {"If-Match": '"no"'}
+    name = {"name": "x"}
+    return [
+        item("GET 200", "GET", 200),
+        item("HEAD 200", "HEAD", 200),
+        item("GET 304", "GET", 304, fresh),
+        item("HEAD 304", "HEAD", 304, fresh),
+        item("GET 400 API error", "GET", 400, {"If-None-Match": 'x"'}),
+        item("GET 412 API error", "GET", 412, stale),
+        item("HEAD 412 API error", "HEAD", 412, stale),
+        item("PUT 428 API error", "PUT", 428, {}, name),
+        item("PUT 412 API error", "PUT", 412, stale, name),
+        item("PUT 400 API error", "PUT", 400, {"If-Match": "x"}, name),
+        item("PUT 200", "PUT", 200, {"If-Match": '"v1"'}, name),
+        item("GET 404", "GET", 404, url=f"{base}/9"),
+        item("GET 422", "GET", 422, url=f"{base}/x"),
+        item("DELETE 405", "DELETE", 405),
+    ]
+
+
 def wire_exchanges() -> list[Exchange]:
     thing = on("secured", "/wire/secured/1")
     summary_ = on("summary", "/wire/secured/1/summary")
@@ -380,6 +431,7 @@ def wire_exchanges() -> list[Exchange]:
         on("turtle", "/wire/media/turtle/1")("GET text/turtle", "GET", 200),
         on("own", "/wire/media/own/1")("GET own Links", "GET", 200),
         on("own", "/wire/media/own/9")("GET 404 load", "GET", 404),
+        *item_exchanges("fallback", "/wire/fallback"),
     ]
 
 
@@ -552,6 +604,7 @@ OPTIONS = [
     ("turtle", "/wire/media/turtle/1", {}),
     ("own", "/wire/media/own/1", {}),
     ("boom", "/wire/media/boom", {}),
+    ("fallback", "/wire/fallback/1", {}),
 ] + (
     [
         ("item", "/api/roles/{pk}", ACME),
@@ -632,6 +685,7 @@ ALLOW = [
     ("anonymous described", "/wire/secured/1/summary", {}, {"OPTIONS"}),
     ("reader described", "/wire/secured/1/summary", READER, {"GET", "HEAD", "OPTIONS"}),
     ("anonymous media", "/wire/media/csv/1", {}, {"GET", "OPTIONS"}),
+    ("anonymous fallback", "/wire/fallback/1", {}, {"GET", "HEAD", "PUT", "OPTIONS"}),
 ] + (
     [
         ("anonymous role", "/api/roles/{pk}", {}, {"OPTIONS"}),
