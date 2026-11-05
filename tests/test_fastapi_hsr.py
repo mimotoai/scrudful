@@ -1000,6 +1000,35 @@ def test_an_app_whose_hsr_route_was_removed_warns_once(make_client):
     assert client.get(NOTE_TARGET).status_code == 200
 
 
+def test_a_removed_hsr_route_is_announced_once_across_index_rebuilds(make_client):
+    """Once given, the removed HSR route's warning isn't repeated when the
+    app's resources are indexed again (a route added later), however many
+    times."""
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {"id": id}
+
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    app.router.routes[:] = [
+        route
+        for route in app.router.routes
+        if not getattr(route, "path", "").startswith("/_hsr/")
+    ]
+    with pytest.warns(RuntimeWarning, match="was removed from its routes"):
+        client.get("/notes/1")
+    for name in ("one", "two"):
+        app.get(f"/{name}")(lambda: {})
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            response = client.get("/notes/1")
+        assert response.status_code == 200
+        assert HSR_DOCUMENT_REL not in (response.headers.get("link") or "")
+
+
 def test_router_hsr_per_app_has_its_own_etag(make_client):
     """The served bytes, and so the ``ETag``, are each app's."""
     _, apps = router_in_three_apps()
@@ -2852,6 +2881,44 @@ def test_router_resource_the_hooks_miss_is_announced(make_client):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert hsr_link_problems(client.get("/things/1").headers, target) == []
+
+
+def test_an_unserved_router_resource_is_announced_once_across_index_rebuilds(
+    make_client,
+):
+    """Once given, the warning of a router resource without OPTIONS or HSR
+    route isn't repeated when the router's resources are indexed again (a
+    route appended later, which doesn't complete the router), however many
+    times."""
+    from fastapi.routing import APIRoute
+
+    router = APIRouter()
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+
+    @router.get("/items/{id}")
+    @scrudful(**links)
+    async def get_item(id: int):
+        return {}
+
+    add_options(router, base_url=BASE)
+
+    async def thing(id: int):
+        return {}
+
+    router.routes.append(
+        APIRoute("/things/{id}", scrudful(**links)(thing), methods=["GET"])
+    )
+    app = FastAPI()
+    app.include_router(router)
+    client = make_client(app)
+    with pytest.warns(RuntimeWarning, match=r"'/things/\{id\}'.*add_options"):
+        client.get("/items/1")
+    for name in ("one", "two"):
+        router.routes.append(APIRoute(f"/{name}", lambda: {}, methods=["GET"]))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert client.get("/items/1").status_code == 200
+            assert client.get("/things/1").status_code == 200
 
 
 class _BuggyConvertor(Convertor):
