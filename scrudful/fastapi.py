@@ -50,13 +50,11 @@ from scrudful._adapter import (
     describe_content,
     describe_read,
     describe_write,
-    essence,
     evaluated_signature,
     evaluates_preconditions,
     expose_headers,
     has_default_entity,
     is_json,
-    media_type_key,
     merge_links,
     options_links,
     precondition_headers,
@@ -735,6 +733,25 @@ _RANGE_TEXT = {
     "5": "Server Error",
 }
 _STATUS_KEY = re.compile(r"[1-5](?:[0-9]{2}|XX)")
+#: A path parameter of a route template, ``{name}`` or ``{name:convertor}``.
+_TEMPLATE_PARAMETER = re.compile(r"\{[^{}]*\}")
+
+
+def _template_key(path: str) -> str:
+    """The resource key of the route template ``path``: its parameters,
+    names and convertors left out (``/items/{id}`` and ``/items/{item_id:int}``
+    are ``/items/{}``), since Starlette routes the same URLs to both."""
+    return _TEMPLATE_PARAMETER.sub("{}", path)
+
+
+@dataclass
+class _Resource:
+    """The routes of one resource (a :func:`_template_key`), in routing order,
+    and the template of the first, which names it."""
+
+    template: str
+    routes: list[Any] = field(default_factory=list)
+
 
 #: FastAPI's flattening of included routers into their routes, as its OpenAPI
 #: generation walks them (FastAPI versions that include routers lazily); older
@@ -804,21 +821,25 @@ def add_options(
     nor an ``include_router`` call's), so it needs no credentials, and is not
     in the OpenAPI document.
 
-    Given a ``FastAPI`` app, the paths are the full path strings of its
-    routes: those of the routers included in it (with their prefixes) and
-    those under a ``Mount(routes=...)`` (with the Mount's path). A URL is
-    answered with the document of the first route whose path matches it, as
-    Starlette routes it. Routes with the same path string, on the app or on
-    several routers, are one resource: its document describes, for each
-    method, the first of them that serves it. Overlapping templates are
-    separate resources: ``/items/new`` beside ``/items/{id}``, and
-    ``/items/{id}`` beside ``/items/{item_id}`` (on another router), each
-    have their own document and OPTIONS answer. Given an ``APIRouter``, it
-    adds an OPTIONS route to each of the router's own paths that has a
-    scrudful route, answered with the router's document of that path (keyed
-    by the router's path strings); call it before including the router
-    (older FastAPI versions copy a router's routes when it is included).
-    Prefer calling it on the app.
+    Given a ``FastAPI`` app, the resources are keyed by the full path
+    templates of its routes (those of the routers included in it, with their
+    prefixes, and those under a ``Mount(routes=...)``, with the Mount's
+    path), with the parameters' names and convertors left out: Starlette
+    routes the same URLs to ``/items/{id}`` and ``/items/{item_id:int}``, so
+    routes with either template, on the app or on several routers, are one
+    resource. Its document describes, for each method, the first of them
+    that serves it, as Starlette routes it: a route after a ``Mount`` whose
+    path covers all its URLs is never reached, and is left out. A URL is
+    answered with the document of the first route whose path matches it.
+    Templates that overlap otherwise are separate resources: ``/items/new``
+    beside ``/items/{id}`` each have their own document and OPTIONS answer,
+    although ``GET /items/new`` reaches whichever route comes first; avoid
+    such overlaps, or give them the same methods. Given an ``APIRouter``,
+    it adds an OPTIONS route to each resource of the router's own routes
+    that has a scrudful route (at the path of its first route), answered
+    with the router's document of it (keyed by the router's own templates);
+    call it before including the router (older FastAPI versions copy a
+    router's routes when it is included). Prefer calling it on the app.
 
     A mounted Starlette or FastAPI app, a ``Mount`` with ``middleware`` and
     a ``Router`` with ``middleware`` are left alone: answering for them from
@@ -852,10 +873,12 @@ def add_options(
     Each method also lists the statuses its route declares in
     ``responses=`` (a status code, or a range such as ``"4XX"``), with the
     declared ``description`` (else the reason phrase): a success status
-    (2xx but 204) with the endpoint's content, under its media type and
-    every other media type the declared ``content`` lists (described by the
-    same schema and context), an error status (4xx, 5xx) with the content
-    of the error entity its raised errors get (below), any other status
+    (2xx but 204) with the endpoint's content, under its entity's media
+    type (another media type the declared ``content`` lists is not
+    described, since scrudful's Links describe the entity's: give the
+    endpoint ``entity=`` to describe another), an error status (4xx, 5xx)
+    with the content of the error entity its raised errors get (below), any
+    other status
     without content. A status scrudful describes itself (the success status,
     and scrudful's 304, 400, 412 and 428 when conditional) keeps scrudful's
     entry. A status set only at run time (``response.status_code = 201``)
@@ -995,9 +1018,10 @@ def _hsr_options(owner: FastAPI | APIRouter) -> _HsrOptions:
 def http_schema_resource(app: FastAPI | APIRouter, path: str) -> dict[str, Any]:
     """The HTTP Schema Resource (an OpenAPI 3.1 Path Item) of ``path``.
 
-    ``path`` is the full path string of the routes, as :func:`add_options`
+    ``path`` is the full path template of the routes, as :func:`add_options`
     keys them (e.g. ``"/v1/items/{item_id}"`` for a router included with
-    ``prefix="/v1"``; for an ``APIRouter``, the router's own path). The
+    ``prefix="/v1"``; for an ``APIRouter``, the router's own template), with
+    any parameter names: ``"/v1/items/{id}"`` gives the same document. The
     document is the same for every requester: it is built without a
     request, once (see :func:`add_options`, which describes its content and
     whose ``base_url`` it uses), and a copy is returned.
@@ -1040,16 +1064,19 @@ def _hsr_flow(owner: FastAPI | APIRouter, path: str) -> _Flow[dict[str, Any]]:
     one built, unless the routes of ``path`` or the error entity changed."""
     options = _hsr_options(owner)
     paths = _scrudful_paths(owner)
-    routes = paths.get(path)
-    if routes is None:
+    key = _template_key(path)
+    resource = paths.get(key)
+    if resource is None:
+        templates = sorted(resource.template for resource in paths.values())
         raise ValueError(
             f"{path!r} is not the path of a scrudful endpoint of this "
-            f"{type(owner).__name__} (its paths are {sorted(paths)}): give the "
+            f"{type(owner).__name__} (its paths are {templates}): give the "
             "route's full path string"
         )
+    routes = resource.routes
     api_error = _api_error(owner)
     originals = tuple(getattr(route, "original_route", route) for route in routes)
-    built = options.built.get(path)
+    built = options.built.get(key)
     if (
         built is not None
         and len(built[0]) == len(originals)
@@ -1058,7 +1085,7 @@ def _hsr_flow(owner: FastAPI | APIRouter, path: str) -> _Flow[dict[str, Any]]:
     ):
         return built[2]
     document = yield from _describe_path(routes, options.base_url, api_error)
-    options.built[path] = (originals, api_error, document)
+    options.built[key] = (originals, api_error, document)
     return document
 
 
@@ -1121,37 +1148,77 @@ def _describing_error(func: Any, where: str, exc: Exception) -> ValueError:
     )
 
 
-def _scrudful_paths(owner: FastAPI | APIRouter) -> dict[str, list[Any]]:
-    """The routes of each path template of ``owner`` that a scrudful endpoint
-    serves, in routing order (see :func:`add_options`)."""
-    paths: dict[str, list[Any]] = {}
+def _scrudful_paths(owner: FastAPI | APIRouter) -> dict[str, _Resource]:
+    """The resources of ``owner`` that a scrudful endpoint serves, by
+    :func:`_template_key` (see :func:`add_options`)."""
+    paths: dict[str, _Resource] = {}
     routes = owner.router.routes if isinstance(owner, FastAPI) else owner.routes
-    _collect_paths(routes, "", paths)
+    _collect_paths(routes, "", paths, [])
     return {
-        path: served
-        for path, served in paths.items()
-        if any(_endpoint_config(getattr(route, "endpoint", None)) for route in served)
+        key: resource
+        for key, resource in paths.items()
+        if any(
+            _endpoint_config(getattr(route, "endpoint", None))
+            for route in resource.routes
+        )
     }
 
 
 def _collect_paths(
-    routes: Sequence[Any], prefix: str, paths: dict[str, list[Any]]
+    routes: Sequence[Any],
+    prefix: str,
+    paths: dict[str, _Resource],
+    mounts: list[list[str]],
 ) -> None:
-    """Add the HTTP routes under ``routes`` to ``paths``, by full path.
+    """Add the HTTP routes under ``routes`` to ``paths``, by
+    :func:`_template_key` of their full path, in routing order.
 
     Into the ``Mount``\\ s and ``Host``\\ s :func:`_contents` looks into; the
-    automatic OPTIONS routes are skipped.
+    automatic OPTIONS routes are skipped. ``mounts`` collects the segments of
+    the ``Mount``\\ s passed: Starlette routes every URL under a Mount into it,
+    so a later route (or Mount) whose URLs are all under one is never
+    reached, and is left out (see :func:`_shadowed`).
     """
     for route in _flat(routes):
         if _is_automatic(route):
             continue
         contents = _contents(route)
-        if contents is _OPAQUE:
-            continue
+        mount = _mount_path(route)
+        is_mount = isinstance(getattr(route, "original_route", route), Mount)
         if contents is not None:
-            _collect_paths(contents, prefix + _mount_path(route), paths)
+            if is_mount and _shadowed(prefix + mount + "/", mounts):
+                continue
+            if contents is not _OPAQUE:
+                _collect_paths(contents, prefix + mount, paths, mounts)
+            if is_mount:
+                mounts.append(_segments(_template_key(prefix + mount)))
         elif isinstance(getattr(route, "original_route", route), Route):
-            paths.setdefault(prefix + route.path, []).append(route)
+            template = prefix + route.path
+            if _shadowed(template, mounts):
+                continue
+            resource = paths.setdefault(
+                _template_key(template), _Resource(template=template)
+            )
+            resource.routes.append(route)
+
+
+def _segments(key: str) -> list[str]:
+    """The segments of a Mount's path key (none for the root Mount)."""
+    stripped = key.strip("/")
+    return stripped.split("/") if stripped else []
+
+
+def _shadowed(template: str, mounts: list[list[str]]) -> bool:
+    """Whether every URL of ``template`` is under one of the ``mounts``
+    (segment lists of :func:`_template_key`\\ s; a ``{}`` segment of a Mount
+    matches any segment). A template only partly under one (a parameter where
+    the Mount has a literal) is not."""
+    segments = _template_key(template).split("/")[1:]
+    return any(
+        len(segments) > len(mount)
+        and all(own == "{}" or own == other for own, other in zip(mount, segments))
+        for mount in mounts
+    )
 
 
 def _mount_path(route: Any) -> str:
@@ -1277,13 +1344,10 @@ def _describe_route(
             continue
         kind = _status_kind(method, key)
         if kind == "success" and content:
-            described = entry.setdefault("content", copy.deepcopy(content))
-            known = {essence(media_type) for media_type in described}
-            for media_type in declared.get("content") or ():
-                if essence(media_type_key(media_type)) not in known:
-                    more = yield from media(config, media_type, key)
-                    described.update(more or {})
-                    known.add(essence(media_type))
+            # The endpoint's content, under its entity's media type. Other
+            # media types the declared ``content`` lists are not described:
+            # scrudful's Links describe the entity's (use entity= for another).
+            entry.setdefault("content", copy.deepcopy(content))
         elif kind == "error" and fresh and raised is not None:
             more = yield from media(raised, raised.media_type, key)
             if more:
@@ -1393,6 +1457,8 @@ def _media(
         )
     except HsrConfigError as exc:
         raise HsrConfigError(f"{where}: {exc}") from exc
+    except ValueError as exc:  # e.g. a non-JSON context without a type
+        raise ValueError(f"{where}: {exc}") from exc
 
 
 def _field(
@@ -1445,7 +1511,8 @@ class _OptionsRoute(BaseRoute):
 
 
 def _options_path(app: FastAPI, scope: Scope) -> str | None:
-    """The path template whose document answers the OPTIONS ``scope``.
+    """The resource key (:func:`_template_key`) whose document answers the
+    OPTIONS ``scope``.
 
     That of the first route whose path matches the URL (see
     :func:`_match_path`), when it is a scrudful path; ``None`` when another
@@ -1456,9 +1523,9 @@ def _options_path(app: FastAPI, scope: Scope) -> str | None:
     if _match(routes, {**scope, "method": "OPTIONS"}) is not None:
         return None
     path = _match_path(routes, scope)
-    if path is None or path not in _scrudful_paths(app):
+    if path is None or _template_key(path) not in _scrudful_paths(app):
         return None
-    return path
+    return _template_key(path)
 
 
 def _match_path(routes: Sequence[Any], scope: Scope, prefix: str = "") -> str | None:
@@ -1583,18 +1650,19 @@ def _match(routes: Sequence[Any], scope: Scope) -> tuple[Any, Scope] | None:
 
 
 def _add_path_options(router: APIRouter) -> None:
-    """:func:`add_options` for an ``APIRouter``: an OPTIONS route per path."""
+    """:func:`add_options` for an ``APIRouter``: an OPTIONS route per
+    resource (:func:`_template_key`), at its first route's path."""
     paths: dict[str, list[Route]] = {}
     for route in router.routes:
         if isinstance(route, Route):
-            paths.setdefault(route.path, []).append(route)
-    for path, routes in paths.items():
+            paths.setdefault(_template_key(route.path), []).append(route)
+    for key, routes in paths.items():
         if any(_endpoint_config(route.endpoint) for route in routes) and not any(
             route.methods is None or "OPTIONS" in route.methods for route in routes
         ):
             router.add_route(
-                path,
-                _options_endpoint(router, path),
+                routes[0].path,
+                _options_endpoint(router, key),
                 methods=["OPTIONS"],
                 name="scrudful_options",
                 include_in_schema=False,
@@ -1602,9 +1670,10 @@ def _add_path_options(router: APIRouter) -> None:
 
 
 def _options_endpoint(router: APIRouter, path: str) -> Callable[[Request], Any]:
-    """The endpoint of the OPTIONS route of ``path`` on ``router``: the
-    router's document of ``path``, whichever app or prefix the router is
-    included through (routes added to the path later are described)."""
+    """The endpoint of the OPTIONS route of the resource ``path`` (a
+    :func:`_template_key`) on ``router``: the router's document of it,
+    whichever app or prefix the router is included through (routes added to
+    it later are described)."""
 
     async def scrudful_options(request: Request) -> Response:
         body = await _run_describing_async(_hsr_flow(router, path))

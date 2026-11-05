@@ -2844,8 +2844,9 @@ def test_add_options_path_split_across_routers(make_client):
 
 
 def test_add_options_differently_named_parameters(make_client):
-    """``/items/{id}`` and ``/items/{item_id}`` are separate resources
-    (design §3, FastAPI key): OPTIONS answers the first route's."""
+    """Starlette routes ``/items/5`` GET to ``/items/{id}`` and PUT to
+    ``/items/{item_id}``: one resource (R20), whose document has both, under
+    either template, and whose ``Allow`` lists both."""
     received = []
 
     def schema(**kwargs):
@@ -2870,10 +2871,37 @@ def test_add_options_differently_named_parameters(make_client):
     app.include_router(writes)
     add_options(app, base_url=TEST_BASE_URL)
     response = make_client(app).options("/items/5")
-    assert response.headers["allow"] == "GET, OPTIONS"
-    assert response.json() == http_schema_resource(app, "/items/{id}")
-    assert list(http_schema_resource(app, "/items/{item_id}")) == ["put", "options"]
-    assert received == [{}, {}]
+    assert response.headers["allow"] == "GET, PUT, OPTIONS"
+    body = response.json()
+    assert list(body) == ["get", "put", "options"]
+    assert body == http_schema_resource(app, "/items/{id}")
+    assert body == http_schema_resource(app, "/items/{item_id}")
+    assert received == [{}, {}]  # each endpoint's callable, once
+
+
+def test_add_options_on_a_router_groups_differently_named_parameters(make_client):
+    """Router mode: one OPTIONS route for the resource, not one per template."""
+    links = dict(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+    router = APIRouter()
+
+    @router.get("/items/{id}")
+    @scrudful(**links)
+    async def read(id: int):
+        return {}
+
+    @router.put("/items/{item_id}")
+    @scrudful(**links)
+    async def write(item_id: int):
+        return {}
+
+    add_options(router, base_url=TEST_BASE_URL)
+    automatic = [route for route in router.routes if "OPTIONS" in route.methods]
+    assert [route.path for route in automatic] == ["/items/{id}"]
+    app = FastAPI()
+    app.include_router(router)
+    response = make_client(app).options("/items/5")
+    assert response.headers["allow"] == "GET, PUT, OPTIONS"
+    assert response.json() == http_schema_resource(router, "/items/{item_id}")
 
 
 def test_add_options_mount(make_client):

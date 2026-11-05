@@ -208,8 +208,8 @@ def test_routes_added_later_are_described():
 
 def test_unknown_path_raises():
     app = make_app()
-    with pytest.raises(ValueError, match=r"'/users/\{user_id\}'.*'/users/\{id\}'"):
-        http_schema_resource(app, "/users/{user_id}")
+    with pytest.raises(ValueError, match=r"'/people/\{id\}'.*'/users/\{id\}'"):
+        http_schema_resource(app, "/people/{id}")
     with pytest.raises(TypeError, match="FastAPI application or an APIRouter"):
         http_schema_resource(object(), "/users/{id}")  # type: ignore[arg-type]
 
@@ -226,23 +226,19 @@ def test_a_path_without_a_scrudful_endpoint_has_no_hsr():
         http_schema_resource(app, "/plain")
 
 
-def test_overlapping_templates_are_separate_resources(make_client):
-    """Keyed by the route path: a literal beside a template, and differently
-    named parameters, are separate resources (design §3, FastAPI key)."""
+def test_parameter_names_and_convertors_are_one_resource(make_client):
+    """Starlette routes ``/items/5`` GET to ``/items/{id}`` and PUT to
+    ``/items/{item_id:int}``: one resource, one document, under either
+    template (R20)."""
     links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
     reads, writes = APIRouter(), APIRouter()
-
-    @reads.get("/items/new")
-    @scrudful(**links)
-    async def new_item():
-        return {}
 
     @reads.get("/items/{id}")
     @scrudful(**links)
     async def read(id: int):
         return {}
 
-    @writes.put("/items/{item_id}")
+    @writes.put("/items/{item_id:int}")
     @scrudful(**links)
     async def write(item_id: int):
         return {}
@@ -251,18 +247,73 @@ def test_overlapping_templates_are_separate_resources(make_client):
     app.include_router(reads)
     app.include_router(writes)
     add_options(app, base_url=BASE)
+    hsr = http_schema_resource(app, "/items/{id}")
+    assert list(hsr) == ["get", "put", "options"]
+    assert http_schema_resource(app, "/items/{item_id}") == hsr
+    assert http_schema_resource(app, "/items/{x:int}") == hsr
+    response = make_client(app).options("/items/5")
+    assert response.json() == hsr
+    assert response.headers["allow"] == "GET, PUT, OPTIONS"
+
+
+def test_a_literal_beside_a_template_is_a_separate_resource(make_client):
+    """A limitation: ``/items/new`` and ``/items/{id}`` are separate resources."""
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    app = FastAPI()
+
+    @app.get("/items/new")
+    @scrudful(**links)
+    async def new_item():
+        return {}
+
+    @app.put("/items/{id}")
+    @scrudful(**links)
+    async def write(id: int):
+        return {}
+
+    add_options(app, base_url=BASE)
     assert list(http_schema_resource(app, "/items/new")) == ["get", "options"]
-    assert list(http_schema_resource(app, "/items/{id}")) == ["get", "options"]
-    assert list(http_schema_resource(app, "/items/{item_id}")) == ["put", "options"]
+    assert list(http_schema_resource(app, "/items/{id}")) == ["put", "options"]
     client = make_client(app)
-    # OPTIONS answers for the first route whose path matches, as Starlette
-    # would route it.
-    response = client.options("/items/5")
-    assert response.json() == http_schema_resource(app, "/items/{id}")
-    assert response.headers["allow"] == "GET, OPTIONS"
     assert client.options("/items/new").json() == http_schema_resource(
         app, "/items/new"
     )
+    assert client.options("/items/5").json() == http_schema_resource(app, "/items/{id}")
+
+
+def test_routes_a_mount_shadows_are_left_out(make_client):
+    """Starlette routes every URL under a Mount into it: a later route whose
+    URLs are all under it is never reached, so it isn't described."""
+    from fastapi.routing import APIRoute
+
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+
+    async def item(id: int):
+        return {}
+
+    get_item = scrudful(**links)(item)
+    put_item = scrudful(**links)(item)
+    app = FastAPI()
+    app.router.routes.append(
+        Mount("/n", routes=[APIRoute("/items/{id}", get_item, methods=["GET"])])
+    )
+    app.router.routes.append(APIRoute("/n/items/{id}", put_item, methods=["PUT"]))
+    app.router.routes.append(APIRoute("/{tenant}/x/{id}", put_item, methods=["PUT"]))
+    app.router.routes.append(
+        Mount("/{tenant}", routes=[APIRoute("/y", get_item, methods=["GET"])])
+    )
+    app.router.routes.append(APIRoute("/acme/z", get_item, methods=["GET"]))
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    assert client.put("/n/items/1").status_code == 405  # the Mount's answer
+    assert list(http_schema_resource(app, "/n/items/{id}")) == ["get", "options"]
+    # Before the Mount: reached, and described.
+    assert list(http_schema_resource(app, "/{t}/x/{id}")) == ["put", "options"]
+    assert list(http_schema_resource(app, "/{t}/y")) == ["get", "options"]
+    # After it, and under it: never reached.
+    assert client.get("/acme/z").status_code == 404
+    with pytest.raises(ValueError, match="'/acme/z'"):
+        http_schema_resource(app, "/acme/z")
 
 
 def test_full_path_keys_under_a_prefix_and_a_mount(make_client):
@@ -684,18 +735,14 @@ def test_responses_statuses_and_media_types():
     @app.get(
         "/items/{id}",
         responses={
-            200: {"content": {"text/csv": {}}},
-            "203": {"description": "From a cache"},
+            200: {"content": {"image/png": {}, "application/json; charset=utf-8": {}}},
+            "203": {"description": "From a cache", "content": {"text/csv": {}}},
             301: {"description": "Moved"},
             "4XX": {"description": "A client error"},
             "default": {"description": "Anything else"},
         },
     )
-    @scrudful(
-        schema_link_or_func="/s.json",
-        context_link_or_func="/c.jsonld",
-        context_type_or_func="application/ld+json",
-    )
+    @scrudful(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
     async def get_item(id: int):
         return {}
 
@@ -706,20 +753,18 @@ def test_responses_statuses_and_media_types():
     responses = hsr["get"]["responses"]
     assert list(responses) == ["200", "203", "301", "4XX", "default"]
     item = {
-        "schema": {"$ref": "https://api.example/s.json"},
-        "x-rdf-context": {
-            "href": "https://api.example/c.jsonld",
-            "type": "application/ld+json",
-        },
+        "application/json": {
+            "schema": {"$ref": "https://api.example/s.json"},
+            "x-rdf-context": {
+                "href": "https://api.example/c.jsonld",
+                "type": "application/ld+json",
+            },
+        }
     }
-    assert responses["200"] == {
-        "description": "OK",
-        "content": {"application/json": item, "text/csv": item},
-    }
-    assert responses["203"] == {
-        "description": "From a cache",
-        "content": {"application/json": item},
-    }
+    # Only the entity's media type is described (R21): a declared PNG or CSV
+    # is undescribed content, not a JSON-LD-described entry.
+    assert responses["200"] == {"description": "OK", "content": item}
+    assert responses["203"] == {"description": "From a cache", "content": item}
     assert responses["301"] == {"description": "Moved"}
     assert responses["4XX"] == {
         "description": "A client error",
@@ -729,6 +774,30 @@ def test_responses_statuses_and_media_types():
         "description": "Error.",
         "content": APP_ERROR_CONTENT,
     }
+
+
+def test_a_describe_content_error_names_the_entry():
+    """A CSV entity whose context type callable returns nothing: a
+    ``ValueError`` naming the entry, not a bare one."""
+    app = FastAPI()
+    csv = Entity(
+        media_type="text/csv",
+        schema_link_or_func="/schemas/item.csvm.json",
+        schema_type_or_func="application/csvm+json",
+        context_link_or_func="/contexts/item.csvm.json",
+        context_type_or_func=lambda **kwargs: None,
+    )
+
+    @app.get("/items/{id}")
+    @scrudful(entity=csv)
+    async def get_item(id: int):
+        return Response("id\n1\n", media_type="text/csv")
+
+    add_options(app, base_url=BASE)
+    with pytest.raises(
+        ValueError, match=r"get_item\(\)'s 200 response: the context of 'text/csv'"
+    ):
+        http_schema_resource(app, "/items/{id}")
 
 
 def test_conditional_statuses_keep_scrudful_entries():
