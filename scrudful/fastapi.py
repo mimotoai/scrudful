@@ -29,12 +29,16 @@ from typing import Annotated, Any, TypeVar, get_args, get_origin
 from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, FastAPI, Request, Response
+from fastapi import params as fastapi_params
 from fastapi import routing as fastapi_routing
 from fastapi import exception_handlers as fastapi_handlers
 from fastapi.datastructures import DefaultPlaceholder
+from fastapi.dependencies import models as fastapi_dependencies_models
+from fastapi.dependencies import utils as fastapi_dependency_utils
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.security.base import SecurityBase
 from starlette.concurrency import run_in_threadpool
 from starlette.applications import Starlette
 from starlette.datastructures import Headers, MutableHeaders, URLPath
@@ -57,7 +61,6 @@ from scrudful._adapter import (
     DEFAULT_SCHEMA_TYPE,
     METHOD_KEYS,
     SCHEMA_TYPE,
-    allow_header,
     check_error_body_func,
     check_error_media_type,
     check_validators,
@@ -72,7 +75,6 @@ from scrudful._adapter import (
     has_default_entity,
     is_json,
     merge_links,
-    options_links,
     precondition_headers,
     reason_phrase,
     resolve_annotation,
@@ -87,9 +89,12 @@ from scrudful._hsr import (
     HSR_ROUTE_SEGMENT,
     HsrConfigError,
     absolute_for_hsr,
+    allow_value,
     hsr_etag,
+    hsr_link,
     hsr_response_links,
     hsr_route_name,
+    is_preflight,
     options_operation,
     serialize_hsr,
 )
@@ -637,7 +642,10 @@ def _error_handler(
             return response
         headers = response.headers
         route = request.scope.get("route")
-        base = _live_base(request, getattr(route, "endpoint", None))
+        # The routed endpoint: an included router's Starlette route (as
+        # scrudful's router-mode OPTIONS) leaves the router in "route".
+        endpoint = getattr(route, "endpoint", None) or request.scope.get("endpoint")
+        base = _live_base(request, endpoint)
         entity, kwargs = _raised_entity(request, error)
         link = merge_links(
             ", ".join(headers.getlist("link")),
@@ -809,9 +817,9 @@ class _HsrOptions:
     hsr_route: bool = True
     hsr_url: Callable[[str], str] | None = None
     hsr_cache_control: str = DEFAULT_HSR_CACHE_CONTROL
-    #: ``allowed(request, method, obj)`` (Task 16).
+    #: ``allowed(request, method, obj)``, for the OPTIONS ``Allow``.
     allowed: Callable[..., Any] | None = None
-    #: ``load(request, **path_params)`` (Task 16).
+    #: ``load(request, **path_params)``, the object of the OPTIONS checks.
     load: Callable[..., Any] | None = None
     #: Whether :func:`add_options` gave them (else they are the defaults, for
     #: :func:`http_schema_resource` on an app without it).
@@ -851,21 +859,77 @@ def add_options(
     allowed: Callable[..., Any] | None = None,
     load: Callable[..., Any] | None = None,
 ) -> None:
-    """Answer OPTIONS on ``app``'s scrudful paths with their HTTP Schema Resource.
+    """Answer OPTIONS on ``app``'s scrudful paths, linking to their HTTP
+    Schema Resource.
 
     Each path template (the route's path string, e.g. ``"/items/{item_id}"``)
     that a :func:`scrudful` endpoint serves with some method has an HTTP
     Schema Resource (Semantic HTTP 0.1, an OpenAPI 3.1 Path Item), the same
-    for every requester: :func:`http_schema_resource` returns it. An OPTIONS
-    request to a URL of such a path, which no other route serves OPTIONS
-    for, is answered with 200 and that document as ``application/json``, the
-    Links of its published JSON Schema and JSON-LD context
-    (:func:`scrudful._adapter.options_links`), an ``Allow`` listing the
-    document's methods and ``Access-Control-Expose-Headers``. Other OPTIONS
-    requests are routed as before (e.g. a 405, or your own OPTIONS route).
-    The OPTIONS answer has no dependencies (neither the app's, a router's
-    nor an ``include_router`` call's), so it needs no credentials, and is not
-    in the OpenAPI document.
+    for every requester: :func:`http_schema_resource` returns it, and the HSR
+    route (below) serves it. An OPTIONS request to a URL of such a path,
+    which no other route serves OPTIONS for, is answered with a 204 without
+    content (and without ``Content-Type``), an ``Allow`` listing exactly the
+    methods this requester may use (below), one Link to the document (the
+    ``https://w3id.org/semantic-http/ns#http-schema-resource-document``
+    relation, ``type="application/json"``) and
+    ``Access-Control-Expose-Headers``. Other OPTIONS requests are routed as
+    before (e.g. a 405, or your own OPTIONS route). The OPTIONS answer has
+    no dependencies (neither the app's, a router's nor an ``include_router``
+    call's): OPTIONS itself needs no credentials (an anonymous requester on
+    a locked resource gets ``Allow: OPTIONS``, not a 401), and it is not in
+    the OpenAPI document.
+
+    The answer runs in this order:
+
+    1. A CORS preflight (an OPTIONS with ``Origin`` and
+       ``Access-Control-Request-Method``) is a 204 with no content, no Links
+       and no ``Allow``, before any dependency, ``load`` or ``allowed`` runs.
+       A ``CORSMiddleware`` in front usually answers it first, and adds its
+       headers to this one when it doesn't.
+    2. Each method the resource's routes serve (all of them: a plain FastAPI
+       or Starlette route on the path too) is checked for this requester,
+       without the object. With ``allowed``, every method passes this step:
+       the hook needs the object. Otherwise the route's security
+       dependencies decide: those of ``dependencies=`` (the route's, its
+       routers', ``include_router``'s and the app's), those declared with
+       ``Security(...)``, and a plain ``Depends`` relying on a security
+       scheme (a ``fastapi.security`` class such as ``HTTPBearer``, or a
+       ``Security(...)``, at any depth, as a ``get_current_user`` reading a
+       token does). They are resolved by FastAPI (its
+       ``solve_dependencies``, so with ``dependency_overrides``) on a copy
+       of the request whose method is the method checked, without its body
+       and without validating the endpoint's own parameters; a dependency
+       with ``yield`` is cleaned up before the answer. An ``HTTPException``
+       with 401, 403 or 404, or a parameter of theirs failing validation
+       (FastAPI's 422), means not allowed. No other dependency, and never
+       the endpoint, runs: a dependency that throttles is a dependency like
+       any other, so keep it out of ``dependencies=`` (and away from
+       security schemes) if OPTIONS must not consume it, since these checks
+       resolve those. A dependency that needs the request's body (a body,
+       form or file parameter, at any depth) can't be resolved: it is
+       skipped, and does not refuse its method. ``HEAD`` is listed only
+       when a route serves it (FastAPI's GET route doesn't; list ``"HEAD"``
+       in its methods, as ``@app.head`` does), with that route's checks.
+    3. When at least one method passed, the object is loaded:
+       ``load(request, **path_params)``, else there is none (``None``). So a
+       requester whom the security dependencies refuse everything gets a 204
+       with ``Allow: OPTIONS`` for a missing and an existing object alike,
+       and can't tell which exist. With ``allowed``, every requester passes
+       step 2, so the object is loaded for each: ``load`` should then hide
+       (``None``, or a 404) the objects a requester may not see, or OPTIONS
+       tells which exist.
+    4. With ``allowed``, ``allowed(request, method, obj)`` alone decides
+       each method.
+    5. The 204 answers, ``Allow`` listing the methods allowed and OPTIONS.
+
+    An ``HTTPException`` raised by ``load`` or ``allowed`` (a 404 for a
+    missing object, or any other status), or by a check with a status other
+    than 401, 403 and 404 (a throttle's 429), is answered by the app's
+    exception handlers (those of :func:`add_error_links` add the error
+    entity's Links), with the HSR link; anything else raised propagates (a
+    500). Without ``allowed``, object-level rules (who may change *this*
+    object) can't show in ``Allow``: give ``allowed`` (and ``load``) for an
+    exact one.
 
     Given a ``FastAPI`` app, the resources are keyed by the full path
     templates of its routes (those of the routers included in it, with their
@@ -876,8 +940,10 @@ def add_options(
     routers, are one resource. Its document describes, for each method, the
     first of them that serves it, as Starlette routes it: a route after a
     ``Mount`` whose
-    path covers all its URLs is never reached, and is left out. A URL is
-    answered with the document of the first route whose path matches it.
+    path covers all its URLs is never reached, and is left out. The OPTIONS
+    of a URL is answered for the resource of the first route whose path
+    matches it: its ``Allow`` covers the methods of that resource's routes,
+    and it links to that resource's document.
     Templates that overlap otherwise are separate resources: ``/items/new``
     beside ``/items/{id}``, or ``/items/{id:int}`` beside ``/items/{name}``
     (or ``/files/{p:path}`` beside ``/files/{name}``), each have their own
@@ -885,8 +951,10 @@ def add_options(
     ``/items/5``) reaches whichever route comes first; avoid such overlaps,
     or give them the same methods. Given an ``APIRouter``,
     it adds an OPTIONS route to each resource of the router's own routes
-    that has a scrudful route (at the path of its first route), answered
-    with the router's document of it (keyed by the router's own templates);
+    that has a scrudful route (at the path of its first route), answered as
+    above with the router's options, linking to the router's document of it
+    (keyed by the router's own templates), its checks running the
+    dependencies the app and ``include_router`` give the routes;
     call it before including the router (older FastAPI versions copy a
     router's routes when it is included). Prefer calling it on the app.
 
@@ -987,9 +1055,7 @@ def add_options(
 
     Call it once the routes are added (the endpoints added later are
     described, but their callables are not checked); calling it again adds
-    no route, and replaces the options. CORS preflight requests are meant to
-    be answered by ``CORSMiddleware`` before routing; one that reaches this
-    answer gets the description like any other OPTIONS.
+    no route, and replaces the options.
 
     Parameters
     ----------
@@ -1012,11 +1078,27 @@ def add_options(
         The ``Cache-Control`` of the document's GET response (default
         ``"public, max-age=300"``).
     allowed : callable, optional
-        ``allowed(request, method, obj)``: whether the requester may use
-        ``method``, for ``Allow``.
+        ``allowed(request, method, obj) -> bool``: whether the requester may
+        use ``method`` (``"GET"``, ``"PUT"`` ...) on ``obj`` (what ``load``
+        returned, else ``None``), for ``Allow``; when given, it alone
+        decides, for every method of every path covered (no security
+        dependency runs). ``request`` is a copy of the OPTIONS request whose
+        method is ``method``, with the URL's path parameters. It is called
+        for every requester, after ``load`` (see step 3 above for what that
+        reveals). A ``def`` runs in the threadpool, an ``async def`` (or an
+        awaitable result) is awaited. Anything but a ``bool`` returned is a
+        ``TypeError``.
     load : callable, optional
         ``load(request, **path_params)``: the object at the URL, for
-        ``allowed``.
+        ``allowed``, or ``None`` for none (a collection, a missing object);
+        an ``HTTPException`` it raises (a 404) is the answer. ``request`` is
+        the OPTIONS request, and ``path_params`` the URL's path parameters,
+        as Starlette converts them (a ``str`` without a convertor), named as
+        in the template of the resource's first route (for a router, with
+        those of the prefix it is included under). Called on every path
+        covered (it gets no parameters on one without), only when a method
+        passed step 2. A ``def`` runs in the threadpool, an ``async def`` is
+        awaited.
 
     Raises
     ------
@@ -1029,6 +1111,11 @@ def add_options(
         one HSR route name (with ``hsr_route``); or a link callable of a
         scrudful endpoint (or of its ``error``) can't be called with no
         arguments.
+
+    An OPTIONS request raises ``RuntimeError`` if the installed FastAPI's
+    ``fastapi.dependencies.utils.solve_dependencies`` (or the ``Dependant``
+    and exit stack it takes), which the security checks rely on, differs
+    from those of the FastAPI releases scrudful supports.
     """
     _check_owner(app)
     options = _check_hsr_options(
@@ -1672,8 +1759,14 @@ class _OptionsRoute(BaseRoute):
         path = scope.get(_SERVED_KEY) or _options_path(self.owner, scope)
         if path is None:
             raise HTTPException(status_code=404)
-        body = await _run_describing_async(_hsr_flow(self.owner, path))
-        await _options_response(body)(scope, receive, send)
+        request = Request(scope, receive, send)
+        routes = self.owner.router.routes
+
+        def routed(method: str) -> tuple[Any, Scope] | None:
+            return _match(routes, {**scope, "method": method})
+
+        response = await _options_answer(request, self.owner, path, routed, None)
+        await response(scope, receive, send)
 
 
 def _options_path(app: FastAPI, scope: Scope) -> str | None:
@@ -1810,7 +1903,9 @@ def _match(routes: Sequence[Any], scope: Scope) -> tuple[Any, Scope] | None:
         contents = _contents(route)
         if contents is not None and contents is not _OPAQUE:
             return _match(contents, routed)
-        routed.setdefault("route", getattr(route, "original_route", route))
+        if "route" not in child_scope:
+            # Not the route that routed ``scope`` (the OPTIONS route).
+            routed["route"] = getattr(route, "original_route", route)
         return route, routed
     return None
 
@@ -1842,20 +1937,458 @@ def _options_endpoint(router: APIRouter, path: str) -> Callable[[Request], Any]:
     it later are described)."""
 
     async def scrudful_options(request: Request) -> Response:
-        body = await _run_describing_async(_hsr_flow(router, path))
-        return _options_response(body)
+        resource = _resource(router, _scrudful_paths(router), path)
+
+        def routed(method: str) -> tuple[Any, Scope] | None:
+            return _router_match(request, resource, method)
+
+        params = dict(request.path_params)
+        return await _options_answer(request, router, path, routed, params)
 
     scrudful_options._scrudful_options = True  # type: ignore[attr-defined]
+    with contextlib.suppress(TypeError):  # not weakly referenceable
+        # For the base URL of the Links of its errors (see _live_base).
+        _ROUTER_ENDPOINTS[scrudful_options] = weakref.ref(router)
     return scrudful_options
 
 
-def _options_response(body: dict[str, Any]) -> Response:
-    """The OPTIONS response with the HTTP Schema Resource ``body``."""
-    response = JSONResponse(body)
-    response.headers["Link"] = options_links()
-    response.headers["Allow"] = allow_header(body)
+def _router_match(
+    request: Request, resource: _Resource, method: str
+) -> tuple[Any, Scope] | None:
+    """The route serving ``method`` at the URL of ``request`` (to a router's
+    OPTIONS route), and the scope it gets, for the router's ``resource``.
+
+    The first of the resource's routes serving ``method``, as the app the
+    request reached serves it: the route of the app (under the Mounts
+    :func:`_contents` looks into) with that route's endpoint that matches the
+    request, so with the dependencies ``include_router`` and the app give
+    it (FastAPI copies an included router's routes, or wraps them in route
+    contexts); else the router's own route.
+    """
+    route = next((r for r in resource.routes if _serves(r, method)), None)
+    if route is None:
+        return None
+    scope = {**request.scope, "method": method}
+    endpoint = getattr(route, "endpoint", None)
+    app = request.scope.get("app")
+    routes = getattr(getattr(app, "router", None), "routes", None) or []
+    for candidate in _leaf_routes(routes):
+        if (
+            endpoint is None
+            or getattr(candidate, "endpoint", None) is not endpoint
+            or not _serves(candidate, method)
+        ):
+            continue
+        match, child_scope = candidate.matches(scope)
+        if match == Match.FULL:
+            routed = {**scope, **child_scope}
+            if "route" not in child_scope:
+                routed["route"] = getattr(candidate, "original_route", candidate)
+            return candidate, routed
+    _, child_scope = route.matches(scope)
+    return route, {**scope, **child_scope, "route": route}
+
+
+def _leaf_routes(routes: Sequence[Any]) -> Iterator[Any]:
+    """The routes under ``routes`` that aren't a ``Mount`` or ``Host``, in
+    routing order, with those under the Mounts and Hosts :func:`_contents`
+    looks into; but the automatic OPTIONS routes."""
+    for route in _flat(routes):
+        if _is_automatic(route):
+            continue
+        contents = _contents(route)
+        if contents is None:
+            yield route
+        elif contents is not _OPAQUE:
+            yield from _leaf_routes(contents)
+
+
+# --- OPTIONS: a 204 with a per-requester Allow -------------------------------------
+
+#: The statuses of an ``HTTPException`` a per-method check of OPTIONS raises
+#: that mean "not allowed".
+_DENIAL_STATUSES = frozenset({401, 403, 404})
+
+
+async def _options_answer(
+    request: Request,
+    owner: FastAPI | APIRouter,
+    path: str,
+    routed: Callable[[str], tuple[Any, Scope] | None],
+    params: dict[str, Any] | None,
+) -> Response:
+    """The answer to the OPTIONS ``request`` of the resource ``path`` (a
+    :func:`_template_key`) of ``owner``; ``routed(method)`` is the route
+    serving ``method`` at the request's URL and the scope it gets
+    (:func:`_match`), ``params`` the URL's path parameters (``None``: those
+    of the route of the resource's first method). In order:
+
+    1. a CORS preflight (:func:`scrudful._hsr.is_preflight`) is a 204 with no
+       content and no Links, before anything else runs;
+    2. each method the resource serves is checked for this requester, without
+       the object: with an ``allowed`` hook, it passes (the hook needs the
+       object); else by its security dependencies (:func:`_may_use`);
+    3. only when one passed is the object loaded: ``load(request,
+       **params)``, else there is none (``None``), so a requester refused
+       everything can't tell which objects exist;
+    4. with an ``allowed`` hook, ``allowed(clone, method, obj)`` decides each
+       method (:func:`_hooked`);
+    5. the answer is a 204 with no content and no ``Content-Type``, the
+       ``Allow`` of the methods allowed (:func:`scrudful._hsr.allow_value`),
+       the HSR link (:func:`_hsr_target`) and the exposed headers.
+
+    An ``HTTPException`` raised by ``load``, the hook or a check (but a
+    check's 401, 403 or 404) is answered by the app's exception handlers,
+    with the HSR link (:func:`_options_error`). Anything else raised
+    propagates.
+    """
+    if is_preflight(request.method, request.headers.get):
+        return Response(status_code=204)
+    options = _hsr_options(owner)
+    resource = _resource(owner, _scrudful_paths(owner), path)
+    target = _hsr_target(request, path, owner=owner)
+    found = {method: routed(method) for method in _served_methods(resource)}
+    served = {method: f for method, f in found.items() if f is not None}
+    if params is None:
+        first = next(
+            (f for m, f in served.items() if _serves(resource.routes[0], m)), None
+        )
+        params = dict(first[1].get("path_params") or {}) if first else {}
+        subject = Request({**request.scope, "path_params": params}, request.receive)
+    else:
+        subject = request
+    try:
+        allowed = {
+            method: options.allowed is not None or await _may_use(method, f)
+            for method, f in served.items()
+        }
+        obj = None
+        if options.load is not None and any(allowed.values()):
+            obj = await _call(functools.partial(options.load, subject), params)
+        if options.allowed is not None:
+            for method in allowed:
+                allowed[method] = await _hooked(options.allowed, subject, method, obj)
+    except HTTPException as exc:
+        return await _options_error(subject, exc, target)
+    response = Response(status_code=204)
+    response.headers["Allow"] = allow_value(m for m, ok in allowed.items() if ok)
+    response.headers["Link"] = hsr_link(target)
     expose_headers(response.headers)
     return response
+
+
+def _served_methods(resource: _Resource) -> list[str]:
+    """The methods ``resource``'s routes serve, but OPTIONS, in the order of
+    :data:`~scrudful._adapter.METHOD_KEYS`, then any others sorted. HEAD only
+    when a route lists it: FastAPI's ``APIRoute`` serves no HEAD for GET (a
+    Starlette ``Route`` with GET does, and lists HEAD)."""
+    methods: set[str] = set()
+    for route in resource.routes:
+        route_methods = getattr(route, "methods", None)
+        if route_methods is None:
+            methods.update(key.upper() for key in METHOD_KEYS)
+        else:
+            methods.update(method.upper() for method in route_methods)
+    methods.discard("OPTIONS")
+    known = [key.upper() for key in METHOD_KEYS]
+    return [m for m in known if m in methods] + sorted(methods - set(known))
+
+
+async def _hooked(
+    allowed: Callable[..., Any], request: Request, method: str, obj: Any
+) -> bool:
+    """``allowed(clone, method, obj)``, with ``clone`` a copy of ``request``
+    whose method is ``method`` (sync hooks run in the threadpool, an
+    awaitable result is awaited).
+
+    Raises
+    ------
+    TypeError
+        If it returns something other than a ``bool``.
+    """
+    clone = Request({**request.scope, "method": method}, request.receive)
+    result = await _call(functools.partial(allowed, clone, method, obj), {})
+    if not isinstance(result, bool):
+        raise TypeError(
+            f"allowed returned {result!r} for {method}: it must return a bool"
+        )
+    return result
+
+
+async def _options_error(request: Request, exc: HTTPException, target: str) -> Response:
+    """The app's exception handlers' answer to ``exc``, raised for the OPTIONS
+    ``request``, with the HSR link to ``target`` merged into its Link (a Link
+    with the HSR relation the handler set wins) and the exposed headers.
+
+    The handler is the one Starlette's ``ExceptionMiddleware`` would pick
+    from the app's ``exception_handlers``: the one for the exception's status
+    code, else for the nearest of its classes (500 and ``Exception`` are
+    Starlette's server error handler's, not looked up). Without one, ``exc``
+    is raised again.
+    """
+    handler = _exception_handler(request, exc)
+    if handler is None:
+        raise exc
+    response = await _call_handler(handler, request, exc)
+    if not isinstance(response, Response):
+        return response  # type: ignore[no-any-return]
+    headers = response.headers
+    link = merge_links(", ".join(headers.getlist("link")), None, None, hsr_link(target))
+    if link is not None:
+        headers["Link"] = link
+    _join_expose_lines(headers)
+    expose_headers(headers)
+    return response
+
+
+def _exception_handler(
+    request: Request, exc: Exception
+) -> Callable[[Request, Exception], Any] | None:
+    """The handler of ``request``'s app for ``exc`` (see :func:`_options_error`)."""
+    handlers = getattr(request.scope.get("app"), "exception_handlers", None)
+    if not isinstance(handlers, Mapping):
+        return None
+    status = getattr(exc, "status_code", None)
+    if isinstance(exc, HTTPException) and status != 500 and status in handlers:
+        return handlers[status]  # type: ignore[no-any-return]
+    for cls in type(exc).__mro__:
+        if cls is not Exception and cls in handlers:
+            return handlers[cls]  # type: ignore[no-any-return]
+    return None
+
+
+async def _may_use(method: str, found: tuple[Any, Scope]) -> bool:
+    """Whether the requester may use ``method``, served by the route of
+    ``found`` (with the scope it gets), by the route's security dependencies
+    (:func:`_security_dependencies`), resolved on a copy of the scope with
+    ``method`` (:func:`_resolves`). A route without dependencies (a Starlette
+    ``Route``) has none: allowed."""
+    route, scope = found
+    dependant = getattr(route, "dependant", None)
+    if dependant is None:
+        return True
+    checks = _security_dependencies(dependant)
+    if not checks:
+        return True
+    return await _resolves(route, checks, {**scope, "method": method})
+
+
+def _security_dependencies(dependant: Any) -> list[Any]:
+    """The sub-dependants of a route's ``dependant`` that the per-method
+    checks of OPTIONS resolve: those of ``dependencies=`` (the route's, its
+    routers', ``include_router``'s and the app's: FastAPI puts them first,
+    without a name), those of a parameter declared with ``Security(...)``,
+    and those relying on a security scheme (a ``fastapi.security`` class such
+    as ``HTTPBearer``, or ``Security(...)``, anywhere below them: the
+    ``Depends(get_current_user)`` of a user resolved from a token). Of
+    those, any that needs the request's body (a body, form or file parameter
+    anywhere below it) is left out: it can't be resolved without the body.
+    The endpoint's other parameters and dependencies are never resolved.
+    """
+    declared = _declared_security(getattr(dependant, "call", None))
+    return [
+        sub
+        for sub in getattr(dependant, "dependencies", None) or ()
+        if (
+            getattr(sub, "name", None) is None
+            or sub.name in declared
+            or _uses_security(sub)
+        )
+        and not _needs_body(sub)
+    ]
+
+
+def _uses_security(dependant: Any) -> bool:
+    """Whether ``dependant`` is, or depends on (at any depth), a security
+    scheme or a ``Security(...)`` dependency."""
+    call = getattr(dependant, "call", None)
+    scheme = call
+    while isinstance(scheme, functools.partial):
+        scheme = scheme.func
+    if isinstance(scheme, SecurityBase) or isinstance(
+        inspect.unwrap(scheme) if scheme is not None else None, SecurityBase
+    ):
+        return True
+    if getattr(dependant, "own_oauth_scopes", None) or getattr(
+        dependant, "security_requirements", None
+    ):
+        return True
+    declared = _declared_security(call)
+    return any(
+        getattr(sub, "name", None) in declared or _uses_security(sub)
+        for sub in getattr(dependant, "dependencies", None) or ()
+    )
+
+
+def _declared_security(call: Any) -> frozenset[str]:
+    """The names of ``call``'s parameters declared with ``Security(...)`` (as
+    their default, or in their ``Annotated`` metadata)."""
+    if call is None:
+        return frozenset()
+    try:
+        signature = evaluated_signature(call)
+    except (TypeError, ValueError):
+        return frozenset()
+    names = set()
+    for parameter in signature.parameters.values():
+        marks = [parameter.default]
+        if get_origin(parameter.annotation) is Annotated:
+            marks += get_args(parameter.annotation)[1:]
+        if any(isinstance(mark, fastapi_params.Security) for mark in marks):
+            names.add(parameter.name)
+    return frozenset(names)
+
+
+def _needs_body(dependant: Any) -> bool:
+    """Whether ``dependant``, or a dependency of it, takes the request's body."""
+    return bool(getattr(dependant, "body_params", None)) or any(
+        _needs_body(sub) for sub in getattr(dependant, "dependencies", None) or ()
+    )
+
+
+async def _empty_body() -> dict[str, Any]:
+    """The ``receive`` of a per-method check's request: no body."""
+    return {"type": "http.request", "body": b"", "more_body": False}
+
+
+#: The internal of FastAPI the per-method checks of OPTIONS resolve
+#: dependencies with.
+_SOLVER = "fastapi.dependencies.utils.solve_dependencies"
+#: The keyword parameters scrudful passes it: always, and when it has them.
+_SOLVER_PARAMETERS = frozenset(
+    {"request", "dependant", "dependency_overrides_provider"}
+)
+_SOLVER_OPTIONAL = frozenset({"async_exit_stack", "embed_body_fields"})
+#: The scope keys of the exit stack its dependencies with ``yield`` are
+#: entered on: ``fastapi_astack`` (FastAPI < 0.106), then the request's and
+#: the function's stacks (FastAPI >= 0.121).
+_EXIT_STACK_KEYS = (
+    "fastapi_astack",
+    "fastapi_inner_astack",
+    "fastapi_function_astack",
+)
+
+
+def _solver_error(detail: str) -> RuntimeError:
+    return RuntimeError(
+        f"scrudful's per-requester Allow of OPTIONS resolves the routes' "
+        f"security dependencies with FastAPI's {_SOLVER}, which {detail}: "
+        "upgrade scrudful, or use a FastAPI release it supports (0.100 to "
+        "0.159)"
+    )
+
+
+def _solver() -> tuple[Callable[..., Any], frozenset[str]]:
+    """FastAPI's ``solve_dependencies``, and the parameters it takes of
+    :data:`_SOLVER_OPTIONAL`.
+
+    Raises
+    ------
+    RuntimeError
+        If the installed FastAPI's can't be called as scrudful calls it: an
+        ``async`` function taking :data:`_SOLVER_PARAMETERS` by keyword,
+        whose other parameters have defaults, but those of
+        :data:`_SOLVER_OPTIONAL`.
+    """
+    solve = getattr(fastapi_dependency_utils, "solve_dependencies", None)
+    if not inspect.iscoroutinefunction(solve):
+        raise _solver_error("the installed FastAPI doesn't have as an async function")
+    keyword = (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    parameters = {
+        name: parameter
+        for name, parameter in inspect.signature(solve).parameters.items()
+        if parameter.kind in keyword
+    }
+    required = {
+        name
+        for name, parameter in parameters.items()
+        if parameter.default is inspect.Parameter.empty
+    }
+    if not _SOLVER_PARAMETERS <= set(parameters) or (
+        required - _SOLVER_PARAMETERS - _SOLVER_OPTIONAL
+    ):
+        raise _solver_error(
+            "the installed FastAPI's takes other parameters than "
+            f"{sorted(_SOLVER_PARAMETERS | _SOLVER_OPTIONAL)}"
+        )
+    return solve, frozenset(parameters) & _SOLVER_OPTIONAL
+
+
+async def _resolves(route: Any, checks: list[Any], scope: Scope) -> bool:
+    """Whether ``checks`` (sub-dependants of ``route``'s) resolve for the
+    request of ``scope`` (which has the method checked), without the body
+    (:func:`_empty_body`): FastAPI's ``solve_dependencies`` (:func:`_solver`)
+    runs them, with the route's ``dependency_overrides_provider`` (the app's
+    ``dependency_overrides`` apply), and their dependencies with ``yield``
+    are cleaned up before this returns, on an exit stack of their own.
+
+    Not when one raises an ``HTTPException`` with 401, 403 or 404 (another
+    propagates, as anything else raised does), or when their parameters fail
+    validation (where FastAPI would answer 422).
+
+    Raises
+    ------
+    RuntimeError
+        If the installed FastAPI's ``solve_dependencies``, its ``Dependant``
+        or the scope key of its exit stack differ from those of the FastAPI
+        releases scrudful supports.
+    """
+    solve, optional = _solver()
+    try:
+        dependant = fastapi_dependencies_models.Dependant(dependencies=list(checks))
+    except TypeError as exc:
+        raise _solver_error(
+            "takes a fastapi.dependencies.models.Dependant the installed "
+            "FastAPI doesn't build as scrudful does (Dependant(dependencies=...))"
+        ) from exc
+    scope = dict(scope)
+    if isinstance(scope.get("state"), dict):
+        # What a check sets on ``request.state`` stays with it.
+        scope["state"] = dict(scope["state"])
+    kwargs: dict[str, Any] = {
+        "dependant": dependant,
+        "dependency_overrides_provider": getattr(
+            route, "dependency_overrides_provider", None
+        ),
+    }
+    if "embed_body_fields" in optional:
+        kwargs["embed_body_fields"] = False
+    resolved = False
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            for key in _EXIT_STACK_KEYS:
+                scope[key] = stack
+            if "async_exit_stack" in optional:
+                kwargs["async_exit_stack"] = stack
+            try:
+                result = await solve(request=Request(scope, _empty_body), **kwargs)
+            except AssertionError as exc:
+                if "astack" in str(exc):
+                    raise _solver_error(
+                        f"needs an exit stack scrudful doesn't give it ({exc})"
+                    ) from exc
+                raise
+            errors = _solved_errors(result)
+            resolved = True
+    except HTTPException as exc:
+        if exc.status_code in _DENIAL_STATUSES:
+            return False
+        raise
+    # A dependency with ``yield`` that swallowed an exception leaves it unresolved.
+    return resolved and not errors
+
+
+def _solved_errors(result: Any) -> list[Any]:
+    """The validation errors of a ``solve_dependencies`` result: a
+    ``SolvedDependency`` (FastAPI >= 0.113), or a 5-tuple (older)."""
+    errors = getattr(result, "errors", None)
+    if errors is None and isinstance(result, tuple) and len(result) == 5:
+        errors = result[1]
+    if not isinstance(errors, list):
+        raise _solver_error(
+            "returned a result scrudful doesn't know (no list of errors)"
+        )
+    return errors
 
 
 # --- The HSR route -----------------------------------------------------------------

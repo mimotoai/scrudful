@@ -42,17 +42,15 @@ from scrudful.fastapi import (
     http_schema_resource,
     scrudful,
 )
-from scrudful._adapter import (
-    allow_header,
-    describe_options,
-    describe_read,
-    describe_write,
-    options_links,
-)
-from scrudful._hsr import options_operation
+from scrudful._adapter import describe_read, describe_write
+from scrudful._hsr import hsr_link, options_operation
 from tests import fastapi_future_annotations as future_endpoints
 from tests.semantic_http import (
+    HSR_DOCUMENT_REL,
+    hsr_get_problems,
+    hsr_link_problems,
     link_problems,
+    options_204_problems,
     parse_links,
     validate_http_schema_resource,
 )
@@ -2018,7 +2016,7 @@ def test_raised_error_gets_the_endpoint_error(make_client, store, method, header
     """An HTTPException the endpoint raises carries the endpoint's ``error``, as
     the OPTIONS body describes its 400, not the app-wide one."""
     client = make_client(_raising_app(store))
-    hsr = client.options("/items/3").json()
+    hsr = options_hsr(client, "/items/3")
     response = client.request(method, "/items/3", headers=headers)
     assert response.status_code == 400
     assert response.json() == {"detail": "Bad item"}
@@ -2034,7 +2032,7 @@ def test_raised_error_without_endpoint_error_gets_the_app_error(make_client, sto
     assert response.headers["link"] == APP_ERROR_LINKS
     assert response.headers["content-type"] == "application/json"
     # Not conditional: the OPTIONS body lists no 400 to agree with.
-    assert "400" not in client.options("/plain/3").json()["get"]["responses"]
+    assert "400" not in options_hsr(client, "/plain/3")["get"]["responses"]
     assert link_problems("GET", 400, response.headers, True) == []
 
 
@@ -2123,11 +2121,45 @@ def with_default(operation, content=None):
     return {**operation, "responses": {**operation["responses"], "default": default}}
 
 
-def answered_hsr(body):
-    """``body`` with the ``options`` entry of the 200 OPTIONS response that
-    returned it, for agreement checks of that response: until OPTIONS answers
-    204, the HTTP Schema Resource's own entry (a 204) doesn't describe it."""
-    return {**body, "options": describe_options()}
+def hsr_target(name, prefix=""):
+    """The HSR link target of the resource whose HSR route name is ``name``."""
+    return f"http://testserver{prefix}/_hsr/{name}"
+
+
+def options_204(client, url, allow, target=None, **kwargs):
+    """The OPTIONS response of ``url``: a 204 without content, with ``Allow:
+    <allow>`` (exactly, in its order), one HSR link (to ``target``, unless
+    ``None``) and the exposed ``Link`` and ``Allow``."""
+    response = client.options(url, **kwargs)
+    headers = dict(response.headers)
+    expected = {method.strip() for method in allow.split(",")}
+    assert (
+        options_204_problems(response.status_code, headers, response.content, expected)
+        == []
+    ), (url, response.status_code, response.content)
+    assert response.headers["allow"] == allow, url
+    assert hsr_link_problems(headers, target) == [], url
+    assert {"Link", "Allow"} <= set(_exposed(response))
+    return response
+
+
+def options_hsr(client, url, **kwargs):
+    """The HTTP Schema Resource the OPTIONS of ``url`` links to: the 204's HSR
+    link, followed by a GET of the HSR route."""
+    response = client.options(url, **kwargs)
+    headers = dict(response.headers)
+    assert options_204_problems(response.status_code, headers, response.content) == []
+    (target,) = [
+        target
+        for target, params in parse_links(headers["link"])
+        if params.get("rel") == HSR_DOCUMENT_REL
+    ]
+    document = client.get(target)
+    assert (
+        hsr_get_problems(document.status_code, dict(document.headers), document.content)
+        == []
+    ), target
+    return document.json()
 
 
 class ItemIn(BaseModel):
@@ -2171,18 +2203,18 @@ def _options_app(store):
 
 def test_add_options_body_and_headers(make_client, store):
     client = make_client(_options_app(store))
-    response = client.options("/items/3")
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "application/json"
-    body = response.json()
+    response = options_204(
+        client,
+        "/items/3",
+        "GET, PUT, DELETE, OPTIONS, HEAD, PATCH",
+        hsr_target("items.item_id"),
+    )
+    assert response.headers["link"] == hsr_link(hsr_target("items.item_id"))
+    assert "content-type" not in response.headers
+    body = options_hsr(client, "/items/3")
+    assert body == http_schema_resource(client.app, "/items/{item_id}")
     validate_http_schema_resource(body)
     assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
-    assert response.headers["link"] == options_links()
-    assert response.headers["allow"] == allow_header(body)
-    assert response.headers["allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
-    assert "Link" in _exposed(response)
-    hsr = answered_hsr(body)
-    assert link_problems("OPTIONS", 200, response.headers, True, hsr) == []
 
     assert body["get"] == with_default(
         describe_read(ITEM_CONTENT, True, [200], ERROR_CONTENT)
@@ -2214,7 +2246,7 @@ def test_add_options_body_and_headers(make_client, store):
 
 def test_add_options_success_status_and_conditional_post(make_client, store):
     client = make_client(_options_app(store))
-    body = client.options("/items").json()
+    body = options_hsr(client, "/items")
     validate_http_schema_resource(body)
     assert list(body) == ["post", "options"]
     assert body["post"] == with_default(
@@ -2229,7 +2261,7 @@ def test_add_options_success_status_and_conditional_post(make_client, store):
         )
     )
     # A conditional POST: scrudful's 400 and 412, never a 428.
-    body = client.options("/items/3/actions").json()
+    body = options_hsr(client, "/items/3/actions")
     validate_http_schema_resource(body)
     assert set(body["post"]["responses"]) == {"200", "400", "412", "default"}
     assert body["post"]["responses"]["400"]["content"] == ERROR_CONTENT
@@ -2248,7 +2280,7 @@ def test_trace_gets_no_links(make_client):
 
     add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    body = client.options("/items/3").json()
+    body = options_hsr(client, "/items/3")
     assert body["trace"] == OK
     response = client.request("TRACE", "/items/3")
     assert response.status_code == 200
@@ -2275,7 +2307,7 @@ def test_trace_ignores_preconditions(make_client, store):
         assert "last-modified" not in response.headers
     assert store.calls == []
     assert client.get("/items/3", headers={"If-Match": '"nope"'}).status_code == 412
-    body = client.options("/items/3").json()
+    body = options_hsr(client, "/items/3")
     assert body["trace"] == OK
     assert "412" in body["get"]["responses"]
 
@@ -2295,7 +2327,7 @@ def test_a_context_type_callable_returning_none_takes_the_default(make_client):
 
     add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    body = client.options("/items/3").json()
+    body = options_hsr(client, "/items/3")
     content = body["get"]["responses"]["200"]["content"]["application/json"]
     assert content["x-rdf-context"] == {"href": CONTEXT, "type": "application/ld+json"}
     response = client.get("/items/3")
@@ -2320,7 +2352,7 @@ def test_add_options_success_content_only_on_a_2xx(make_client):
 
     add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    body = client.options("/items/3").json()
+    body = options_hsr(client, "/items/3")
     validate_http_schema_resource(body)
     assert body["get"]["responses"] == {
         "307": {"description": "Temporary Redirect"},
@@ -2357,7 +2389,7 @@ def test_add_options_agrees_with_the_responses(
     make_client, store, method, path, headers, json, status
 ):
     client = make_client(_options_app(store))
-    hsr = client.options(path).json()
+    hsr = options_hsr(client, path)
     response = client.request(method, path, headers=headers, json=json)
     assert response.status_code == status
     content = method != "HEAD"
@@ -2394,14 +2426,15 @@ def test_add_options_skips_existing_options(make_client):
     assert client.options("/items/3").json() == {"own": True}
     assert client.options("/plain").status_code == 405
     assert client.options("/nowhere").status_code == 404
-    assert client.options("/others").status_code == 200
+    options_204(client, "/others", "GET, OPTIONS", hsr_target("others"))
     assert "options" not in app.openapi()["paths"]["/others"]
     assert app.url_path_for("get_item", item_id=3) == "/items/3"
 
 
 def test_add_options_mixed_path(make_client, store):
     """Review Focus 5: a plain method on a scrudful path is described without
-    content or a request body, and ``Allow`` still follows the body."""
+    content or a request body, and ``Allow`` still lists the methods the
+    body describes (none of them has a check)."""
     app = FastAPI()
 
     @app.get("/items/{item_id}")
@@ -2418,15 +2451,15 @@ def test_add_options_mixed_path(make_client, store):
 
     app.add_route("/items/{item_id}", starlette_patch, methods=["PATCH"])
     add_options(app, base_url=TEST_BASE_URL)
-    response = make_client(app).options("/items/3")
-    body = response.json()
+    client = make_client(app)
+    body = options_hsr(client, "/items/3")
     validate_http_schema_resource(body)
     assert body["put"] == OK
     assert body["patch"] == OK
-    assert response.headers["allow"] == allow_header(body)
-    assert response.headers["allow"] == "GET, PUT, OPTIONS, PATCH"
-    hsr = answered_hsr(body)
-    assert link_problems("OPTIONS", 200, response.headers, True, hsr) == []
+    assert list(body) == ["get", "put", "options", "patch"]
+    options_204(
+        client, "/items/3", "GET, PUT, OPTIONS, PATCH", hsr_target("items.item_id")
+    )
 
 
 def test_add_options_link_callables_are_called_in_describe_mode(make_client, store):
@@ -2465,7 +2498,7 @@ def test_add_options_link_callables_are_called_in_describe_mode(make_client, sto
 
     add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    body = client.options("/items/3?x=1").json()
+    body = options_hsr(client, "/items/3?x=1")
     validate_http_schema_resource(body)
     assert body["get"]["responses"]["200"]["content"] == {
         "application/json": {
@@ -2483,7 +2516,7 @@ def test_add_options_link_callables_are_called_in_describe_mode(make_client, sto
         }
     }
     assert received == [("schema", {}), ("context", {}), ("error", {})]
-    assert client.options("/items/4").json() == body  # built once
+    assert options_hsr(client, "/items/4") == body  # built once
     assert len(received) == 3
     # The Links of the GET agree with it: inside the endpoint the callables
     # get its keyword arguments, and the URLs resolve against base_url too.
@@ -2496,11 +2529,15 @@ def test_add_options_link_callables_are_called_in_describe_mode(make_client, sto
         assert kwargs["item_id"] == 3
 
     received.clear()
-    client.options("/others/7")
+    options_hsr(client, "/others/7")
     assert received == [("schema", {})]
 
 
 def test_add_options_needs_no_credentials(make_client):
+    """OPTIONS isn't gated by the app's, a router's or ``include_router``'s
+    dependencies: it is a 204 whose ``Allow`` they refuse everything but
+    OPTIONS, and the document it links to is served without credentials."""
+
     def deny():
         raise HTTPException(status_code=401)
 
@@ -2522,11 +2559,10 @@ def test_add_options_needs_no_credentials(make_client):
     app.include_router(router, prefix="/v1", dependencies=[Depends(deny)])
     add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    for path in ("/v1/items/3", "/things"):
+    for path, name in (("/v1/items/3", "v1.items.item_id"), ("/things", "things")):
         assert client.get(path).status_code == 401
-        response = client.options(path)
-        assert response.status_code == 200
-        assert response.headers["allow"] == "GET, OPTIONS"
+        options_204(client, path, "OPTIONS", hsr_target(name))
+        assert list(options_hsr(client, path)) == ["get", "options"]
 
 
 def test_add_options_covers_included_routers(make_client):
@@ -2543,9 +2579,13 @@ def test_add_options_covers_included_routers(make_client):
     app.include_router(outer, prefix="/v1")
     add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    response = client.options("/v1/inner/items/3")
-    assert response.status_code == 200
-    body = response.json()
+    options_204(
+        client,
+        "/v1/inner/items/3",
+        "GET, OPTIONS",
+        hsr_target("v1.inner.items.item_id"),
+    )
+    body = options_hsr(client, "/v1/inner/items/3")
     assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
     get = client.get("/v1/inner/items/3")
     assert link_problems("GET", 200, get.headers, True, body) == []
@@ -2584,9 +2624,13 @@ def test_add_options_under_a_prefix_with_path_parameters(make_client, on):
     get = client.get("/users/1/items/2")
     assert get.status_code == 200
     assert received == [{"item_id": 2}]
-    response = client.options("/users/1/items/2")
-    assert response.status_code == 200
-    body = response.json()
+    target = (
+        hsr_target("items.item_id", "/users/1")
+        if on == "router"
+        else hsr_target("users.user_id.items.item_id")
+    )
+    options_204(client, "/users/1/items/2", "GET, OPTIONS", target)
+    body = options_hsr(client, "/users/1/items/2")
     assert body["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
         "$ref": "http://testserver/schemas/item"
     }
@@ -2671,7 +2715,8 @@ def test_add_options_after_the_app_started(make_client):
     client = make_client(app)
     assert client.options("/items/3").status_code == 405
     add_options(app, base_url=TEST_BASE_URL)
-    assert client.options("/items/3").status_code == 200
+    options_204(client, "/items/3", "GET, OPTIONS", hsr_target("items.item_id"))
+    assert list(options_hsr(client, "/items/3")) == ["get", "options"]
 
 
 def test_add_options_needs_an_app_or_router():
@@ -2698,7 +2743,7 @@ def test_add_options_skips_the_error_of_an_unconditional_endpoint(make_client):
         return {}
 
     add_options(app, base_url=TEST_BASE_URL)
-    body = make_client(app).options("/items/3").json()
+    body = options_hsr(make_client(app), "/items/3")
     validate_http_schema_resource(body)
     assert set(body["put"]["responses"]) == {"200", "default"}
     assert body["put"]["responses"]["default"] == DEFAULT
@@ -2788,7 +2833,7 @@ def test_outside_callables_with_kwargs_or_defaults_pass(make_client, store):
     add_error_links(app, APP_ERROR)
     add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    body = client.options("/items/3").json()
+    body = options_hsr(client, "/items/3")
     validate_http_schema_resource(body)
     assert received == [(None, None)]  # describe mode: func()
     assert errors == [None]
@@ -2832,11 +2877,12 @@ def test_add_options_path_split_across_routers(make_client):
 
     add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    options = client.options("/v1/items/1")
-    body = options.json()
+    options_204(
+        client, "/v1/items/1", "GET, PUT, DELETE, OPTIONS", hsr_target("v1.items.i")
+    )
+    body = options_hsr(client, "/v1/items/1")
     validate_http_schema_resource(body)
-    assert options.headers["allow"] == "GET, PUT, DELETE, OPTIONS"
-    assert options.headers["allow"] == allow_header(body)
+    assert list(body) == ["get", "put", "delete", "options"]
     for method in ("GET", "PUT", "DELETE"):
         response = client.request(method, "/v1/items/1")
         assert response.status_code == 200
@@ -2870,9 +2916,9 @@ def test_add_options_differently_named_parameters(make_client):
     app.include_router(reads)
     app.include_router(writes)
     add_options(app, base_url=TEST_BASE_URL)
-    response = make_client(app).options("/items/5")
-    assert response.headers["allow"] == "GET, PUT, OPTIONS"
-    body = response.json()
+    client = make_client(app)
+    options_204(client, "/items/5", "GET, PUT, OPTIONS", hsr_target("items.id"))
+    body = options_hsr(client, "/items/5")
     assert list(body) == ["get", "put", "options"]
     assert body == http_schema_resource(app, "/items/{id}")
     assert body == http_schema_resource(app, "/items/{item_id}")
@@ -2916,11 +2962,12 @@ def test_add_options_on_a_router_groups_differently_named_parameters(make_client
     app = FastAPI()
     app.include_router(router)
     client = make_client(app)
-    response = client.options("/items/5")
-    assert response.headers["allow"] == "GET, PUT, OPTIONS"
-    assert response.json() == http_schema_resource(router, "/items/{item_id}")
-    assert client.options("/things/5").headers["allow"] == "DELETE, OPTIONS"
-    assert client.options("/things/abc").headers["allow"] == "GET, OPTIONS"
+    options_204(client, "/items/5", "GET, PUT, OPTIONS", hsr_target("items.id"))
+    assert options_hsr(client, "/items/5") == http_schema_resource(
+        router, "/items/{item_id}"
+    )
+    options_204(client, "/things/5", "DELETE, OPTIONS", hsr_target("things.n-int"))
+    options_204(client, "/things/abc", "GET, OPTIONS", hsr_target("things.name"))
 
 
 def test_add_options_mount(make_client):
@@ -2939,15 +2986,14 @@ def test_add_options_mount(make_client):
     )
     add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    for path, allow, method in [
-        ("/m/items/1", "GET, OPTIONS", "GET"),
-        ("/n/items/1", "PUT, OPTIONS", "PUT"),
+    for path, allow, method, name in [
+        ("/m/items/1", "GET, OPTIONS", "GET", "m.items.item_id"),
+        ("/n/items/1", "PUT, OPTIONS", "PUT", "n.items.item_id"),
     ]:
-        options = client.options(path)
-        assert options.status_code == 200
-        assert options.headers["allow"] == allow
+        options_204(client, path, allow, hsr_target(name))
+        hsr = options_hsr(client, path)
         response = client.request(method, path)
-        assert link_problems(method, 200, response.headers, True, options.json()) == []
+        assert link_problems(method, 200, response.headers, True, hsr) == []
 
 
 def test_add_options_mounted_fastapi_app(make_client):
@@ -2972,9 +3018,11 @@ def test_add_options_mounted_fastapi_app(make_client):
     response = client.options("/sub/items/1", headers=preflight)
     assert response.headers["access-control-allow-origin"] == "https://a.example"
     add_options(sub, base_url=TEST_BASE_URL)
-    options = client.options("/sub/items/1")
-    assert options.status_code == 200
-    assert options.json()["get"]["responses"]["200"]["content"] == ITEM_CONTENT
+    # The sub-app's own HSR route, where the sub-app is mounted.
+    target = hsr_target("items.item_id", "/sub")
+    options_204(client, "/sub/items/1", "GET, OPTIONS", target)
+    hsr = options_hsr(client, "/sub/items/1")
+    assert hsr["get"]["responses"]["200"]["content"] == ITEM_CONTENT
     response = client.options("/sub/items/1", headers=preflight)
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "https://a.example"
@@ -3047,8 +3095,9 @@ def test_mount_callables_get_the_path_parameters_that_reach_them(make_client):
 
 @pytest.mark.parametrize("mode", ["app", "router"])
 def test_options_answers_the_matched_path(make_client, mode):
-    """The app's or the router's OPTIONS answer is the document of the path
-    matched, built without the request: the callables get no arguments."""
+    """The app's or the router's OPTIONS answer links to the document of the
+    path matched, built without the request: the callables get no
+    arguments."""
     seen = []
 
     def schema(*args, **kwargs):
@@ -3068,14 +3117,15 @@ def test_options_answers_the_matched_path(make_client, mode):
     app.include_router(router)
     if mode == "app":
         add_options(app, base_url=TEST_BASE_URL)
-    response = make_client(app).options("/items/7")
-    assert response.status_code == 200
-    content = response.json()["get"]["responses"]["200"]["content"]
+    client = make_client(app)
+    options_204(client, "/items/7", "GET, OPTIONS", hsr_target("items.item_id"))
+    hsr = options_hsr(client, "/items/7")
+    content = hsr["get"]["responses"]["200"]["content"]
     assert content["application/json"]["schema"] == {
         "$ref": "http://testserver/s/item.json"
     }
     owner = router if mode == "router" else app
-    assert response.json() == http_schema_resource(owner, "/items/{item_id}")
+    assert hsr == http_schema_resource(owner, "/items/{item_id}")
     assert seen == [((), {})]
 
 

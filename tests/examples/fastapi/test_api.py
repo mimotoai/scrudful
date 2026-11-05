@@ -9,11 +9,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from examples.fastapi import api
-from scrudful._adapter import allow_header, describe_options, options_links
 from scrudful._hsr import options_operation
 from scrudful.fastapi import add_options
 from tests.semantic_http import (
+    HSR_DOCUMENT_REL,
+    hsr_get_problems,
+    hsr_link_problems,
     link_problems,
+    options_204_problems,
     parse_links,
     validate_http_schema_resource,
 )
@@ -65,11 +68,23 @@ def client():
         yield client
 
 
-def answered_hsr(body):
-    """``body`` with the ``options`` entry of the 200 OPTIONS response that
-    returned it, for agreement checks of that response: until OPTIONS answers
-    204, the HTTP Schema Resource's own entry (a 204) doesn't describe it."""
-    return {**body, "options": describe_options()}
+def hsr_of(client, path):
+    """The HTTP Schema Resource the OPTIONS of ``path`` links to: the 204's
+    HSR link, followed by a GET of the HSR route."""
+    response = client.options(path)
+    headers = dict(response.headers)
+    assert options_204_problems(response.status_code, headers, response.content) == []
+    (target,) = [
+        target
+        for target, params in parse_links(headers["link"])
+        if params.get("rel") == HSR_DOCUMENT_REL
+    ]
+    document = client.get(target)
+    assert (
+        hsr_get_problems(document.status_code, dict(document.headers), document.content)
+        == []
+    )
+    return document.json()
 
 
 def assert_unchanged(client, user_id=2):
@@ -429,12 +444,18 @@ def test_openapi_documents_conditional_responses(client):
 
 def test_options_user(client):
     response = client.options("/users/1")
-    assert response.status_code == 200
-    body = response.json()
-    validate_http_schema_resource(body)
+    headers = dict(response.headers)
+    allow = {"GET", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"}
+    assert (
+        options_204_problems(response.status_code, headers, response.content, allow)
+        == []
+    )
+    assert response.status_code == 204
     assert response.headers["allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
-    assert response.headers["allow"] == allow_header(body)
-    assert response.headers["link"] == options_links()
+    assert hsr_link_problems(headers, f"{BASE}/_hsr/users.user_id") == []
+    body = hsr_of(client, "/users/1")
+    validate_http_schema_resource(body)
+    assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
     assert body["get"]["responses"]["200"]["content"] == {
         "application/json": {
             "schema": {"$ref": f"{BASE}/schemas/user.json"},
@@ -455,8 +476,11 @@ def test_options_user(client):
     }
     assert body["options"] == options_operation()
     users = client.options("/users")
+    headers = dict(users.headers)
+    assert options_204_problems(users.status_code, headers, users.content) == []
     assert users.headers["allow"] == "POST, OPTIONS"
-    validate_http_schema_resource(users.json())
+    assert hsr_link_problems(headers, f"{BASE}/_hsr/users") == []
+    validate_http_schema_resource(hsr_of(client, "/users"))
 
 
 USER = "/users/2"
@@ -489,7 +513,7 @@ CONFORMANCE = [
     ("delete", USER, {}, 428),
     ("delete", USER, {"headers": IF_MATCH_STALE}, 412),
     ("delete", USER, {"headers": MALFORMED}, 400),
-    ("options", USER, {}, 200),
+    ("options", USER, {}, 204),
     ("get", "/users/99", {}, 404),
     ("head", "/users/99", {}, 404),
     ("get", "/users/x", {}, 422),
@@ -498,7 +522,7 @@ CONFORMANCE = [
     ("post", USER, {}, 405),
     ("post", USERS, {"json": BODY}, 201),
     ("post", USERS, {"json": INVALID}, 422),
-    ("options", USERS, {}, 200),
+    ("options", USERS, {}, 204),
     ("get", USERS, {}, 405),
     ("get", "/nowhere", {}, 404),
 ]
@@ -519,13 +543,15 @@ def test_example_links_everywhere(client, method, path, arguments, status):
     """Every response, a HEAD included, follows the Semantic HTTP 0.1 Link rules
     and agrees with the OPTIONS body of its path."""
     options = client.options(path)
-    hsr = options.json() if options.status_code == 200 else None
-    if hsr is not None and method == "options":
-        hsr = answered_hsr(hsr)
+    hsr = hsr_of(client, path) if options.status_code == 204 else None
     response = client.request(method.upper(), path, **arguments)
     assert response.status_code == status
     content = method != "head" and bool(response.content)
     assert content == (status not in (204, 304) and method != "head")
+    if method == "options":
+        headers = dict(response.headers)
+        assert options_204_problems(status, headers, response.content) == []
+        return
     problems = link_problems(
         method.upper(),
         status,
