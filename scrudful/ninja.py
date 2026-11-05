@@ -4215,7 +4215,11 @@ def _problem_422(
         return
     status = response.status_code
     problem = problem_from_errors(status, body["detail"], "Request validation failed")
-    response.content = api.renderer.render(request, problem, response_status=status)
+    renderer = api.renderer
+    if is_json_syntax(getattr(renderer, "media_type", None) or ""):
+        response.content = renderer.render(request, problem, response_status=status)
+    else:  # JSON content, though the API renders another media type
+        response.content = json.dumps(problem)
 
 
 def _error_links(
@@ -4928,9 +4932,9 @@ def _adopt_path_view(router: ScrudfulRouter, path: str, path_view: Any) -> None:
     if type(path_view) is not PathView:
         raise ConfigError(
             "scrudful's JSON 405 replaces ninja's PathView of each path of a "
-            f"ScrudfulRouter, which the installed ninja made a "
-            f"{type(path_view).__qualname__} as ninja 1.7.0 and 1.7.1 don't: "
-            "upgrade scrudful, or keep ninja at one of those releases"
+            "ScrudfulRouter, but the installed ninja made a "
+            f"{type(path_view).__qualname__}, where ninja 1.7.0 and 1.7.1 make "
+            "a PathView: upgrade scrudful, or keep ninja at one of those releases"
         )
     path_view.__class__ = _ScrudfulPathView
     path_view._scrudful_router = router

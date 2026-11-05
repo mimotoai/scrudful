@@ -1,6 +1,7 @@
 """Links on error responses: errors raised in an operation, ``add_error_links``."""
 
 import functools
+import json
 import uuid
 from typing import Any
 
@@ -1121,6 +1122,51 @@ def test_without_source_the_path_view_fingerprints_are_checked(
     monkeypatch.setattr(scrudful.ninja, "_source_digest", lambda func: None)
     r = TestClient(hsr_api()).request("TRACE", "/1")
     assert r.status_code == 405 and r.json() == {"detail": "Method not allowed"}
+
+
+def test_405_needs_ninjas_own_path_view(monkeypatch):
+    import ninja.operation
+    import ninja.router
+
+    class OtherPathView(ninja.operation.PathView):
+        pass
+
+    monkeypatch.setattr(ninja.router, "PathView", OtherPathView)
+    with pytest.raises(ConfigError, match=r"made a .*OtherPathView.*upgrade"):
+        hsr_api()
+
+
+def test_validation_422_problem_without_a_json_renderer():
+    """An API whose renderer writes another media type: the problem details
+    of the JSON 422 its handler made are still JSON."""
+    from ninja.renderers import BaseRenderer
+
+    class Text(BaseRenderer):
+        media_type = "text/plain"
+
+        def render(self, request, data, *, response_status):
+            return str(data)
+
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}", renderer=Text())
+
+    @api.exception_handler(ninja_errors.ValidationError)
+    def json_422(request, exc):
+        return HttpResponse(
+            json.dumps({"detail": exc.errors}),
+            status=422,
+            content_type="application/json",
+        )
+
+    @api.post("/things")
+    def create(request, payload: ItemIn):
+        return {}
+
+    add_error_links(api, PROBLEM_ERROR)
+    r = TestClient(api).post("/things", json={})
+    assert r.status_code == 422
+    body = json.loads(r.content)
+    Draft202012Validator(PROBLEM_DETAILS_SCHEMA).validate(body)
+    assert body["errors"]
 
 
 # --- Problem-details 422 ------------------------------------------------------
