@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import pathlib
+from http import HTTPStatus
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -214,7 +215,15 @@ def test_handler_lets_an_unexpected_error_propagate(rf, settings, monkeypatch):
         view(rf.get("/nowhere", HTTP_ACCEPT="application/json"), Http404())
 
 
-@pytest.mark.parametrize("status", [403, 400, "404", 404.0, None])
+@pytest.mark.parametrize("status", [HTTPStatus.NOT_FOUND, HTTPStatus(500)])
+def test_handler_takes_an_http_status(rf, status):
+    view = error_handler(status, PROBLEM_ERROR)
+    response = view(rf.get("/x", HTTP_ACCEPT="application/json"), Http404())
+    assert response.status_code == status
+    assert json.loads(response.content)["status"] == status
+
+
+@pytest.mark.parametrize("status", [403, 400, "404", 404.0, None, True])
 def test_handler_is_a_404_or_500_handler(status):
     """Its HTML answer is Django's page of 404 or 500: another status would
     answer a browser with the 500 page."""

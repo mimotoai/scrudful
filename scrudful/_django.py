@@ -488,16 +488,21 @@ def error_handler(
         If ``error`` is not an :class:`~scrudful.entity.Entity`, or a link
         of it is a callable.
     ValueError
-        If ``status`` is not the ``int`` 404 or 500 (the HTML answer is
-        Django's page of one of them); if ``error``'s media type is not JSON
-        (``application/json`` or a ``+json`` type), or a rel or type of its
-        links has characters a Link can't carry (control characters, or
-        outside Latin-1).
+        If ``status`` is not the ``int`` (or ``HTTPStatus``) 404 or 500 (the
+        HTML answer is Django's page of one of them); if ``error``'s media
+        type is not JSON (``application/json`` or a ``+json`` type), or a rel
+        or type of its links has characters a Link can't carry (control
+        characters, or outside Latin-1).
     ImproperlyConfigured
         If a plain link URL of ``error`` can't be parsed.
     """
-    if type(status) is not int or status not in (404, 500):
+    if (
+        not isinstance(status, int)
+        or isinstance(status, bool)
+        or status not in (404, 500)
+    ):
         raise ValueError(f"status must be 404 or 500, not {status!r}")
+    status = int(status)  # an HTTPStatus answers as its number
     if not isinstance(error, Entity):
         raise TypeError(f"error must be an Entity, not {type(error).__name__}")
     _adapter.check_error_media_type(error.media_type)

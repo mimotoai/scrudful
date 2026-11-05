@@ -126,9 +126,6 @@ Behaviour change (all adapters)
   ``scrudful._django`` logger, with the request's path, and the error served
   without the entity's Links. A ``handler500`` that fails anyway first logs
   the error it was answering, which Django then doesn't log.
-* ``scrudful._django.error_handler``, behind them, raises ``ValueError`` for a
-  status other than 404 or 500 (another one answered a browser with Django's
-  500 page).
 * A base URL that can't be parsed at all (``"http://[::1"``) is refused as a
   relative one is (``HsrConfigError``, so ``scrudful.E006`` /
   ``ImproperlyConfigured`` for ``SCRUDFUL["BASE_URL"]``), not with a bare
