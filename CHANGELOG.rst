@@ -210,6 +210,17 @@ Behaviour change (ninja)
   method; from ``allowed``, a 401, 403 or ``PermissionDenied`` refuses it and
   a 404 is the OPTIONS's answer; anything else raised is answered by the
   API's exception handler.
+* The per-method checks of OPTIONS get a copy of the request with that
+  method in ``request.method``, while ``request.META["REQUEST_METHOD"]``
+  stays ``"OPTIONS"``: a ``load`` that locks its row should lock only when
+  it isn't ``"OPTIONS"``. On an OPTIONS whose ``META`` has no
+  ``REQUEST_METHOD`` (ninja's ``TestClient`` builds such requests),
+  scrudful sets it to ``"OPTIONS"`` first, so that check holds there too.
+* A ``@scrudful`` handler with ``before=`` or ``after_throttles=`` called
+  directly from inside another operation's function raises ``RuntimeError``
+  (naming both): its hooks didn't run for that request. Move the shared code
+  into a plain function instead. (Since 0.7.1, such a call from an operation
+  with hooks of its own ran the handler with its hooks skipped.)
 * OPTIONS is answered by an ``Operation.run`` decorator, so the API's and
   routers' ``add_decorator(mode="operation")`` decorators no longer gate it
   (they did in 0.9); ``mode="view"`` ones still run first. A non-preflight

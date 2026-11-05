@@ -3627,6 +3627,32 @@ def test_a_methods_own_load_tells_options_by_the_request_line(client, db):
     assert LOCK_SEEN == [("PUT", "OPTIONS")]
 
 
+def test_options_gives_a_request_without_a_request_line_its_method():
+    """ninja's test client builds a request whose ``META`` has no
+    ``REQUEST_METHOD``: on OPTIONS, scrudful sets it to ``"OPTIONS"``, so the
+    documented check holds there too. A ``META`` that has one keeps it."""
+    LOCK_SEEN.clear()
+    client = TestClient(_locking_api())
+    assert options(client, "/1").status_code == 204
+    assert LOCK_SEEN == [("PUT", "OPTIONS")]
+    LOCK_SEEN.clear()
+    meta = {"REMOTE_ADDR": "127.0.0.1", "REQUEST_METHOD": "KEPT"}
+    assert options(client, "/1", META=meta).status_code == 204
+    assert LOCK_SEEN == [("PUT", "KEPT")]
+
+
+def test_options_sets_no_request_line_of_another_method():
+    store, seen = Store(), []
+
+    def load(request, pk, **params):
+        seen.append(request.META.get("REQUEST_METHOD"))
+        return store.load(request, pk, **params)
+
+    api, _ = make_api(load=load)
+    assert TestClient(api).get("/1").status_code == 200
+    assert seen == [None]
+
+
 def test_options_with_an_allowed_hook_runs_no_methods_own_load():
     """An ``allowed`` hook alone decides: a method's own ``load`` doesn't
     run, and the hook gets the loader's object."""

@@ -117,8 +117,10 @@ Validators
     ``UPDATE ... WHERE version = <expected>``). OPTIONS runs a method's own
     ``load`` too, on a copy of the request with that method: inside a
     transaction, lock only when ``request.META.get("REQUEST_METHOD") !=
-    "OPTIONS"`` (the request line's method, which the copy keeps), or the
-    OPTIONS holds the lock until it ends. Without a transaction,
+    "OPTIONS"`` (the request line's method, which the copy keeps; on an
+    OPTIONS whose ``META`` has none, as ninja's test client builds it,
+    scrudful sets it to ``"OPTIONS"``), or the OPTIONS holds the lock until
+    it ends. Without a transaction,
     ``select_for_update()`` fails the write itself.
 
     After the handler runs, 2xx responses to GET/HEAD get the validators
@@ -6044,6 +6046,16 @@ def _options_answer(
     api = _operation_api(operation)
     # As ninja's _run_checks marks the request of a CSRF-exempt operation.
     request._ninja_csrf_exempt = True  # type: ignore[attr-defined]
+    meta = getattr(request, "META", None)
+    if (
+        request.method == "OPTIONS"
+        and isinstance(meta, dict)
+        and "REQUEST_METHOD" not in meta
+    ):
+        # ninja's test clients build a request without the request line's
+        # method: the per-method checks get copies whose ``method`` is
+        # theirs, so this is how they tell an OPTIONS (as documented).
+        meta["REQUEST_METHOD"] = "OPTIONS"
     try:
         bound_router, bound_view = _bound_mount(api, operation)
         throttled = _options_throttled(api, operation, bound_router, request)
