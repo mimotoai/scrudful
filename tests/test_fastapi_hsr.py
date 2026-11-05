@@ -2298,6 +2298,46 @@ def test_router_resource_added_later_has_no_route_until_add_options(make_client)
     assert client.get("/_hsr/things.id").status_code == 200
 
 
+class InsertingRouter(APIRouter):
+    """A router whose ``add_api_route`` inserts the route first, rather than
+    appending it."""
+
+    def add_api_route(self, path: str, endpoint: Any, **kwargs: Any) -> None:
+        super().add_api_route(path, endpoint, **kwargs)
+        self.routes.insert(0, self.routes.pop())
+
+
+def test_router_resource_inserted_later_is_described(make_client):
+    """A route-adding call that inserts its route, rather than appending it,
+    adds nothing at the end of the routes: the routes are compared with
+    those seen, so the inserted resource still gets its OPTIONS and HSR
+    routes."""
+    router = InsertingRouter()
+
+    @router.get("/items/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def get_item(id: int):
+        return {}
+
+    add_options(router, base_url=BASE)
+
+    @router.get("/inserted/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def get_inserted(id: int):
+        return {}
+
+    paths = [getattr(route, "path", None) for route in router.routes]
+    assert paths.index("/inserted/{id}") < paths.index("/items/{id}")
+    app = FastAPI()
+    app.include_router(router)
+    client = make_client(app)
+    for name in ("inserted", "items"):
+        target = f"{BASE}_hsr/{name}.id"
+        options_204(client, f"/{name}/1", "GET, OPTIONS", target)
+        assert hsr_link_problems(client.get(f"/{name}/1").headers, target) == []
+        assert client.get(target).status_code == 200
+
+
 def test_router_resource_added_later_is_described_as_it_is_added(make_client):
     """A resource added to a router after its :func:`add_options` (with its
     route decorators) gets its OPTIONS and HSR routes as it is added, as an
