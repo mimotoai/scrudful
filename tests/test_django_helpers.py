@@ -5,6 +5,8 @@ import pathlib
 from http import HTTPStatus
 from datetime import datetime, timedelta, timezone
 
+from typing import Any
+
 import pytest
 from django.core.exceptions import ImproperlyConfigured
 from django.http import Http404
@@ -200,19 +202,40 @@ def test_handler_logs_the_request_it_cant_link(rf, settings, caplog):
     assert "/some/where" in record.getMessage()
 
 
-def test_handler_lets_an_unexpected_error_propagate(rf, settings, monkeypatch):
-    """Only the documented causes (the setting, the host, the entity's
-    configuration) are logged and served without Links: anything else
-    raised building them is a bug, which takes Django's own 500 path."""
+@pytest.mark.parametrize("status", [404, 500])
+def test_handler_serves_its_error_whatever_breaks_its_links(
+    rf, settings, caplog, monkeypatch, status
+):
+    """Any error building the Links, a bug included, is logged with its
+    traceback and the request's path, and the error served without them:
+    the handler never raises for its Links."""
     settings.SCRUDFUL = None
 
     def broken(*args):
         raise KeyError("bug")
 
-    view = error_handler(404, Entity("https://x/s", context_link_or_func="https://x/c"))
+    view = error_handler(
+        status, Entity("https://x/s", context_link_or_func="https://x/c")
+    )
     monkeypatch.setattr(_django, "link_content", broken)
-    with pytest.raises(KeyError, match="bug"):
-        view(rf.get("/nowhere", HTTP_ACCEPT="application/json"), Http404())
+    request = rf.get("/nowhere", HTTP_ACCEPT="application/json")
+    with caplog.at_level("ERROR", logger="scrudful"):
+        response = view(request, Http404()) if status == 404 else view(request)
+    assert response.status_code == status and "Link" not in response
+    assert json.loads(response.content) == {"detail": REASONS[status]}
+    [record] = caplog.records
+    assert f"handler{status}" in record.getMessage()
+    assert "/nowhere" in record.getMessage()
+    assert isinstance(record.exc_info[1], KeyError)
+    assert record.exc_info[2] is not None  # the traceback
+
+
+REASONS = {404: "Not Found", 500: "Internal Server Error"}
+
+
+def _broken_body(*args):
+    """In place of ``json_response``: a bug past the Links' fallback."""
+    raise KeyError("bug")
 
 
 @pytest.mark.parametrize("status", [HTTPStatus.NOT_FOUND, HTTPStatus(500)])
@@ -385,17 +408,13 @@ def test_a_failing_handler500_logs_the_error_it_was_answering(
     client, db, settings, caplog, monkeypatch
 ):
     """Django logs the error a ``handler500`` answers only once it returns,
-    and nothing past it catches what it raises: when it fails for a reason
-    it doesn't serve around (a bug), it logs the error it was answering
-    first, which would otherwise reach no log but as the context of its own
-    exception."""
+    and nothing past it catches what it raises: when it fails anyway (a bug
+    past its Links, which never make it fail), it logs the error it was
+    answering first, which would otherwise reach no log but as the context
+    of its own exception."""
     settings.ROOT_URLCONF = FailingHandler500URLconf
     settings.SCRUDFUL = None
-
-    def broken(*args):
-        raise KeyError("bug")
-
-    monkeypatch.setattr(_django, "link_content", broken)
+    monkeypatch.setattr(_django, "json_response", _broken_body)
     client.raise_request_exception = False
     with caplog.at_level("ERROR"), pytest.raises(KeyError, match="bug"):
         client.get("/boom", HTTP_ACCEPT="application/json")
@@ -425,27 +444,54 @@ class SharedBugURLconf:
     )
 
 
+def _get(url: str, asynchronous: bool) -> Any:
+    """A JSON GET of ``url`` through Django's handlers (and middleware)."""
+    if asynchronous:
+        client = AsyncClient(raise_request_exception=False)
+        return asyncio.run(client.get(url, headers={"accept": "application/json"}))
+    client = Client(raise_request_exception=False)
+    return client.get(url, HTTP_ACCEPT="application/json")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("url, status", [("/boom", 500), ("/missing", 404)])
+def test_the_error_handlers_answer_whatever_breaks_their_links(
+    db, settings, caplog, url, status, asynchronous
+):
+    """A lazy link whose evaluation has a bug doesn't make either handler
+    fail: the error is answered with the plain body, the bug logged once,
+    with its traceback, and Django still logs the error answered."""
+    settings.ROOT_URLCONF = SharedBugURLconf
+    settings.SCRUDFUL = None
+    with caplog.at_level("WARNING"):
+        response = _get(url, asynchronous)
+    assert response.status_code == status and "Link" not in response
+    assert json.loads(response.content) == {"detail": REASONS[status]}
+    [record] = [r for r in caplog.records if r.name == "scrudful._django"]
+    assert f"handler{status}" in record.getMessage() and url in record.getMessage()
+    assert isinstance(record.exc_info[1], KeyError)
+    [logged] = [r for r in caplog.records if r.name == "django.request"]
+    if status == 500:
+        assert isinstance(logged.exc_info[1], RuntimeError)
+
+
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize(
     "url, logged",
-    [("/boom", RuntimeError("original bug")), ("/missing", KeyError("lazy bug"))],
+    [("/boom", RuntimeError("original bug")), ("/missing", KeyError("bug"))],
 )
 def test_failing_error_handlers_log_the_error_answered_once(
-    db, settings, caplog, url, logged, asynchronous
+    db, settings, caplog, monkeypatch, url, logged, asynchronous
 ):
-    """When the error handlers fail, the error the ``handler500`` first
-    answered is logged exactly once, across Django's call of it at each
-    middleware layer: the view's error, or the ``handler404``'s own
-    failure (a 404 needs no log of its own)."""
+    """When both error handlers fail anyway (a bug past their Links), the
+    error the ``handler500`` first answered is logged exactly once, across
+    Django's call of it at each middleware layer: the view's error, or the
+    ``handler404``'s own failure (a 404 needs no log of its own)."""
     settings.ROOT_URLCONF = SharedBugURLconf
     settings.SCRUDFUL = None
-    with caplog.at_level("ERROR"), pytest.raises(KeyError, match="lazy bug"):
-        if asynchronous:
-            client = AsyncClient(raise_request_exception=False)
-            asyncio.run(client.get(url, headers={"accept": "application/json"}))
-        else:
-            client = Client(raise_request_exception=False)
-            client.get(url, HTTP_ACCEPT="application/json")
+    monkeypatch.setattr(_django, "json_response", _broken_body)
+    with caplog.at_level("ERROR"), pytest.raises(KeyError, match="bug"):
+        _get(url, asynchronous)
     [record] = [r for r in caplog.records if r.name == "scrudful._django"]
     assert "handler500" in record.getMessage() and url in record.getMessage()
     assert type(record.exc_info[1]) is type(logged)
@@ -455,15 +501,12 @@ def test_failing_error_handlers_log_the_error_answered_once(
 def test_a_failing_handler404_logs_nothing_of_its_own(
     rf, settings, caplog, monkeypatch
 ):
-    """A ``handler404`` that fails is Django's to answer, with its
-    ``handler500``: only that one logs the error it was answering."""
+    """A ``handler404`` that fails anyway (a bug past its Links) is
+    Django's to answer, with its ``handler500``: only that one logs the
+    error it was answering."""
     settings.SCRUDFUL = None
-
-    def broken(*args):
-        raise KeyError("bug")
-
     view = error_handler(404, Entity("https://x/s", context_link_or_func="https://x/c"))
-    monkeypatch.setattr(_django, "link_content", broken)
+    monkeypatch.setattr(_django, "json_response", _broken_body)
     with caplog.at_level("ERROR"), pytest.raises(KeyError):
         try:
             raise Http404("missing")

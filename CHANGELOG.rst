@@ -121,11 +121,12 @@ Behaviour change (all adapters)
   don't evaluate one when made either, so both may be made in ``urls.py``
   above the ``urlpatterns`` they name.
 * ``handler404`` / ``handler500`` refuse a plain link URL that can't be parsed
-  when made (``ImproperlyConfigured``). A lazy one that doesn't reverse
-  (``NoReverseMatch``) or can't be parsed is logged on the
-  ``scrudful._django`` logger, with the request's path, and the error served
-  without the entity's Links. A ``handler500`` that fails anyway first logs
-  the error it was answering, which Django then doesn't log.
+  when made (``ImproperlyConfigured``). They never raise for their Links: any
+  error building them (a lazy URL that doesn't reverse, can't be parsed, or
+  raises anything else) is logged on the ``scrudful._django`` logger, with
+  its traceback and the request's path, and the error served without the
+  entity's Links. A ``handler500`` that fails anyway, past its Links, first
+  logs the error it was answering, which Django then doesn't log.
 * A base URL that can't be parsed at all (``"http://[::1"``) is refused as a
   relative one is (``HsrConfigError``, so ``scrudful.E006`` /
   ``ImproperlyConfigured`` for ``SCRUDFUL["BASE_URL"]``), not with a bare

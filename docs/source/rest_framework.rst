@@ -516,12 +516,13 @@ a link URL that can't be parsed), and answer JSON (problem
 details for an ``application/problem+json`` entity, else ``{"detail": <reason
 phrase>}``) with its Links, resolved against ``SCRUDFUL["BASE_URL"]``, unless
 ``Accept`` prefers ``text/html``, and always send ``Vary: Accept``. Django uses
-them with ``DEBUG`` off. They get no HSR link. A Link they can't build for the
-settings, the request or the URLconf (an invalid ``SCRUDFUL["BASE_URL"]``, a
-relative link without a base URL on a request whose host ``ALLOWED_HOSTS``
-refuses, or a ``reverse_lazy`` link that doesn't reverse) is logged on the
-``scrudful._django`` logger, with the request's path, and the error served
-without the Links, so Django still logs the error it answers.
+them with ``DEBUG`` off. They get no HSR link. A Link they can't build,
+whatever the cause (an invalid ``SCRUDFUL["BASE_URL"]``, a relative link
+without a base URL on a request whose host ``ALLOWED_HOSTS`` refuses, a
+``reverse_lazy`` link that doesn't reverse, or a lazy link that raises), is
+logged on the ``scrudful._django`` logger, with its traceback and the
+request's path, and the error served without the Links, so Django still logs
+the error it answers.
 
 Callbacks
 ---------

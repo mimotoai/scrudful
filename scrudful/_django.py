@@ -18,7 +18,7 @@ from typing import Any, Literal, TypedDict
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from django.conf import settings
-from django.core.exceptions import DisallowedHost, ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured
 from django.core.paginator import UnorderedObjectListWarning
 from django.db.models import QuerySet
 from django.http import (
@@ -30,7 +30,6 @@ from django.http import (
     JsonResponse,
     QueryDict,
 )
-from django.urls import NoReverseMatch
 from django.utils import timezone
 from django.utils.cache import patch_vary_headers
 from django.views import defaults
@@ -470,16 +469,15 @@ def error_handler(
     types a Link can carry. A lazy URL (``reverse_lazy``) is evaluated only
     when the handler answers.
 
-    It doesn't raise for a Link that depends on the settings, the request or
-    the URLconf: Django logs the error it answers only once the handler
-    returns, so a Link it can't build for one of those (an invalid
-    ``SCRUDFUL["BASE_URL"]``; a relative link without a base URL, on a
-    request whose host ``ALLOWED_HOSTS`` refuses; a lazy URL that doesn't
-    reverse, or that can't be parsed) is logged, on the ``scrudful._django``
-    logger with the exception and the request's path, and the error is
-    served without the entity's Links. Anything else raised building them
-    propagates, to Django's own handling of an error handler that fails;
-    a ``handler500`` first logs, on the same logger, the error it was
+    It never raises for its Links: Django logs the error it answers only
+    once the handler returns, so a Link it can't build, whatever the cause
+    (an invalid ``SCRUDFUL["BASE_URL"]``; a relative link without a base
+    URL, on a request whose host ``ALLOWED_HOSTS`` refuses; a lazy URL that
+    doesn't reverse, can't be parsed, or raises anything else) is logged, on
+    the ``scrudful._django`` logger with the traceback and the request's
+    path, and the error is served without the entity's Links. Should it fail
+    anyway, past its Links (Django's HTML page, the JSON body), a
+    ``handler500`` first logs, on the same logger, the error it was
     answering, which Django then doesn't log.
 
     Raises
@@ -561,10 +559,11 @@ def error_handler(
             response = json_response(body, status, error.media_type)
             try:
                 link = _plain_links(error, request)
-            except (ImproperlyConfigured, DisallowedHost, NoReverseMatch, ValueError):
-                # Serve the error, and keep Django's own log of what it is
-                # answering, rather than fail inside the error handler. The
-                # settings' errors are HsrConfigError, a ValueError, too.
+            except Exception:
+                # Whatever the cause (the settings, the host, the URLconf, or
+                # a bug in a lazy URL), serve the error, and keep Django's own
+                # log of what it is answering, rather than fail inside the
+                # error handler; the cause is logged, with its traceback.
                 logger.exception(
                     "scrudful handler%s: the error entity's Links can't be "
                     "built for %s; answering without them",
