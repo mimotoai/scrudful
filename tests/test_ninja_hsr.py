@@ -33,6 +33,7 @@ from ninja.testing import TestAsyncClient, TestClient
 from scrudful._django import scrudful_setting
 from scrudful._hsr import hsr_etag, serialize_hsr
 from scrudful.entity import HsrConfigError
+from scrudful.problem import PROBLEM_JSON
 from scrudful.ninja import (
     Entity,
     ScrudfulRouter,
@@ -50,6 +51,7 @@ from tests.semantic_http import (
     hsr_link_problems,
     link_problems,
     options_204_problems,
+    status_entry_problems,
     validate_http_schema_resource,
 )
 from tests.test_ninja_adapter import ItemIn, ItemOut, Store, etag, modified, update
@@ -375,6 +377,101 @@ def test_default_and_explicit_error_entries():
         == entity_content(API_ERROR)
     )
     assert responses["429"]["content"] == entity_content(API_ERROR)
+
+
+NOT_FOUND = Entity(
+    schema_link_or_func="https://api.example/schemas/not-found",
+    context_link_or_func="https://api.example/contexts/not-found",
+)
+FORBIDDEN = Entity(
+    schema_link_or_func="https://api.example/schemas/forbidden",
+    context_link_or_func="https://api.example/contexts/forbidden",
+)
+UNAUTHORIZED = Entity(
+    schema_link_or_func="https://api.example/schemas/unauthorized",
+    context_link_or_func="https://api.example/contexts/unauthorized",
+)
+
+
+def declared_errors_api(with_api_entity: bool) -> tuple[NinjaAPI, ScrudfulRouter]:
+    """A GET declaring error statuses in ``responses=`` (not in ninja's
+    ``response=``) beside its ``error``, ninja's auth and, optionally, an
+    API-wide entity. ``/404`` and ``/403`` raise those statuses; a request
+    without a key gets ninja's own 401."""
+
+    def load(request, pk: int):
+        if pk in (403, 404):
+            raise HttpError(pk, "no")
+        return {"id": pk, "name": "x"}
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/{pk}", response=ItemOut, auth=KeyAuth())
+    @scrudful(
+        load=load,
+        responses={404: NOT_FOUND, 403: FORBIDDEN, 401: UNAUTHORIZED},
+        error=OP_ERROR,
+        **LINKS,
+    )
+    def get_item(request, pk: int, obj):
+        return obj
+
+    api = mount(router)
+    if with_api_entity:
+        add_error_links(api, API_ERROR)
+    return api, router
+
+
+@pytest.mark.parametrize("with_api_entity", [True, False], ids=["api-wide", "none"])
+def test_a_declared_error_status_has_its_entry_and_wins_on_the_wire(with_api_entity):
+    """Each error status of ``responses=`` gets an entry of its own, with its
+    entity, over ``default`` and over the API-wide 401 and 403 entries; every
+    response with that status, ninja's own 401 included, carries it."""
+    api, router = declared_errors_api(with_api_entity)
+    hsr = http_schema_resource(router, "/{pk}")
+    responses = hsr["get"]["responses"]
+    for status, entity in ((404, NOT_FOUND), (403, FORBIDDEN), (401, UNAUTHORIZED)):
+        assert responses[str(status)]["content"] == entity_content(entity)
+        assert responses[str(status)]["description"]
+    assert responses["default"]["content"] == entity_content(OP_ERROR)
+    if with_api_entity:  # ninja's own 422 and 429 keep the API-wide entity
+        assert responses["422"]["content"] == entity_content(API_ERROR)
+    client = TestClient(api)
+    assert client.get("/_hsr/pk").json() == hsr
+    for url, headers, status in (
+        ("/404", BOB_KEY, 404),
+        ("/403", BOB_KEY, 403),
+        ("/1", {}, 401),
+    ):
+        response = client.get(url, headers=headers)
+        assert response.status_code == status
+        response_headers = dict(response.headers)
+        assert status_entry_problems("GET", status, hsr) == []
+        assert link_problems("GET", status, response_headers, True, hsr) == []
+
+
+@pytest.mark.parametrize("with_api_entity", [True, False], ids=["api-wide", "none"])
+def test_a_declared_problem_details_422_reshapes_ninjas_validation_body(
+    with_api_entity,
+):
+    invalid = Entity(
+        "https://api.example/schemas/invalid",
+        context_link_or_func="https://api.example/contexts/invalid",
+        media_type=PROBLEM_JSON,
+    )
+    api, router = make_api(responses={422: invalid})
+    if with_api_entity:
+        add_error_links(api, API_ERROR)
+    hsr = http_schema_resource(router, "/{pk}")
+    assert hsr["get"]["responses"]["422"]["content"] == {
+        PROBLEM_JSON: entity_content(invalid)["application/json"]
+    }
+    response = TestClient(api).get("/not-a-number")
+    assert response.status_code == 422
+    assert response.headers["Content-Type"].startswith(PROBLEM_JSON)
+    body = response.json()
+    assert body["status"] == 422 and isinstance(body["errors"], list)
+    assert link_problems("GET", 422, dict(response.headers), True, hsr) == []
 
 
 def test_default_error_entry_is_the_api_wide_entity():

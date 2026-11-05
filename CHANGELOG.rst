@@ -177,9 +177,17 @@ Behaviour change (ninja)
   **API-wide entity** (was the operation's ``error`` for those the operation,
   ``before=`` or ``after_throttles=`` raised): those of ninja's authentication
   (a failed CSRF check, an ``AuthorizationError``) always did, so each 401 and
-  403 agrees with the HSR, which lists a 403 entry beside the 401, 422 and 429
-  (unless ``responses=`` declares the status). Without an API-wide entity,
-  nothing changes.
+  403 agrees with the HSR, which lists a 403 entry beside the 401, 422 and 429.
+  This applies only to the statuses the operation doesn't declare in
+  ``responses=``. Without an API-wide entity, nothing changes.
+* An error status declared in ``responses=`` has an HSR entry of its own,
+  with that entity's content (it fell under ``default``, the ``error``'s, or
+  the API-wide 401 and 403 entries, while the response carried the declared
+  entity's Links), and that entity wins on the wire too: the errors ninja
+  answers before the operation (its authentication's 401 and 403, its
+  validation's 422, problem details for a problem-details entity, a 429)
+  carry it, with or without ``add_error_links`` (they carried the API-wide
+  entity, or none).
 * A path whose HSR link can't be computed (the route off without
   ``hsr_url``, a route that can't be reversed) raises ``ConfigError`` on
   every response of the path.

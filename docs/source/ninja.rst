@@ -798,9 +798,13 @@ differs from the API-wide one, the 401, 403, 422 and 429 that ninja answers
 itself, with the API-wide entity, have entries of their own, and every 401 and
 403 of the operation carries that entity: those of ninja's authentication (a
 failed CSRF check, an ``AuthorizationError``), of ``before=`` and
-``after_throttles=``, and those the operation raises (unless it declares the
-status in ``responses=``). Without an API-wide entity, the 401, 422 and 429
-have entries without content, and a 403 is the operation's. ``head`` (where an
+``after_throttles=``, and those the operation raises. Without an API-wide
+entity, the 401, 422 and 429 have entries without content, and a 403 is the
+operation's. **An error status the operation declares in** ``responses=``
+**has an entry of its own** with that entity's content, which wins over all
+of these: every response with that status carries it, those ninja answers
+before the operation (its authentication's 401, its validation's 422, the
+latter as problem details for a problem-details entity) included. ``head`` (where an
 operation routes it) is described like ``get``, without content, and
 ``options`` is exactly ``{"responses": {"204": {"description": "No
 Content"}}}``.
@@ -1011,8 +1015,10 @@ body are the API's, custom handlers included. That response then gets the Links
 of the entity the operation's HTTP Schema Resource describes for its
 status:
 ``responses[status]`` if declared (``error`` first for scrudful's own 400, 412
-and 428 when the operation evaluates the ``If-*`` headers), else ``error``. So a
-404 a client gets agrees with the HTTP Schema Resource:
+and 428 when the operation evaluates the ``If-*`` headers); else, for a 401 or
+403 when :func:`~scrudful.ninja.add_error_links`'s entity is set and differs
+from ``error``, that entity; else ``error``. The HSR has an entry for each
+status of ``responses=``, so a 404 a client gets agrees with it:
 
 .. code-block:: python
 
@@ -1032,7 +1038,9 @@ loaded. A status the operation has no entity for gets no Link from it.
 **Errors ninja answers before the operation runs**, the 422 of a parameter that
 does not validate, the 401 of missing credentials, the 403 of an
 ``AuthorizationError`` and the 429 of a throttle, come from the API's exception
-handlers. :func:`~scrudful.ninja.add_error_links` gives them an API-wide error
+handlers. A scrudful operation declaring the status in ``responses=`` gives
+them that entity's Links (with or without an API-wide entity);
+:func:`~scrudful.ninja.add_error_links` gives the others an API-wide error
 entity:
 
 .. code-block:: python
