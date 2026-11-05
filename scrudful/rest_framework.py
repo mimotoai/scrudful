@@ -172,9 +172,10 @@ OPTIONS
        and each method that passed step 3 and, with an object,
        ``check_object_permissions``; or whose
        ``allowed_func(view, request, method, obj)`` returns ``True``. DRF's
-       ``PermissionDenied`` or ``NotAuthenticated`` (or Django's
-       ``PermissionDenied``) means not allowed; anything else raised
-       propagates, answered as in step 4: an object check raising
+       ``PermissionDenied`` or ``NotAuthenticated``, any other 401 or 403
+       ``APIException`` (``AuthenticationFailed``, one of the project's), or
+       Django's ``PermissionDenied`` means not allowed; anything else
+       raised propagates, answered as in step 4: an object check raising
        ``Http404`` (``DjangoObjectPermissions`` for an object the requester
        may not read) answers that 404. No throttle runs per method. HEAD,
        which DRF dispatches to the GET handler, is listed when the view
@@ -545,8 +546,8 @@ class ScrudfulViewFunc:
         for the ``Allow`` of OPTIONS: when given, it alone decides (see
         "OPTIONS" in the module docstring). ``request`` is a request of
         ``method``; it must return a ``bool`` (else ``TypeError``), and may
-        raise DRF's ``PermissionDenied`` or ``NotAuthenticated`` for
-        ``False``.
+        raise DRF's ``PermissionDenied`` or ``NotAuthenticated``, or any 401
+        or 403 ``APIException``, for ``False``.
     base_url : str, optional
         The absolute URL that relative link URLs are resolved against
         (default ``SCRUDFUL["BASE_URL"]``), in the HTTP Schema Resource and
@@ -1835,7 +1836,9 @@ def _loads_object(view: APIView, action: str | None) -> bool:
     return any(name != "format" for name in kwargs)
 
 
-#: What a per-method check of OPTIONS raises for "not allowed".
+#: What a per-method check of OPTIONS raises for "not allowed", besides an
+#: ``APIException`` of a :data:`_DENIAL_STATUSES` status
+#: (:func:`_is_denial`).
 #:
 #: ``Http404`` is deliberately absent (ruling R16), unlike ninja's denials:
 #: a check that raises it, as DRF's ``DjangoObjectPermissions`` does for an
@@ -1843,6 +1846,20 @@ def _loads_object(view: APIView, action: str | None) -> bool:
 #: answers that 404 (as a GET would) rather than an ``Allow`` that reveals
 #: the object exists.
 _DENIALS = (DRFPermissionDenied, NotAuthenticated, PermissionDenied)
+#: The statuses of an ``APIException`` that refuses the method checked
+#: (``AuthenticationFailed``, or a 401 or 403 of the project's own), as
+#: ninja's and FastAPI's hooks refuse it with a 401 or 403.
+_DENIAL_STATUSES = frozenset({401, 403})
+
+
+def _is_denial(exc: Exception) -> bool:
+    """Whether ``exc``, raised by a per-method check of OPTIONS, means "not
+    allowed": one of :data:`_DENIALS`, or an ``APIException`` whose
+    ``status_code`` is 401 or 403."""
+    return isinstance(exc, _DENIALS) or (
+        isinstance(exc, APIException)
+        and getattr(exc, "status_code", None) in _DENIAL_STATUSES
+    )
 
 
 def _allowed_methods(view: APIView, request: Request) -> list[str]:
@@ -1916,8 +1933,10 @@ def _may_use(
     parser context, see :func:`_clone_request`), which is also
     ``view.request`` meanwhile, and a viewset has the method's action as
     ``view.action``, as when DRF dispatches ``method``; both are put back
-    after. A :data:`_DENIALS` exception means not allowed; anything else
-    raised propagates. No throttle runs.
+    after. A denial (:func:`_is_denial`: DRF's ``PermissionDenied`` or
+    ``NotAuthenticated``, Django's ``PermissionDenied``, or any 401 or 403
+    ``APIException``, ``AuthenticationFailed`` included) means not allowed;
+    anything else raised propagates. No throttle runs.
     """
     clone = _clone_request(request, method)
     values: dict[str, Any] = {"request": clone}
@@ -1927,8 +1946,10 @@ def _may_use(
     with _instance_attributes(view, **values):
         try:
             return check(clone) is not False
-        except _DENIALS:
-            return False
+        except Exception as exc:
+            if _is_denial(exc):
+                return False
+            raise
 
 
 def _object_check(view: APIView, obj: Any, clone: Request) -> None:

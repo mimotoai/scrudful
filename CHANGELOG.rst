@@ -42,8 +42,9 @@ Behaviour change (all adapters)
   or not (else the hook gets ``obj=None``). A 404 the loader raises is the OPTIONS's
   answer, with the error Links and the HSR link; ``None`` is no object.
 * A denial an ``Allow`` hook raises refuses that method, in every adapter:
-  DRF's ``PermissionDenied`` or ``NotAuthenticated`` (or Django's
-  ``PermissionDenied``) from ``allowed_func``; ninja's ``HttpError`` 401 or
+  DRF's ``PermissionDenied`` or ``NotAuthenticated``, any other 401 or 403
+  ``APIException`` (``AuthenticationFailed``, a project's own), or Django's
+  ``PermissionDenied`` from ``allowed_func`` (or a permission check); ninja's ``HttpError`` 401 or
   403 (``AuthenticationError``, ``AuthorizationError``) or ``PermissionDenied``
   from ``allowed``; FastAPI's ``HTTPException`` 401 or 403 from
   ``add_options(allowed=)`` (ninja and FastAPI failed the whole OPTIONS). A

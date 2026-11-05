@@ -27,7 +27,12 @@ from django.urls import ResolverMatch, include, path, resolve, reverse
 from rest_framework import viewsets
 from rest_framework.authentication import BasicAuthentication
 from rest_framework.decorators import action
-from rest_framework.exceptions import NotAuthenticated, NotFound
+from rest_framework.exceptions import (
+    APIException,
+    AuthenticationFailed,
+    NotAuthenticated,
+    NotFound,
+)
 from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
 from rest_framework.metadata import BaseMetadata
 from rest_framework.permissions import BasePermission, IsAuthenticated
@@ -2265,11 +2270,31 @@ def test_another_exception_of_a_check_propagates(settings, client):
         client.options("/broken/1/")
 
 
+class Locked(APIException):
+    """A 403 of the project's own."""
+
+    status_code = 403
+
+
+class Expired(APIException):
+    """A 401 of the project's own."""
+
+    status_code = 401
+
+
+class Teapot(APIException):
+    status_code = 418
+
+
 #: What the ``raising/<case>/`` views' ``allowed_func`` raises for PUT.
 HOOK_RAISES = {
     "drf-denied": DRFPermissionDenied(),
     "not-authenticated": NotAuthenticated(),
     "django-denied": DjangoPermissionDenied(),
+    "auth-failed": AuthenticationFailed(),
+    "locked": Locked(),
+    "expired": Expired(),
+    "teapot": Teapot(),
     "http404": Http404(),
     "not-found": NotFound(),
     "broken": LookupError("broken"),
@@ -2305,9 +2330,20 @@ class RaisingHookURLconf:
     ]
 
 
-@pytest.mark.parametrize("case", ["drf-denied", "not-authenticated", "django-denied"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "drf-denied",
+        "not-authenticated",
+        "django-denied",
+        "auth-failed",
+        "locked",
+        "expired",
+    ],
+)
 def test_a_denial_an_allowed_func_raises_means_not_allowed(settings, client, case):
-    """R30: as ninja's allowed= and FastAPI's allowed= do."""
+    """Any 401 or 403 a hook raises refuses its method, as ninja's allowed=
+    and FastAPI's allowed= do."""
     settings.ROOT_URLCONF = RaisingHookURLconf
     response = client.options(f"/raising/{case}/")
     assert response.status_code == 204
@@ -2324,6 +2360,38 @@ def test_another_exception_an_allowed_func_raises_propagates(settings, client):
     settings.ROOT_URLCONF = RaisingHookURLconf
     with pytest.raises(LookupError, match="broken"):
         client.options("/raising/broken/")
+    # An APIException of another status is the OPTIONS's answer.
+    assert client.options("/raising/teapot/").status_code == 418
+
+
+class FailsAuthenticationForPut(BasePermission):
+    def has_permission(self, request, view):
+        if request.method == "PUT":
+            raise AuthenticationFailed("expired for writes")
+        return True
+
+
+@scrudful_viewset
+class AuthFailingViewSet(drf_hsr_urls.ItemViewSetBase):
+    permission_classes = [FailsAuthenticationForPut]
+
+
+class AuthFailingURLconf:
+    urlpatterns = [
+        path(
+            "auth-failing/<str:pk>/",
+            AuthFailingViewSet.as_view({"get": "retrieve", "put": "update"}),
+            name="auth-failing",
+        ),
+        path("", include(hsr_urls())),
+    ]
+
+
+def test_a_permission_raising_a_401_refuses_its_method(settings, client):
+    settings.ROOT_URLCONF = AuthFailingURLconf
+    response = client.options("/auth-failing/1/")
+    assert response.status_code == 204
+    assert response["Allow"] == "GET, OPTIONS, HEAD"
 
 
 # --- OPTIONS: the object loaded as the checked method loads it ------------------

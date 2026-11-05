@@ -329,8 +329,9 @@ With ``ScrudfulMetadata`` installed, OPTIONS is answered in this order:
 5. **Each method that passed is checked against the object**:
    ``check_object_permissions``, on the same request of that method (with no
    object, a collection's, the method is allowed). DRF's ``PermissionDenied``
-   or ``NotAuthenticated`` (or Django's ``PermissionDenied``) means not
-   allowed; anything else raised propagates, answered as in step 4. An
+   or ``NotAuthenticated``, any other 401 or 403 ``APIException``
+   (``AuthenticationFailed``, or one of yours), or Django's
+   ``PermissionDenied`` means not allowed; anything else raised propagates, answered as in step 4. An
    ``Http404`` raised there (``DjangoObjectPermissions`` for an object the
    requester may not read) is the OPTIONS's 404, as a GET's would be, not a
    method refused.
@@ -345,8 +346,9 @@ With ``ScrudfulMetadata`` installed, OPTIONS is answered in this order:
 ``Meta.allowed_func`` for every handler of a viewset), when given, alone decides
 its method: ``request`` is a request of ``method``, ``obj`` the loaded object
 or ``None``. It returns a ``bool`` (``TypeError`` otherwise), and may raise
-DRF's ``PermissionDenied`` or ``NotAuthenticated`` (or Django's
-``PermissionDenied``) for ``False``, as ninja's and FastAPI's hooks may raise
+DRF's ``PermissionDenied`` or ``NotAuthenticated``, any other 401 or 403
+``APIException`` (``AuthenticationFailed``, or one of yours), or Django's
+``PermissionDenied`` for ``False``, as ninja's and FastAPI's hooks may raise
 their 401 and 403; an ``Http404`` (or ``NotFound``) it raises is the OPTIONS's
 404, anything else propagates. Use it for
 authorization the permission classes don't hold (a policy checked in the
