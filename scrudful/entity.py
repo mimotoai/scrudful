@@ -31,7 +31,11 @@ class Entity:
     the calling convention of its adapter: ``func(request, obj)`` for
     django-ninja (``obj`` is the object the operation has at that point, the
     loaded object or ``None``), ``func(view, request, **url_kwargs)`` for DRF
-    and ``func(**endpoint_kwargs)`` for FastAPI.
+    and ``func(**endpoint_kwargs)`` for FastAPI. When the HTTP Schema
+    Resource is built, it is also called in *describe* mode, without a
+    request: ``func(None, None)`` (django-ninja), ``func(view, None)`` (DRF)
+    and ``func()`` (FastAPI). It must return the same target in both modes;
+    one that raises then is a configuration error.
 
     Attributes
     ----------
@@ -55,17 +59,18 @@ class Entity:
           of the lifting description must be given. A
           ``context_type_or_func`` callable that returns nothing for it is a
           programming error: building the response's Links raises
-          ``ValueError``, as building its OPTIONS description does, rather
-          than send a context Link without a type.
+          ``ValueError``, and building the HTTP Schema Resource raises the
+          adapter's configuration error, rather than send a context Link
+          without a type.
 
         An explicit ``context_rel_or_func`` or ``context_type_or_func`` wins
         over these defaults.
 
-        It is declarative: it decides the Links and the OPTIONS body, but
-        scrudful sets a response's Content-Type to it only for error
-        responses (its own 400, 412 and 428, those of the error helpers and,
-        with django-ninja, the JSON responses to errors an operation raises),
-        never for a success response. The operation must serve the media
+        It is declarative: it decides the Links and the HTTP Schema
+        Resource's ``content``, but scrudful sets a response's Content-Type
+        to it only for error responses (its own 400, 412 and 428, those of
+        the error helpers and, with django-ninja, the JSON responses to
+        errors an operation raises), never for a success response. The operation must serve the media
         type its entities declare.
 
     Raises
