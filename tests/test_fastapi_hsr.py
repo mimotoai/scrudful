@@ -1878,10 +1878,46 @@ def test_load_and_allowed_hook_get_object(make_client):
     options_204(
         client, "/notes/7", "GET, PUT, OPTIONS, HEAD", NOTE_TARGET, headers=alice
     )
-    # A path without parameters: load gets none.
+    # A path without parameters has no object: load isn't called (R26).
     loaded.clear()
+    seen.clear()
     options_204(client, "/notes", "OPTIONS", "https://api.example/_hsr/notes")
-    assert loaded == [("OPTIONS", {}, {})]
+    assert loaded == []
+    assert seen == [("POST", "POST", None)]
+
+
+def test_load_is_not_called_without_path_parameters(make_client):
+    """A ``load(request, id)`` that can't take a collection's (no)
+    parameters: the collection's OPTIONS is still a 204 (R26)."""
+    loaded = []
+
+    def load(request: Request, id: str) -> Any:
+        loaded.append(id)
+        return {"id": id}
+
+    client = make_client(note_app(load=load))
+    options_204(client, "/notes", "POST, OPTIONS", "https://api.example/_hsr/notes")
+    options_204(client, "/notes/3", "GET, OPTIONS, HEAD", NOTE_TARGET, headers=READER)
+    assert loaded == ["3"]
+
+
+def test_a_nested_collection_load_gets_its_parent_parameters(make_client):
+    loaded = []
+
+    def load(request: Request, **params: Any) -> Any:
+        loaded.append(params)
+
+    app = FastAPI()
+
+    @app.post("/orgs/{org}/notes", status_code=201)
+    @scrudful(**NOTE_LINKS)
+    async def create(org: str):
+        return {}
+
+    add_options(app, base_url=BASE, load=load)
+    target = "https://api.example/_hsr/orgs.org.notes"
+    options_204(make_client(app), "/orgs/acme/notes", "POST, OPTIONS", target)
+    assert loaded == [{"org": "acme"}]
 
 
 def test_allowed_hook_must_return_a_bool(make_client):
@@ -1971,7 +2007,7 @@ def test_a_check_setting_request_state_leaves_the_others_alone(make_client):
     app = FastAPI()
 
     @app.api_route(
-        "/notes/{id}", methods=["GET", "PUT"], dependencies=[Depends(remember)]
+        "/notes/{id}", methods=["GET", "PUT"], dependencies=[Security(remember)]
     )
     @scrudful(**NOTE_LINKS)
     async def note(id: int):
@@ -2058,10 +2094,13 @@ def test_preflight_runs_nothing(make_client, extra):
 
 
 def test_checks_run_only_security_dependencies(make_client):
-    """The per-method checks run the ``Security`` dependencies, those of
-    ``dependencies=`` (the route's, a router's, ``include_router``'s and the
-    app's) and a plain ``Depends`` that relies on a security scheme, but no
-    other dependency, and never the endpoint."""
+    """The per-method checks run only the security dependencies (R25):
+    those declared with ``Security(...)`` (a scope-less one too) and a plain
+    ``Depends`` that relies on a security scheme, wherever they are declared
+    (the endpoint's parameters, ``dependencies=`` of the route, a router,
+    ``include_router`` and the app). A plain ``Depends`` without a scheme
+    below it (a throttle, a write) is never run, even in ``dependencies=``,
+    and neither is the endpoint."""
     calls: list[str] = []
 
     def current_user(
@@ -2072,36 +2111,81 @@ def test_checks_run_only_security_dependencies(make_client):
             raise HTTPException(status_code=401)
         return credentials.credentials
 
-    router = APIRouter(dependencies=[Depends(counted(calls, "router"))])
+    def levels(name: str) -> list[Any]:
+        return [
+            Depends(counted(calls, f"plain {name}")),
+            Security(counted(calls, f"security {name}")),
+        ]
 
-    @router.get("/notes/{id}", dependencies=[Depends(counted(calls, "route"))])
+    router = APIRouter(dependencies=levels("router"))
+
+    @router.get("/notes/{id}", dependencies=levels("route"))
     @scrudful(**NOTE_LINKS)
     async def read(
         id: int,
-        plain: None = Depends(counted(calls, "plain")),
-        extra: Any = Security(counted(calls, "security")),
+        plain: None = Depends(counted(calls, "plain parameter")),
+        extra: Any = Security(counted(calls, "security parameter")),
         user: str = Depends(current_user),
     ):
         calls.append("endpoint")
         return {}
 
-    app = FastAPI(dependencies=[Depends(counted(calls, "app"))])
-    app.include_router(router, dependencies=[Depends(counted(calls, "include"))])
+    app = FastAPI(dependencies=levels("app"))
+    app.include_router(router, dependencies=levels("include"))
     add_options(app, base_url=BASE)
     client = make_client(app)
+    security = [f"security {level}" for level in ("app", "include", "router", "route")]
     options_204(client, "/notes/1", "OPTIONS", NOTE_TARGET)
-    assert sorted(calls) == sorted(
-        ["app", "include", "router", "route", "security", "current_user"]
-    )
+    assert calls == [*security, "security parameter", "current_user"]
     calls.clear()
     token = {"Authorization": "Bearer t"}
     options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET, headers=token)
-    assert "current_user" in calls
-    assert calls.count("plain") == calls.count("endpoint") == 0
+    assert calls == [*security, "security parameter", "current_user"]
+    assert not [call for call in calls if call.startswith("plain")]
     # A GET runs them all.
     calls.clear()
     assert client.get("/notes/1", headers=token).status_code == 200
-    assert "plain" in calls and "endpoint" in calls
+    assert "plain parameter" in calls and "endpoint" in calls
+    assert "plain route" in calls and "plain app" in calls
+
+
+def test_a_scope_less_security_in_dependencies_is_run(make_client):
+    """``Security(fn)`` without scopes, in ``dependencies=``, leaves no trace on
+    FastAPI's sub-dependant: it is read off the route's ``dependencies``."""
+    calls: list[str] = []
+
+    def deny() -> None:
+        calls.append("deny")
+        raise HTTPException(status_code=403)
+
+    app = FastAPI()
+
+    @app.get("/notes/{id}", dependencies=[Security(deny)])
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {}
+
+    @app.put("/notes/{id}", dependencies=[Depends(deny)])
+    @scrudful(**NOTE_LINKS)
+    async def write(id: int):
+        return {}
+
+    add_options(app, base_url=BASE)
+    # The plain Depends(deny) isn't run: PUT is listed.
+    options_204(make_client(app), "/notes/1", "PUT, OPTIONS", NOTE_TARGET)
+    assert calls == ["deny"]
+
+
+def test_a_route_whose_dependencies_dont_match_its_dependant_raises(make_client):
+    """scrudful maps ``APIRoute.dependencies`` onto the leading sub-dependants
+    of ``APIRoute.dependant``: a FastAPI that doesn't build them so is a
+    ``RuntimeError`` naming them."""
+    app = note_app()
+    for route in app.router.routes:
+        if getattr(route, "methods", None) == {"PUT"}:
+            route.dependencies = [Security(lambda: None)]
+    with pytest.raises(RuntimeError, match=r"APIRoute\.dependencies"):
+        make_client(app).options("/notes/1", headers=ADMIN)
 
 
 def test_dependency_overrides_apply_to_the_checks(make_client):
@@ -2121,7 +2205,7 @@ def test_dependency_overrides_apply_to_the_checks(make_client):
 
 
 def test_body_reading_dependency_is_skipped_and_method_allowed(make_client):
-    """A dependency that needs the body can't run without it: it is skipped,
+    """A security dependency that needs the body can't run without it: it is skipped,
     and its method allowed (exact object-level ``Allow`` needs
     ``allowed=``). The method's other dependencies still run."""
     calls = []
@@ -2139,7 +2223,7 @@ def test_body_reading_dependency_is_skipped_and_method_allowed(make_client):
 
     app = FastAPI()
 
-    @app.put("/notes/{id}", dependencies=[Depends(needs_body), Depends(wraps_body)])
+    @app.put("/notes/{id}", dependencies=[Security(needs_body), Security(wraps_body)])
     @scrudful(**NOTE_LINKS)
     async def write(id: int):
         return {}
@@ -2151,7 +2235,7 @@ def test_body_reading_dependency_is_skipped_and_method_allowed(make_client):
 
     @app.patch(
         "/notes/{id}",
-        dependencies=[Depends(needs_body), Security(require_role("writer"))],
+        dependencies=[Security(needs_body), Security(require_role("writer"))],
     )
     @scrudful(**NOTE_LINKS)
     async def patch(id: int):
@@ -2235,7 +2319,7 @@ def test_a_check_gets_the_method_and_the_path_parameters(make_client):
     app = FastAPI()
 
     @app.api_route(
-        "/notes/{id}", methods=["GET", "DELETE"], dependencies=[Depends(owner_only)]
+        "/notes/{id}", methods=["GET", "DELETE"], dependencies=[Security(owner_only)]
     )
     @scrudful(**NOTE_LINKS)
     async def note(id: int):
@@ -2250,15 +2334,18 @@ def test_a_check_gets_the_method_and_the_path_parameters(make_client):
 
 
 def test_another_http_exception_from_a_check_is_answered(make_client):
-    """Only 401, 403 and 404 mean "not allowed": another status (a throttle's
-    429) is the app's exception handlers' answer, with the HSR link."""
+    """Only 401, 403 and 404 mean "not allowed": another status a security
+    check raises (a token check's 429 for a client over its quota) is the
+    app's exception handlers' answer, with the HSR link."""
 
-    def throttled() -> None:
+    def rate_limited_token(
+        credentials: HTTPAuthorizationCredentials | None = Security(bearer),
+    ) -> None:
         raise HTTPException(status_code=429, detail="Slow down")
 
     app = FastAPI()
 
-    @app.get("/notes/{id}", dependencies=[Depends(throttled)])
+    @app.get("/notes/{id}", dependencies=[Depends(rate_limited_token)])
     @scrudful(**NOTE_LINKS)
     async def read(id: int):
         return {}
@@ -2271,13 +2358,43 @@ def test_another_http_exception_from_a_check_is_answered(make_client):
     assert link_problems("OPTIONS", 429, dict(response.headers), True) == []
 
 
+def test_options_consumes_no_throttle_quota(make_client):
+    """A throttle in ``dependencies=`` (no security scheme below it) isn't run
+    by the checks: OPTIONS consumes none of its quota (R25)."""
+    quota = {"left": 1}
+
+    def throttle() -> None:
+        if quota["left"] == 0:
+            raise HTTPException(status_code=429)
+        quota["left"] -= 1
+
+    app = FastAPI()
+
+    @app.api_route(
+        "/notes/{id}",
+        methods=["GET", "PUT", "DELETE"],
+        dependencies=[Depends(throttle)],
+    )
+    @scrudful(**NOTE_LINKS)
+    async def note(id: int):
+        return {}
+
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    for _ in range(3):
+        options_204(client, "/notes/1", "GET, PUT, DELETE, OPTIONS", NOTE_TARGET)
+    assert quota == {"left": 1}
+    assert client.get("/notes/1").status_code == 200
+    assert client.get("/notes/1").status_code == 429
+
+
 def test_another_exception_from_a_check_propagates(make_client):
     def broken() -> None:
         raise RuntimeError("broken check")
 
     app = FastAPI()
 
-    @app.get("/notes/{id}", dependencies=[Depends(broken)])
+    @app.get("/notes/{id}", dependencies=[Security(broken)])
     @scrudful(**NOTE_LINKS)
     async def read(id: int):
         return {}

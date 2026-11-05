@@ -17,6 +17,7 @@ from fastapi import (
     Query,
     Request,
     Response,
+    Security,
 )
 from fastapi.exception_handlers import (
     http_exception_handler,
@@ -2533,17 +2534,21 @@ def test_add_options_link_callables_are_called_in_describe_mode(make_client, sto
     assert received == [("schema", {})]
 
 
-def test_add_options_needs_no_credentials(make_client):
+@pytest.mark.parametrize("security", [False, True])
+def test_add_options_needs_no_credentials(make_client, security):
     """OPTIONS isn't gated by the app's, a router's or ``include_router``'s
-    dependencies: it is a 204 whose ``Allow`` they refuse everything but
-    OPTIONS, and the document it links to is served without credentials."""
+    dependencies, and the document it links to is served without
+    credentials. Its ``Allow`` runs only security dependencies (R25): a
+    plain ``Depends(deny)`` isn't run, so GET is listed; a ``Security(deny)``
+    refuses everything but OPTIONS."""
 
     def deny():
         raise HTTPException(status_code=401)
 
+    declare = Security if security else Depends
     links = dict(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
-    app = FastAPI(dependencies=[Depends(deny)])
-    router = APIRouter(dependencies=[Depends(deny)])
+    app = FastAPI(dependencies=[declare(deny)])
+    router = APIRouter(dependencies=[declare(deny)])
 
     @router.get("/items/{item_id}")
     @scrudful(**links)
@@ -2556,12 +2561,13 @@ def test_add_options_needs_no_credentials(make_client):
         return {}
 
     add_options(router, base_url=TEST_BASE_URL)
-    app.include_router(router, prefix="/v1", dependencies=[Depends(deny)])
+    app.include_router(router, prefix="/v1", dependencies=[declare(deny)])
     add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
+    allow = "OPTIONS" if security else "GET, OPTIONS"
     for path, name in (("/v1/items/3", "v1.items.item_id"), ("/things", "things")):
         assert client.get(path).status_code == 401
-        options_204(client, path, "OPTIONS", hsr_target(name))
+        options_204(client, path, allow, hsr_target(name))
         assert list(options_hsr(client, path)) == ["get", "options"]
 
 

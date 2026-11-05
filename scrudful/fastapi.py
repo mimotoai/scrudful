@@ -890,28 +890,35 @@ def add_options(
        or Starlette route on the path too) is checked for this requester,
        without the object. With ``allowed``, every method passes this step:
        the hook needs the object. Otherwise the route's security
-       dependencies decide: those of ``dependencies=`` (the route's, its
-       routers', ``include_router``'s and the app's), those declared with
-       ``Security(...)``, and a plain ``Depends`` relying on a security
-       scheme (a ``fastapi.security`` class such as ``HTTPBearer``, or a
+       dependencies decide, and only they run: those declared with
+       ``Security(...)``, and any ``Depends`` relying on a security scheme
+       (a ``fastapi.security`` class such as ``HTTPBearer``, or a
        ``Security(...)``, at any depth, as a ``get_current_user`` reading a
-       token does). They are resolved by FastAPI (its
+       token does), wherever they are declared (a parameter of the
+       endpoint, or ``dependencies=`` of the route, its routers,
+       ``include_router`` or the app). A dependency with no security scheme
+       below it is not run, even in ``dependencies=``: authorization written
+       as a plain ``Depends`` (hand-rolled header checks) doesn't show in
+       ``Allow``; declare it with ``Security(...)``, or give ``allowed``.
+       They are resolved by FastAPI (its
        ``solve_dependencies``, so with ``dependency_overrides``) on a copy
        of the request whose method is the method checked, without its body
        and without validating the endpoint's own parameters; a dependency
        with ``yield`` is cleaned up before the answer. An ``HTTPException``
        with 401, 403 or 404, or a parameter of theirs failing validation
        (FastAPI's 422), means not allowed. No other dependency, and never
-       the endpoint, runs: a dependency that throttles is a dependency like
-       any other, so keep it out of ``dependencies=`` (and away from
-       security schemes) if OPTIONS must not consume it, since these checks
-       resolve those. A dependency that needs the request's body (a body,
-       form or file parameter, at any depth) can't be resolved: it is
-       skipped, and does not refuse its method. ``HEAD`` is listed only
-       when a route serves it (FastAPI's GET route doesn't; list ``"HEAD"``
-       in its methods, as ``@app.head`` does), with that route's checks.
-    3. When at least one method passed, the object is loaded:
-       ``load(request, **path_params)``, else there is none (``None``). So a
+       the endpoint, runs, so computing ``Allow`` consumes no throttle
+       quota (FastAPI has no throttles of its own: a throttling dependency
+       without a security scheme below it isn't run) and writes nothing a
+       non-security dependency would. A security dependency that needs the
+       request's body (a body, form or file parameter, at any depth) can't
+       be resolved: it is skipped, and does not refuse its method. ``HEAD``
+       is listed only when a route serves it (FastAPI's GET route doesn't;
+       list ``"HEAD"`` in its methods, as ``@app.head`` does), with that
+       route's checks.
+    3. When at least one method passed and the URL has path parameters,
+       the object is loaded: ``load(request, **path_params)``, else there is
+       none (``None``). So a
        requester whom the security dependencies refuse everything gets a 204
        with ``Allow: OPTIONS`` for a missing and an existing object alike,
        and can't tell which exist. With ``allowed``, every requester passes
@@ -1094,10 +1101,14 @@ def add_options(
         an ``HTTPException`` it raises (a 404) is the answer. ``request`` is
         the OPTIONS request, and ``path_params`` the URL's path parameters,
         as Starlette converts them (a ``str`` without a convertor), named as
-        in the template of the resource's first route (for a router, with
-        those of the prefix it is included under). Called on every path
-        covered (it gets no parameters on one without), only when a method
-        passed step 2. A ``def`` runs in the threadpool, an ``async def`` is
+        in the template of the resource's first route, all of them (those
+        of a ``Mount`` or of the prefix a router is included under too).
+        Called only when the matched URL has path parameters, and only when
+        a method passed step 2: a URL without any (a top-level collection
+        such as ``/items``) has no object, and ``load`` isn't called. A
+        nested collection (``/orgs/{org}/items``) is called with its
+        parent's parameters (``org``): return ``None`` for it, or raise its
+        parent's 404. A ``def`` runs in the threadpool, an ``async def`` is
         awaited.
 
     Raises
@@ -2028,9 +2039,9 @@ async def _options_answer(
     2. each method the resource serves is checked for this requester, without
        the object: with an ``allowed`` hook, it passes (the hook needs the
        object); else by its security dependencies (:func:`_may_use`);
-    3. only when one passed is the object loaded: ``load(request,
-       **params)``, else there is none (``None``), so a requester refused
-       everything can't tell which objects exist;
+    3. only when one passed, and the URL has path parameters, is the object
+       loaded: ``load(request, **params)``, else there is none (``None``),
+       so a requester refused everything can't tell which objects exist;
     4. with an ``allowed`` hook, ``allowed(clone, method, obj)`` decides each
        method (:func:`_hooked`);
     5. the answer is a 204 with no content and no ``Content-Type``, the
@@ -2063,7 +2074,9 @@ async def _options_answer(
             for method, f in served.items()
         }
         obj = None
-        if options.load is not None and any(allowed.values()):
+        # A URL without path parameters (a top-level collection) has no
+        # object: nothing to load.
+        if options.load is not None and params and any(allowed.values()):
             obj = await _call(functools.partial(options.load, subject), params)
         if options.allowed is not None:
             for method in allowed:
@@ -2167,34 +2180,79 @@ async def _may_use(method: str, found: tuple[Any, Scope]) -> bool:
     dependant = getattr(route, "dependant", None)
     if dependant is None:
         return True
-    checks = _security_dependencies(dependant)
+    checks = _security_dependencies(route, dependant)
     if not checks:
         return True
     return await _resolves(route, checks, {**scope, "method": method})
 
 
-def _security_dependencies(dependant: Any) -> list[Any]:
-    """The sub-dependants of a route's ``dependant`` that the per-method
-    checks of OPTIONS resolve: those of ``dependencies=`` (the route's, its
-    routers', ``include_router``'s and the app's: FastAPI puts them first,
-    without a name), those of a parameter declared with ``Security(...)``,
-    and those relying on a security scheme (a ``fastapi.security`` class such
-    as ``HTTPBearer``, or ``Security(...)``, anywhere below them: the
-    ``Depends(get_current_user)`` of a user resolved from a token). Of
-    those, any that needs the request's body (a body, form or file parameter
-    anywhere below it) is left out: it can't be resolved without the body.
-    The endpoint's other parameters and dependencies are never resolved.
+def _security_dependencies(route: Any, dependant: Any) -> list[Any]:
+    """The sub-dependants of ``route``'s ``dependant`` that the per-method
+    checks of OPTIONS resolve: the security dependencies, wherever they are
+    declared (a parameter of the endpoint, or ``dependencies=`` of the
+    route, its routers, ``include_router`` or the app). A security
+    dependency is one declared with ``Security(...)`` (see
+    :func:`_parameterless_security` for those of ``dependencies=``), or one
+    whose subtree has a security scheme (a ``fastapi.security`` class such
+    as ``HTTPBearer``) or a ``Security(...)``: the ``Depends(get_current_user)``
+    of a user resolved from a token (:func:`_uses_security`). Of those, any
+    that needs the request's body (a body, form or file parameter anywhere
+    below it) is left out: it can't be resolved without the body. No other
+    dependency (a plain ``Depends`` without a scheme below it, even in
+    ``dependencies=``: a throttle, a database write) and never the endpoint
+    is resolved, so computing ``Allow`` consumes and writes nothing.
     """
     declared = _declared_security(getattr(dependant, "call", None))
+    parameterless = _parameterless_security(route, dependant)
+    checks = []
+    for sub in getattr(dependant, "dependencies", None) or ():
+        name = getattr(sub, "name", None)
+        secured = (
+            any(sub is marked for marked in parameterless)
+            if name is None
+            else name in declared
+        )
+        if (secured or _uses_security(sub)) and not _needs_body(sub):
+            checks.append(sub)
+    return checks
+
+
+def _parameterless_security(route: Any, dependant: Any) -> list[Any]:
+    """The sub-dependants of ``route``'s ``dependant`` from its
+    ``dependencies=`` (those of its routers, ``include_router`` and the app
+    included) that are declared with ``Security(...)``.
+
+    A ``Security(fn)`` without scopes leaves no trace on its sub-dependant,
+    so they are read off ``route.dependencies``, the ``params.Depends`` that
+    FastAPI turns, in order, into the leading unnamed sub-dependants of
+    ``route.dependant``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``route.dependencies`` doesn't match those sub-dependants (their
+        calls, in order), as in the FastAPI releases scrudful supports.
+    """
+    declared = getattr(route, "dependencies", None)
+    if not declared:
+        return []
+    subs = list(getattr(dependant, "dependencies", None) or ())[: len(declared)]
+    if len(subs) != len(declared) or any(
+        getattr(sub, "name", None) is not None
+        or getattr(sub, "call", None) is not getattr(depends, "dependency", None)
+        for sub, depends in zip(subs, declared)
+    ):
+        raise RuntimeError(
+            "scrudful's per-requester Allow of OPTIONS reads which of a route's "
+            "dependencies= are Security(...) off APIRoute.dependencies, which "
+            "the installed FastAPI doesn't turn into the leading sub-dependants "
+            "of APIRoute.dependant, in order, as FastAPI 0.100 to 0.159 do: "
+            "upgrade scrudful, or use a FastAPI release it supports"
+        )
     return [
         sub
-        for sub in getattr(dependant, "dependencies", None) or ()
-        if (
-            getattr(sub, "name", None) is None
-            or sub.name in declared
-            or _uses_security(sub)
-        )
-        and not _needs_body(sub)
+        for sub, depends in zip(subs, declared)
+        if isinstance(depends, fastapi_params.Security)
     ]
 
 
