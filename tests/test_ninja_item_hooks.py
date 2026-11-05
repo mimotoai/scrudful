@@ -676,3 +676,100 @@ def test_item_without_hooks_keeps_ninja_checks():
     for path_view in router.path_operations.values():
         for operation in path_view.operations:
             assert "_run_checks" not in vars(operation)
+
+
+def nested_router(asynchronous: bool, hook: str, caller_hooks: bool, log: list[str]):
+    """``/b/{pk}``, whose ``hook`` refuses every request (403), and ``/a/{pk}``,
+    whose function calls ``/b/{pk}``'s decorated handler directly; ``/a``'s
+    own ``before`` allows every request, when ``caller_hooks``."""
+
+    def refuse(request, **params):
+        log.append(f"b.{hook}")
+        raise HttpError(403, "b refuses")
+
+    def allow(request, **params):
+        log.append("a.before")
+
+    def load(request, pk, **params):
+        return {"id": pk, "name": "secret", "version": 1}
+
+    callee = {hook: refuse}
+    caller = {"before": allow} if caller_hooks else {}
+    router = Router()
+    if asynchronous:
+
+        @router.get("/b/{pk}", response=ItemOut)
+        @scrudful(load=load, **callee)
+        async def get_b(request, pk: int, response: HttpResponse, obj):
+            log.append("b.handler")
+            return obj
+
+        @router.get("/a/{pk}", response=ItemOut)
+        @scrudful(load=load, **caller)
+        async def get_a(request, pk: int, response: HttpResponse, obj):
+            log.append("a.handler")
+            return await get_b(request, pk=pk, response=response)
+
+    else:
+
+        @router.get("/b/{pk}", response=ItemOut)
+        @scrudful(load=load, **callee)
+        def get_b(request, pk: int, response: HttpResponse, obj):
+            log.append("b.handler")
+            return obj
+
+        @router.get("/a/{pk}", response=ItemOut)
+        @scrudful(load=load, **caller)
+        def get_a(request, pk: int, response: HttpResponse, obj):
+            log.append("a.handler")
+            return get_b(request, pk=pk, response=response)
+
+    return router
+
+
+@ASYNC
+@pytest.mark.parametrize("hook", HOOKS)
+@pytest.mark.parametrize("caller_hooks", [True, False], ids=["hooked", "hookless"])
+def test_a_handler_with_hooks_called_from_another_operation_fails_closed(
+    asynchronous, hook, caller_hooks
+):
+    """A handler whose ``before=`` or ``after_throttles=`` refuses a request
+    never runs for it when another operation's function calls the decorated
+    handler directly: those hooks didn't run for the request (only the
+    caller's did), so the call raises ``RuntimeError``, naming both
+    operations and the fix, whatever the caller's own hooks."""
+    log: list[str] = []
+    request = requester(
+        asynchronous, api_for(nested_router(asynchronous, hook, caller_hooks, log))
+    )
+    direct = request("GET", "/b/1")
+    assert direct.status_code == 403
+    assert log == [f"b.{hook}"]
+    log.clear()
+    with pytest.raises(RuntimeError, match="called directly from inside") as raised:
+        request("GET", "/a/1")
+    message = str(raised.value)
+    assert "get_b()" in message and "get_a()" in message and f"{hook}=" in message
+    assert "plain function" in message
+    assert log == (["a.before", "a.handler"] if caller_hooks else ["a.handler"])
+
+
+def test_a_handler_called_from_another_operation_notes_nothing_of_it():
+    """A handler without hooks may be called from inside another operation,
+    but what it raised or answered is that operation's to describe: it
+    notes nothing on the running operation's record."""
+    from scrudful.ninja import _RAISED, _Config, _note_answered, _note_raised
+    from scrudful.ninja import _Raised
+
+    running, called = _Config(kind="item"), _Config(kind="item")
+    raised = _Raised(running)
+    token = _RAISED.set(raised)
+    try:
+        _note_raised(HttpError(404, "gone"), called)
+        _note_answered(called)
+        assert not raised.raised_error and not raised.answered
+        _note_raised(HttpError(404, "gone"), running)
+        _note_answered(running)
+        assert raised.raised_error and raised.answered
+    finally:
+        _RAISED.reset(token)

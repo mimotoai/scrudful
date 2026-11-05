@@ -3255,9 +3255,9 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                     try:
                         content = await _run_async(flow(request, values, answers))
                     except Exception as exc:
-                        _note_raised(exc)
+                        _note_raised(exc, config)
                         raise
-                    _note_answered()
+                    _note_answered(config)
                     return content
 
             else:
@@ -3268,9 +3268,9 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                     try:
                         content = _run_sync(flow(request, values, answers))
                     except Exception as exc:
-                        _note_raised(exc)
+                        _note_raised(exc, config)
                         raise
-                    _note_answered()
+                    _note_answered(config)
                     return content
 
             wrapper.__signature__ = hidden.signature  # type: ignore[attr-defined]
@@ -3439,6 +3439,8 @@ class _Raised:
 
     #: The configuration of the operation running.
     operation: _Config
+    #: The operation, as scrudful's errors name it.
+    label: str = ""
     #: The path parameters, as the URL gives them (strings, unless the path
     #: uses a converter).
     path_params: dict[str, Any] = field(default_factory=dict)
@@ -3750,18 +3752,30 @@ def _json_values(data: Any) -> Any:
     return json.loads(json.dumps(data, cls=NinjaJSONEncoder))
 
 
-def _note_answered() -> None:
-    """Note that the operation's wrapper returned (see :class:`_Raised`)."""
+def _running(config: _Config) -> _Raised | None:
+    """The :class:`_Raised` of the operation running, if ``config`` is its
+    configuration: not for the handler of another operation called directly
+    from inside it."""
     raised = _RAISED.get()
+    return raised if raised is not None and raised.operation is config else None
+
+
+def _note_answered(config: _Config) -> None:
+    """Note that the wrapper of ``config``'s operation returned (see
+    :class:`_Raised`), if it is the operation running."""
+    raised = _running(config)
     if raised is not None:
         raised.answered = True
 
 
-def _note_raised(exc: Exception) -> None:
-    """Note ``exc`` if it is an ``HttpError`` or ``Http404`` the operation
-    running raised (its wrapper, or a hook): its response gets the Links of
-    the operation's entity for the status (see :func:`_raised_links_run`)."""
-    raised = _RAISED.get()
+def _note_raised(exc: Exception, config: _Config) -> None:
+    """Note ``exc`` if it is an ``HttpError`` or ``Http404`` that
+    ``config``'s operation raised (its wrapper, or a hook) while it runs: its
+    response gets the Links of the operation's entity for the status (see
+    :func:`_raised_links_run`). The handler of another operation, called
+    directly from inside it, notes nothing: what it raises is the running
+    operation's to describe, if it lets it through."""
+    raised = _running(config)
     if raised is not None and isinstance(exc, (HttpError, Http404)):
         raised.raised_error = True
 
@@ -3839,7 +3853,7 @@ def _raised_links_run(
 
             @functools.wraps(run)
             async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                raised = _Raised(config, path_params=kw)
+                raised = _Raised(config, label=label, path_params=kw)
                 token = _RAISED.set(raised)
                 try:
                     with _serving(operation):
@@ -3858,7 +3872,7 @@ def _raised_links_run(
 
             @functools.wraps(run)
             def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                raised = _Raised(config, path_params=kw)
+                raised = _Raised(config, label=label, path_params=kw)
                 token = _RAISED.set(raised)
                 try:
                     with _serving(operation):
@@ -4584,7 +4598,7 @@ def _install_hooks(
 
     def answer(request: HttpRequest, exc: Exception) -> HttpResponseBase:
         """The API's answer to what a hook raised."""
-        _note_raised(exc)
+        _note_raised(exc, config)
         return operation.api.on_exception(request, exc)  # type: ignore[no-any-return]
 
     def allowed(hook: str, result: Any) -> None:
@@ -4683,11 +4697,21 @@ def _check_hooks_allowed(config: _Config, label: str) -> None:
     So a request never reaches the function without them: if ninja served an
     operation without scrudful's checks (e.g. a copy it made without
     re-applying ``Operation.run``'s decorators), the request fails instead
-    of going on unchecked.
+    of going on unchecked. So does a call of the decorated handler from
+    inside another operation (its function calling it directly): that
+    operation's hooks ran for the request, not this one's.
     """
     if not config.hooks:
         return
     raised = _RAISED.get()
+    if raised is not None and raised.operation is not config:
+        raise RuntimeError(
+            f"{label} was called directly from inside another operation, "
+            f"{raised.label or 'a scrudful one'}, so its {config.hooks_label} "
+            "didn't run for this request (only that operation's checks did). "
+            "Refusing the request: move the code both need into a plain "
+            "function and call that, not the decorated handler."
+        )
     if raised is None or not raised.hooks_allowed:
         raise RuntimeError(
             f"{label}: {config.hooks_label} didn't run for this request: the operation "
