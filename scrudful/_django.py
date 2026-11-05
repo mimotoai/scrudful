@@ -201,7 +201,8 @@ def setting_hsr_cache_control() -> str:
     Raises
     ------
     ImproperlyConfigured
-        If it is not a non-empty ``str``.
+        If it is not a non-empty ``str``, or has control characters (but a
+        tab) or characters outside Latin-1, which no field can carry.
     """
     value = scrudful_setting("HSR_CACHE_CONTROL", DEFAULT_HSR_CACHE_CONTROL)
     try:

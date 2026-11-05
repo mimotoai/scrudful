@@ -26,7 +26,7 @@ from scrudful._adapter import (
     SCHEMA_TYPE,
     HsrConfigError,
 )
-from scrudful.utils import _CTL_RE, _NON_LATIN1_RE, link_content, resolve_uri
+from scrudful.utils import _NON_LATIN1_RE, link_content, resolve_uri
 
 __all__ = [
     "DEFAULT_HSR_CACHE_CONTROL",
@@ -57,6 +57,8 @@ PROBLEM_DETAILS_CONTEXT_URL = (
     "https://w3id.org/semantic-http/0.1/problem-details.context.jsonld"
 )
 DEFAULT_HSR_CACHE_CONTROL = "public, max-age=300"
+#: The control characters no field value may hold: all but HTAB (RFC 9110).
+_FIELD_CTL_RE = re.compile("[\x00-\x08\x0a-\x1f\x7f]")
 #: The path segment the HSR routes live under.
 HSR_ROUTE_SEGMENT = "_hsr"
 
@@ -222,14 +224,15 @@ def check_hsr_cache_control(value: Any, what: str) -> str:
     HsrConfigError
         If ``value`` is not a ``str``, is empty (an empty ``Cache-Control``
         field says nothing), or has characters a field can't carry: control
-        characters (CR, LF, tab, ...), or characters outside Latin-1.
+        characters (CR, LF, NUL ...; a tab is allowed, as RFC 9110's
+        field values allow it), or characters outside Latin-1.
     """
     if not isinstance(value, str) or not value.strip():
         raise HsrConfigError(
             f"{what} must be a non-empty str of Cache-Control directives, "
             f"not {value!r}"
         )
-    if _CTL_RE.search(value):
+    if _FIELD_CTL_RE.search(value):
         raise HsrConfigError(f"{what} {value!r} contains control characters")
     if _NON_LATIN1_RE.search(value):
         raise HsrConfigError(f"{what} {value!r} contains characters outside Latin-1")

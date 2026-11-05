@@ -142,8 +142,11 @@ def test_check_hsr_url_result_rejects_the_rest(value):
         check_hsr_url_result(value, "hsr_url('/x')")
 
 
-@pytest.mark.parametrize("value", ["no-cache", "public, max-age=60"])
+@pytest.mark.parametrize(
+    "value", ["no-cache", "public, max-age=60", "public,\tmax-age=60"]
+)
 def test_check_hsr_cache_control_accepts_a_directive_list(value):
+    """A field value may hold a tab (RFC 9110's HTAB), as a space."""
     assert check_hsr_cache_control(value, "hsr_cache_control") == value
 
 
@@ -158,7 +161,7 @@ def test_check_hsr_cache_control_rejects_empty_and_non_str(value):
     [
         ("public\r\nX-Injected: 1", "control"),
         ("no-cache\n", "control"),
-        ("public,\tmax-age=60", "control"),
+        ("public,\x0bmax-age=60", "control"),
         ("public\x00", "control"),
         ("public\x7f", "control"),
         ("public, max-age=300 \u2713", "Latin-1"),
