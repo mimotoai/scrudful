@@ -182,7 +182,8 @@ Behaviour change (ninja)
   ``auth=`` and ``before`` (or ``allowed``), then, for a ``@scrudful``
   item operation with a ``load``, that ``load``, on a copy of the request
   with that method, unless it is the very call the loading operation made
-  (the same function, method, path parameters and ``request.auth``; so a
+  (the same function, method, a HEAD counting as a GET, path parameters
+  and ``request.auth``; so a
   ``load`` shared with the loading operation runs again for each other
   method, and one authorizing by ``request.method`` is checked per method,
   as DRF loads per action): any ``HttpError``, ``Http404`` or ``PermissionDenied`` it

@@ -3148,6 +3148,56 @@ def test_options_runs_the_loaders_load_again_only_for_another_method():
     assert calls == ["GET", "PUT"]
 
 
+@pytest.mark.parametrize("together", [True, False], ids=["one-operation", "two"])
+def test_head_shares_the_loaders_load_of_get(together):
+    """Django serves a HEAD as a GET, so HEAD beside GET (one operation
+    listing both, or one of its own sharing GET's ``load``) doesn't load
+    again: it gets the loader's answer. PUT still loads with its method."""
+    store, calls = Store(), []
+
+    def load(request, pk, **params):
+        calls.append(request.method)
+        return store.load(request, pk, **params)
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+    if together:
+        router.api_operation(["GET", "HEAD"], "/{pk}", response=ItemOut)(
+            scrudful(load=load, **LINKS)(pk_handler)
+        )
+    else:
+        router.get("/{pk}", response=ItemOut)(scrudful(load=load, **LINKS)(pk_handler))
+        router.api_operation(["HEAD"], "/{pk}", response=ItemOut)(
+            scrudful(load=load, **LINKS)(pk_handler)
+        )
+    router.put("/{pk}", response=ItemOut)(scrudful(load=load, **LINKS)(pk_handler))
+    response = options(TestClient(mount(router)), "/1")
+    assert response.headers["Allow"] == "GET, PUT, OPTIONS, HEAD"
+    assert calls == ["GET", "PUT"]
+
+
+def test_the_load_identity_is_the_method_checked_not_the_requests():
+    """The method of the identity is the one OPTIONS checks: a ``before``
+    that rewrites the copy's ``request.method`` doesn't make PUT's load
+    pass for the loader's call."""
+    store, calls = Store(), []
+
+    def load(request, pk, **params):
+        calls.append(request.method)
+        return store.load(request, pk, **params)
+
+    def rewrite(request, **params):
+        request.method = "GET"
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+    router.get("/{pk}", response=ItemOut)(scrudful(load=load, **LINKS)(pk_handler))
+    router.put("/{pk}", response=ItemOut)(
+        scrudful(load=load, before=rewrite, **LINKS)(pk_handler)
+    )
+    response = options(TestClient(mount(router)), "/1")
+    assert response.headers["Allow"] == "GET, PUT, OPTIONS"
+    assert len(calls) == 2
+
+
 def method_scoped_router(asynchronous: bool) -> tuple[NinjaAPI, list[Any]]:
     """GET and PUT share one ``load``, which lets anyone read and only alice
     write: it refuses a PUT, PATCH or DELETE of anyone else with a 403, by

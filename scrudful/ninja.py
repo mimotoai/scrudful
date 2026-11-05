@@ -420,8 +420,9 @@ OPTIONS
        ``HttpError`` that ``load`` raises (whatever its status), ``Http404``
        or ``PermissionDenied`` leaves only that method out: only step 3's
        error answers the OPTIONS. A ``load`` isn't called again only for
-       the very call step 3 made (the same function, method, path
-       parameters and ``request.auth``): step 3's method gets step 3's
+       the very call step 3 made (the same function, method, a HEAD
+       counting as a GET, path parameters and ``request.auth``): step 3's
+       method (and HEAD beside a GET) gets step 3's
        answer. A ``load`` step 3's operation shares with another method runs
        again for that method, with its method, so a ``load`` authorizing by
        ``request.method`` is checked per method; so it does for every
@@ -6719,7 +6720,7 @@ def _may_use(
         return False
     if values is None:
         return False
-    return _own_load_allows(config, requester, values, loaded, path)
+    return _own_load_allows(config, requester, values, loaded, path, method)
 
 
 def _load_must_run(config: _Config | None, loaded: _Loaded | None, method: str) -> bool:
@@ -6728,7 +6729,17 @@ def _load_must_run(config: _Config | None, loaded: _Loaded | None, method: str) 
     isn't the function ``loaded`` called for that same method."""
     if config is None or config.kind != "item" or config.load is None:
         return False
-    return loaded is None or config.load != loaded.load or method != loaded.method
+    return (
+        loaded is None
+        or config.load != loaded.load
+        or _load_method(method) != _load_method(loaded.method)
+    )
+
+
+def _load_method(method: str) -> str:
+    """``method`` as a ``load`` sees it, for the identity of its call: a
+    HEAD is GET's (Django serves a HEAD as a GET)."""
+    return "GET" if method == "HEAD" else method
 
 
 def _own_load_allows(
@@ -6737,13 +6748,15 @@ def _own_load_allows(
     values: dict[str, Any],
     loaded: _Loaded | None,
     path: str,
+    method: str,
 ) -> bool:
     """Whether the item operation's own ``load`` lets ``requester`` (a copy of
     the OPTIONS request with the method, authenticated and allowed by
     ``before``) use the method: it is called as the operation calls it, with
     its validated path parameters ``values``, unless ``loaded`` (the call
     :func:`_options_object` made, whose answer is the OPTIONS') is that same
-    call: the same function, method, path parameters and ``auth``. So a
+    call: the same function, method (``method``, the one checked; a HEAD is
+    a GET), path parameters and ``auth``. So a
     ``load`` shared with the loader runs again for each other method, with
     that method (one that authorizes by ``request.method`` is checked per
     method), and for the loader's own method when the loader didn't run (it
@@ -6763,7 +6776,7 @@ def _own_load_allows(
     if loaded is not None and _same_call(
         loaded,
         config.load,
-        requester.method or "",
+        method,
         values,
         getattr(requester, "auth", None),
     ):
@@ -6781,7 +6794,7 @@ def _own_load_allows(
                 "scrudful's OPTIONS of %r leaves %s out of Allow: its own load "
                 "raised HttpError %s",
                 path,
-                requester.method,
+                method,
                 exc.status_code,
                 exc_info=exc,
             )
@@ -6798,11 +6811,11 @@ def _same_call(
 ) -> bool:
     """Whether calling ``load`` with ``values`` for a ``method`` request of a
     requester with ``auth`` is the call ``loaded`` made, so that its object
-    is the one being checked.
+    is the one being checked. A HEAD's call is a GET's (:func:`_load_method`).
     """
     return (
         load == loaded.load
-        and method == loaded.method
+        and _load_method(method) == _load_method(loaded.method)
         and values == loaded.values
         and (auth is loaded.auth or auth == loaded.auth)
     )
