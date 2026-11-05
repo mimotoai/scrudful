@@ -62,13 +62,14 @@ def test_hsr_response_links():
     )
 
 
-def test_serialize_and_etag_are_stable():
-    body = {
-        "get": {"responses": {"200": {"description": "OK"}}},
-        "options": options_operation(),
-    }
+def test_serialize_hsr_is_compact_utf8_json():
+    """Compact separators, non-ASCII kept as UTF-8, keys in the given order."""
+    body = {"get": {"responses": {"200": {"description": "café"}}}, "a": [1, 2]}
+    assert serialize_hsr(body) == (
+        '{"get":{"responses":{"200":{"description":"café"}}},"a":[1,2]}'.encode()
+    )
     assert serialize_hsr(body) == serialize_hsr(json.loads(serialize_hsr(body)))
-    assert hsr_etag(serialize_hsr(body)).startswith('"') and len(hsr_etag(b"x")) == 34
+    assert len(hsr_etag(b"x")) == 34
 
 
 def test_hsr_etag_identifies_the_bytes():
