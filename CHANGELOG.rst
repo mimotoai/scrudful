@@ -198,7 +198,11 @@ Behaviour change (ninja)
   (``api.urls``), a path of a router added to the API before it, or of the
   API itself, that Django would match first (``"/{kind}/{pk}"`` beside a
   ``"/{pk}"`` at one prefix): the HSR link would target it. Add the
-  ``ScrudfulRouter`` first, or use ``hsr_route=False`` and ``hsr_url=``.
+  ``ScrudfulRouter`` first, or use ``hsr_route=False`` and ``hsr_url=``. A
+  route the check can't cover fully (a prefix converter no sample value
+  fits, a prefix of more than five parameters) gets a ``RuntimeWarning``;
+  a ``NinjaAPI`` subclass overriding ``_get_urls`` or ``_get_bound_routers``
+  gets ``ConfigError`` there.
 * Every operation on a ``ScrudfulRouter`` needs an entity: adding a plain
   operation without ``@described(Entity(...))`` (or ``scrudful_entity=``)
   raises ``ConfigError`` (it was described without content). One routing

@@ -917,8 +917,17 @@ your operations included, are not: that middleware gates them.)
   converter accepts), so a path capturing only numeric values of it
   (``"/orgs/{int:n}/{a}/{b}"`` before a router at ``"/orgs/{org}"``) is
   caught; one capturing a single literal value (``"/orgs/acme/{a}/{b}"``) is
-  not. A prefix converter accepting none of these (nor a short run of one
-  character) leaves the route unchecked, with a ``RuntimeWarning``.
+  not. A value counts when the converter's regex and its ``to_python``
+  accept it. A prefix converter accepting none of these (nor a short run of
+  one character) leaves the route unchecked, and a prefix of more than five
+  parameters gets each parameter's values tried but not every combination of
+  them (at most 243 URLs per route): either way a ``RuntimeWarning`` names the
+  route and the reason, once. The check relies on ninja's own
+  ``NinjaAPI._get_urls`` and ``_get_bound_routers`` (the order of the API's
+  patterns): a ``NinjaAPI`` subclass overriding either gets ``ConfigError``
+  when its URL patterns are built, once it mounts a ``ScrudfulRouter`` with
+  HSR routes (add URLs in your URLconf instead, or serve the documents
+  elsewhere with ``hsr_route=False``).
 * **The** ``add_decorator`` **decorators still wrap it.** ninja applies the
   API's and routers' ``add_decorator`` decorators (either mode) to every
   operation, the HSR route included: a gate added that way (a permission

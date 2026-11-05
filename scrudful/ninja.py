@@ -585,6 +585,7 @@ import inspect
 import io
 import itertools
 import json
+import math
 import re
 import textwrap
 import tokenize
@@ -595,6 +596,7 @@ from collections.abc import (
     Awaitable,
     Callable,
     Generator,
+    Iterable,
     Iterator,
     Mapping,
     Sequence,
@@ -5623,17 +5625,19 @@ class _ScrudfulPathView(PathView):
 
 
 #: The values tried for a parameter of an HSR route's prefix, to build the
-#: URLs the route serves (:func:`_sample_urls`): each one its converter's
-#: regex accepts is used, one per class of value Django's converters tell
-#: apart (a word, a number, a UUID); the word is unlikely to be a literal
-#: segment of another route.
+#: URLs the route serves (:func:`_sample_urls`): each one its converter
+#: accepts (its regex and its ``to_python``) is used, one per class of value
+#: Django's converters tell apart (a word, a number, a UUID); the word is
+#: unlikely to be a literal segment of another route.
 _SAMPLE_VALUES = ("scrudful-sample", "0", "00000000-0000-0000-0000-000000000000")
 #: Tried, in order, for a converter (a custom one) accepting none of
 #: :data:`_SAMPLE_VALUES`: the first one it accepts is used.
 _FALLBACK_SAMPLES = tuple(char * size for size in range(1, 9) for char in "0aA-_")
-#: The most URLs checked per HSR route: at most 3**k for a prefix of k
-#: parameters (k <= 5 is checked in full), each matched against every path
-#: before the route in its API, once, when the API's URL patterns are built.
+#: The most combinations of sample values checked per HSR route: every one
+#: for a prefix of up to 5 parameters (3**5); past it, each parameter's
+#: values with the others at their first (see :func:`_sample_urls`). Each
+#: URL is matched against every path before the route in its API, once, when
+#: the API's URL patterns are built.
 _MAX_SAMPLE_URLS = 3**5
 #: The HSR routes already warned about (see :func:`_check_hsr_route_reachable`).
 _UNCHECKED_ROUTES: set[tuple[int, str]] = set()
@@ -5649,40 +5653,81 @@ def _route(prefix: str, path: str) -> str:
     return ninja_router.normalize_path(route).lstrip("/")  # type: ignore[no-any-return]
 
 
-def _sample_urls(route: str) -> tuple[list[str], str | None]:
-    """URL paths that the Django ``route`` matches, and the name of a
-    parameter it couldn't fill (``None`` when every one was).
+def _converter_samples(converter: Any) -> list[str]:
+    """The sample values ``converter`` accepts: by its regex and by its
+    ``to_python`` (as Django's resolver does, a ``ValueError`` refuses)."""
 
-    Each parameter takes every :data:`_SAMPLE_VALUES` its converter accepts,
-    else the first :data:`_FALLBACK_SAMPLES` one; the URLs are their product
-    (in order, at most :data:`_MAX_SAMPLE_URLS`), less those the route itself
-    refuses (its converters' ``to_python``). So a shadow of some values of a
-    parameter only (an ``int`` segment where the prefix takes any ``str``)
-    is found; a shadow of one literal value (``"/orgs/acme/{a}/{b}"``) isn't.
+    def accepted(value: str) -> bool:
+        if not re.fullmatch(converter.regex, value):
+            return False
+        try:
+            converter.to_python(value)
+        except ValueError:
+            return False
+        return True
+
+    values = [value for value in _SAMPLE_VALUES if accepted(value)]
+    return values or [value for value in _FALLBACK_SAMPLES if accepted(value)][:1]
+
+
+def _sample_urls(route: str) -> tuple[list[str], str | None]:
+    """URL paths that the Django ``route`` matches, and why they don't cover
+    every combination of sample values (``None`` when they do).
+
+    Each parameter takes every :data:`_SAMPLE_VALUES` its converter accepts
+    (:func:`_converter_samples`), else the first :data:`_FALLBACK_SAMPLES`
+    one. The URLs are their product when it has at most
+    :data:`_MAX_SAMPLE_URLS` combinations; past that, each value of each
+    parameter with the others at their first value (at most 1 + 2k for k
+    parameters), then the product's first combinations up to the cap: every
+    parameter's values are still tried, not every combination of them. So a
+    shadow of some values of a parameter only (an ``int`` segment where the
+    prefix takes any ``str``) is found; a shadow of one literal value
+    (``"/orgs/acme/{a}/{b}"``) isn't. Without a value for a parameter there
+    is no URL.
     """
     pattern = RoutePattern(route, is_endpoint=True)
     names: list[str] = []
     choices: list[list[str]] = []
     for name, converter in pattern.converters.items():
-        values = [v for v in _SAMPLE_VALUES if re.fullmatch(converter.regex, v)]
+        values = _converter_samples(converter)
         if not values:
-            values = [v for v in _FALLBACK_SAMPLES if re.fullmatch(converter.regex, v)][
-                :1
-            ]
-        if not values:
-            return [], name
+            return [], (
+                "no sample value fits the converter of its prefix's "
+                f"{name!r} (its regex, or its to_python, refuses them)"
+            )
         names.append(name)
         choices.append(values)
+    total = math.prod(len(values) for values in choices)
+    reason = None
+    combinations: Iterable[tuple[str, ...]] = itertools.product(*choices)
+    if total > _MAX_SAMPLE_URLS:
+        first = tuple(values[0] for values in choices)
+        covering = [first] + [
+            first[:index] + (value,) + first[index + 1 :]
+            for index, values in enumerate(choices)
+            for value in values[1:]
+        ]
+        rest = itertools.islice(
+            itertools.product(*choices), max(_MAX_SAMPLE_URLS - len(covering), 0)
+        )
+        combinations = dict.fromkeys([*covering, *rest])
+        reason = (
+            f"the {len(names)} parameters of its prefix give {total} combinations "
+            f"of sample values, over the {_MAX_SAMPLE_URLS} checked, so each "
+            "parameter's values were tried but not every combination of them"
+        )
     urls = []
-    combinations = itertools.product(*choices)
-    for combination in itertools.islice(combinations, _MAX_SAMPLE_URLS):
+    for combination in combinations:
         values = dict(zip(names, combination, strict=True))
         url = re.sub(
             r"<(?:[^>:]+:)?([^>]+)>", lambda match: values[match.group(1)], route
         )
         if pattern.match(url) is not None:
             urls.append(url)
-    return urls, None
+    if not urls:
+        return [], "no URL built from the sample values matches it"
+    return urls, reason
 
 
 def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
@@ -5700,10 +5745,13 @@ def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
     patterns, so the route is checked when the API's URL patterns are built,
     by matching the URLs it serves (:func:`_sample_urls`) against each
     earlier path of the API's mounts: at most :data:`_MAX_SAMPLE_URLS` URLs
-    times the number of earlier paths, once per route and mount. Nothing is
-    checked for a clone without an API (not bound yet). A prefix parameter
-    whose converter accepts no sample value leaves the route unchecked,
-    which a ``RuntimeWarning`` says, once per route.
+    (or 1 + 2k, for a prefix of k parameters, past it) times the number of
+    earlier paths, once per route and mount. Nothing is checked for a clone
+    without an API (not bound yet). When the URLs don't cover every
+    combination of sample values (past the cap), or there are none (a prefix
+    parameter whose converter accepts no sample value), a ``RuntimeWarning``
+    says so, once per route, naming the route and the reason; the URLs there
+    are are still checked.
 
     Raises
     ------
@@ -5738,21 +5786,19 @@ def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
             break
     if route is None:
         raise _bound_path_error()
-    urls, unfilled = _sample_urls(route)
-    if unfilled is not None:
+    urls, partial = _sample_urls(route)
+    if partial is not None:
         key = (path_view._scrudful_router._scrudful_serial, route)
         if key not in _UNCHECKED_ROUTES:
             _UNCHECKED_ROUTES.add(key)
             warnings.warn(
-                f"scrudful can't check that no earlier path of the API shadows "
-                f"the HTTP Schema Resource route {route!r} of "
-                f"{_described_path(path_view)!r}: no sample value fits the "
-                f"converter of its prefix's {unfilled!r}. Make sure no router "
+                "scrudful can't check every URL of the HTTP Schema Resource "
+                f"route {route!r} of {_described_path(path_view)!r} against "
+                f"the earlier paths of the API: {partial}. Make sure no router "
                 "added to the API before this ScrudfulRouter (nor the API "
                 "itself) has a path matching it.",
                 RuntimeWarning,
             )
-        return
     for other, view in earlier:
         pattern = RoutePattern(other, is_endpoint=True)
         url = next((url for url in urls if pattern.match(url) is not None), None)

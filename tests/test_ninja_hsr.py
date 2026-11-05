@@ -27,7 +27,7 @@ from ninja.errors import (
 )
 from ninja.renderers import JSONRenderer
 from ninja.security import APIKeyHeader, django_auth
-from ninja.throttling import AnonRateThrottle
+from ninja.throttling import AnonRateThrottle, BaseThrottle
 from django.urls import path, register_converter
 from ninja.testing import TestAsyncClient, TestClient
 
@@ -1372,6 +1372,89 @@ def test_a_prefix_without_a_sample_warns_that_it_is_unchecked():
         api.urls
 
 
+class RangedYear:
+    """A four-digit year from 1900 to 2100: the regex accepts samples that
+    ``to_python`` refuses."""
+
+    regex = "[0-9]{4}"
+
+    def to_python(self, value):
+        year = int(value)
+        if not 1900 <= year <= 2100:
+            raise ValueError(value)
+        return year
+
+    def to_url(self, value):
+        return str(value)
+
+
+register_converter(RangedYear, "scrudful_test_ranged_year")
+
+
+def test_a_prefix_whose_converter_refuses_every_sample_warns():
+    def shadow(request, y: int, a: str, b: str):
+        return {"shadow": True}  # pragma: no cover
+
+    api = prefixed_router_api(
+        "/y/{scrudful_test_ranged_year:y}/{a}/{b}",
+        shadow,
+        "/y/{scrudful_test_ranged_year:x}",
+    )
+    with pytest.warns(
+        RuntimeWarning,
+        match=r"can't check.*'y/<scrudful_test_ranged_year:x>/_hsr/pk'.*'x'",
+    ):
+        api.urls
+
+
+SIX = "/{x1}/{x2}/{x3}/{x4}/{x5}/{x6}"
+
+
+def six_parameter_api(earlier: str | None) -> NinjaAPI:
+    """A ``ScrudfulRouter`` ``"/{pk}"`` mounted at a prefix of six parameters
+    (3**6 sample URLs, over the cap), after ``earlier`` (eight segments)."""
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    if earlier is not None:
+
+        @api.get(earlier)
+        def shadow(
+            request, a: str, b: str, c: str, d: str, e: str, f: str, g: str, h: str
+        ):
+            return {"shadow": True}  # pragma: no cover
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+    _, _, item = split_options({})
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def get_item(request, x1, x2, x3, x4, x5, x6, pk: int, obj):
+        return obj  # pragma: no cover
+
+    api.add_router(SIX, router)
+    return api
+
+
+@pytest.mark.parametrize("numeric", ["a", "f"])
+def test_past_the_cap_each_prefix_parameter_is_still_tried(numeric):
+    """Over the cap, each parameter's values are tried with the others at
+    their first: a shadow of the numbers of any one parameter is caught,
+    and a warning says not every combination was."""
+    segments = [f"{{{name}}}" for name in "abcdefgh"]
+    segments["abcdefgh".index(numeric)] = f"{{int:{numeric}}}"
+    api = six_parameter_api("/" + "/".join(segments))
+    with pytest.warns(RuntimeWarning, match=r"can't check every.*729.*243"):
+        with pytest.raises(ConfigError, match="shadowed by GET"):
+            api.urls
+
+
+def test_past_the_cap_an_unshadowed_route_warns_and_is_served():
+    api = six_parameter_api(None)
+    with pytest.warns(RuntimeWarning, match=r"can't check every.*<x6>/_hsr/pk'"):
+        api.urls
+    r = TestClient(api).get("/a/b/c/d/e/f/_hsr/pk")
+    assert hsr_get_problems(r.status_code, dict(r.headers), r.content) == []
+
+
 def test_a_router_mounted_twice_at_one_prefix_names_its_earlier_mount():
     api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
     router = ScrudfulRouter(base_url=BASE_URL)
@@ -2632,6 +2715,61 @@ def test_a_parent_routers_auth_decides_a_nested_routers_allow(parent_class):
     alice = options(client, "/items/1", headers={"X-API-Key": ALICE})
     assert alice.headers["Allow"] == "GET, PUT, OPTIONS"
     assert client.get("/items/1").status_code == 401
+
+
+@pytest.mark.parametrize("parent_class", [Router, ScrudfulRouter])
+def test_a_nested_mounts_own_auth_decides_its_allow(parent_class):
+    """``parent.add_router(..., auth=)``: the mount's auth (which ninja 1.7.2
+    keeps per mount, where 1.7.0 and 1.7.1 set it on the nested router)."""
+    _, child = make_api()
+    parent = Router() if parent_class is Router else ScrudfulRouter(base_url=BASE_URL)
+    parent.add_router("/items", child, auth=KeyAuth())
+    client = TestClient(mount(parent))
+    assert client.get("/items/1").status_code == 401
+    anonymous = options(client, "/items/1")
+    assert anonymous.status_code == 204 and anonymous.headers["Allow"] == "OPTIONS"
+    alice = options(client, "/items/1", headers={"X-API-Key": ALICE})
+    assert alice.headers["Allow"] == "GET, PUT, OPTIONS"
+
+
+def test_a_nested_router_under_two_parents_agrees_with_each_mount():
+    """One nested router under a locked parent mount and an open one: on each,
+    ``Allow`` lists GET exactly when GET is allowed (ninja 1.7.0 and 1.7.1
+    lock both mounts, 1.7.2 and 1.7.3 only the locked one)."""
+    _, child = make_api()
+    locked, unlocked = Router(), Router()
+    locked.add_router("/items", child, auth=KeyAuth())
+    unlocked.add_router("/items", child)
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    api.add_router("/l", locked, url_name_prefix="l")
+    api.add_router("/o", unlocked, url_name_prefix="o")
+    client = TestClient(api)
+    for prefix in ("/l", "/o"):
+        get = client.get(f"{prefix}/items/1").status_code
+        allow = options(client, f"{prefix}/items/1").headers["Allow"].split(", ")
+        assert ("GET" in allow) == (get == 200), (prefix, get, allow)
+    assert client.get("/l/items/1").status_code == 401
+
+
+class HeaderThrottle(BaseThrottle):
+    """Refuses a request sending ``X-Throttle: yes``."""
+
+    def allow_request(self, request):
+        return request.headers.get("X-Throttle") != "yes"
+
+    def wait(self):
+        return None
+
+
+def test_a_nested_mounts_own_throttle_throttles_its_options():
+    _, child = make_api()
+    parent = Router()
+    parent.add_router("/items", child, throttle=[HeaderThrottle()])
+    client = TestClient(mount(parent))
+    refused = {"X-Throttle": "yes"}
+    assert client.get("/items/1", headers=refused).status_code == 429
+    assert options(client, "/items/1", headers=refused).status_code == 429
+    assert options(client, "/items/1").status_code == 204
 
 
 def test_options_awaits_an_async_load():
