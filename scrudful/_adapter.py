@@ -594,8 +594,8 @@ def merge_links(
 # --- HTTP Schema Resource descriptions ---------------------------------------
 #
 # The operations of an HTTP Schema Resource (an OpenAPI Path Item), shared by
-# the DRF and django-ninja adapters. ``content`` is a Media
-# Type map as built by :func:`describe_content`; falsy means none.
+# the three adapters. ``content`` is a Media Type map as built by
+# :func:`describe_content`; falsy means none.
 # ``conditional``: whether the method's preconditions are evaluated.
 
 

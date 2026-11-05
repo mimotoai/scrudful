@@ -153,9 +153,10 @@ def hsr_route_name(path_template: str) -> str:
     """A route name for ``path_template``: its segments joined with ``.``.
 
     ``{name}`` and ``{converter:name}`` become ``name``; the empty path is
-    ``"_root"``. It reads Django's and ninja's ``{converter:name}`` order
-    only: Starlette's ``{name:converter}`` would give ``converter`` (the
-    FastAPI adapter rewrites its templates first).
+    ``"_root"``. It reads ninja's ``{converter:name}`` order only, in
+    braces (Django's ``<converter:name>`` is left as it is; DRF names its
+    HSR routes by URL name instead): Starlette's ``{name:converter}`` would
+    give ``converter`` (the FastAPI adapter rewrites its templates first).
     """
     segments = [
         _PARAMETER.sub(r"\1", segment)

@@ -3562,7 +3562,7 @@ def _solved_errors(result: Any) -> list[Any]:
 # --- The HSR route -----------------------------------------------------------------
 
 #: The path parameter of the HSR route: the route name of the resource
-#: (:func:`scrudful._hsr.hsr_route_name`). Named so that it can't clash with
+#: (:func:`_hsr_route_name`). Named so that it can't clash with
 #: a parameter of the prefix of a router it is on (``"/users/{name}"``).
 _HSR_PARAMETER = "scrudful_hsr_name"
 #: The path of an app's HSR route.
@@ -3680,7 +3680,8 @@ def _hsr_route_name(template: str) -> str:
 
     :func:`~scrudful._hsr.hsr_route_name` of it, with each parameter's
     convertor but ``str`` joined to its name by ``-`` (that function reads
-    Django's and ninja's ``{convertor:name}``): ``/items/{id}`` and
+    ninja's ``{convertor:name}`` order, so it would drop Starlette's
+    ``{name:convertor}`` one): ``/items/{id}`` and
     ``/items/{id:str}`` are ``items.id``, ``/items/{id:int}`` is
     ``items.id-int``, ``/files/{p:path}`` is ``files.p-path``. So two
     resource keys (:func:`_template_key`) have one name only when the scheme
@@ -3728,9 +3729,8 @@ def _owner_hsr_names(
 
 
 def _hsr_names(paths: Mapping[str, _Resource]) -> dict[str, str]:
-    """The resource key of each HSR route name (the
-    :func:`~scrudful._hsr.hsr_route_name` of the resource's template) of
-    ``paths``.
+    """The resource key of each HSR route name (the :func:`_hsr_route_name`
+    of the resource's template) of ``paths``.
 
     Raises
     ------
