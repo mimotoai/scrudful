@@ -72,7 +72,8 @@ operation without one raises ``ConfigError``:
 
 A ``@described`` operation's responses get the entity's Links and the HSR
 link, as a scrudful operation's do; its link callables get ``(request,
-None)``.
+None)`` on a response, and ``(None, None)`` when the HTTP Schema Resource is
+built: they must return the same target in both.
 
 HEAD is routed like any method: ninja answers 405 to HEAD on an operation
 declared with ``get``. Declare ``api_operation(["GET", "HEAD"], ...)`` for the
@@ -941,7 +942,12 @@ for a preflight too. In this order:
    operation validates them (no object for one it would refuse with a 422),
    and only them: give ``load``'s other parameters defaults, or take
    ``**kwargs``. ``None`` is no object, and the object-level checks are
-   skipped. An ``HttpError`` or ``Http404`` it raises (the 404 of a missing
+   skipped. So an ``allowed`` hook gets ``obj=None`` both when nothing was
+   loaded (no loader, a collection, the loading operation's ``auth=`` or
+   ``before`` refusing the requester, path parameters it would refuse) and
+   when ``load`` returned ``None`` (no object): it can't tell them apart, so
+   decide from the request alone when ``obj`` is ``None`` (DRF loads whenever
+   a method passes its object-free checks). An ``HttpError`` or ``Http404`` it raises (the 404 of a missing
    or hidden object) is the answer, by the API's exception handler, with
    ``add_error_links``'s Links and the HSR link: return ``None`` for a 204 on
    a missing object (a PUT that may create, say).
@@ -958,8 +964,10 @@ for a preflight too. In this order:
 
    A raised ``HttpError`` with status 401, 403 or 404 (as ninja's
    ``AuthenticationError`` and ``AuthorizationError`` are), ``Http404`` or
-   ``PermissionDenied`` refuses the method: a ``before`` that signals denial
-   with a 404 refuses it, it doesn't answer the OPTIONS. An ``allowed`` hook's
+   ``PermissionDenied`` refuses the method: a ``before`` (or ``auth=``
+   callback) that signals denial with a 404 refuses it, it doesn't answer the
+   OPTIONS (as in FastAPI; DRF answers the OPTIONS with a 404 its permission
+   checks raise). An ``allowed`` hook's
    401, 403 or ``PermissionDenied`` refuses the method too (as DRF's
    ``allowed_func`` and FastAPI's ``allowed`` do), but a 404 it raises is the
    OPTIONS's answer, as ``load``'s is. Anything else raised is answered by the

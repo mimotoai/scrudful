@@ -339,14 +339,14 @@ OPTIONS
     ``type="application/json"``, see :class:`ScrudfulRouter` for its target)
     and ``Access-Control-Expose-Headers``. It is not in the OpenAPI document,
     and has the URL name ``scrudful_options`` on every path, so don't
-    ``reverse()`` it. In this order:
+    ``reverse()`` it.
 
     It is answered by an ``Operation.run`` decorator of the operation, so
     before ninja's checks and before the operation's function, which the
     API's and routers' ``add_decorator(mode="operation")`` decorators wrap:
     those never gate OPTIONS. The ``add_decorator(mode="view")`` decorators
     wrap ``Operation.run`` itself, so they run first, as for any operation
-    (a CORS preflight too).
+    (a CORS preflight too). In this order:
 
     1. A CORS preflight (an OPTIONS with ``Origin`` and
        ``Access-Control-Request-Method``) is answered 204, without content or
@@ -365,7 +365,9 @@ OPTIONS
        the path parameters, validated as the operation validates them (no
        object for one it would refuse with a 422), and only them: give
        ``load``'s other parameters defaults, or take ``**kwargs``. ``None``
-       is no object, and only ``None``: an ``HttpError`` or ``Http404`` it
+       is no object, and only ``None`` (so a hook gets ``obj=None`` both when
+       nothing was loaded and when there is no object, and can't tell them
+       apart): an ``HttpError`` or ``Http404`` it
        raises (the 404 of a missing or hidden object) is the answer, that
        status by the API's exception handler, with the Links of
        :func:`add_error_links` and the HSR link (for a 204 on a missing
@@ -382,7 +384,9 @@ OPTIONS
        404 (as ninja's ``AuthenticationError`` and ``AuthorizationError``
        are), ``Http404`` or ``PermissionDenied`` refuses the method, except
        a 404 (``HttpError`` or ``Http404``) an ``allowed`` hook raises, which
-       answers the OPTIONS, as ``load``'s does; anything else raised is
+       answers the OPTIONS, as ``load``'s does (a 404 of ``auth=`` or
+       ``before`` refuses the method, as in FastAPI; DRF answers the OPTIONS
+       with its permission checks' 404); anything else raised is
        answered by the API's exception handler, as ninja answers what an
        operation raises (re-raised without a handler).
        What an ``async def`` callback returns is awaited
@@ -411,8 +415,9 @@ OPTIONS
     request: the same document for every requester.
     For each method the path serves, in the order ``get``,
     ``put``, ``post``, ``delete``, ``options``, ``head``, ``patch``,
-    ``trace``, an operation in the shape DRF's ``ScrudfulMetadata`` produces
-    (``scrudful.rest_framework``), which it extends:
+    ``trace``, an operation in the shape
+    :func:`scrudful.rest_framework.http_schema_resource` gives, which it
+    extends:
 
     - ``requestBody`` (POST, PUT, PATCH) with the ``content`` of the
       ``request`` entity, else of the item entity, as in DRF; left out when
@@ -1874,9 +1879,13 @@ class ScrudfulRouter(Router):
         def``. ``request`` is a copy with ``method``, authenticated by the
         operation's ``auth=`` callbacks when they authenticate the requester
         (``request.auth``), else as it came. ``obj`` was loaded only once the
-        loading operation's ``auth=`` and ``before`` allowed the requester.
-        Without a hook, the operations' ``auth=`` callbacks and ``before``
-        decide (see "OPTIONS" in the module docstring).
+        loading operation's ``auth=`` and ``before`` allowed the requester:
+        it is ``None`` both when nothing was loaded (no loader, a
+        collection, the loading operation refusing the requester, invalid
+        path parameters) and when ``load`` returned ``None``, which a hook
+        can't tell apart. Without a hook, the operations' ``auth=``
+        callbacks and ``before`` decide (see "OPTIONS" in the module
+        docstring).
 
     Each is also an attribute of the router, checked as the argument is
     when set (``hsr_route`` only before the router's first operation); a
@@ -2423,12 +2432,13 @@ def described(entity: Entity) -> Callable[[Handler], Handler]:
     (POST, PUT, PATCH) and its 2xx responses but 204 with ``entity``'s
     ``content``. Those responses (and HEAD's, as GET's) get ``entity``'s
     schema and context Links, as a scrudful operation's do, so that they
-    agree with the description; link callables get ``(request, None)``
-    (there is no loaded object), and may be ``async def`` only in an async
-    operation. Every response of the operation gets the HTTP Schema
-    Resource link, and its path answers OPTIONS (see
-    :class:`ScrudfulRouter`). ninja's operation decorators don't pass
-    unknown arguments on, so it is a decorator, below the operation
+    agree with the description; link callables get ``(request, None)`` on
+    a response (there is no loaded object), and ``(None, None)`` when the
+    HTTP Schema Resource is built, and must return the same target in both;
+    they may be ``async def`` only in an async operation. Every response of
+    the operation gets the HTTP Schema Resource link, and its path answers
+    OPTIONS (see :class:`ScrudfulRouter`). ninja's operation decorators
+    don't pass unknown arguments on, so it is a decorator, below the operation
     decorator::
 
         @router.get("/health")
