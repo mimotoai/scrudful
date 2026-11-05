@@ -47,8 +47,7 @@ from scrudful.fastapi import (
     http_schema_resource,
     scrudful,
 )
-from scrudful._adapter import describe_read, describe_write
-from scrudful._hsr import hsr_link, options_operation
+from scrudful._hsr import hsr_link
 from scrudful.problem import problem_from_errors
 from tests import fastapi_future_annotations as future_endpoints
 from tests.semantic_http import (
@@ -2327,6 +2326,88 @@ def _options_app(store):
     return app
 
 
+#: The literal entries of :func:`_options_app`'s ``/items/{item_id}``: the
+#: expectations don't come from the functions that build them.
+NOT_MODIFIED = {
+    "description": (
+        "Not Modified: the representation matches the request's If-None-Match "
+        "or If-Modified-Since validators."
+    )
+}
+MALFORMED = "Malformed If-Match or If-None-Match header."
+FAILED = "Precondition Failed."
+REQUIRED = (
+    "Precondition Required: this request must be conditional (send If-Match or "
+    "If-Unmodified-Since)."
+)
+PRECONDITION_PARAMETERS = [
+    {
+        "in": "header",
+        "name": name,
+        "schema": {"type": "string"},
+        "required": False,
+        "description": (
+            f"The {what} of the current representation. Either If-Match or "
+            "If-Unmodified-Since is required."
+        ),
+    }
+    for name, what in (
+        ("If-Match", "entity-tag"),
+        ("If-Unmodified-Since", "Last-Modified date"),
+    )
+]
+
+
+def _write_entry(request: str | None, status: str) -> dict:
+    responses = {status: {"description": "OK" if status == "200" else "No Content"}}
+    if status == "200":
+        responses[status]["content"] = ITEM_CONTENT
+    responses.update(
+        {
+            "400": {"description": MALFORMED, "content": ERROR_CONTENT},
+            "412": {"description": FAILED, "content": ERROR_CONTENT},
+            "428": {"description": REQUIRED, "content": ERROR_CONTENT},
+            "default": {"description": "Error."},
+        }
+    )
+    entry: dict = {}
+    if request is not None:
+        entry["requestBody"] = {
+            "description": request,
+            "required": True,
+            "content": ITEM_CONTENT,
+        }
+    entry["responses"] = responses
+    entry["parameters"] = PRECONDITION_PARAMETERS
+    return entry
+
+
+ITEM_HSR = {
+    "get": {
+        "responses": {
+            "200": {"description": "OK", "content": ITEM_CONTENT},
+            "304": NOT_MODIFIED,
+            "400": {"description": MALFORMED, "content": ERROR_CONTENT},
+            "412": {"description": FAILED, "content": ERROR_CONTENT},
+            "default": {"description": "Error."},
+        }
+    },
+    "put": _write_entry("The new content of the resource.", "200"),
+    "delete": _write_entry(None, "204"),
+    "options": {"responses": {"204": {"description": "No Content"}}},
+    "head": {
+        "responses": {
+            "200": {"description": "OK"},
+            "304": NOT_MODIFIED,
+            "400": {"description": MALFORMED},
+            "412": {"description": FAILED},
+            "default": {"description": "Error."},
+        }
+    },
+    "patch": _write_entry("The changes to apply to the resource.", "200"),
+}
+
+
 def test_add_options_body_and_headers(make_client, store):
     client = make_client(_options_app(store))
     response = options_204(
@@ -2341,33 +2422,7 @@ def test_add_options_body_and_headers(make_client, store):
     assert body == http_schema_resource(client.app, "/items/{item_id}")
     validate_http_schema_resource(body)
     assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
-
-    assert body["get"] == with_default(
-        describe_read(ITEM_CONTENT, True, [200], ERROR_CONTENT)
-    )
-    assert body["get"]["responses"]["412"]["content"] == ERROR_CONTENT
-    assert body["head"] == with_default(describe_read(None, True, [200]))
-    for method in ("put", "patch"):
-        assert body[method] == with_default(
-            describe_write(
-                method,
-                ITEM_CONTENT,
-                True,
-                True,
-                True,
-                [200],
-                response_content=ITEM_CONTENT,
-                error_content=ERROR_CONTENT,
-            )
-        )
-    assert body["put"]["responses"]["428"]["content"] == ERROR_CONTENT
-    assert body["delete"] == with_default(
-        describe_write(
-            "delete", None, True, True, True, [204], error_content=ERROR_CONTENT
-        )
-    )
-    assert "content" not in body["delete"]["responses"]["204"]
-    assert body["options"] == options_operation()
+    assert body == ITEM_HSR
 
 
 def test_add_options_success_status_and_conditional_post(make_client, store):
@@ -2375,17 +2430,17 @@ def test_add_options_success_status_and_conditional_post(make_client, store):
     body = options_hsr(client, "/items")
     validate_http_schema_resource(body)
     assert list(body) == ["post", "options"]
-    assert body["post"] == with_default(
-        describe_write(
-            "post",
-            ITEM_CONTENT,
-            False,
-            False,
-            False,
-            [201],
-            response_content=ITEM_CONTENT,
-        )
-    )
+    assert body["post"] == {
+        "requestBody": {
+            "description": "The content for the resource to be created.",
+            "required": True,
+            "content": ITEM_CONTENT,
+        },
+        "responses": {
+            "201": {"description": "Created", "content": ITEM_CONTENT},
+            "default": {"description": "Error."},
+        },
+    }
     # A conditional POST: scrudful's 400 and 412, never a 428.
     body = options_hsr(client, "/items/3/actions")
     validate_http_schema_resource(body)
