@@ -2948,12 +2948,13 @@ def add_error_links(api: NinjaAPI, error: Entity) -> None:
     entity for the status, if it has one (``responses[status]``, else its
     ``error``), and its media type: it describes the response, as the
     OPTIONS of the operation does, and ``error`` here applies only otherwise.
-    A 401 or 403 is the exception: one the operation (or its ``before`` or
-    ``after_throttles``) raises gets ``error`` here when the operation's
-    ``error`` differs (and no ``responses[status]`` is declared), as the
-    401 and 403 ninja's authentication answers (a failed CSRF check, an
-    ``AuthorizationError``) get it: each 401 and 403 of the operation agrees
-    with the HTTP Schema Resource's 401 and 403 entries. A status the
+    A 401, 403, 422 or 429 is the exception: one the operation (its
+    function, ``load``, ``before`` or ``after_throttles``) raises gets
+    ``error`` here when the operation's ``error`` differs (and no
+    ``responses[status]`` is declared), as those ninja answers itself (its
+    authentication's 401, a failed CSRF check, an ``AuthorizationError``,
+    its validation's 422, its throttles' 429) get it: each response of these
+    statuses agrees with the HTTP Schema Resource's entry for it. A status the
     operation declares in ``responses=`` gets that entity instead, on the
     errors ninja answers for it too (its authentication's 401, its
     validation's 422).

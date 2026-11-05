@@ -168,7 +168,12 @@ Behaviour change (ninja)
 
 * ``ScrudfulRouter``'s OPTIONS runs the operations' checks: the loading
   operation's ``auth=`` and ``before`` (then ``load``), and each method's
-  ``auth=`` and ``before`` (or ``allowed``). Bad credentials make the
+  ``auth=`` and ``before`` (or ``allowed``), then, for a ``@scrudful``
+  operation whose ``load`` differs from the loading operation's, its own
+  ``load``: a 401, 403 or 404 it raises leaves only that method out of
+  ``Allow`` (the loading operation's 404 is still the OPTIONS's answer), so
+  authorization in a method's ``load`` shapes ``Allow``; it runs only once
+  the method's ``auth=`` and ``before`` passed. Bad credentials make the
   requester anonymous (ninja's auth callbacks return ``None``), so they get
   the anonymous ``Allow``. A raised ``HttpError`` 401, 403 or 404,
   ``Http404`` or ``PermissionDenied`` from ``auth=`` or ``before`` refuses a
@@ -183,7 +188,11 @@ Behaviour change (ninja)
   prefix (``"/{pk}"`` → ``_hsr/pk``, ``""`` → ``_hsr/_root``), before its other
   paths; the API's and routers' ``add_decorator`` decorators wrap that route
   too. An operation under ``/_hsr/``, or two paths with one name, is a
-  ``ConfigError``.
+  ``ConfigError``. So is, when the API's URL patterns are built
+  (``api.urls``), a path of a router added to the API before it, or of the
+  API itself, that Django would match first (``"/{kind}/{pk}"`` beside a
+  ``"/{pk}"`` at one prefix): the HSR link would target it. Add the
+  ``ScrudfulRouter`` first, or use ``hsr_route=False`` and ``hsr_url=``.
 * Every operation on a ``ScrudfulRouter`` needs an entity: adding a plain
   operation without ``@described(Entity(...))`` (or ``scrudful_entity=``)
   raises ``ConfigError`` (it was described without content). One routing
@@ -196,14 +205,23 @@ Behaviour change (ninja)
   (``ConfigError`` when the installed ninja's differ).
 * The HSR is compact JSON written by scrudful, whatever the API's renderer
   (0.7–0.9 had the OPTIONS body written by the renderer); OPTIONS has no body.
-* With ``add_error_links``, every 401 and 403 answered for a scrudful
-  operation whose ``error`` differs from the API-wide entity carries the
-  **API-wide entity** (was the operation's ``error`` for those the operation,
-  ``before=`` or ``after_throttles=`` raised): those of ninja's authentication
-  (a failed CSRF check, an ``AuthorizationError``) always did, so each 401 and
-  403 agrees with the HSR, which lists a 403 entry beside the 401, 422 and 429.
-  This applies only to the statuses the operation doesn't declare in
-  ``responses=``. Without an API-wide entity, nothing changes.
+* With ``add_error_links``, every 401, 403, 422 and 429 answered for a
+  scrudful operation whose ``error`` differs from the API-wide entity carries
+  the **API-wide entity** (was the operation's ``error`` for those the
+  operation, ``load``, ``before=`` or ``after_throttles=`` raised, e.g. a
+  domain ``HttpError(422)`` or the operation's own ``HttpError(429)``): those
+  ninja answers itself (its authentication's, a failed CSRF check, an
+  ``AuthorizationError``, its validation's 422, its throttles' 429) always
+  did, so each agrees with the HSR, which lists a 401, 403, 422 and 429
+  entry with that entity. This applies only to the statuses the operation
+  doesn't declare in ``responses=``.
+* Without ``add_error_links``, ninja's own 401 and 403 for a scrudful
+  operation with an ``error`` (its authentication, an ``AuthorizationError``,
+  a failed CSRF check) carry that ``error``'s **Links** and media type (they
+  carried none), as the 401s and 403s the operation raises do, and the HSR
+  lists neither status explicitly (it listed a 401 without content), so
+  every 401 and 403 agrees with its ``default`` entry. Its 422 and 429 still
+  carry none, under entries without content.
 * An error status declared in ``responses=`` has an HSR entry of its own,
   with that entity's content, and that entity wins on the wire too: the
   errors ninja answers before the operation (its authentication's 401 and
