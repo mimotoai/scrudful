@@ -1211,6 +1211,93 @@ def test_hsr_routes_resolve_before_every_path_of_the_router(hsr_path, path):
     assert json.loads(r.content) == http_schema_resource(router, path)
 
 
+def shadowing_api(where: str) -> NinjaAPI:
+    """An API serving a scrudful ``"/{pk}"`` on a ``ScrudfulRouter`` mounted
+    at ``""`` after a plain ``"/{kind}/{pk}"``, which would match its HSR
+    route ``/_hsr/pk`` first: on a sibling router mounted before it, or on
+    the API itself (its default router, which ninja mounts first)."""
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    owner = api if where == "api" else Router()
+
+    @owner.get("/{kind}/{pk}")
+    def kind_item(request, kind: str, pk: str):
+        return {"plain": f"{kind}/{pk}"}
+
+    if where == "sibling":
+        api.add_router("", owner)
+    router = ScrudfulRouter(base_url=BASE_URL)
+    _, _, item = split_options({})
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    api.add_router("", router)
+    return api
+
+
+@pytest.mark.parametrize("where", ["sibling", "api"])
+def test_a_shadowed_hsr_route_is_a_config_error(where):
+    """Django tries the API's patterns in order, so an earlier router's (or
+    the API's own) path matching ``/_hsr/<name>`` would answer the HSR link
+    with something that isn't the HSR: building the API's URLs refuses it,
+    naming the operation and the way out."""
+    api = shadowing_api(where)
+    message = (
+        r"the HTTP Schema Resource route '_hsr/pk' of '/\{pk\}'.*"
+        r"GET '<kind>/<pk>' \(.*kind_item\(\)\).*hsr_route=False.*hsr_url="
+    )
+    with pytest.raises(ConfigError, match=message):
+        api.urls
+    with pytest.raises(ConfigError, match=message):
+        TestClient(api).get("/_hsr/pk")
+
+
+def test_an_earlier_hsr_route_of_the_same_name_shadows_it():
+    """Two ``ScrudfulRouter`` mounted at one prefix with one HSR route name:
+    the second's would be the first's."""
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    _, _, item = split_options({})
+    for _ in range(2):
+        router = ScrudfulRouter(base_url=BASE_URL)
+        router.get("/{pk}", response=ItemOut)(scrudful(**item)(pk_handler))
+        api.add_router("", router)
+    with pytest.raises(
+        ConfigError,
+        match=r"shadowed by the HTTP Schema Resource route .*of another ScrudfulRouter",
+    ):
+        api.urls
+
+
+def test_routes_of_other_shapes_dont_shadow_the_hsr_route():
+    """A sibling router before it, a prefix with a parameter and paths that
+    can't match ``_hsr/<name>``: served."""
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+
+    @api.get("/{kind}/{pk}/{rest}")
+    def deeper(request, kind: str, pk: str, rest: str):
+        return {}
+
+    @api.get("/{int:number}/{pk}")
+    def numbered(request, number: int, pk: str):
+        return {}
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+    _, _, item = split_options({})
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(**item)
+    def get_item(request, org: str, pk: int, obj):
+        return obj
+
+    api.add_router("/orgs/{org}", router)
+    client = TestClient(api)
+    r = client.get("/orgs/acme/_hsr/pk")
+    assert hsr_get_problems(r.status_code, dict(r.headers), r.content) == []
+    assert json.loads(r.content) == http_schema_resource(router, "/{pk}")
+
+
 def test_described_only_path_gets_an_hsr_route():
     router = ScrudfulRouter(base_url=BASE_URL)
 

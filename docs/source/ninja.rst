@@ -901,6 +901,18 @@ your operations included, are not: that middleware gates them.)
   operation under ``/_hsr/``, or two paths with one name (``"/a/{x}"`` and
   ``"/a/{x}/"``), is a ``ConfigError``. The routes' URL names are private:
   don't ``reverse()`` them.
+* **Another router can't shadow them either.** Django tries the API's
+  patterns in ninja's order: the API's own operations first, then each router
+  in the order it was added. A path of an earlier router, or of the API, that
+  would match a route first (``"/{kind}/{pk}"`` on a router added at ``""``
+  before one with ``"/{pk}"``, or an ``@api.get("/{kind}/{pk}")``) would
+  answer the HSR link with something else, and ninja offers no way to put
+  the routes ahead of it: building the API's URL patterns (``api.urls``, at
+  startup) raises ``ConfigError``, naming that operation. Add the
+  ``ScrudfulRouter`` before that router (move the API's own operations to a
+  router added after it), or serve the documents elsewhere with
+  ``hsr_route=False`` and ``hsr_url=``. A pattern of your URLconf placed
+  before the API's include is yours to order.
 * **The** ``add_decorator`` **decorators still wrap it.** ninja applies the
   API's and routers' ``add_decorator`` decorators (either mode) to every
   operation, the HSR route included: a gate added that way (a permission

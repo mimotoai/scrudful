@@ -618,7 +618,7 @@ from django.http import (
     HttpResponseBase,
 )
 from django.urls import NoReverseMatch, Resolver404, URLResolver, resolve, reverse
-from django.urls.resolvers import RegexPattern
+from django.urls.resolvers import RegexPattern, RoutePattern
 from django.utils.encoding import iri_to_uri
 from ninja import NinjaAPI, Query, Router, Schema, Status
 from ninja import errors as ninja_errors
@@ -1841,6 +1841,11 @@ class ScrudfulRouter(Router):
     before the router's other paths, so ``"/{kind}/{pk}"`` doesn't match
     them, and ``/_hsr/`` is reserved: an operation under it, or two paths
     with one name (``"/a/{x}"`` and ``"/a/{x}/"``), is a ``ConfigError``.
+    A path of a router mounted earlier in the API, or of the API itself
+    (ninja tries its own operations first), that would match a route first
+    (``"/{kind}/{pk}"`` beside this router's ``"/{pk}"`` at one prefix) is
+    a ``ConfigError`` when the API's URL patterns are built: mount this
+    router first, or serve the documents elsewhere.
     Their URL names are private (unique per router and mount), so don't
     ``reverse()`` them. With ``hsr_route=False``, serve the document elsewhere with
     :func:`http_schema_resource_view` and say where with ``hsr_url``.
@@ -2202,7 +2207,10 @@ class ScrudfulRouter(Router):
         otherwise match ``/_hsr/<name>``. That order is kept by ninja's
         ``BoundRouter._bind_operations`` (which clones the paths for each
         mount) and ``BoundRouter.urls_paths`` (which yields their URL
-        patterns), checked to be ninja 1.7.0's and 1.7.1's.
+        patterns), checked to be ninja 1.7.0's and 1.7.1's. A path of an
+        earlier router of the API, or of the API itself, that matches a
+        route first is refused when the API's URL patterns are built
+        (:func:`_check_hsr_route_reachable`).
 
         The route's operation has an explicit ``url_name``,
         ``scrudful_hsr_<serial>_<name>`` (unique per router), which
@@ -5540,9 +5548,17 @@ class _ScrudfulPathView(PathView):
         """ninja's view of the path, the one its URL pattern routes to
         (``BoundRouter.urls_paths``); an HSR route's is public under
         Django's ``LoginRequiredMiddleware`` (Django >= 5.1), which reads
-        ``login_required`` from it."""
+        ``login_required`` from it, and is checked to be reachable
+        (:func:`_check_hsr_route_reachable`).
+
+        Raises
+        ------
+        ninja.errors.ConfigError
+            See :func:`_check_hsr_route_reachable`.
+        """
         view = super().get_view()
         if self._scrudful_hsr_route:
+            _check_hsr_route_reachable(self)
             view.login_required = False  # type: ignore[attr-defined]
         return view  # type: ignore[no-any-return]
 
@@ -5563,6 +5579,138 @@ class _ScrudfulPathView(PathView):
             return await run(request, *a, **kw)  # type: ignore[no-any-return]
         response = await sync_to_async(run)(request, *a, **kw)
         return response  # type: ignore[no-any-return]
+
+
+#: Values tried, in order, for a parameter of an HSR route's prefix (one each
+#: converter's regex accepts), to build a URL the route serves; unlikely to
+#: be a literal segment of another route.
+_SAMPLE_VALUES = ("scrudful-sample", "0", "00000000-0000-0000-0000-000000000000")
+
+
+def _route(prefix: str, path: str) -> str:
+    """The Django route of ``path`` mounted at ``prefix``, as ninja 1.7's
+    ``BoundRouter.urls_paths`` builds it (version-guarded where the HSR
+    routes are added, :meth:`ScrudfulRouter._add_hsr_route`)."""
+    prefix = ninja_router.replace_path_param_notation(prefix)
+    path = ninja_router.replace_path_param_notation(path)
+    route = "/".join([part for part in (prefix, path) if part])
+    return ninja_router.normalize_path(route).lstrip("/")  # type: ignore[no-any-return]
+
+
+def _sample_url(route: str) -> str | None:
+    """A URL path that the Django ``route`` matches (its parameters replaced
+    by :data:`_SAMPLE_VALUES`), or ``None`` if a converter accepts none."""
+    pattern = RoutePattern(route, is_endpoint=True)
+    values: dict[str, str] = {}
+    for name, converter in pattern.converters.items():
+        value = next(
+            (v for v in _SAMPLE_VALUES if re.fullmatch(converter.regex, v)), None
+        )
+        if value is None:
+            return None
+        values[name] = value
+    url = re.sub(r"<(?:[^>:]+:)?([^>]+)>", lambda match: values[match.group(1)], route)
+    return url if pattern.match(url) is not None else None
+
+
+def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
+    """Refuse an HSR route that a URL pattern before it in its API would
+    shadow.
+
+    Django tries an API's patterns in ninja's order: the API's own operations
+    (its default router), then each router mounted, in the order mounted
+    (``NinjaAPI._get_urls``, ninja 1.7). The router's HSR routes come first
+    among its own paths (:meth:`ScrudfulRouter._add_hsr_route`), but an
+    earlier router's path (or the API's), e.g. ``"/{kind}/{pk}"`` beside a
+    router's ``"/{pk}"`` at the same prefix, matches ``/_hsr/pk`` before the
+    route does: the HSR link would target something that isn't the HSR.
+    ninja gives scrudful no way to place its routes ahead of the API's other
+    patterns, so the route is checked when the API's URL patterns are built,
+    by matching a URL it serves (:func:`_sample_url`) against each earlier
+    path of the API's mounts. Nothing is checked for a clone without an API
+    (not bound yet) or a prefix whose converters accept no sample value.
+
+    Raises
+    ------
+    ninja.errors.ConfigError
+        If an earlier path of the API matches the route; or if the installed
+        ninja's ``NinjaAPI._get_bound_routers`` differs from ninja 1.7.0's
+        and 1.7.1's, or its bound routers don't hold the route.
+    """
+    api = getattr(next(iter(path_view.operations), None), "api", None)
+    if not isinstance(api, NinjaAPI):
+        return
+    _check_ninja_internal(
+        type(api),
+        "NinjaAPI",
+        "_get_bound_routers",
+        "scrudful's check of the HTTP Schema Resource routes",
+    )
+    earlier: list[tuple[str, Any]] = []
+    route = None
+    for bound_router in api._get_bound_routers():
+        path_operations = getattr(bound_router, "path_operations", None)
+        if not isinstance(path_operations, dict):
+            raise _bound_path_error()
+        for path, view in path_operations.items():
+            if view is path_view:
+                route = _route(bound_router.prefix, path)
+                break
+            earlier.append((_route(bound_router.prefix, path), view))
+        if route is not None:
+            break
+    if route is None:
+        raise _bound_path_error()
+    url = _sample_url(route)
+    if url is None:
+        return
+    for other, view in earlier:
+        if RoutePattern(other, is_endpoint=True).match(url) is None:
+            continue
+        raise ConfigError(
+            f"the HTTP Schema Resource route {route!r} of "
+            f"{_described_path(path_view)!r} "
+            f"(a ScrudfulRouter's) is shadowed by {_route_label(other, view)}, "
+            "which an earlier router of the API (or the API itself) mounts "
+            f"and which Django tries first, so a GET of {url!r} (below the "
+            "API's root) wouldn't reach "
+            "the HTTP Schema Resource its responses link to. Mount the "
+            "ScrudfulRouter before that router (the API's own operations "
+            "always come first: move them to a router mounted after it), or "
+            "give it hsr_route=False and hsr_url= to serve the HTTP Schema "
+            "Resources elsewhere (see http_schema_resource_view)"
+        )
+
+
+def _described_path(path_view: _ScrudfulPathView) -> str:
+    """The path (as given to the operation decorator) whose HTTP Schema
+    Resource the HSR route ``path_view`` serves."""
+    router = path_view._scrudful_router
+    return next(
+        (
+            path
+            for path, route in router._scrudful_hsr_routes.items()
+            if route == path_view._scrudful_path
+        ),
+        path_view._scrudful_path,
+    )
+
+
+def _route_label(route: str, path_view: Any) -> str:
+    """``path_view``'s operations at ``route``, for an error."""
+    if getattr(path_view, "_scrudful_hsr_route", False):
+        return (
+            f"the HTTP Schema Resource route {route!r} of "
+            f"{_described_path(path_view)!r} of another ScrudfulRouter"
+        )
+    labels = []
+    for operation in getattr(path_view, "operations", ()):
+        if _is_automatic_options(operation):
+            continue
+        func = inspect.unwrap(operation.view_func)
+        name = getattr(func, "__qualname__", repr(func))
+        labels.append(f"{'/'.join(operation.methods)} {route!r} ({name}())")
+    return ", ".join(labels) or repr(route)
 
 
 def _method_not_allowed(
