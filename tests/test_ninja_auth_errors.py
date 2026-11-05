@@ -1,12 +1,13 @@
-"""ninja's 401 and 403 agree with the HTTP Schema Resource.
+"""ninja's 401, 403, 422 and 429 agree with the HTTP Schema Resource.
 
 An operation's ``error`` differs from the API-wide :func:`add_error_links`
-entity: every 401 and 403 answered for the operation, whether ninja's
-authentication answers it before the operation runs (a CSRF failure, an
+entity: every 401, 403, 422 and 429 answered for the operation, whether ninja
+answers it before the operation runs (a CSRF failure, an
 ``AuthorizationError``, an ``HttpError`` of an auth callback) or ``before=``,
-``after_throttles=`` or the operation raises it, carries the API-wide entity,
-which the HSR's explicit 401 and 403 entries describe. The module is its own
-URLconf.
+``after_throttles=``, ``load`` or the operation raises it, carries the
+API-wide entity, which the HSR's explicit entries describe. Without an
+API-wide entity, every 401 and 403 carries the operation's ``error``, which
+the HSR's ``default`` describes. The module is its own URLconf.
 """
 
 import json
@@ -21,7 +22,7 @@ from ninja.security import APIKeyCookie, APIKeyHeader
 
 from scrudful.ninja import Entity, ScrudfulRouter, add_error_links, scrudful
 from scrudful.problem import PROBLEM_JSON
-from tests.semantic_http import link_problems, parse_links
+from tests.semantic_http import link_problems, parse_links, status_entry_problems
 
 pytestmark = [pytest.mark.urls(__name__), pytest.mark.django_db]
 
@@ -94,14 +95,6 @@ def load(request: Any, pk: int, **kwargs: Any) -> Any:
 router = ScrudfulRouter(base_url=BASE_URL)
 
 
-@router.get("/{pk}", response=Thing, auth=Key())
-@scrudful(
-    load=load,
-    error=OWN,
-    before=before,
-    after_throttles=after_throttles,
-    **LINKS,
-)
 def get_thing(request: Any, pk: int, obj: Any) -> Any:
     if pk == 401:
         raise HttpError(401, "who are you")
@@ -110,6 +103,21 @@ def get_thing(request: Any, pk: int, obj: Any) -> Any:
     if pk in (404, 422, 429):
         raise HttpError(pk, "the operation says no")
     return obj
+
+
+router.add_api_operation(
+    "/{pk}",
+    ["GET"],
+    scrudful(
+        load=load,
+        error=OWN,
+        before=before,
+        after_throttles=after_throttles,
+        **LINKS,
+    )(get_thing),
+    response=Thing,
+    auth=Key(),
+)
 
 
 @router.post("/{pk}", response=Thing, auth=Cookie())
@@ -122,15 +130,24 @@ api = NinjaAPI(urls_namespace="auth-errors")
 api.add_router("/things", router)
 add_error_links(api, API_WIDE)
 
-#: The same paths without an API-wide entity: nothing changes.
+#: The same operations without an API-wide entity: every 401 and 403 of an
+#: operation carries its ``error``, which the HSR's ``default`` describes.
 plain_router = ScrudfulRouter(base_url=BASE_URL)
 plain_router.add_api_operation(
     "/{pk}",
     ["GET"],
-    scrudful(load=lambda request, pk, **kw: {"id": pk}, error=OWN, **LINKS)(
-        lambda request, pk, obj: (_ for _ in ()).throw(HttpError(403, "no"))
+    scrudful(load=load, error=OWN, before=before, **LINKS)(get_thing),
+    response=Thing,
+    auth=Key(),
+)
+plain_router.add_api_operation(
+    "/{pk}",
+    ["POST"],
+    scrudful(load=load, error=OWN, **LINKS)(
+        lambda request, pk, obj: obj  # pragma: no cover (CSRF refuses it)
     ),
     response=Thing,
+    auth=Cookie(),
 )
 plain_api = NinjaAPI(urls_namespace="auth-errors-plain")
 plain_api.add_router("/things", plain_router)
@@ -218,17 +235,57 @@ def test_other_errors_keep_the_operations_entity():
     assert schema_links(response) == [OWN.schema_link_or_func]
 
 
-def test_without_an_api_wide_entity_the_operations_entity_stays():
+def test_without_an_api_wide_entity_401_and_403_are_under_default():
+    responses = hsr_of(Client(), "/q/things/_hsr/pk")["get"]["responses"]
+    # ninja's own 422 and 429 carry no entity: explicit entries without
+    # content. Every 401 and 403 carries the operation's: default.
+    assert {"422", "429"} <= responses.keys()
+    assert "content" not in responses["422"]
+    assert not {"401", "403"} & responses.keys()
+    [schema] = [
+        entry["schema"]["$ref"] for entry in responses["default"]["content"].values()
+    ]
+    assert schema == OWN.schema_link_or_func
+
+
+@pytest.mark.parametrize(
+    "url, headers, status",
+    [
+        # ninja's authentication, before the operation runs.
+        ("/q/things/1", {"X-Key": "banned"}, 403),
+        ("/q/things/1", {"X-Key": "unauthorized"}, 403),
+        ("/q/things/1", {}, 401),
+        # before= raises it.
+        ("/q/things/1", {"X-Key": "ok", "X-Before": "deny"}, 403),
+        # The operation raises it.
+        ("/q/things/403", {"X-Key": "ok"}, 403),
+        ("/q/things/401", {"X-Key": "ok"}, 401),
+    ],
+    ids=["auth-error", "AuthorizationError", "no-key", "before", "op-403", "op-401"],
+)
+def test_without_an_api_wide_entity_401_and_403_carry_the_operations_entity(
+    url, headers, status
+):
+    """Whoever answers it, ninja or the operation: one entity for every 401
+    and 403 of the operation, so each agrees with the entry Agreement picks."""
     client = Client()
     hsr = hsr_of(client, "/q/things/_hsr/pk")
-    responses = hsr["get"]["responses"]
-    # Without an API-wide entity: ninja's own 401, 422 and 429, without
-    # content, and the operation's 403 under default.
-    assert {"401", "422", "429"} <= responses.keys()
-    assert "403" not in responses
-    response = client.get("/q/things/1")
+    response = client.get(url, headers=headers)
+    assert response.status_code == status
+    assert status_entry_problems("GET", status, hsr) == []
+    assert link_problems("GET", status, dict(response.items()), True, hsr) == []
+    assert schema_links(response) == [OWN.schema_link_or_func]
+
+
+def test_without_an_api_wide_entity_a_csrf_403_carries_the_operations_entity():
+    client = Client(enforce_csrf_checks=True)
+    hsr = hsr_of(client, "/q/things/_hsr/pk")
+    client.cookies["key"] = "secret"
+    response = client.post("/q/things/1")
     assert response.status_code == 403
-    assert link_problems("GET", 403, dict(response.items()), True, hsr) == []
+    assert b"CSRF" in response.content
+    assert status_entry_problems("POST", 403, hsr) == []
+    assert link_problems("POST", 403, dict(response.items()), True, hsr) == []
     assert schema_links(response) == [OWN.schema_link_or_func]
 
 

@@ -88,12 +88,9 @@ EITHER = " Either If-Match or If-Unmodified-Since is required."
 #: The ``default`` entry of an operation without an error entity.
 DEFAULT_ERROR = {"description": "Error."}
 #: ninja's own errors, described for an operation whose ``error`` differs
-#: from the API-wide entity (none here: no content).
+#: from the API-wide entity (none here: no content). Its 401 and 403 then
+#: carry the operation's ``error``, under ``default``.
 FRAMEWORK_ERRORS = {
-    "401": {
-        "description": "Unauthorized: the request lacks valid authentication "
-        "credentials."
-    },
     "422": {
         "description": "Unprocessable Content: the request's parameters or "
         "body are invalid."
@@ -1008,7 +1005,7 @@ def test_options_entities():
         },
         # A Media Type Object needs a schema: a context alone is not described.
         "404": {"description": "Not Found"},
-        # ninja's own errors don't get the operation's error entity.
+        # ninja's own 422 and 429 don't get the operation's error entity.
         **FRAMEWORK_ERRORS,
         "default": {**DEFAULT_ERROR, "content": error_content},
     }

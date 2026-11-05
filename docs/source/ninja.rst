@@ -651,7 +651,8 @@ has used its throttle quota, as in DRF. Its contract is ``before``'s: the
 same raw path parameters (each hook gets its own copy), ``None`` to go on
 (anything else, or an awaitable in a sync operation, raises ``TypeError``),
 an error raised to answer first, answered by the API's exception handler
-with the operation's error Links and never passing through the
+with the Links of the entity the operation's HTTP Schema Resource describes
+for the status (see "Error responses" below) and never passing through the
 ``add_decorator(mode="operation")`` decorators, ``async def`` in an
 ``async def`` operation, the same ``ConfigError`` at startup and the same
 ``RuntimeError`` for a request that reaches the function without it having
@@ -1065,10 +1066,12 @@ of the entity the operation's HTTP Schema Resource describes for its
 status:
 ``responses[status]`` if declared (``error`` first for scrudful's own 400, 412
 and 428 when the operation evaluates the ``If-*`` headers, and the API-wide
-entity when neither is set); else, for a 401 or
-403 when :func:`~scrudful.ninja.add_error_links`'s entity is set and differs
-from ``error``, that entity; else ``error``. The HSR has an entry for each
-status of ``responses=``, so a 404 a client gets agrees with it:
+entity when neither is set); else, for a status ninja answers itself too
+(401, 403, 422, 429) when :func:`~scrudful.ninja.add_error_links`'s entity is
+set and differs from ``error``, that entity, as ninja's own carry it; else
+``error``; else (an operation without ``error``) the API-wide entity. The HSR
+has an entry for each status of ``responses=``, so a 404 a client gets agrees
+with it:
 
 .. code-block:: python
 
@@ -1091,7 +1094,11 @@ does not validate, the 401 of missing credentials, the 403 of an
 handlers. A scrudful operation declaring the status in ``responses=`` gives
 them that entity's Links (with or without an API-wide entity);
 :func:`~scrudful.ninja.add_error_links` gives the others an API-wide error
-entity:
+entity. Without one, the 401 and 403 of a scrudful operation with an
+``error`` (missing credentials, an ``AuthorizationError``, a CSRF failure)
+carry ``error``'s Links, as the 401s and 403s the operation raises do, so
+every 401 and 403 agrees with the HSR's ``default`` entry; its 422 and 429
+carry none, and the HSR lists them without content:
 
 .. code-block:: python
 
