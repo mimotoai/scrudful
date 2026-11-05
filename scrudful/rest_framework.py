@@ -207,7 +207,10 @@ System checks
     - ``scrudful.E005``: a view whose HTTP Schema Resource can't be built
       (a relative link URL without a base URL, a schema without an RDF
       context, a link callable failing when called as ``func(view, None)``);
-    - ``scrudful.E006``: an invalid ``SCRUDFUL`` setting.
+    - ``scrudful.E006``: an invalid ``SCRUDFUL`` setting: not a dict of its
+      keys, or a key whose value is invalid (one error for each). While the
+      setting is invalid, what depends on it is not checked (no document
+      is built).
 
     Each would otherwise fail on a request. The check builds each document
     as :func:`http_schema_resource` does (no request, no database access by
@@ -297,12 +300,14 @@ from scrudful._adapter import (
     with_error_body,
 )
 from scrudful._django import (
+    SETTING_ACCESSORS,
     aware,
     error_handler,
     hsr_not_allowed,
     hsr_response,
     no_content,
     page_url,
+    scrudful_setting,
     setting_base_url,
     setting_error,
     setting_hsr_cache_control,
@@ -2370,26 +2375,59 @@ class _HsrURLPattern(URLPattern):
 def _scrudful_url_errors(
     resolver: URLResolver, scan: _Scan
 ) -> list[checks.CheckMessage]:
-    """The errors of the system check (see :func:`_check_hsr_urls`)."""
+    """The messages of the system check (see :func:`_check_hsr_urls`): the
+    ``SCRUDFUL`` setting's errors (:func:`_setting_errors`), then the
+    routes' (:func:`_hsr_url_errors`)."""
+    errors = _setting_errors()
+    return errors + _hsr_url_errors(resolver, scan, settings_valid=not errors)
+
+
+def _setting_errors() -> list[checks.CheckMessage]:
+    """``scrudful.E006`` for the ``SCRUDFUL`` setting: one if it isn't a dict
+    of its keys, else one for each key whose value is invalid (each key's
+    accessor, :data:`scrudful._django.SETTING_ACCESSORS`, names it)."""
     try:
-        return _hsr_url_errors(resolver, scan)
-    except ImproperlyConfigured as exc:  # an invalid SCRUDFUL setting
+        scrudful_setting("BASE_URL", None)  # the dict and its keys
+    except ImproperlyConfigured as exc:
         return [checks.Error(str(exc), id="scrudful.E006")]
+    errors: list[checks.CheckMessage] = []
+    for accessor in SETTING_ACCESSORS.values():
+        try:
+            accessor()
+        except ImproperlyConfigured as exc:
+            errors.append(checks.Error(str(exc), id="scrudful.E006"))
+    return errors
 
 
-def _hsr_url_errors(resolver: URLResolver, scan: _Scan) -> list[checks.CheckMessage]:
-    """The errors of :func:`_scrudful_url_errors`."""
+def _hsr_url_errors(
+    resolver: URLResolver, scan: _Scan, settings_valid: bool
+) -> list[checks.CheckMessage]:
+    """The routes' errors of :func:`_scrudful_url_errors`.
+
+    Each entry is checked apart. With an invalid setting
+    (``settings_valid`` false; :func:`_setting_errors` reports it), the
+    entries whose answer depends on it are left out, and no HTTP Schema
+    Resource is built: each build reads the setting.
+    """
     errors: list[checks.CheckMessage] = []
     for callback, message in scan.unnamed:
-        if _hsr_url(callback.cls) is None:  # an hsr_url needs no name
+        try:
+            hsr_url = _hsr_url(callback.cls)
+        except ImproperlyConfigured:  # the setting's, reported
+            continue
+        if hsr_url is None:  # an hsr_url needs no name
             errors.append(checks.Error(message, obj=callback.cls, id="scrudful.E001"))
     for message in scan.clashes.values():
         errors.append(checks.Error(message, id="scrudful.E002"))
     needs_route = []
     for view_name, view_func in scan.views.items():
-        if _hsr_url(view_func.cls) is not None:
+        try:
+            if _hsr_url(view_func.cls) is not None:
+                continue
+            route_on = _hsr_route_on(view_func.cls)
+        except ImproperlyConfigured:  # the setting's, reported
             continue
-        if _hsr_route_on(view_func.cls):
+        if route_on:
             needs_route.append(view_name)
         else:
             errors.append(
@@ -2408,6 +2446,8 @@ def _hsr_url_errors(resolver: URLResolver, scan: _Scan) -> list[checks.CheckMess
             )
         except NoReverseMatch:
             errors.append(checks.Error(_NO_HSR_URLS, id="scrudful.E003"))
+    if not settings_valid:
+        return errors
     for view_name, view_func in scan.views.items():
         try:
             # Built as the route builds it, but not kept (the settings may

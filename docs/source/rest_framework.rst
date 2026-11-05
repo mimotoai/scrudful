@@ -60,7 +60,9 @@ misconfigurations before any request, as errors of Django's URL system check:
 * ``scrudful.E005``: a view's HSR can't be built (a relative link URL without
   a base URL, a schema link without an RDF context, a link callable failing
   when called as ``func(view, None)``);
-* ``scrudful.E006``: the ``SCRUDFUL`` setting is invalid.
+* ``scrudful.E006``: the ``SCRUDFUL`` setting is invalid: it isn't a dict of
+  its keys, or a key's value is invalid (one error for each key). While it is,
+  the checks that depend on it are skipped (no HSR is built).
 
 The check builds each view's HSR as the route does (without a request; link
 callables are called) and keeps none. With the include, it runs in Django's own

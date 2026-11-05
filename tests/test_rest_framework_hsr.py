@@ -1230,6 +1230,50 @@ def test_system_check_reports_an_invalid_setting(urls, settings):
     assert "HSR_ROUTE" in error.msg
 
 
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("BASE_URL", "/v1/"),
+        ("ERROR", "not an entity"),
+        ("HSR_CACHE_CONTROL", 300),
+        ("HSR_CACHE_CONTROL", ""),
+        ("HSR_ROUTE", "yes"),
+        ("HSR_URL", "https://x/"),
+    ],
+)
+def test_system_check_reports_each_invalid_setting_key_once(
+    urls, settings, key, value
+):
+    """One E006 naming the key, whichever it is, and no E005 per view for a
+    cause that is the setting's."""
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL, key: value}
+    [error] = scrudful_check_errors()
+    assert error.id == "scrudful.E006"
+    assert f'SCRUDFUL["{key}"]' in error.msg
+
+
+@pytest.mark.parametrize(
+    "value, match",
+    [(["BASE_URL"], "must be a dict"), ({"BASE_URLS": BASE_URL}, "unknown keys")],
+)
+def test_system_check_reports_a_malformed_setting_once(urls, settings, value, match):
+    settings.SCRUDFUL = value
+    [error] = scrudful_check_errors()
+    assert error.id == "scrudful.E006"
+    assert match in error.msg
+
+
+def test_an_invalid_setting_keeps_the_route_errors(settings):
+    """E006 is reported beside the URLconf's own errors, not in their place."""
+    settings.ROOT_URLCONF = UnnamedURLconf
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL, "HSR_ROUTE": "yes"}
+    errors = scrudful_check_errors()
+    assert sorted(error.id for error in errors) == ["scrudful.E001", "scrudful.E006"]
+    settings.ROOT_URLCONF = ClashURLconf
+    errors = scrudful_check_errors()
+    assert sorted(error.id for error in errors) == ["scrudful.E002", "scrudful.E006"]
+
+
 def test_system_check_reports_an_hsr_that_cannot_be_built(urls, settings):
     # The views' relative links need a base URL.
     settings.SCRUDFUL = None

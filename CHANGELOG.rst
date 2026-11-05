@@ -194,8 +194,9 @@ Behaviour change (DRF)
   (no ``hsr_urls()`` include where a view needs it), ``E004`` (a route turned
   off without ``hsr_url``), ``E005`` (an HSR that can't be built: a relative
   link without a base URL, a schema without a context, a link callable failing
-  as ``func(view, None)``) and ``E006`` (an invalid ``SCRUDFUL`` setting). The
-  ``hsr_urls()`` pattern runs the check in Django's URL check; ``E003`` needs
+  as ``func(view, None)``) and ``E006`` (an invalid ``SCRUDFUL`` setting: one
+  error for each invalid key, ``HSR_CACHE_CONTROL`` and ``ERROR`` included,
+  reported beside the routes' errors). The ``hsr_urls()`` pattern runs the check in Django's URL check; ``E003`` needs
   ``scrudful.rest_framework`` imported before the checks start, which
   registers the check (an ``AppConfig.ready()``).
 * OPTIONS is no longer gated by the view's permissions (DRF's ``initial()``
