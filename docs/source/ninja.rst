@@ -837,9 +837,11 @@ Content"}}}``.
   decorating; for a callable one, building the HSR raises ``ConfigError``.
 * The reason phrases of extra statuses are ``http.HTTPStatus(code).phrase``,
   which can differ between Python versions (e.g. for 422).
-* A path whose HSR link can't be computed (no route and no ``hsr_url``, a
-  route that can't be reversed) raises ``ConfigError`` on every response of
-  the path, not only on OPTIONS.
+* A path whose HSR link can't be computed (an ``hsr_url`` that raises or
+  returns a relative URL, a route that can't be reversed) raises on every
+  request of the path, not only on OPTIONS: the link is resolved before the
+  operation runs (before ninja's checks too), so such a request fails before
+  the handler writes anything.
 
 The HSR route
 ~~~~~~~~~~~~~

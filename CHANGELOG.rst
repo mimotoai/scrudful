@@ -188,9 +188,11 @@ Behaviour change (ninja)
   validation's 422, problem details for a problem-details entity, a 429)
   carry it, with or without ``add_error_links`` (they carried the API-wide
   entity, or none).
-* A path whose HSR link can't be computed (the route off without
-  ``hsr_url``, a route that can't be reversed) raises ``ConfigError`` on
-  every response of the path.
+* A path whose HSR link can't be computed (an ``hsr_url`` raising or
+  returning a relative URL, a route that can't be reversed) raises on every
+  request of the path. The link is resolved before the operation runs, so
+  such a request fails before the handler writes anything (it was resolved
+  once the response was made, after the write).
 * ``add_error_links``'s entity is also the HSR's API-wide error entity, and
   calling it discards the built HSRs; its link callables are called as
   ``(None, None)`` there.

@@ -3337,6 +3337,12 @@ def _serving_router_run(
     :func:`_hsr_target`), while it runs, and giving the response it returns
     the HTTP Schema Resource link (:func:`_add_hsr_link`).
 
+    The link is resolved (:func:`_resolved_hsr_link`) before ``run``: a
+    misconfiguration it raises (an ``hsr_url`` raising or returning a
+    relative URL, a route that can't be reversed) fails the request before
+    ninja's checks and the operation run, so before any write, rather than
+    after one.
+
     Outermost of scrudful's, so the API's exception handlers ninja calls in
     ``run`` see them too, and every response the operation answers gets the
     link: the operation's own, scrudful's early ones, and those of ninja's
@@ -3351,8 +3357,9 @@ def _serving_router_run(
             @functools.wraps(run)
             async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
                 with _serving_router(router, operation):
+                    link = _resolved_hsr_link(request, router, path)
                     response = await run(request, *args, **kw)
-                    _add_hsr_link(response, request, router, path)
+                _add_hsr_link(response, link)
                 return response
 
         else:
@@ -3360,8 +3367,9 @@ def _serving_router_run(
             @functools.wraps(run)
             def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
                 with _serving_router(router, operation):
+                    link = _resolved_hsr_link(request, router, path)
                     response = run(request, *args, **kw)
-                    _add_hsr_link(response, request, router, path)
+                _add_hsr_link(response, link)
                 return response
 
         return scrudful_run
@@ -3369,31 +3377,33 @@ def _serving_router_run(
     return decorator
 
 
-def _add_hsr_link(
-    response: HttpResponseBase,
-    request: HttpRequest,
-    router: ScrudfulRouter,
-    path: str,
-) -> None:
-    """Give ``response``, of ``router``'s ``path``, the link to the path's
-    HTTP Schema Resource (:func:`_hsr_target`) and the exposed headers.
-
-    Unless the path has no HTTP Schema Resource (no scrudful or
-    :func:`described` operation), or the request is a CORS preflight, whose
-    answer carries no Links. A Link with the HSR relation the response
-    already has (the handler's) replaces it (see
-    :func:`scrudful._adapter.merge_links`). Called within
-    :func:`_serving_router`, which :func:`_hsr_target` reads under ninja's
-    ``TestClient``.
-    """
+def _resolved_hsr_link(
+    request: HttpRequest, router: ScrudfulRouter, path: str
+) -> str | None:
+    """The link to the HTTP Schema Resource of ``router``'s ``path``
+    (:func:`_hsr_target`), for ``request``'s response; ``None`` when the path
+    has no HTTP Schema Resource (no scrudful or :func:`described`
+    operation), or for a CORS preflight, whose answer carries no Links.
+    Called within :func:`_serving_router`, which :func:`_hsr_target` reads
+    under ninja's ``TestClient``."""
     if is_preflight(request.method or "", request.headers.get):
-        return
+        return None
     if not router._describes(path):
+        return None
+    return hsr_link(_hsr_target(request, router, path))
+
+
+def _add_hsr_link(response: HttpResponseBase, link: str | None) -> None:
+    """Give ``response`` the HTTP Schema Resource ``link``
+    (:func:`_resolved_hsr_link`) and the exposed headers; nothing when
+    ``link`` is ``None``. A Link with the HSR relation the response already
+    has (the handler's) replaces it (see
+    :func:`scrudful._adapter.merge_links`)."""
+    if link is None:
         return
-    hsr = hsr_link(_hsr_target(request, router, path))
-    link = merge_links(response.get("Link"), None, None, hsr)
-    if link is not None:
-        response["Link"] = link
+    merged = merge_links(response.get("Link"), None, None, link)
+    if merged is not None:
+        response["Link"] = merged
     expose_headers(response)
 
 
@@ -5340,8 +5350,9 @@ def _method_not_allowed(
     operation = path_view.operations[0]
     api = _operation_api(operation)
     with _serving_router(router, operation):
+        link = _resolved_hsr_link(request, router, path_view._scrudful_path)
         response = api.on_exception(request, HttpError(405, "Method not allowed"))
-        _add_hsr_link(response, request, router, path_view._scrudful_path)
+    _add_hsr_link(response, link)
     served = {
         method.upper()
         for operation in path_view.operations
@@ -5435,16 +5446,18 @@ def _options_answer(
        the operation (:func:`_options_throttled`): a 429 is ninja's;
     3. the object is loaded (:func:`_options_object`); an ``HttpError`` or
        ``Http404`` the loader raises is answered by the API's exception
-       handler, with the HSR link;
+       handler;
     4. each method of the path is checked for this requester
        (:func:`_may_use`), with the operations of the mount the request came
        through (:func:`_served_operations`), ninja's clones of the template's;
-    5. the answer is a 204 with no content and no ``Content-Type``, the
-       ``Allow`` of the methods allowed (:func:`scrudful._hsr.allow_value`),
-       the HSR link (:func:`_hsr_target`) and the exposed headers.
+    5. the answer is a 204 with no content and no ``Content-Type``, and the
+       ``Allow`` of the methods allowed (:func:`scrudful._hsr.allow_value`).
 
     Anything else raised is answered by the API's exception handler, as
     ninja's ``Operation.run`` answers it (re-raised without a handler).
+    Every answer but the preflight's gets the HSR link and the exposed
+    headers from the operation's outer run decorator
+    (:func:`_serving_router_run`), which resolved the link before.
     """
     if is_preflight(request.method or "", request.headers.get):
         return no_content()
@@ -5457,7 +5470,6 @@ def _options_answer(
         if throttled is not None:
             return throttled
         served = _served_operations(bound_view, path_view)
-        target = _hsr_target(request, router, path)
         # The URL's parameters, as the operations' hooks get them (also those
         # of a prefix).
         match = getattr(request, "resolver_match", None)
@@ -5465,12 +5477,7 @@ def _options_answer(
         try:
             obj = _options_object(request, api, served, url_params)
         except (HttpError, Http404) as exc:
-            response = api.on_exception(request, exc)
-            link = merge_links(response.get("Link"), None, None, hsr_link(target))
-            if link is not None:
-                response["Link"] = link
-            expose_headers(response)
-            return response  # type: ignore[no-any-return]
+            return api.on_exception(request, exc)  # type: ignore[no-any-return]
         allowed = [
             method
             for method, template, bound in served
@@ -5480,8 +5487,6 @@ def _options_answer(
         return api.on_exception(request, exc)  # type: ignore[no-any-return]
     response = no_content()
     response["Allow"] = allow_value(allowed)
-    response["Link"] = hsr_link(target)
-    expose_headers(response)
     return response
 
 
@@ -5805,9 +5810,9 @@ def _authenticated(
             "doesn't have as ninja 1.7.0 and 1.7.1 do (a sequence of "
             "callables): upgrade scrudful, or keep ninja at one of those releases"
         )
+    # A copy of the OPTIONS request, which _options_answer marked CSRF-exempt.
     requester = copy.copy(request)
     requester.method = method
-    requester._ninja_csrf_exempt = True  # type: ignore[attr-defined]
     if not callbacks:
         return requester, True
     for callback in callbacks:

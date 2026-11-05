@@ -802,6 +802,72 @@ def test_empty_hsr_cache_control_is_rejected(settings, value):
         TestClient(make_api()[0]).get("/_hsr/pk")
 
 
+def _raising_hsr_url(path):
+    raise LookupError(f"no HSR URL registered for {path!r}")
+
+
+@pytest.mark.parametrize(
+    "hsr_url, error",
+    [(_raising_hsr_url, LookupError), (lambda path: "/relative", ConfigError)],
+    ids=["raises", "relative"],
+)
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_an_hsr_link_that_cant_be_resolved_fails_before_the_operation(
+    hsr_url, error, asynchronous
+):
+    """The link is resolved before the operation runs, so a misconfigured
+    one fails the request before the handler writes anything."""
+    writes = []
+    router = ScrudfulRouter(base_url=BASE_URL, hsr_url=hsr_url)
+    create = scrudful_create(
+        location_func=lambda request, obj: f"/things/{obj['name']}", **LINKS
+    )
+    if asynchronous:
+
+        @router.post("/things", response={201: ItemIn})
+        @create
+        async def add(request, payload: ItemIn):
+            writes.append(payload.name)
+            return {"name": payload.name}
+
+        def post():
+            return async_to_sync(TestAsyncClient(mount(router)).post)(
+                "/things", json={"name": "a"}
+            )
+
+    else:
+
+        @router.post("/things", response={201: ItemIn})
+        @create
+        def add(request, payload: ItemIn):
+            writes.append(payload.name)
+            return {"name": payload.name}
+
+        def post():
+            return TestClient(mount(router)).post("/things", json={"name": "a"})
+
+    with pytest.raises(error):
+        post()
+    assert writes == []
+
+
+def test_the_hsr_link_is_resolved_once_per_request():
+    calls = []
+
+    def hsr_url(path):
+        calls.append(path)
+        return "https://docs.example/hsr/item"
+
+    client = TestClient(make_api(hsr_url=hsr_url)[0])
+    for send in (lambda: client.get("/1"), lambda: options(client, "/1")):
+        calls.clear()
+        response = send()
+        assert response.status_code in (200, 204)
+        target = "https://docs.example/hsr/item"
+        assert hsr_link_problems(dict(response.headers), target) == []
+        assert calls == ["/{pk}"]
+
+
 @pytest.mark.parametrize("returned", [None, "", "/hsr/{pk}", 3])
 def test_hsr_url_must_return_an_absolute_url(rf, returned):
     router = target_router("a", hsr_route=False, hsr_url=lambda path: returned)
@@ -2221,7 +2287,9 @@ def test_options_needs_ninjas_internals(monkeypatch, fresh_ninja_code, owner, me
 def test_options_needs_the_bound_path_operations(monkeypatch, shape):
     api, _ = make_api()
     client = TestClient(api)
-    assert client.urls  # the URL patterns are built, and kept
+    # The URL patterns are built and kept, and the HSR link, resolved first,
+    # has the API's resolver.
+    assert client.get("/1").status_code == 200
     for bound in api._get_bound_routers():
         monkeypatch.setattr(bound, "path_operations", shape)
     with pytest.raises(ConfigError, match=r"BoundRouter\.path_operations"):
