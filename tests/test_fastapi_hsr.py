@@ -231,6 +231,78 @@ def test_routes_added_later_are_described():
     assert "delete" in http_schema_resource(app, "/items/{id}")
 
 
+def test_requests_dont_walk_the_routes_again(make_client, monkeypatch):
+    """The resources are indexed once per change of the routes: a request
+    doesn't walk every route of the app (the final review's F1)."""
+    import scrudful.fastapi as module
+
+    walks = []
+    collect = module._collect_paths
+
+    def counting(routes, prefix, paths, mounts):
+        if not prefix and not mounts:
+            walks.append(routes)
+        return collect(routes, prefix, paths, mounts)
+
+    monkeypatch.setattr(module, "_collect_paths", counting)
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    app = FastAPI()
+    for i in range(20):
+
+        @app.get(f"/r{i}/{{id}}")
+        @scrudful(**links)
+        async def get_item(id: int):
+            return {}
+
+    router = APIRouter()
+
+    @router.get("/things/{id}")
+    @scrudful(**links)
+    async def get_thing(id: int):
+        return {}
+
+    app.include_router(router, prefix="/v1")
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    for url in ("/r3/1", "/v1/things/1", "/_hsr/r3.id"):
+        assert client.get(url).status_code == 200
+    assert client.options("/r3/1").status_code == 204
+    before = len(walks)
+    for _ in range(5):
+        response = client.get("/r19/1")
+        assert hsr_link_problems(response.headers, f"{BASE}_hsr/r19.id") == []
+        assert client.get("/v1/things/1").status_code == 200
+        assert client.get("/_hsr/v1.things.id").status_code == 200
+        assert client.options("/r19/1").status_code == 204
+    assert len(walks) == before
+    # A route added later is seen: the routes changed.
+
+    @app.get("/later/{id}")
+    @scrudful(**links)
+    async def get_later(id: int):
+        return {}
+
+    response = client.get("/later/1")
+    assert hsr_link_problems(response.headers, f"{BASE}_hsr/later.id") == []
+    assert client.get("/_hsr/later.id").status_code == 200
+    # So is one added to an included router, included lazily or copied.
+
+    @router.get("/more/{id}")
+    @scrudful(**links)
+    async def get_more(id: int):
+        return {}
+
+    app.include_router(APIRouter())  # a copying FastAPI needs a new include
+    if module._iter_route_contexts is None:
+        app.include_router(router, prefix="/v2")
+        url, name = "/v2/more/1", "v2.more.id"
+    else:
+        url, name = "/v1/more/1", "v1.more.id"
+    response = client.get(url)
+    assert hsr_link_problems(response.headers, f"{BASE}_hsr/{name}") == []
+    assert client.get(f"/_hsr/{name}").status_code == 200
+
+
 def test_unknown_path_raises():
     app = make_app()
     with pytest.raises(ValueError, match=r"'/people/\{id\}'.*'/users/\{id\}'"):

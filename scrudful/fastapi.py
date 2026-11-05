@@ -890,6 +890,7 @@ _TEMPLATE_PARAMETER = re.compile(r"\{([^{}:]*)(?::([^{}]*))?\}")
 _ANY_SEGMENT = frozenset({"{}", "{:path}"})
 
 
+@functools.lru_cache(maxsize=4096)
 def _template_key(path: str) -> str:
     """The resource key of the route template ``path``: its parameters'
     names left out, their convertors kept (``str`` is no convertor), so two
@@ -953,6 +954,30 @@ class _HsrOptions:
     serialized: dict[str, tuple[dict[str, Any], bytes, str]] = field(
         default_factory=dict
     )
+    #: The owner's resources, indexed (see :func:`_scrudful_paths`).
+    index: _PathsIndex | None = field(default=None, compare=False, repr=False)
+
+
+@dataclass(eq=False)
+class _PathsIndex:
+    """An app's or router's :func:`_scrudful_paths`, and what each request
+    looks up in them, kept until the routes change (see
+    :func:`_routes_fingerprint`): a response's HSR link needs no walk of
+    every route of the app."""
+
+    #: :func:`_routes_fingerprint` of the routes indexed.
+    fingerprint: tuple[Any, ...]
+    #: The resources, by :func:`_template_key`.
+    paths: dict[str, _Resource]
+    #: The keys of the resources each route is on, by ``id`` of the route
+    #: (its ``original_route``), in the order of ``paths``.
+    by_route: dict[int, list[str]]
+    #: The same, by ``id`` of the route's endpoint.
+    by_endpoint: dict[int, list[str]]
+    #: :func:`_hsr_names` of ``paths``, once computed (it may raise).
+    names: dict[str, str] | None = None
+    #: The HSR route name of each resource key, from ``names``.
+    name_of: dict[str, str] | None = None
 
 
 #: The attribute of an app or router holding its :class:`_HsrOptions` (an
@@ -1542,9 +1567,46 @@ def _describing_error(func: Any, where: str, exc: Exception) -> ValueError:
 
 def _scrudful_paths(owner: FastAPI | APIRouter) -> dict[str, _Resource]:
     """The resources of ``owner`` that a scrudful endpoint serves, by
-    :func:`_template_key` (see :func:`add_options`)."""
-    paths: dict[str, _Resource] = {}
+    :func:`_template_key` (see :func:`add_options`); kept, with their index,
+    until ``owner``'s routes change (see :func:`_paths_index`). The caller
+    must not change them."""
+    return _paths_index(owner).paths
+
+
+def _paths_index(owner: FastAPI | APIRouter) -> _PathsIndex:
+    """``owner``'s :class:`_PathsIndex`, rebuilt when its routes changed
+    since (their :func:`_routes_fingerprint`), or always when it can't
+    tell."""
+    options = _hsr_options(owner)
     routes = owner.router.routes if isinstance(owner, FastAPI) else owner.routes
+    fingerprint = _routes_fingerprint(routes)
+    index = options.index
+    if index is not None and fingerprint is not None:
+        if index.fingerprint == fingerprint:
+            return index
+    paths = _find_scrudful_paths(routes)
+    by_route: dict[int, list[str]] = {}
+    by_endpoint: dict[int, list[str]] = {}
+    for key, resource in paths.items():
+        for route in resource.routes:
+            original = getattr(route, "original_route", route)
+            endpoint = getattr(original, "endpoint", None)
+            for found, of in ((original, by_route), (endpoint, by_endpoint)):
+                if found is None:
+                    continue
+                keys = of.setdefault(id(found), [])
+                if key not in keys:
+                    keys.append(key)
+    index = _PathsIndex(fingerprint or (), paths, by_route, by_endpoint)
+    if fingerprint is not None:
+        options.index = index
+    return index
+
+
+def _find_scrudful_paths(routes: Sequence[Any]) -> dict[str, _Resource]:
+    """:func:`_scrudful_paths` of an owner whose routes are ``routes``,
+    found by walking them."""
+    paths: dict[str, _Resource] = {}
     _collect_paths(routes, "", paths, [])
     return {
         key: resource
@@ -1554,6 +1616,54 @@ def _scrudful_paths(owner: FastAPI | APIRouter) -> dict[str, _Resource]:
             for route in resource.routes
         )
     }
+
+
+def _routes_fingerprint(routes: list[Any]) -> tuple[Any, ...] | None:
+    """What changes when a route is added under ``routes`` (or removed): the
+    identity and length of each list of routes :func:`_collect_paths` walks,
+    ``routes``, those of the ``Mount``\\ s and ``Host``\\ s it looks into and
+    those of the routers FastAPI includes lazily (``original_router``, the
+    included ``APIRouter``, of the entries :func:`_flat` expands); ``None``
+    when one of those entries can't be seen into (another FastAPI's), so the
+    caller walks the routes each time, as before the index.
+
+    It walks the lists, not the routes' templates and endpoints, so it is
+    cheap next to :func:`_find_scrudful_paths`; a route replaced in place,
+    keeping its list's length, isn't seen (FastAPI and Starlette add routes,
+    they don't replace them).
+    """
+    parts: list[Any] = []
+    pending = [routes]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        parts.append((id(current), len(current)))
+        for route in current:
+            if isinstance(route, Route):
+                continue
+            contents = _contents(route)
+            if contents is not None:
+                if contents is not _OPAQUE:
+                    pending.append(contents)
+                continue
+            if _iter_route_contexts is None or _is_leaf(route):
+                continue
+            inner = getattr(getattr(route, "original_router", None), "routes", None)
+            if not isinstance(inner, list):
+                return None
+            pending.append(inner)
+    return tuple(parts)
+
+
+def _is_leaf(route: Any) -> bool:
+    """Whether :func:`_flat` gives ``route`` as itself (a ``WebSocketRoute``,
+    a route of a kind of its own), rather than the routes of an included
+    router."""
+    flat = _flat([route])
+    return len(flat) == 1 and getattr(flat[0], "original_route", flat[0]) is route
 
 
 def _collect_paths(
@@ -2657,7 +2767,7 @@ class _HsrRoute(Route):
             return Match.NONE, {}
         paths = _scrudful_paths(self.owner)
         name = child_scope["path_params"].get(_HSR_PARAMETER)
-        key = _hsr_names(paths).get(name)
+        key = _owner_hsr_names(self.owner, paths)[0].get(name)
         if key is None:
             return Match.NONE, {}
         return match, {**child_scope, _HSR_SERVED_KEY: (key, paths)}
@@ -2709,6 +2819,7 @@ def _hsr_route_of(owner: FastAPI | APIRouter, key: str) -> Route | None:
     return route if isinstance(route, Route) else None
 
 
+@functools.lru_cache(maxsize=4096)
 def _hsr_route_name(template: str) -> str:
     """The HSR route name of the Starlette route template ``template``.
 
@@ -2737,6 +2848,28 @@ def _check_reserved(paths: Mapping[str, _Resource]) -> None:
                 f"{resource.template!r} is under '/{HSR_ROUTE_SEGMENT}/', which "
                 "is reserved for scrudful's HTTP Schema Resource routes"
             )
+
+
+def _owner_hsr_names(
+    owner: FastAPI | APIRouter, paths: Mapping[str, _Resource]
+) -> tuple[dict[str, str], dict[str, str]]:
+    """:func:`_hsr_names` of ``owner``'s ``paths`` and its inverse (the name
+    of each resource key), kept on ``owner``'s index when ``paths`` are its
+    (see :func:`_paths_index`).
+
+    Raises
+    ------
+    ValueError
+        As :func:`_hsr_names`.
+    """
+    index = _hsr_options(owner).index
+    if index is None or index.paths is not paths:
+        names = _hsr_names(paths)
+        return names, {key: name for name, key in names.items()}
+    if index.names is None or index.name_of is None:
+        names = _hsr_names(paths)
+        index.names, index.name_of = names, {key: n for n, key in names.items()}
+    return index.names, index.name_of
 
 
 def _hsr_names(paths: Mapping[str, _Resource]) -> dict[str, str]:
@@ -2783,7 +2916,8 @@ async def _hsr_route_response(
     else:
         paths = _scrudful_paths(owner)
         if key is None:
-            key = _hsr_names(paths).get(request.path_params.get(_HSR_PARAMETER))
+            names = _owner_hsr_names(owner, paths)[0]
+            key = names.get(request.path_params.get(_HSR_PARAMETER))
     if key is None or key not in paths:
         return _hsr_not_found()
     return await _hsr_get(request, owner, key, paths)
@@ -2940,6 +3074,8 @@ def _routed_resource(
     """
     route = request.scope.get("route")
     endpoint = request.scope.get("endpoint")
+    index = _hsr_options(owner).index
+    indexed = index is not None and index.paths is paths
 
     def keys_of(found: Callable[[Any], bool]) -> list[str]:
         return [
@@ -2948,9 +3084,19 @@ def _routed_resource(
             if any(found(getattr(r, "original_route", r)) for r in resource.routes)
         ]
 
-    keys = keys_of(lambda r: r is route) if route is not None else []
+    keys: list[str] = []
+    if route is not None:
+        keys = (
+            index.by_route.get(id(route), [])  # type: ignore[union-attr]
+            if indexed
+            else keys_of(lambda r: r is route)
+        )
     if not keys and endpoint is not None:
-        keys = keys_of(lambda r: getattr(r, "endpoint", None) is endpoint)
+        keys = (
+            index.by_endpoint.get(id(endpoint), [])  # type: ignore[union-attr]
+            if indexed
+            else keys_of(lambda r: getattr(r, "endpoint", None) is endpoint)
+        )
     for key in keys:
         if _root_of(request, paths[key], owner) is not None:
             return key
@@ -3008,7 +3154,7 @@ def _hsr_target(
         return options.hsr_url(resource.template)
     if not options.hsr_route:
         raise ValueError("hsr_route=False needs hsr_url=")
-    names = _hsr_names(paths)
+    _, name_of = _owner_hsr_names(owner, paths)
     key = _template_key(resource.template)
     route = _hsr_route_of(owner, key)
     if route is None:
@@ -3019,7 +3165,7 @@ def _hsr_target(
         )
     params: dict[str, str] = {}
     if isinstance(owner, FastAPI):
-        params[_HSR_PARAMETER] = next(n for n, k in names.items() if k == key)
+        params[_HSR_PARAMETER] = name_of[key]
     route_path = owner.url_path_for(route.name, **params)
     root = _root_of(request, resource, owner)
     if root is None:
@@ -3036,6 +3182,11 @@ def _hsr_target(
 #: The characters a URL path keeps as they are (RFC 3986 ``pchar`` and ``/``;
 #: ``%`` is quoted, as the request's path is decoded).
 _PATH_SAFE = "/!$&'()*+,;=:@-._~"
+
+
+#: Starlette's ``compile_path``, once per template (each request's
+#: :func:`_root_of` needs its template's).
+_compiled_path = functools.lru_cache(maxsize=4096)(compile_path)
 
 
 def _root_of(
@@ -3070,7 +3221,7 @@ def _root_of(
     path = scope["path"]
     if not path.startswith(root):  # Starlette < 0.33: the rest of the path
         path = root + path
-    regex, _, convertors = compile_path(resource.template)
+    regex, _, convertors = _compiled_path(resource.template)
     if isinstance(owner, FastAPI):
         # root_path, then its prefixes: without the Mounts within the app.
         candidates = [root[:i] for i in range(len(root), -1, -1)]
