@@ -523,7 +523,8 @@ New
   ``allowed_func``, ``base_url``, ``hsr_route``, ``hsr_url`` and
   ``hsr_cache_control`` on ``scrudful_viewset``.
 * FastAPI: ``scrudful(entity=)``; ``http_schema_resource(app_or_router,
-  path)`` and ``http_schema_resource_endpoint(app_or_router, path)``.
+  path, *, for_app=None)`` and ``http_schema_resource_endpoint(app_or_router,
+  path)``.
 
 Removed
 -------
