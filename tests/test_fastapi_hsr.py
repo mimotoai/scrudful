@@ -226,10 +226,10 @@ def test_a_path_without_a_scrudful_endpoint_has_no_hsr():
         http_schema_resource(app, "/plain")
 
 
-def test_parameter_names_and_convertors_are_one_resource(make_client):
-    """Starlette routes ``/items/5`` GET to ``/items/{id}`` and PUT to
-    ``/items/{item_id:int}``: one resource, one document, under either
-    template (R20)."""
+def test_parameter_names_are_one_resource_convertors_are_distinct(make_client):
+    """Templates that match the same URLs are one resource whatever their
+    parameters' names (``str`` is no convertor); another convertor matches
+    other URLs, so it is another resource (R20a)."""
     links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
     reads, writes = APIRouter(), APIRouter()
 
@@ -238,22 +238,59 @@ def test_parameter_names_and_convertors_are_one_resource(make_client):
     async def read(id: int):
         return {}
 
-    @writes.put("/items/{item_id:int}")
+    @writes.put("/items/{item_id}")
     @scrudful(**links)
     async def write(item_id: int):
         return {}
+
+    @writes.patch("/items/{x:str}")
+    @scrudful(**links)
+    async def patch(x: str):
+        return {}
+
+    @writes.delete("/items/{id:int}", status_code=204)
+    @scrudful()
+    async def remove(id: int):
+        return None
 
     app = FastAPI()
     app.include_router(reads)
     app.include_router(writes)
     add_options(app, base_url=BASE)
     hsr = http_schema_resource(app, "/items/{id}")
-    assert list(hsr) == ["get", "put", "options"]
+    assert list(hsr) == ["get", "put", "options", "patch"]
     assert http_schema_resource(app, "/items/{item_id}") == hsr
-    assert http_schema_resource(app, "/items/{x:int}") == hsr
-    response = make_client(app).options("/items/5")
+    assert http_schema_resource(app, "/items/{y:str}") == hsr
+    assert list(http_schema_resource(app, "/items/{n:int}")) == ["delete", "options"]
+    client = make_client(app)
+    response = client.options("/items/abc")
     assert response.json() == hsr
-    assert response.headers["allow"] == "GET, PUT, OPTIONS"
+    assert response.headers["allow"] == "GET, PUT, OPTIONS, PATCH"
+    assert client.delete("/items/abc").status_code == 405  # not this resource's
+
+
+def test_a_convertor_beside_a_str_parameter_is_a_separate_resource(make_client):
+    """A limitation, like a literal beside a template: ``/items/5`` matches
+    both, and reaches whichever route comes first."""
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    app = FastAPI()
+
+    @app.put("/items/{id:int}")
+    @scrudful(**links)
+    async def write(id: int):
+        return {}
+
+    @app.get("/items/{name}")
+    @scrudful(**links)
+    async def read(name: str):
+        return {}
+
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    response = client.options("/items/abc")
+    assert response.headers["allow"] == "GET, OPTIONS"
+    assert client.put("/items/abc").status_code == 405
+    assert client.options("/items/5").headers["allow"] == "PUT, OPTIONS"
 
 
 def test_a_literal_beside_a_template_is_a_separate_resource(make_client):
@@ -314,6 +351,66 @@ def test_routes_a_mount_shadows_are_left_out(make_client):
     assert client.get("/acme/z").status_code == 404
     with pytest.raises(ValueError, match="'/acme/z'"):
         http_schema_resource(app, "/acme/z")
+
+
+def test_a_convertor_mount_shadows_only_what_it_matches(make_client):
+    """``Mount("/{x:int}")`` takes only digit segments: ``/about/us`` after it
+    is still reached, described and answered."""
+    from fastapi.routing import APIRoute
+
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+
+    async def page():
+        return {}
+
+    endpoint = scrudful(**links)(page)
+    app = FastAPI()
+    app.router.routes.append(
+        Mount("/{x:int}", routes=[APIRoute("/y", endpoint, methods=["GET"])])
+    )
+    app.router.routes.append(APIRoute("/about/us", endpoint, methods=["GET"]))
+    app.router.routes.append(APIRoute("/{n:int}/z", endpoint, methods=["GET"]))
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    assert client.get("/about/us").status_code == 200
+    hsr = http_schema_resource(app, "/about/us")
+    assert list(hsr) == ["get", "options"]
+    assert client.options("/about/us").json() == hsr
+    # Its like is shadowed: /5/z goes into the Mount.
+    assert client.get("/5/z").status_code == 404
+    with pytest.raises(ValueError, match=r"'/\{n:int\}/z'"):
+        http_schema_resource(app, "/{n:int}/z")
+
+
+def test_a_mount_under_a_host_shadows_only_within_it(make_client):
+    """A Host routes only its host's requests: its Mount doesn't shadow the
+    app's later routes."""
+    from fastapi.routing import APIRoute
+    from starlette.routing import Host
+
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+
+    async def page():
+        return {}
+
+    endpoint = scrudful(**links)(page)
+    app = FastAPI()
+    app.router.routes.append(
+        Host(
+            "api.example",
+            app=Router(
+                [Mount("/n", routes=[APIRoute("/y", endpoint, methods=["GET"])])]
+            ),
+        )
+    )
+    app.router.routes.append(APIRoute("/n/z", endpoint, methods=["GET"]))
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    assert client.get("/n/z").status_code == 200
+    hsr = http_schema_resource(app, "/n/z")
+    assert list(hsr) == ["get", "options"]
+    assert client.options("/n/z").json() == hsr
+    assert list(http_schema_resource(app, "/n/y")) == ["get", "options"]
 
 
 def test_full_path_keys_under_a_prefix_and_a_mount(make_client):

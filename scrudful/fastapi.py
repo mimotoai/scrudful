@@ -734,14 +734,25 @@ _RANGE_TEXT = {
 }
 _STATUS_KEY = re.compile(r"[1-5](?:[0-9]{2}|XX)")
 #: A path parameter of a route template, ``{name}`` or ``{name:convertor}``.
-_TEMPLATE_PARAMETER = re.compile(r"\{[^{}]*\}")
+_TEMPLATE_PARAMETER = re.compile(r"\{[^{}:]*(?::([^{}]*))?\}")
+#: The segments of a Mount's key that match any one segment (``str``), or
+#: any rest of the path (``path``); a segment of another convertor (``int``,
+#: ``uuid``, a custom one) matches only some, so it shadows only itself.
+_ANY_SEGMENT = frozenset({"{}", "{:path}"})
 
 
 def _template_key(path: str) -> str:
-    """The resource key of the route template ``path``: its parameters,
-    names and convertors left out (``/items/{id}`` and ``/items/{item_id:int}``
-    are ``/items/{}``), since Starlette routes the same URLs to both."""
-    return _TEMPLATE_PARAMETER.sub("{}", path)
+    """The resource key of the route template ``path``: its parameters'
+    names left out, their convertors kept (``str`` is no convertor), so two
+    templates have one key exactly when they match the same URLs:
+    ``/items/{id}``, ``/items/{item_id}`` and ``/items/{x:str}`` are
+    ``/items/{}``, ``/items/{id:int}`` is ``/items/{:int}``."""
+
+    def parameter(match: re.Match[str]) -> str:
+        convertor = (match.group(1) or "").strip()
+        return "{}" if convertor in ("", "str") else f"{{:{convertor}}}"
+
+    return _TEMPLATE_PARAMETER.sub(parameter, path)
 
 
 @dataclass
@@ -824,17 +835,20 @@ def add_options(
     Given a ``FastAPI`` app, the resources are keyed by the full path
     templates of its routes (those of the routers included in it, with their
     prefixes, and those under a ``Mount(routes=...)``, with the Mount's
-    path), with the parameters' names and convertors left out: Starlette
-    routes the same URLs to ``/items/{id}`` and ``/items/{item_id:int}``, so
-    routes with either template, on the app or on several routers, are one
-    resource. Its document describes, for each method, the first of them
-    that serves it, as Starlette routes it: a route after a ``Mount`` whose
+    path), with the parameters' names left out and their convertors kept
+    (``str`` being none): templates that match the same URLs, such as
+    ``/items/{id}`` and ``/items/{item_id}``, on the app or on several
+    routers, are one resource. Its document describes, for each method, the
+    first of them that serves it, as Starlette routes it: a route after a
+    ``Mount`` whose
     path covers all its URLs is never reached, and is left out. A URL is
     answered with the document of the first route whose path matches it.
     Templates that overlap otherwise are separate resources: ``/items/new``
-    beside ``/items/{id}`` each have their own document and OPTIONS answer,
-    although ``GET /items/new`` reaches whichever route comes first; avoid
-    such overlaps, or give them the same methods. Given an ``APIRouter``,
+    beside ``/items/{id}``, or ``/items/{id:int}`` beside ``/items/{name}``
+    (or ``/files/{p:path}`` beside ``/files/{name}``), each have their own
+    document and OPTIONS answer, although a URL both match (``/items/new``,
+    ``/items/5``) reaches whichever route comes first; avoid such overlaps,
+    or give them the same methods. Given an ``APIRouter``,
     it adds an OPTIONS route to each resource of the router's own routes
     that has a scrudful route (at the path of its first route), answered
     with the router's document of it (keyed by the router's own templates);
@@ -1177,7 +1191,8 @@ def _collect_paths(
     automatic OPTIONS routes are skipped. ``mounts`` collects the segments of
     the ``Mount``\\ s passed: Starlette routes every URL under a Mount into it,
     so a later route (or Mount) whose URLs are all under one is never
-    reached, and is left out (see :func:`_shadowed`).
+    reached, and is left out (see :func:`_shadowed`). A ``Host`` routes
+    only its host's requests, so the Mounts under it shadow only within it.
     """
     for route in _flat(routes):
         if _is_automatic(route):
@@ -1189,7 +1204,9 @@ def _collect_paths(
             if is_mount and _shadowed(prefix + mount + "/", mounts):
                 continue
             if contents is not _OPAQUE:
-                _collect_paths(contents, prefix + mount, paths, mounts)
+                # Under a Host, the Mounts shadow only within it.
+                within = mounts if is_mount else list(mounts)
+                _collect_paths(contents, prefix + mount, paths, within)
             if is_mount:
                 mounts.append(_segments(_template_key(prefix + mount)))
         elif isinstance(getattr(route, "original_route", route), Route):
@@ -1210,13 +1227,18 @@ def _segments(key: str) -> list[str]:
 
 def _shadowed(template: str, mounts: list[list[str]]) -> bool:
     """Whether every URL of ``template`` is under one of the ``mounts``
-    (segment lists of :func:`_template_key`\\ s; a ``{}`` segment of a Mount
-    matches any segment). A template only partly under one (a parameter where
-    the Mount has a literal) is not."""
+    (segment lists of :func:`_template_key`\\ s). A Mount segment matches the
+    template's segment when they are equal, or when it is a ``str`` or
+    ``path`` parameter (see :data:`_ANY_SEGMENT`); a parameter of another
+    convertor (``{x:int}``) matches only its like. A template only partly
+    under one (a parameter where the Mount has a literal, or ``int``) is not.
+    """
     segments = _template_key(template).split("/")[1:]
     return any(
         len(segments) > len(mount)
-        and all(own == "{}" or own == other for own, other in zip(mount, segments))
+        and all(
+            own in _ANY_SEGMENT or own == other for own, other in zip(mount, segments)
+        )
         for mount in mounts
     )
 

@@ -2894,14 +2894,32 @@ def test_add_options_on_a_router_groups_differently_named_parameters(make_client
     async def write(item_id: int):
         return {}
 
+    # Another convertor matches other URLs: another resource (R20a).
+    @router.delete("/things/{n:int}", status_code=204)
+    @scrudful()
+    async def remove(n: int):
+        return None
+
+    @router.get("/things/{name}")
+    @scrudful(**links)
+    async def thing(name: str):
+        return {}
+
     add_options(router, base_url=TEST_BASE_URL)
     automatic = [route for route in router.routes if "OPTIONS" in route.methods]
-    assert [route.path for route in automatic] == ["/items/{id}"]
+    assert [route.path for route in automatic] == [
+        "/items/{id}",
+        "/things/{n:int}",
+        "/things/{name}",
+    ]
     app = FastAPI()
     app.include_router(router)
-    response = make_client(app).options("/items/5")
+    client = make_client(app)
+    response = client.options("/items/5")
     assert response.headers["allow"] == "GET, PUT, OPTIONS"
     assert response.json() == http_schema_resource(router, "/items/{item_id}")
+    assert client.options("/things/5").headers["allow"] == "DELETE, OPTIONS"
+    assert client.options("/things/abc").headers["allow"] == "GET, OPTIONS"
 
 
 def test_add_options_mount(make_client):
