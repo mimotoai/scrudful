@@ -358,6 +358,15 @@ is loaded for anyone, and a missing one is a 404 whoever asks, so OPTIONS tells
 anyone which objects exist, unless ``get_object()`` itself hides those a
 requester may not see (with a 404).
 
+**A 404 from a per-method check is the OPTIONS's answer.** A view-level or
+object permission (``has_permission``, ``has_object_permission``) or an
+``allowed_func`` that raises ``Http404`` or ``NotFound`` for a method answers
+the whole OPTIONS with that 404 (error Links and HSR link), as the method's own
+request would be answered, so ``Allow`` never reveals a resource a check hides.
+This differs from ninja and FastAPI, where a 404 that a method's ``auth=`` /
+``before`` or security dependency raises refuses only that method (their hooks'
+404 is the answer, as here).
+
 A 405 keeps DRF's ``Allow``, every method the view serves. An ``Accept`` that
 none of the view's renderers serves (e.g. ``text/html`` on a view without the
 browsable API) still gets DRF's 406, raised before OPTIONS is handled. With

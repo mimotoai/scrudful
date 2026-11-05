@@ -2394,6 +2394,43 @@ def test_a_permission_raising_a_401_refuses_its_method(settings, client):
     assert response["Allow"] == "GET, OPTIONS, HEAD"
 
 
+class HidesForPut(BasePermission):
+    """A view-level check that hides the resource from a PUT (a 404)."""
+
+    def has_permission(self, request, view):
+        if request.method == "PUT":
+            raise NotFound
+        return True
+
+
+@scrudful_viewset
+class HidingViewSet(drf_hsr_urls.ItemViewSetBase):
+    permission_classes = [HidesForPut]
+
+
+class HidingURLconf:
+    urlpatterns = [
+        path(
+            "hiding/<str:pk>/",
+            HidingViewSet.as_view({"get": "retrieve", "put": "update"}),
+            name="hiding",
+        ),
+        path("", include(hsr_urls())),
+    ]
+
+
+def test_a_view_level_check_raising_a_404_is_the_answer(settings, client):
+    """DRF's choice for a per-method check's 404 (unlike ninja's and FastAPI's,
+    which refuse the method): the OPTIONS answers it, as the method's request
+    would be, so Allow never reveals a resource the check hides. The object
+    check's and the hook's 404 are pinned above."""
+    settings.ROOT_URLCONF = HidingURLconf
+    response = client.options("/hiding/1/")
+    assert response.status_code == 404
+    assert hsr_link_problems(dict(response.items()), f"{BASE_URL}_hsr/hiding") == []
+    assert client.put("/hiding/1/").status_code == 404
+
+
 # --- OPTIONS: the object loaded as the checked method loads it ------------------
 
 #: The action (or method) each loader below was called under.
