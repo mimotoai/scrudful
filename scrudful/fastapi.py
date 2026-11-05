@@ -1085,7 +1085,7 @@ def add_options(
     app: FastAPI | APIRouter,
     *,
     base_url: str | None = None,
-    hsr_route: bool = True,
+    hsr_route: bool | None = None,
     hsr_url: Callable[[str], str] | None = None,
     hsr_cache_control: str | None = None,
     allowed: Callable[..., Any] | None = None,
@@ -1340,9 +1340,10 @@ def add_options(
         Schema Resource and on the Link headers of the responses of the
         paths covered. Without it, a relative URL in the document raises
         ``ValueError`` when the document is built.
-    hsr_route : bool, optional
+    hsr_route : bool or None, optional
         Whether to serve each path's document by GET at ``/_hsr/<name>``
-        (default ``True``). Turning it off needs ``hsr_url``.
+        (``None``, the default, is ``True``, as there is no setting to read).
+        Turning it off needs ``hsr_url``.
     hsr_url : callable, optional
         ``hsr_url(path)``: the URL the document of ``path`` (the resource's
         template, its first route's) is served at, when it is mounted
@@ -1440,8 +1441,13 @@ def _check_hsr_options(
         raise TypeError(
             f"hsr_cache_control must be a str, not {type(hsr_cache_control).__name__}"
         )
+    if hsr_route is None:
+        # As ninja's and DRF's None, which read a setting FastAPI hasn't.
+        hsr_route = True
     if not isinstance(hsr_route, bool):
-        raise TypeError(f"hsr_route must be a bool, not {type(hsr_route).__name__}")
+        raise TypeError(
+            f"hsr_route must be a bool or None, not {type(hsr_route).__name__}"
+        )
     for name, value in (("hsr_url", hsr_url), ("allowed", allowed), ("load", load)):
         if value is not None and not callable(value):
             raise TypeError(f"{name} must be callable, not {type(value).__name__}")

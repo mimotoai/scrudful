@@ -337,6 +337,8 @@ Behaviour change (FastAPI)
   other route (an ``APIRouter`` gets one route per resource), named after the
   template with each convertor but ``str`` joined by ``-`` (``users.id``,
   ``users.id-int``).
+* ``add_options(hsr_route=None)`` is accepted, and is the default (``True``),
+  as ninja's and DRF's ``hsr_route`` take ``None`` (it was a ``TypeError``).
 * ``add_options(router)`` adds an OPTIONS route to the resources of the
   routers included in the router too, at any depth (they advertised and
   served an HSR, but answered OPTIONS with FastAPI's 405).

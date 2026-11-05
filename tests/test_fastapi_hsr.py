@@ -1696,6 +1696,31 @@ def test_hsr_route_false_needs_hsr_url(make_client):
     assert make_client(app).get("/_hsr/users.id").status_code == 404
 
 
+@pytest.mark.parametrize("owner", ["app", "router"])
+def test_hsr_route_none_is_the_default(make_client, owner):
+    """``hsr_route`` takes ``bool | None``, as ninja's and DRF's do; ``None``
+    (FastAPI has no setting to read) is the default, on."""
+    if owner == "app":
+        app = make_app(hsr_route=None)
+    else:
+        router = APIRouter()
+
+        @router.get("/users/{id}")
+        @scrudful(**USER_LINKS)
+        async def get_user(id: int):
+            return {}
+
+        add_options(router, base_url=BASE, hsr_route=None)
+        app = FastAPI()
+        app.include_router(router)
+    client = make_client(app)
+    assert hsr_problems(client.get("/_hsr/users.id")) == []
+    response = client.get("/users/1")
+    assert hsr_link_problems(response.headers, f"{BASE}_hsr/users.id") == []
+    with pytest.raises(TypeError, match="hsr_route must be a bool or None"):
+        add_options(FastAPI(), hsr_route="yes")
+
+
 def test_http_schema_resource_endpoint_for_mounting(make_client):
     app = make_app(hsr_route=False, hsr_url=lambda p: f"https://docs.example/hsr{p}")
     endpoint = http_schema_resource_endpoint(app, "/users/{id}")

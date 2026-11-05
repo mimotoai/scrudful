@@ -79,8 +79,10 @@ again), and adds the routes still missing:
        ``ValueError`` when the document is built, and the responses resolve
        their Links against the request's URL.
    * - ``hsr_route``
-     - Whether to serve each document by GET at ``/_hsr/<name>`` (default
-       ``True``). ``False`` needs ``hsr_url``.
+     - Whether to serve each document by GET at ``/_hsr/<name>``: ``True``,
+       ``False`` or ``None`` (the default, which is ``True``: ninja's and
+       DRF's ``None`` read ``SCRUDFUL["HSR_ROUTE"]``, which FastAPI hasn't).
+       ``False`` needs ``hsr_url``.
    * - ``hsr_url``
      - ``hsr_url(path)``: the absolute URL of the document of ``path`` (the
        resource's template, its first route's), served elsewhere (see
