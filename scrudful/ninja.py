@@ -6674,7 +6674,7 @@ def _may_use(
         return False
     if values is None:
         return False
-    return _own_load_allows(config, requester, values, loaded)
+    return _own_load_allows(config, requester, values, loaded, path)
 
 
 def _load_must_run(config: _Config | None, loaded: _Loaded | None, method: str) -> bool:
@@ -6691,6 +6691,7 @@ def _own_load_allows(
     requester: HttpRequest,
     values: dict[str, Any],
     loaded: _Loaded | None,
+    path: str,
 ) -> bool:
     """Whether the item operation's own ``load`` lets ``requester`` (a copy of
     the OPTIONS request with the method, authenticated and allowed by
@@ -6705,9 +6706,12 @@ def _own_load_allows(
     ``HttpError`` (whatever its status), ``Http404`` or ``PermissionDenied``
     it raises refuses that method only: the loader's error alone answers the
     OPTIONS, and a method whose load fails is left out, as when in doubt.
-    What it returns, ``None`` included, allows it: the method's own flow
-    answers that. An ``async def`` load is awaited. Any other exception (a
-    bug) propagates.
+    An ``HttpError`` that isn't a denial (:func:`_is_denial`) is logged, with
+    its traceback, on the ``scrudful.ninja`` logger (``path`` names the
+    route): as an error for a 5xx, else as a warning; nothing else tells the
+    method was left out. What it returns, ``None`` included, allows it: the
+    method's own flow answers that. An ``async def`` load is awaited. Any
+    other exception (a bug) propagates.
     """
     if config is None or config.kind != "item" or config.load is None:
         return True
@@ -6721,7 +6725,21 @@ def _own_load_allows(
         return True
     try:
         _settled(config.load(requester, **values))
-    except (HttpError, Http404, PermissionDenied):
+    except (Http404, PermissionDenied):
+        return False
+    except HttpError as exc:
+        if not _is_denial(exc):
+            # Not a refusal (a 5xx, an outage, above all): the method is out,
+            # which only this log tells.
+            logger.log(
+                logging.ERROR if exc.status_code >= 500 else logging.WARNING,
+                "scrudful's OPTIONS of %r leaves %s out of Allow: its own load "
+                "raised HttpError %s",
+                path,
+                requester.method,
+                exc.status_code,
+                exc_info=exc,
+            )
         return False
     return True
 

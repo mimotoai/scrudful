@@ -2844,16 +2844,21 @@ def test_options_awaits_an_async_load():
     assert hsr_link_problems(dict(r.headers), PK_TARGET) == []
 
 
-def owner_router(asynchronous: bool, owned_status: int = 403, **put: Any) -> Any:
+def owner_router(
+    asynchronous: bool,
+    owned_status: int = 403,
+    refusal: Exception | None = None,
+    **put: Any,
+) -> Any:
     """GET loads any item; PUT loads it only for its owner (alice), raising
-    ``owned_status`` for anyone else. ``calls`` records each PUT load's
-    requester and method."""
+    ``refusal``, else an ``HttpError`` with ``owned_status``, for anyone
+    else. ``calls`` records each PUT load's requester and method."""
     store, calls = Store(), []
 
     def owned(request, pk, **params):
         calls.append((getattr(request, "auth", None), request.method))
         if request.auth != ALICE:
-            raise HttpError(owned_status, "not yours")
+            raise refusal or HttpError(owned_status, "not yours")
         return store.load(request, pk, **params)
 
     async def async_owned(request, pk, **params):
@@ -2899,12 +2904,25 @@ def options_of(api: NinjaAPI, asynchronous: bool, path: str, **kwargs: Any) -> A
 
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("owned_status", [401, 403, 404])
-def test_options_runs_each_methods_own_load(asynchronous, owned_status):
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        HttpError(401, "not yours"),
+        HttpError(403, "not yours"),
+        HttpError(404, "not yours"),
+        Http404("not yours"),
+        PermissionDenied("not yours"),
+    ],
+    ids=["401", "403", "404", "Http404", "PermissionDenied"],
+)
+def test_options_runs_each_methods_own_load(asynchronous, refusal, caplog):
     """Authorization in a method's own ``load`` shapes ``Allow``: a refusal
-    (401, 403 or 404) of PUT's load leaves PUT out for that requester only,
-    and the OPTIONS is still a 204 (only the loader's 404 answers it)."""
-    api, calls = owner_router(asynchronous, owned_status)
+    (an ``HttpError`` 401, 403 or 404, as with Django's ``Http404`` of
+    ``get_object_or_404`` or its ``PermissionDenied``) of PUT's load leaves
+    PUT out for that requester only, unlogged, and the OPTIONS is still a
+    204 (only the loader's 404 answers it)."""
+    caplog.set_level(logging.DEBUG, logger="scrudful.ninja")
+    api, calls = owner_router(asynchronous, refusal=refusal)
     bob = options_of(api, asynchronous, "/1", headers=BOB_KEY)
     assert bob.status_code == 204 and bob.headers["Allow"] == "GET, OPTIONS"
     assert calls == [(BOB, "PUT")]
@@ -2912,20 +2930,40 @@ def test_options_runs_each_methods_own_load(asynchronous, owned_status):
     assert alice.status_code == 204
     assert alice.headers["Allow"] == "GET, PUT, OPTIONS"
     assert calls[-1] == (ALICE, "PUT")
+    assert [r for r in caplog.records if r.name == "scrudful.ninja"] == []
 
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("owned_status", [400, 410, 500])
+@pytest.mark.parametrize(
+    "owned_status, level",
+    [(400, logging.WARNING), (410, logging.WARNING), (500, logging.ERROR)]
+    + [(503, logging.ERROR)],
+)
 def test_any_http_error_of_a_methods_own_load_leaves_only_it_out(
-    asynchronous, owned_status
+    asynchronous, owned_status, level, caplog
 ):
     """Only the loading operation's error answers the OPTIONS: whatever
     ``HttpError`` another method's own ``load`` raises leaves that method out
-    of ``Allow``, as when in doubt."""
+    of ``Allow``, as when in doubt. One that isn't a refusal is logged, with
+    its traceback, on ``scrudful.ninja``: a 5xx (an outage hiding the
+    method) as an error, another as a warning."""
+    caplog.set_level(logging.DEBUG, logger="scrudful.ninja")
     api, calls = owner_router(asynchronous, owned_status)
     bob = options_of(api, asynchronous, "/1", headers=BOB_KEY)
     assert bob.status_code == 204 and bob.headers["Allow"] == "GET, OPTIONS"
     assert calls == [(BOB, "PUT")]
+    records = [r for r in caplog.records if r.name == "scrudful.ninja"]
+    assert len(records) == 1
+    assert records[0].levelno == level
+    assert records[0].exc_info is not None
+    assert (
+        records[0]
+        .getMessage()
+        .startswith(
+            f"scrudful's OPTIONS of '/{{pk}}' leaves PUT out of Allow: its own load "
+            f"raised HttpError {owned_status}"
+        )
+    )
 
 
 def test_another_exception_of_a_methods_own_load_propagates():

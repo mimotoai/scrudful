@@ -188,7 +188,9 @@ Behaviour change (ninja)
   as DRF loads per action): any ``HttpError``, ``Http404`` or ``PermissionDenied`` it
   raises leaves only that method out of ``Allow`` (only the loading
   operation's error answers the OPTIONS; another exception still
-  propagates), so authorization in a method's ``load`` shapes ``Allow``; it
+  propagates; an ``HttpError`` other than a 401, 403 or 404 is logged, with
+  its traceback, on the ``scrudful.ninja`` logger, as an error for a 5xx and
+  as a warning otherwise), so authorization in a method's ``load`` shapes ``Allow``; it
   runs only once the method's ``auth=`` and ``before`` passed. A method whose
   path parameters don't validate (its request would be a 422), or whose path
   validation raises anything, is left out of ``Allow``, and its ``load``
