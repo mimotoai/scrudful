@@ -111,8 +111,8 @@ view, or a class between it and the mixin, sets is kept.
 Subclassing ``ScrudfulMetadata`` does nothing else: OPTIONS has no body and the
 HSR is built without the request, so a subclass may not define
 ``determine_metadata`` or one of 0.9's hooks (``determine_metadata_for_<method>``,
-``_write``, ``required_conditional_headers``), which raise ``TypeError`` when
-the class is created. Shape the document with ``statuses=``, ``entity=`` and
+``_write``, ``required_conditional_headers``), nor ``get_method``, which
+scrudful never calls: each raises ``TypeError`` when the class is created. Shape the document with ``statuses=``, ``entity=`` and
 ``Meta`` instead (see `The HTTP Schema Resource`_). A view that only sets
 ``metadata_class = ScrudfulMetadata``, keeping DRF's ``options``, answers
 OPTIONS with the HSR as DRF's 200 body, which is not Semantic HTTP's OPTIONS.

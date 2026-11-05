@@ -2082,7 +2082,8 @@ class ScrudfulMetadata(BaseMetadata):
         before this one, defines ``determine_metadata``: its output would be
         served nowhere, as scrudful's OPTIONS has no body and the
         :func:`hsr_urls` route builds the document with
-        :func:`http_schema_resource`.
+        :func:`http_schema_resource`. When it defines :meth:`get_method`,
+        which scrudful never calls: the override would change nothing.
     """
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -2099,6 +2100,15 @@ class ScrudfulMetadata(BaseMetadata):
                 "request. Customise the document with the statuses= and "
                 "entity= options of @scrudful / scrudful_api_view or the "
                 "viewset's Meta instead (see the 0.10.0 changelog)"
+            )
+        if any("get_method" in vars(klass) for klass in overriding):
+            raise TypeError(
+                f"{cls.__qualname__}.get_method: scrudful never calls "
+                "ScrudfulMetadata.get_method (the OPTIONS, the HTTP Schema "
+                "Resource and exception_handler look the handlers up "
+                "themselves), so overriding it would change nothing. Give "
+                "the handlers their options with @scrudful or the viewset's "
+                "Meta instead"
             )
         for name in _REMOVED_METADATA_HOOKS:
             # As for determine_metadata: a mixed-in class's would win too.
@@ -2121,7 +2131,10 @@ class ScrudfulMetadata(BaseMetadata):
         return _describe_view(_describe_mode_copy(view))
 
     def get_method(self, view: APIView, name: str) -> ScrudfulViewFunc | None:
-        """Return the :class:`ScrudfulViewFunc` behind ``view.<name>``, if any."""
+        """Return the :class:`ScrudfulViewFunc` behind ``view.<name>``, if any.
+
+        A lookup for callers: scrudful never calls it, so a subclass may not
+        override it (``TypeError`` when the class is created)."""
         return _scrudful_handler(view, name)
 
 

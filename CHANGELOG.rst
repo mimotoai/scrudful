@@ -250,8 +250,9 @@ Behaviour change (DRF)
 * ``ScrudfulMetadata.determine_metadata`` returns the HSR built without the
   request; a view that only sets ``metadata_class = ScrudfulMetadata``,
   keeping DRF's ``options``, answers OPTIONS with it as DRF's 200 body. A
-  ``ScrudfulMetadata`` subclass may not define ``determine_metadata`` or a 0.9
-  hook (see "Removed"): ``TypeError`` when the class is created.
+  ``ScrudfulMetadata`` subclass may not define ``determine_metadata``,
+  ``get_method`` (which scrudful never calls) or a 0.9 hook (see "Removed"):
+  ``TypeError`` when the class is created.
 * The built HSRs are discarded when ``SCRUDFUL``, ``REST_FRAMEWORK`` or
   ``ROOT_URLCONF`` change (``override_settings``).
 

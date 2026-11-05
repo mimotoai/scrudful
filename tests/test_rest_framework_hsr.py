@@ -916,6 +916,27 @@ def test_determine_metadata_served_nowhere_is_a_type_error():
     assert combined.determine_metadata is ScrudfulMetadata.determine_metadata
 
 
+def test_a_get_method_override_is_a_type_error():
+    """scrudful never calls get_method (it looks the handlers up itself), so
+    an override would silently change nothing, mixed in too."""
+
+    def get_method(self, view, name):
+        return None
+
+    Own = type("Own", (), {"get_method": get_method})
+
+    for bases, namespace in [
+        ((ScrudfulMetadata,), {"get_method": get_method}),
+        ((Own, ScrudfulMetadata), {}),
+    ]:
+        with pytest.raises(TypeError, match="Custom.get_method.*never calls"):
+            type("Custom", bases, namespace)
+    # Still callable, as a lookup of the handler.
+    assert ScrudfulMetadata().get_method(ItemViewSet(), "retrieve") is (
+        ItemViewSet.retrieve
+    )
+
+
 def test_a_subclass_without_removed_hooks_still_works(settings, client):
     class Extended(ScrudfulMetadata):
         label = "extended"
