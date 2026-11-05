@@ -279,19 +279,26 @@ Behaviour change (DRF)
 * OPTIONS is no longer gated by the view's permissions (DRF's ``initial()``
   checked them for OPTIONS too); authentication and throttles still run. Its
   ``Allow`` runs each method's ``check_permissions`` and, with the object,
-  ``check_object_permissions``; an ``Http404`` an object check raises
-  (``DjangoObjectPermissions`` for an object the requester may not read) is
-  the OPTIONS's 404. A method with an ``allowed_func`` passes the first pass
+  ``check_object_permissions``; an ``Http404`` the first loaded method's
+  object check raises (``DjangoObjectPermissions`` for an object the
+  requester may not read) is the OPTIONS's 404, another method's leaves out
+  only that method. A method with an ``allowed_func`` passes the first pass
   for every requester, so on such a view the object is loaded for anyone.
 * An action of a ``scrudful_viewset`` class without ``@scrudful`` (an
   ``@action``, or a method its ``mapping`` adds) gets no HSR link on its
   responses, which no HSR describes, and a route of such actions alone has no
   HSR route and no HSR link on its OPTIONS. ``scrudful.E007`` reports
   them.
-* OPTIONS loads the object as the first method that passed its view-level
-  checks loads it (GET, when it did): a request of that method and, on a
-  viewset, its action (``retrieve``), so a ``get_queryset`` scoped by
-  ``self.action`` scopes it as a GET does. A ``get_object`` of the view's own
+* OPTIONS loads the object first as the first method that passed its
+  view-level checks loads it (GET, when it did): a request of that method
+  and, on a viewset, its action (``retrieve``), so a ``get_queryset`` scoped
+  by ``self.action`` scopes it as a GET does. Then it loads it once for each
+  other action of a method that passed, as that action does: a 401, 403 or
+  404 that load raises (a ``get_queryset`` that lets only the owner update or
+  delete) leaves out only that action's methods, as their requests would
+  answer it, where ``Allow`` would otherwise list a PUT or DELETE answered
+  404. The first load's ``Http404`` is still the OPTIONS's answer. A
+  ``get_object`` of the view's own
   is called whatever the URL kwarg is named (on a viewset's item action, or
   on a route with a URL kwarg of a generic view overriding ``get_object``),
   so its object checks run. **Migration:** OPTIONS on such an item route now

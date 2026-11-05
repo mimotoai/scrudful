@@ -2182,9 +2182,9 @@ def test_object_level_denial_excluded(api_client):
 def test_options_itself_is_not_gated(api_client):
     """Authenticate, don't gate: neither check_permissions nor (in loading)
     check_object_permissions runs for OPTIONS; each method is checked once,
-    HEAD by GET's check."""
+    HEAD by GET's check, on the object loaded once for its action."""
     as_user(api_client, "writer").options("/x/perm-items/2/")
-    assert calls("load") == [("2",)]
+    assert calls("load") == [("2",)] * 4
     methods = ["GET", "PUT", "PATCH", "DELETE"]
     assert [call[0] for call in calls("view")] == methods
     assert calls("object") == [(method, "2") for method in methods]
@@ -2762,6 +2762,32 @@ class WriteOnlyViewSet(ByActionViewSet):
         return Group.objects.none()
 
 
+class ReadsOnly(BasePermission):
+    """PATCH is refused on the object with the 404 that hides it."""
+
+    def has_object_permission(self, request, view, obj):
+        if request.method == "PATCH":
+            raise Http404
+        return True
+
+
+@scrudful_viewset
+class ScopedWritesViewSet(ByActionViewSet):
+    """Each write's own action refuses it differently: ``update`` refuses
+    the requester, ``destroy`` sees no group, and ``partial_update`` finds
+    the group but its object check hides it."""
+
+    permission_classes = [ReadsOnly]
+
+    def get_queryset(self):
+        SEEN_ACTIONS.append(self.action)
+        if self.action == "update":
+            raise DRFPermissionDenied
+        if self.action == "destroy":
+            return Group.objects.none()
+        return Group.objects.all()
+
+
 class SlugThing:
     pk = "thing"
 
@@ -2879,6 +2905,7 @@ class LoadingURLconf:
     router = SimpleRouter()
     router.register("by-action", ByActionViewSet, basename="by-action")
     router.register("write-only", WriteOnlyViewSet, basename="write-only")
+    router.register("scoped-writes", ScopedWritesViewSet, basename="scoped-writes")
     urlpatterns = [
         path("", include(router.urls)),
         path("slugs/<slug:slug>/", slug_detail, name="slug-detail"),
@@ -2908,14 +2935,15 @@ def loading(settings):
 
 def test_options_loads_the_object_under_the_get_action(loading, client):
     """The object is loaded as a GET loads it (``action`` ``retrieve``, a GET
-    request), not under DRF's OPTIONS action, ``metadata``."""
+    request), not under DRF's OPTIONS action, ``metadata``; first, and then
+    as each other method that passed its view-level checks loads it."""
     group = Group.objects.create(name="g")
     assert client.get(f"/by-action/{group.pk}/").status_code == 200
     SEEN_ACTIONS.clear()
     r = client.options(f"/by-action/{group.pk}/")
     assert r.status_code == 204
     assert r["Allow"] == "GET, OPTIONS, HEAD"
-    assert SEEN_ACTIONS == ["retrieve"]
+    assert SEEN_ACTIONS == ["retrieve", "update", "partial_update", "destroy"]
     # The view and its request are as DRF left them for OPTIONS.
     request, view = r.renderer_context["request"], r.renderer_context["view"]
     assert view.action == "metadata"
@@ -2924,21 +2952,44 @@ def test_options_loads_the_object_under_the_get_action(loading, client):
     # A missing object is the 404 a GET gives, for the same reason; the
     # view's state is put back before DRF answers it (exception_handler
     # picks the error entity by view.action).
+    SEEN_ACTIONS.clear()
     assert client.options("/by-action/999999/").status_code == 404
     assert SEEN_STATE == [("metadata", "OPTIONS", False)]
+    # GET's 404 answers: no other method's action loads it.
+    assert SEEN_ACTIONS == ["retrieve"]
     assert client.get("/by-action/999999/").status_code == 404
 
 
-def test_options_loads_the_object_under_the_first_allowed_methods_action(
-    loading, client
-):
-    """Without GET, the object is loaded as the first method that passed its
-    view-level checks loads it: PUT, ``update``."""
+def test_options_loads_the_object_under_each_allowed_methods_action(loading, client):
+    """Without GET, the object is loaded as each method that passed its
+    view-level checks loads it, PUT (``update``) first. A queryset scoped by
+    action that hides the object from DELETE and PATCH leaves them out, as
+    those requests answer 404."""
     group = Group.objects.create(name="g")
     r = client.options(f"/write-only/{group.pk}/")
     assert r.status_code == 204
-    assert r["Allow"] == "PUT, DELETE, OPTIONS, PATCH"
+    assert r["Allow"] == "PUT, OPTIONS"
+    assert SEEN_ACTIONS == ["update", "partial_update", "destroy"]
+    assert client.delete(f"/write-only/{group.pk}/").status_code == 404
+    patch = client.patch(
+        f"/write-only/{group.pk}/", data="{}", content_type="application/json"
+    )
+    assert patch.status_code == 404
+    # The first method's 404 still answers the OPTIONS.
+    SEEN_ACTIONS.clear()
+    assert client.options("/write-only/999999/").status_code == 404
     assert SEEN_ACTIONS == ["update"]
+
+
+def test_options_leaves_out_a_method_its_own_load_or_check_refuses(loading, client):
+    """Another method's own load refusing the requester (403) or hiding the
+    object (404), or its object check hiding it (404), leaves out only that
+    method: the OPTIONS doesn't answer that error."""
+    group = Group.objects.create(name="g")
+    r = client.options(f"/scoped-writes/{group.pk}/")
+    assert r.status_code == 204
+    assert r["Allow"] == "GET, OPTIONS, HEAD"
+    assert SEEN_ACTIONS == ["retrieve", "update", "partial_update", "destroy"]
 
 
 def test_options_of_a_collection_loads_nothing(loading, client):
@@ -2950,7 +3001,7 @@ def test_options_of_a_collection_loads_nothing(loading, client):
 @pytest.mark.parametrize(
     "url, loaded",
     [
-        ("/slugs/thing/", ["retrieve"]),
+        ("/slugs/thing/", ["retrieve", "update"]),
         ("/slugs/thing/extra/", ["extra"]),
         ("/slug-view/thing", ["GET"]),
         ("/slug-lookup/thing", ["GET"]),

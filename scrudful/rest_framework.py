@@ -148,11 +148,14 @@ OPTIONS
        the object.
     4. Only if one method passed step 3 is the object loaded, on an item's
        route, with ``get_object()``, its ``check_object_permissions``
-       suppressed, as the first method that passed (GET, when it did) loads
-       it: with a request of that method as the view's ``request`` and,
-       on a viewset, that method's action as ``action`` (so a
-       ``get_queryset`` scoped by action gives the queryset that method
-       gets, not OPTIONS's ``metadata``'s). An item's route is one whose
+       suppressed, first as the first method that passed (GET, when it
+       did) loads it: with a request of that method as the view's
+       ``request`` and, on a viewset, that method's action as ``action``
+       (so a ``get_queryset`` scoped by action gives the queryset that
+       method gets, not OPTIONS's ``metadata``'s); then once for each other
+       action of a method that passed, as that action loads it. A 401, 403
+       or 404 that such another load raises leaves out only the methods of
+       its action, as their requests would answer it. An item's route is one whose
        ``lookup_url_kwarg``, else ``lookup_field``, is in the URL kwargs;
        with a ``get_object`` of the view's own, whatever its URL kwarg is
        named, a viewset route whose action is ``retrieve``, ``update``,
@@ -179,9 +182,10 @@ OPTIONS
        ``PermissionDenied`` or ``NotAuthenticated``, any other 401 or 403
        ``APIException`` (``AuthenticationFailed``, one of the project's), or
        Django's ``PermissionDenied`` means not allowed; anything else
-       raised propagates, answered as in step 4: an object check raising
-       ``Http404`` (``DjangoObjectPermissions`` for an object the requester
-       may not read) answers that 404. No throttle runs per method. HEAD,
+       raised propagates, answered as in step 4: the first loaded method's
+       object check raising ``Http404`` (``DjangoObjectPermissions`` for an
+       object the requester may not read) answers that 404; another
+       method's leaves out only that method. No throttle runs per method. HEAD,
        which DRF dispatches to the GET handler, is listed when the view
        serves it and GET is allowed.
     6. The answer is a 204 without content or ``Content-Type`` (whatever
@@ -1641,18 +1645,19 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
        has none), is taken (:func:`_request_hsr_link`);
     2. each method the view serves is checked for this requester, with its
        view-level permissions, then the object is loaded only if one of them
-       passed (a method with an ``allowed_func`` always does), then the
-       methods that passed are checked against the object
-       (:func:`_allowed_methods`);
+       passed (a method with an ``allowed_func`` always does), once for each
+       action of those methods, then the methods that passed are checked
+       against the object their action loaded (:func:`_allowed_methods`);
     3. the answer is a 204 without content or ``Content-Type`` (rendered by
        DRF's ``JSONRenderer``, whatever renderer DRF's content negotiation
        picked), ``Allow: allow_value(...)`` (also set in ``view.headers``,
        which DRF's ``finalize_response`` writes over the response's), the HSR
        link and the expose headers.
 
-    An exception of step 2 (the ``Http404`` of a missing object, the 404
-    scoped-rbac gives an object the requester may not read, an object check
-    raising ``Http404``, a check's unexpected error) is answered by the
+    An exception of step 2 (the ``Http404`` of a missing object in the
+    first load, the 404 scoped-rbac gives an object the requester may not
+    read, the first method's object check raising ``Http404``, a check's
+    unexpected error) is answered by the
     view's ``handle_exception``, as DRF answers a handler's: with the error
     Links of :func:`exception_handler`, and the HSR link that
     :func:`_finalize_response` gives every response; one the exception
@@ -1855,6 +1860,51 @@ def _options_object(view: APIView, request: Request, method: str) -> Any:
         return view.get_object()
 
 
+def _method_action(view: APIView, method: str) -> str | None:
+    """The action a viewset maps ``method`` to (``None`` on another view, or
+    where the viewset maps none)."""
+    action_map = getattr(view, "action_map", None)
+    if isinstance(action_map, dict):
+        return action_map.get(method.lower())
+    return None
+
+
+def _hides(exc: Exception) -> bool:
+    """Whether ``exc`` answers 404: Django's ``Http404``, or an
+    ``APIException`` whose ``status_code`` is 404 (DRF's ``NotFound``)."""
+    return isinstance(exc, Http404) or (
+        isinstance(exc, APIException) and getattr(exc, "status_code", None) == 404
+    )
+
+
+class _Unavailable(Exception):
+    """A method's own load of the object refused the requester or hid the
+    object: the method is not allowed (see :func:`_allowed_methods`)."""
+
+
+def _other_object(view: APIView, request: Request, method: str) -> Any:
+    """:func:`_options_object` for a method other than the first one loaded,
+    whose denial (:func:`_is_denial`) or 404 (:func:`_hides`) refuses only
+    that method: raised as :class:`_Unavailable`. Anything else raised
+    propagates."""
+    try:
+        return _options_object(view, request, method)
+    except Exception as exc:
+        if _is_denial(exc) or _hides(exc):
+            raise _Unavailable from exc
+        raise
+
+
+def _unhidden(check: Callable[[Request], Any], clone: Request) -> Any:
+    """``check(clone)``, with a 404 it raises (:func:`_hides`) for ``False``."""
+    try:
+        return check(clone)
+    except Exception as exc:
+        if _hides(exc):
+            return False
+        raise
+
+
 #: The actions of a viewset's item routes (``detail=True`` for an ``@action``).
 _DETAIL_ACTIONS = frozenset({"retrieve", "update", "partial_update", "destroy"})
 
@@ -1933,12 +1983,22 @@ def _allowed_methods(view: APIView, request: Request) -> list[str]:
     1. each method's view-level check: ``check_permissions``, or ``True``
        for a method with an ``allowed_func``, which needs the object;
     2. only when one of them passed, the object is loaded
-       (:func:`_options_object`), as the first method that passed (GET,
-       when it did) loads it, and each method that passed is checked
-       again on it: ``check_object_permissions`` (when there is an
-       object), or its ``allowed_func``. When none passed, nothing is
+       (:func:`_options_object`), first as the first method that passed
+       (GET, when it did) loads it, then once for each other action of a
+       method that passed (on a viewset, whose ``get_queryset`` may scope
+       by action), and each method that passed is checked again on the
+       object its action loaded: ``check_object_permissions`` (when there
+       is an object), or its ``allowed_func``. When none passed, nothing is
        loaded: a missing and an existing object both give ``Allow:
        OPTIONS``, as a GET of either is refused alike.
+
+    What the first load raises propagates: its ``Http404`` is the
+    OPTIONS's answer, as is an ``Http404`` of the first method's object
+    check. A denial (:func:`_is_denial`) or a 404 (:func:`_hides`) that
+    another action's load raises refuses only the methods of that action,
+    and a 404 of another method's object check refuses only that method:
+    each of those requests would answer it, while the first method's
+    request reaches the object.
 
     A method with an ``allowed_func`` always passes pass 1 (the hook needs
     the object to decide), so a view with one loads the object for every
@@ -1958,22 +2018,36 @@ def _allowed_methods(view: APIView, request: Request) -> list[str]:
         or _may_use(view, request, method, view.check_permissions)
         for method in checked
     }
-    # Loaded as the first method that passed loads it: GET's, when it did.
+    # Loaded first as the first method that passed loads it (GET's, when it
+    # did): what that raises answers the OPTIONS. Then once for each other
+    # action of a method that passed, which refuses only its methods.
     loader = next((method for method in checked if allowed[method]), None)
-    obj = None if loader is None else _options_object(view, request, loader)
+    objects: dict[str | None, Any] = {}
+    if loader is not None:
+        objects[_method_action(view, loader)] = _options_object(view, request, loader)
     for method in checked:
+        if not allowed[method]:
+            continue
+        action = _method_action(view, method)
+        if action not in objects:
+            try:
+                objects[action] = _other_object(view, request, method)
+            except _Unavailable as exc:
+                objects[action] = exc
+        obj = objects[action]
+        if isinstance(obj, _Unavailable):
+            allowed[method] = False
+            continue
         hook = hooks[method]
         if hook is not None:
-            allowed[method] = _may_use(
-                view, request, method, functools.partial(_hooked, hook, view, obj)
-            )
-        elif allowed[method] and obj is not None:
-            allowed[method] = _may_use(
-                view,
-                request,
-                method,
-                functools.partial(_object_check, view, obj),
-            )
+            check = functools.partial(_hooked, hook, view, obj)
+        elif obj is not None:
+            check = functools.partial(_object_check, view, obj)
+            if method != loader:
+                check = functools.partial(_unhidden, check)
+        else:
+            continue
+        allowed[method] = _may_use(view, request, method, check)
     if "HEAD" in served and "GET" in served:
         allowed["HEAD"] = allowed["GET"]
     return [method for method, may in allowed.items() if may]
