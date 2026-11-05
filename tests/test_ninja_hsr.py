@@ -4,6 +4,7 @@ import dataclasses
 import functools
 import gc
 import json
+import logging
 import re
 import types
 import uuid
@@ -3311,10 +3312,15 @@ class LowerPathModel(ninja.params.models.PathModel):
 LowerPath = type("Path", (ninja.params.models.Path,), {"_model": LowerPathModel})
 
 
-def test_a_path_options_cant_validate_is_left_to_the_method():
-    """A path scrudful can't validate as ninja does (a custom path model) is
-    not checked: the method is decided without it, and no ``ConfigError``
-    is raised for an operation without a ``load``."""
+#: The warning of a path whose parameters OPTIONS can't validate.
+UNCHECKED_PATH = r"can't validate the path parameters of DELETE '/\{pk\}'"
+
+
+def test_a_path_options_cant_validate_is_listed_with_a_warning():
+    """A path scrudful can't validate as ninja does (a custom path model), of
+    a method without a ``load`` of its own, is not checked: the method is
+    decided without it, and a ``RuntimeWarning`` names it, once per route;
+    no ``ConfigError``."""
     router = loading_get_router()
 
     @router.delete("/{pk}")
@@ -3323,20 +3329,49 @@ def test_a_path_options_cant_validate_is_left_to_the_method():
         return {"pk": pk}
 
     client = TestClient(mount(router))
-    response = options(client, "/ABC")
+    with pytest.warns(RuntimeWarning, match=UNCHECKED_PATH) as caught:
+        response = options(client, "/ABC")
     assert response.status_code == 204
     assert response.headers["Allow"] == "GET, DELETE, OPTIONS"
+    assert [str(w.message) for w in caught] == [
+        "scrudful can't validate the path parameters of DELETE '/{pk}' "
+        f"({delete_item.__qualname__}()) for the Allow of OPTIONS: its path "
+        "model LowerPathModel doesn't resolve them as ninja 1.7's PathModel "
+        "does. DELETE is listed without that check."
+    ]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert options(client, "/ABC").headers["Allow"] == "GET, DELETE, OPTIONS"
     assert client.delete("/ABC").json() == {"pk": "abc"}
 
 
-def test_a_custom_path_model_still_fails_a_methods_own_load():
-    """A method whose own ``load`` must run on such a path still gets the
-    ``ConfigError``: its ``load`` can't be given the path parameters as the
-    operation would give them."""
+def test_a_warning_raised_as_an_error_is_given_again():
+    """The route is recorded as warned only once the warning was given."""
     router = loading_get_router()
 
+    @router.delete("/{pk}")
+    @described(Entity(**LINKS))
+    def delete_item(request, pk: str = LowerPath(...)):
+        return {"pk": pk}  # pragma: no cover
+
+    client = TestClient(mount(router))
+    for _ in range(2):
+        with pytest.raises(RuntimeWarning, match=UNCHECKED_PATH):
+            options(client, "/ABC")
+    with pytest.warns(RuntimeWarning, match=UNCHECKED_PATH):
+        options(client, "/ABC")
+
+
+def test_a_custom_path_model_leaves_out_a_method_whose_own_load_must_run():
+    """A method whose own ``load`` must run on such a path is left out of
+    ``Allow``, with the warning: its ``load`` can't be given the path
+    parameters as the operation would give them, so it can't be checked.
+    The OPTIONS is still a 204."""
+    router = loading_get_router()
+    calls = []
+
     def owned(request, pk, **params):
-        return {"id": 1, "name": pk, "version": 1}  # pragma: no cover
+        calls.append(pk)  # pragma: no cover
 
     @router.delete("/{pk}")
     @scrudful(load=owned, **LINKS)
@@ -3344,15 +3379,84 @@ def test_a_custom_path_model_still_fails_a_methods_own_load():
         return {"pk": pk}  # pragma: no cover
 
     client = TestClient(mount(router))
-    with pytest.raises(ConfigError, match="doesn.t resolve as ninja 1.7 does"):
-        options(client, "/ABC")
+    with pytest.warns(RuntimeWarning, match=UNCHECKED_PATH) as caught:
+        response = options(client, "/ABC")
+    assert response.status_code == 204
+    assert response.headers["Allow"] == "GET, OPTIONS"
+    assert len(caught) == 1
+    assert str(caught[0].message).endswith(
+        "DELETE is left out of Allow: its own load can't be called without them."
+    )
+    assert calls == []
 
 
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_a_custom_path_model_of_the_loader_loads_no_object(asynchronous):
+    """The loading operation's path can't be validated either: OPTIONS loads
+    no object (as when the loader refuses the requester), with the warning,
+    and still answers; a method sharing its ``load`` is left out for the
+    same reason, and one without a ``load`` of its own is listed."""
+    calls = []
+
+    def load(request, pk, **params):
+        calls.append(pk)  # pragma: no cover
+
+    async def async_load(request, pk, **params):
+        load(request, pk, **params)  # pragma: no cover
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+    shared = async_load if asynchronous else load
+    if asynchronous:
+
+        @router.get("/{pk}")
+        @scrudful(load=shared, **LINKS)
+        async def get_item(request, pk: str = LowerPath(...), obj=None):
+            return {"pk": pk}  # pragma: no cover
+
+    else:
+
+        @router.get("/{pk}")
+        @scrudful(load=shared, **LINKS)
+        def get_item(request, pk: str = LowerPath(...), obj=None):
+            return {"pk": pk}  # pragma: no cover
+
+    @router.delete("/{pk}", response={204: None})
+    @described(Entity(**LINKS))
+    def delete_item(request, pk: str):
+        return 204, None  # pragma: no cover
+
+    api = mount(router)
+    with pytest.warns(RuntimeWarning, match="parameters of GET") as caught:
+        response = options_of(api, asynchronous, "/ABC")
+    assert response.status_code == 204
+    assert response.headers["Allow"] == "DELETE, OPTIONS"
+    messages = [str(w.message) for w in caught]
+    assert len(messages) == 2
+    assert messages[0].endswith("OPTIONS loads no object with it.")
+    assert messages[1].endswith(
+        "GET is left out of Allow: its own load can't be called without them."
+    )
+    assert calls == []
+
+
+class TenantForbidden(Exception):
+    """An app's own authorization error, which its exception handler maps
+    to a 403."""
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ObjectDoesNotExist("none"), TenantForbidden("not your tenant"), LookupError()],
+    ids=["ObjectDoesNotExist", "app-error", "LookupError"],
+)
 @pytest.mark.parametrize("get_load", [True, False], ids=["loader", "no-loader"])
-def test_another_exception_of_a_methods_path_validation_skips_the_check(get_load):
+def test_another_exception_of_a_methods_path_validation_leaves_it_out(
+    get_load, error, caplog
+):
     """Anything else a method's path validation raises (a lookup's
-    ``ObjectDoesNotExist``) skips the check: the method, without a ``load``
-    of its own, is decided without it, as its request answers that."""
+    ``ObjectDoesNotExist``, an app's own authorization error) leaves the
+    method out, as when in doubt: its own request raises it too. It is
+    logged once per route, with its traceback, on ``scrudful.ninja``."""
     if get_load:
         router = loading_get_router()
     else:
@@ -3363,16 +3467,85 @@ def test_another_exception_of_a_methods_path_validation_skips_the_check(get_load
         def get_item(request, pk: int):
             return {"id": pk, "name": "x", "version": 1}  # pragma: no cover
 
-    lookup = lookup_raising(ObjectDoesNotExist("none"))
+    lookup = lookup_raising(error)
 
     @router.delete("/{pk}", response={204: None})
     @described(Entity(**LINKS))
     def delete_item(request, pk: Annotated[int, BeforeValidator(lookup)]):
         return 204, None  # pragma: no cover
 
-    response = options(TestClient(mount(router)), "/2")
+    api = mount(router)
+
+    @api.exception_handler(TenantForbidden)
+    def forbidden(request, exc):
+        return api.create_response(request, {"detail": str(exc)}, status=403)
+
+    client = TestClient(api)
+    caplog.set_level(logging.WARNING, logger="scrudful.ninja")
+    response = options(client, "/2")
     assert response.status_code == 204
-    assert response.headers["Allow"] == "GET, DELETE, OPTIONS"
+    assert response.headers["Allow"] == "GET, OPTIONS"
+    assert options(client, "/1").headers["Allow"] == "GET, DELETE, OPTIONS"
+    assert options(client, "/2").headers["Allow"] == "GET, OPTIONS"
+    records = [r for r in caplog.records if r.name == "scrudful.ninja"]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is not None
+    assert records[0].getMessage() == (
+        f"scrudful's OPTIONS leaves DELETE '/{{pk}}' ({delete_item.__qualname__}()) "
+        "out of Allow: validating its path parameters raised "
+        f"{type(error).__name__}"
+    )
+    if isinstance(error, TenantForbidden):
+        assert client.delete("/2").status_code == 403
+
+
+@pytest.mark.parametrize(
+    "error",
+    [HttpError(404, "none"), Http404("none"), LookupError("bug")],
+    ids=["HttpError404", "Http404", "LookupError"],
+)
+def test_the_loaders_path_validation_follows_the_same_rules(error, caplog):
+    """A refusal of the loading operation's path validation, or anything
+    else it raises, loads no object, and leaves only that method out: the
+    OPTIONS is still a 204 (only what the loader's ``load`` raises answers
+    it)."""
+    calls = []
+    lookup = lookup_raising(error)
+
+    def load(request, pk, **params):
+        calls.append(pk)
+        return {"id": pk, "name": "x", "version": 1}
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(load=load, **LINKS)
+    def get_item(request, pk: Annotated[int, BeforeValidator(lookup)], obj):
+        return obj  # pragma: no cover
+
+    @router.delete("/{pk}", response={204: None})
+    @described(Entity(**LINKS))
+    def delete_item(request, pk: int):
+        return 204, None  # pragma: no cover
+
+    client = TestClient(mount(router))
+    caplog.set_level(logging.WARNING, logger="scrudful.ninja")
+    response = options(client, "/2")
+    assert response.status_code == 204
+    assert response.headers["Allow"] == "DELETE, OPTIONS"
+    assert calls == []
+    logged = [r.getMessage() for r in caplog.records if r.name == "scrudful.ninja"]
+    if isinstance(error, (HttpError, Http404)):
+        assert logged == []
+    else:
+        # What OPTIONS did about it: no object, and GET left out.
+        assert [message.split(" '/")[0] for message in logged] == [
+            "scrudful's OPTIONS loads no object with GET",
+            "scrudful's OPTIONS leaves GET",
+        ]
+    assert options(client, "/1").headers["Allow"] == "GET, DELETE, OPTIONS"
+    assert calls == [1]
 
 
 #: What PUT's own ``load`` saw of each request reaching it: ``request.method``

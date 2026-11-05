@@ -191,10 +191,17 @@ Behaviour change (ninja)
   propagates), so authorization in a method's ``load`` shapes ``Allow``; it
   runs only once the method's ``auth=`` and ``before`` passed. A method whose
   path parameters don't validate (its request would be a 422), or whose path
-  validation raises an ``HttpError``, ``Http404`` or ``PermissionDenied``, is
-  left out of ``Allow``, and its ``load`` doesn't run. That check is best
-  effort: a path scrudful can't validate as ninja does (a custom path model)
-  or a validator's other error skips it. Bad credentials make the
+  validation raises anything, is left out of ``Allow``, and its ``load``
+  doesn't run: an ``HttpError``, ``Http404`` or ``PermissionDenied``
+  silently, anything else (an app's own error, a lookup's
+  ``ObjectDoesNotExist``) logged once per route, with its traceback, on the
+  ``scrudful.ninja`` logger. A path scrudful can't validate as ninja does (a
+  custom path model) isn't checked, with a ``RuntimeWarning`` once per route
+  naming it: its method is listed, unless it has its own ``load`` to run,
+  which can't be called without the path parameters, and is then left out.
+  The loading operation's path follows the same rules: when it can't be
+  validated, OPTIONS loads no object and still answers. OPTIONS never
+  answers a 500 or raises ``ConfigError`` for such a path. Bad credentials make the
   requester anonymous (ninja's auth callbacks return ``None``), so they get
   the anonymous ``Allow``. A raised ``HttpError`` 401, 403 or 404,
   ``Http404`` or ``PermissionDenied`` from ``auth=`` or ``before`` refuses a

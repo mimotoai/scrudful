@@ -403,10 +403,14 @@ OPTIONS
        ``auth=`` callbacks authenticate the requester, its ``before`` (if
        any) returns ``None``, its path parameters validate (a method whose
        request would be a 422 is left out, and so is one whose path
-       validation raises an ``HttpError``, ``Http404`` or
-       ``PermissionDenied``; the check is best effort, skipped for a path
-       scrudful can't validate as ninja does, such as one with a custom path
-       model, or a validator raising anything else), and then, for a
+       validation raises anything, an ``HttpError``, ``Http404`` or
+       ``PermissionDenied`` silently, anything else logged once per route
+       on the ``scrudful.ninja`` logger; a path scrudful can't validate as
+       ninja does, one with a custom path model, isn't checked, with a
+       ``RuntimeWarning`` once per route, and its method is listed unless
+       its own ``load`` must run, which can't without the path parameters;
+       step 3's path follows the same rules, with no object when it fails),
+       and then, for a
        :func:`scrudful` item operation with a ``load``, that ``load``
        (called as in step 3, on the copy) returns, whatever it returns: so
        authorization in a method's own ``load`` shapes ``Allow``, and
@@ -602,6 +606,7 @@ import hashlib
 import inspect
 import io
 import itertools
+import logging
 import json
 import math
 import re
@@ -815,6 +820,8 @@ CONDITIONAL_WRITE_RESPONSES: dict[int, dict[str, str]] = (
 
 Handler = TypeVar("Handler", bound=Callable[..., Any])
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 #: The request flow, written once for sync and async operations: a generator
 #: that yields each call of a user callable, as ``(func, args, kwargs)``, and
@@ -6048,14 +6055,23 @@ def _options_answer(
         match = getattr(request, "resolver_match", None)
         url_params = dict(match.kwargs) if match is not None else {}
         try:
-            obj, loaded = _options_object(request, api, served, url_params)
+            obj, loaded = _options_object(request, api, served, url_params, path)
         except (HttpError, Http404) as exc:
             return api.on_exception(request, exc)  # type: ignore[no-any-return]
         allowed = [
             method
             for method, template, bound in served
             if _may_use(
-                request, router, method, template, bound, obj, url_params, api, loaded
+                request,
+                router,
+                method,
+                template,
+                bound,
+                obj,
+                url_params,
+                api,
+                loaded,
+                path,
             )
         ]
     except Exception as exc:
@@ -6289,11 +6305,12 @@ def _options_object(
     api: NinjaAPI,
     served: list[tuple[str, Any, Any]],
     url_params: dict[str, Any],
+    path: str,
 ) -> tuple[Any, _Loaded | None]:
-    """The object of OPTIONS: what the loading operation's ``load`` returns,
-    and the call that loaded it (:class:`_Loaded`), ``None`` when nothing
-    loaded (without a loading operation, or when it refused the requester
-    or the path).
+    """The object of OPTIONS of ``path``: what the loading operation's
+    ``load`` returns, and the call that loaded it (:class:`_Loaded`),
+    ``None`` when nothing loaded (without a loading operation, or when it
+    refused the requester or the path).
 
     The loading operation is the GET operation, if it has a ``load``, else
     the first item operation (:func:`scrudful`) with one; ``None`` (no
@@ -6301,14 +6318,20 @@ def _options_object(
     copy of the request with its method, once its ``auth`` callbacks and
     ``before`` allowed the requester (else there is no object: a requester
     who may not use it isn't shown it), with the path parameters validated
-    as it validates them (none it would refuse with a 422: no object). The
-    loader gets only those: give its other parameters defaults, or take
-    ``**kwargs``.
+    as it validates them. Their validation follows :func:`_may_use`'s rules,
+    and there is no object when it fails: for a 422; for a denial it raises
+    (an ``HttpError``, ``Http404`` or ``PermissionDenied``); for a custom
+    path model, which scrudful can't validate as ninja does (with a
+    ``RuntimeWarning``, once per route); for anything else it raises
+    (logged once per route). The loader gets only those: give its other
+    parameters defaults, or take ``**kwargs``.
 
     Raises
     ------
     HttpError, Http404
         What the loader raises: the caller answers it.
+    ConfigError
+        If the installed ninja's internals differ (see :func:`_path_values`).
     """
     loading = None
     candidates = [entry for entry in served if entry[0] == "GET"] + [
@@ -6321,15 +6344,28 @@ def _options_object(
             and config.load is not None
             and (method == "GET" or config.kind == "item")
         ):
-            loading = method, config, bound
+            loading = method, template, config, bound
             break
     if loading is None:
         return None, None
-    method, config, bound = loading
+    method, template, config, bound = loading
     requester, authenticated = _authenticated(request, bound, method)
     if not authenticated or not _before_allows(config, bound, requester, url_params):
         return None, None
-    values = _path_values(requester, api, bound, url_params)
+    try:
+        values = _path_values(requester, api, bound, url_params)
+    except _UnvalidatedPath as exc:
+        _unchecked_path(
+            template, method, path, exc.model, "OPTIONS loads no object with it."
+        )
+        return None, None
+    except (HttpError, Http404, PermissionDenied):
+        return None, None
+    except ConfigError:
+        raise
+    except Exception as exc:
+        _path_error(exc, template, method, path, "loads no object with {route}")
+        return None, None
     if values is None:
         return None, None
     loaded = _Loaded(config.load, method, values, getattr(requester, "auth", None))
@@ -6342,12 +6378,16 @@ def _path_values(
     """``operation``'s path parameters, validated by its path models as
     ninja's ``Operation._get_values`` validates them (ninja 1.7's
     ``Operation.models``, ``ParamModel.resolve`` and
-    ``PathModel.get_request_data``); ``None`` if they are invalid.
+    ``PathModel.get_request_data``); ``None`` if they are invalid. Anything
+    else a validator raises propagates.
 
     Raises
     ------
     ConfigError
         If the installed ninja's differ.
+    _UnvalidatedPath
+        If a path model of ``operation`` is a custom one, which scrudful
+        can't validate as ninja does (before any is validated).
     """
     try:
         from ninja.params import models as ninja_params
@@ -6368,25 +6408,92 @@ def _path_values(
             "(a list of ParamModel classes): upgrade scrudful, or keep ninja at "
             "one of those releases"
         )
+    path_models = [
+        model
+        for model in models
+        if getattr(model, "__ninja_param_source__", None) == "path"
+    ]
+    for model in path_models:
+        if not issubclass(model, path_model):
+            raise _UnvalidatedPath(model)
+        for name, owner in (("resolve", param_model), ("get_request_data", path_model)):
+            if _class_function(model, name) is not _class_function(owner, name):
+                # The class overriding it (ninja's model of the operation's
+                # parameters subclasses the app's).
+                raise _UnvalidatedPath(
+                    next(cls for cls in model.__mro__ if name in vars(cls))
+                )
     values: dict[str, Any] = {}
-    for model in models:
-        if getattr(model, "__ninja_param_source__", None) != "path":
-            continue
-        if not issubclass(model, path_model) or (
-            _class_function(model, "resolve")
-            is not _class_function(param_model, "resolve")
-            or _class_function(model, "get_request_data")
-            is not _class_function(path_model, "get_request_data")
-        ):
-            raise ConfigError(
-                f"{use} validates the path parameters with ninja's PathModel, "
-                f"which {model.__qualname__} doesn't resolve as ninja 1.7 does"
-            )
+    for model in path_models:
         try:
             values.update(model.resolve(request, api, url_params))
         except pydantic.ValidationError:
             return None
     return values
+
+
+class _UnvalidatedPath(Exception):
+    """Raised by :func:`_path_values` for a path model scrudful can't
+    validate as ninja does (a custom one): ``model``."""
+
+    def __init__(self, model: type) -> None:
+        super().__init__(model)
+        self.model = model
+
+
+#: The routes OPTIONS has warned of (or logged) a path it can't check, per
+#: template operation: ``(method, case)``, so each is given once.
+_PATH_UNCHECKED: weakref.WeakKeyDictionary[Any, set[tuple[str, str]]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _route_name(method: str, path: str, template: Any) -> str:
+    """``method`` of ``path``, served by the template operation ``template``,
+    as OPTIONS' warnings name it."""
+    func = inspect.unwrap(template.view_func)
+    return f"{method} {path!r} ({getattr(func, '__qualname__', repr(func))}())"
+
+
+def _unchecked_path(
+    template: Any, method: str, path: str, model: type, consequence: str
+) -> None:
+    """Warn, once per route, that OPTIONS can't validate the path parameters
+    of ``method`` (its path model ``model`` is a custom one): so
+    ``consequence``."""
+    key = (method, consequence)
+    if key in _PATH_UNCHECKED.get(template, ()):
+        return
+    # No stacklevel: OPTIONS runs deep in scrudful, never at one frame of the
+    # app's own code.
+    warnings.warn(
+        "scrudful can't validate the path parameters of "
+        f"{_route_name(method, path, template)} for the Allow of OPTIONS: its "
+        f"path model {model.__qualname__} doesn't resolve them as ninja 1.7's "
+        f"PathModel does. {consequence}",
+        RuntimeWarning,
+    )
+    # Recorded once warned: a warning raised as an error leaves it
+    # unrecorded, so the next OPTIONS warns (or fails) again.
+    _PATH_UNCHECKED.setdefault(template, set()).add(key)
+
+
+def _path_error(
+    exc: Exception, template: Any, method: str, path: str, outcome: str
+) -> None:
+    """Log ``exc``, which ``method``'s path validation raised, once per
+    route, with its traceback, on the ``scrudful.ninja`` logger: what
+    OPTIONS did about it is ``outcome``, with ``{route}`` naming the route."""
+    key = (method, outcome)
+    if key in _PATH_UNCHECKED.get(template, ()):
+        return
+    _PATH_UNCHECKED.setdefault(template, set()).add(key)
+    logger.warning(
+        "scrudful's OPTIONS %s: validating its path parameters raised %s",
+        outcome.format(route=_route_name(method, path, template)),
+        type(exc).__name__,
+        exc_info=exc,
+    )
 
 
 def _class_function(cls: type, name: str) -> Any:
@@ -6488,6 +6595,7 @@ def _may_use(
     url_params: dict[str, Any],
     api: NinjaAPI,
     loaded: _Loaded | None,
+    path: str,
 ) -> bool:
     """Whether the requester of the OPTIONS ``request`` may use ``method``,
     which the template operation ``template`` serves (``bound`` is its clone
@@ -6503,19 +6611,23 @@ def _may_use(
     operation's ``before`` allows it (see :func:`_authenticated` and
     :func:`_before_allows`), its path parameters validate (else its request
     is a 422: see :func:`_path_values`) and then its own ``load`` allows it
-    (:func:`_own_load_allows`). That path check is best effort: an
-    ``HttpError``, ``Http404`` or ``PermissionDenied`` its validation raises
-    refuses the method, and anything else (a ``ConfigError`` for a path
-    model scrudful can't validate as ninja does, a validator's other error)
-    skips it, unless the method's own ``load`` must run (see
-    :func:`_load_must_run`): then it propagates, as that ``load`` can't be
-    called without the path parameters. Neither throttles nor
-    ``after_throttles`` run.
+    (:func:`_own_load_allows`). A denial its path validation raises (an
+    ``HttpError``, ``Http404`` or ``PermissionDenied``) refuses the method,
+    and so does anything else it raises (logged once per route, with its
+    traceback, on the ``scrudful.ninja`` logger): its request would raise
+    it too. A custom path model, which scrudful can't validate as ninja
+    does, is warned of (a ``RuntimeWarning``, once per route), and the
+    method decided without that check, unless its own ``load`` must run
+    (see :func:`_load_must_run`): that ``load`` can't be called without the
+    path parameters, so the method is refused. ``path`` names the route.
+    Neither throttles nor ``after_throttles`` run.
 
     Raises
     ------
     TypeError
         If the hook returns something else than a ``bool``.
+    ConfigError
+        If the installed ninja's internals differ (see :func:`_path_values`).
     """
     config = _scrudful_config(template)
     hook = config.allowed if config is not None else None
@@ -6538,17 +6650,28 @@ def _may_use(
         return False
     try:
         values = _path_values(requester, api, bound, url_params)
+    except _UnvalidatedPath as exc:
+        # Can't be checked: listed as its request decides, unless its own
+        # load must run, which needs those values (when in doubt, out).
+        if _load_must_run(config, loaded, method):
+            consequence = (
+                f"{method} is left out of Allow: its own load can't be called "
+                "without them."
+            )
+        else:
+            consequence = f"{method} is listed without that check."
+        _unchecked_path(template, method, path, exc.model, consequence)
+        return not _load_must_run(config, loaded, method)
     except (HttpError, Http404, PermissionDenied):
         # Refused by its path validation (a lookup validator's 404, say):
         # that method only, as by its own load.
         return False
-    except Exception:
-        # A path scrudful can't validate (a custom path model's ConfigError)
-        # or a validator's other error: the check is best effort, skipped,
-        # unless the method's own load must run, which needs those values.
-        if _load_must_run(config, loaded, method):
-            raise
-        return True
+    except ConfigError:
+        raise
+    except Exception as exc:
+        # Its request raises it too: when in doubt, out.
+        _path_error(exc, template, method, path, "leaves {route} out of Allow")
+        return False
     if values is None:
         return False
     return _own_load_allows(config, requester, values, loaded)
