@@ -21,6 +21,7 @@ from rest_framework.views import APIView
 from scrudful._hsr import HsrConfigError
 from scrudful.rest_framework import (
     Entity,
+    ScrudfulMetadata,
     ScrudfulViewFunc,
     http_schema_resource,
     scrudful,
@@ -726,3 +727,47 @@ def test_error_setting_must_be_an_entity(settings):
     }
     with pytest.raises(ImproperlyConfigured, match="JSON"):
         http_schema_resource(ItemViewSet.as_view({"get": "retrieve"}))
+
+
+# --- Removed ScrudfulMetadata hooks --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "determine_metadata_for_get",
+        "determine_metadata_for_head",
+        "determine_metadata_for_options",
+        "determine_metadata_for_post",
+        "determine_metadata_for_put",
+        "determine_metadata_for_patch",
+        "determine_metadata_for_delete",
+        "_write",
+        "required_conditional_headers",
+    ],
+)
+def test_a_subclass_defining_a_removed_hook_is_a_type_error(name):
+    """0.9's hooks took the request: overriding one would silently do nothing."""
+    with pytest.raises(TypeError) as info:
+        type("Custom", (ScrudfulMetadata,), {name: lambda self, *args: {}})
+    message = str(info.value)
+    assert f"Custom.{name}" in message
+    assert "without a request" in message
+    assert "statuses=" in message and "entity=" in message
+    assert "0.10.0 changelog" in message
+
+
+def test_a_subclass_without_removed_hooks_still_works():
+    class Extended(ScrudfulMetadata):
+        def determine_metadata(self, request, view):
+            return {**super().determine_metadata(request, view), "x-extra": True}
+
+    @scrudful_viewset
+    class V(ItemViewSet):
+        metadata_class = Extended
+
+    func = V.as_view({"get": "retrieve"})
+    response = func(APIRequestFactory().options("/"), pk="1")
+    assert response.status_code == 200
+    assert response.data["x-extra"] is True
+    assert response.data["options"] == OPTIONS_204

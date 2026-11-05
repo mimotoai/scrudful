@@ -1374,6 +1374,15 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
     return response
 
 
+#: The ``ScrudfulMetadata`` hooks of 0.9, removed in 0.10 (see
+#: :meth:`ScrudfulMetadata.__init_subclass__`).
+_REMOVED_METADATA_HOOKS = (
+    *(f"determine_metadata_for_{method}" for method in METHOD_KEYS),
+    "_write",
+    "required_conditional_headers",
+)
+
+
 class ScrudfulMetadata(BaseMetadata):
     """OPTIONS metadata: the HTTP Schema Resource (Semantic HTTP 0.1) of a view.
 
@@ -1387,7 +1396,28 @@ class ScrudfulMetadata(BaseMetadata):
     by the ``options`` that :func:`scrudful_viewset` and
     :func:`scrudful_api_view` install; a view that only sets
     ``metadata_class = ScrudfulMetadata`` gets the body alone.
+
+    Raises
+    ------
+    TypeError
+        When a subclass defines one of the hooks of 0.9
+        (``determine_metadata_for_<method>``, ``_write``,
+        ``required_conditional_headers``): they took the request, and the
+        HTTP Schema Resource is built without one, so they would silently do
+        nothing.
     """
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        for name in _REMOVED_METADATA_HOOKS:
+            if name in vars(cls):
+                raise TypeError(
+                    f"{cls.__qualname__}.{name}: ScrudfulMetadata no longer has "
+                    f"{name}. scrudful 0.10 builds the HTTP Schema Resource "
+                    "without a request, so customise it with the statuses= and "
+                    "entity= options of @scrudful / scrudful_api_view or the "
+                    "viewset's Meta instead (see the 0.10.0 changelog)"
+                )
 
     def determine_metadata(self, request: Request, view: APIView) -> dict[str, Any]:
         func = getattr(getattr(request, "resolver_match", None), "func", None)
