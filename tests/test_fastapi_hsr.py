@@ -297,8 +297,8 @@ def test_requests_dont_walk_the_routes_again(make_client, monkeypatch):
     async def get_more(id: int):
         return {}
 
-    app.include_router(APIRouter())  # a copying FastAPI needs a new include
     if module._iter_route_contexts is None:
+        # A copying FastAPI serves them only from a new include.
         app.include_router(router, prefix="/v2")
         url, name = "/v2/more/1", "v2.more.id"
     else:
@@ -306,6 +306,50 @@ def test_requests_dont_walk_the_routes_again(make_client, monkeypatch):
     response = client.get(url)
     assert hsr_link_problems(response.headers, f"{BASE}_hsr/{name}") == []
     assert client.get(f"/_hsr/{name}").status_code == 200
+
+
+def test_app_routes_added_later_to_an_included_router_are_described(make_client):
+    """With ``add_options(app)``, a route added later to a router the app
+    includes lazily (a new method of a resource, and a new path) is seen
+    without any change to the app's own routes: ``Allow`` and the HSR list
+    the new method, and the new path has its OPTIONS, its HSR and the HSR
+    link."""
+    import scrudful.fastapi as module
+
+    if module._iter_route_contexts is None:
+        pytest.skip("this FastAPI copies an included router's routes")
+    router = APIRouter()
+
+    @router.get("/items/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def get_item(id: int):
+        return {}
+
+    app = FastAPI()
+    app.include_router(router, prefix="/v1")
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    items = f"{BASE}_hsr/v1.items.id"
+    options_204(client, "/v1/items/1", "GET, OPTIONS", items)
+    app_routes = list(app.router.routes)
+
+    @router.put("/items/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def put_item(id: int):
+        return {}
+
+    @router.get("/late/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def get_late(id: int):
+        return {}
+
+    assert app.router.routes == app_routes
+    options_204(client, "/v1/items/1", "GET, PUT, OPTIONS", items)
+    assert "put" in client.get(items).json()
+    late = f"{BASE}_hsr/v1.late.id"
+    assert hsr_link_problems(client.get("/v1/late/1").headers, late) == []
+    options_204(client, "/v1/late/1", "GET, OPTIONS", late)
+    assert client.get(late).status_code == 200
 
 
 def test_a_route_replaced_in_place_is_seen(make_client):
