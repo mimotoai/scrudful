@@ -413,6 +413,12 @@ Behaviour change (DRF)
   A plain ``APIView`` is loaded only on its lookup kwarg
   (``lookup_url_kwarg``, else ``lookup_field``), so its collection routes
   load nothing.
+* Each load and check of OPTIONS gets a clone of the request with the method
+  checked in ``request.method``, while ``request.META["REQUEST_METHOD"]``
+  stays ``"OPTIONS"``: a ``get_queryset`` that locks its row should lock only
+  when it isn't ``"OPTIONS"``. On an OPTIONS whose ``META`` has no
+  ``REQUEST_METHOD`` (a request built by hand), scrudful sets it to
+  ``"OPTIONS"`` first, so that check holds there too.
 * The view class's ``finalize_response`` adds the HSR link to every response
   of a routed scrudful view, OPTIONS's 401, 406 and 429 included; a view with
   a renderer that isn't JSON (the browsable API) also sends ``Vary: Accept``.

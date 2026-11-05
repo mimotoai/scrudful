@@ -1693,7 +1693,10 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
        view-level permissions, then the object is loaded only if one of them
        passed (a method with an ``allowed_func`` always does), once for each
        action of those methods, then the methods that passed are checked
-       against the object their action loaded (:func:`_allowed_methods`);
+       against the object their action loaded (:func:`_allowed_methods`),
+       each on a clone of the request with that method, while
+       ``request.META["REQUEST_METHOD"]`` stays ``"OPTIONS"`` (set to it
+       first when ``META`` lacks it, as a request built by hand may);
     3. the answer is a 204 without content or ``Content-Type`` (rendered by
        DRF's ``JSONRenderer``, whatever renderer DRF's content negotiation
        picked), ``Allow: allow_value(...)`` (also set in ``view.headers``,
@@ -1717,6 +1720,12 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
     if not _answers_options(self):
         return APIView.options(self, request, *args, **kwargs)
     hsr = _request_hsr_link(self, request)
+    meta = getattr(request, "META", None)
+    if isinstance(meta, dict) and "REQUEST_METHOD" not in meta:
+        # A request built by hand may lack the request line's method: the
+        # per-method checks get clones whose ``method`` is theirs, so this is
+        # how they tell an OPTIONS (as documented).
+        meta["REQUEST_METHOD"] = "OPTIONS"
     try:
         allowed = _allowed_methods(self, request)
     except Exception as exc:
