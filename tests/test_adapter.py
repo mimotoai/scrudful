@@ -8,17 +8,13 @@ import pytest
 from scrudful import _adapter
 from scrudful._adapter import (
     CONTEXT_TYPE,
-    HSR_CONTEXT_URL,
-    HSR_SCHEMA_URL,
     JSON_LD_CONTEXT_REL,
     RDF_CONTEXT_REL,
     SCHEMA_TYPE,
-    allow_header,
     check_validators,
     context_defaults,
     context_link_type,
     describe_content,
-    describe_options,
     describe_read,
     describe_write,
     essence,
@@ -27,13 +23,11 @@ from scrudful._adapter import (
     is_json,
     media_type_key,
     merge_links,
-    options_links,
     precondition_headers,
     set_validator_headers,
     validator_policy,
 )
 from scrudful.utils import link_content
-from tests.semantic_http import validate_http_schema_resource
 
 # --- framework independence ------------------------------------------------
 
@@ -584,36 +578,6 @@ def test_describe_error_content_not_shared_between_calls():
     first = describe_read(None, True, error_content=ERRORS)
     first["responses"]["400"]["content"].clear()
     assert ERRORS
-
-
-def test_describe_options_valid():
-    body = {"options": describe_options()}
-    validate_http_schema_resource(body)
-    assert body["options"]["responses"]["200"]["content"] == {
-        "application/json": {
-            "schema": {"$ref": HSR_SCHEMA_URL},
-            "x-rdf-context": {"href": HSR_CONTEXT_URL, "type": CONTEXT_TYPE},
-        }
-    }
-
-
-def test_describe_options_is_fresh():
-    describe_options()["responses"].clear()
-    assert describe_options()["responses"]
-
-
-def test_allow_header():
-    body = {"get": {}, "head": {}, "options": {}, "x-a": 1}
-    assert allow_header(body) == "GET, HEAD, OPTIONS"
-
-
-def test_options_links():
-    assert options_links() == (
-        "<https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json>;"
-        ' rel="describedby"; type="application/schema+json", '
-        "<https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld>;"
-        ' rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
-    )
 
 
 def test_context_link_type():

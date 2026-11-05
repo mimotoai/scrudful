@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from jsonschema import ValidationError
 
-from scrudful._adapter import CONTEXT_TYPE, describe_options, options_links
+from scrudful._adapter import CONTEXT_TYPE
 from tests.semantic_http import (
     hsr_get_problems,
     hsr_link_problems,
@@ -185,34 +185,20 @@ def test_link_problems_preflight_options_is_exempt():
 
 
 def _options_headers(allow="GET, OPTIONS"):
-    return {
-        "Content-Type": "application/json",
-        "Link": options_links(),
-        "Allow": allow,
-    }
+    return {"Link": HSR_LINK, "Allow": allow}
 
 
 def test_link_problems_options_conformant():
-    body = {"get": {"responses": {}}, "options": describe_options()}
-    assert link_problems("OPTIONS", 200, _options_headers(), True, body) == []
+    assert link_problems("OPTIONS", 204, _options_headers(), False) == []
 
 
-def test_link_problems_options_allow_lists_non_body_method():
-    body = {"get": {"responses": {}}, "options": describe_options()}
-    headers = _options_headers("GET, PUT, OPTIONS")
-    problems = link_problems("OPTIONS", 200, headers, True, body)
-    assert any("Allow" in problem for problem in problems)
-
-
-def test_link_problems_options_wrong_targets_and_status():
-    body = {"options": describe_options()}
-    headers = {
-        "Content-Type": "application/json",
-        "Link": f"{SCHEMA}, {CONTEXT}",
-        "Allow": "OPTIONS",
-    }
-    assert link_problems("OPTIONS", 200, headers, True, body)
-    assert link_problems("OPTIONS", 204, _options_headers("OPTIONS"), False, body)
+def test_link_problems_options_wrong_status_content_and_links():
+    """The old 200 answer with the HSR as content is no longer conformant."""
+    assert link_problems("OPTIONS", 200, _options_headers(), False)
+    assert link_problems("OPTIONS", 204, _options_headers(), True)
+    headers = {"Link": f"{SCHEMA}, {CONTEXT}", "Allow": "OPTIONS"}
+    assert link_problems("OPTIONS", 204, headers, False)
+    assert link_problems("OPTIONS", 204, {"Link": HSR_LINK}, False)
 
 
 def test_link_problems_options_error_is_an_error_response():
@@ -221,19 +207,6 @@ def test_link_problems_options_error_is_an_error_response():
     headers = {"Content-Type": "application/json", "Link": f"{SCHEMA}, {CONTEXT}"}
     assert link_problems("OPTIONS", 404, headers, True) == []
     assert link_problems("OPTIONS", 404, {"Content-Type": "application/json"}, True)
-
-
-def test_link_problems_options_head_with_content():
-    body = {
-        "head": {
-            "responses": {
-                "200": {"content": PERSON["get"]["responses"]["200"]["content"]}
-            }
-        },
-        "options": describe_options(),
-    }
-    headers = _options_headers("HEAD, OPTIONS")
-    assert link_problems("OPTIONS", 200, headers, True, body)
 
 
 def test_link_problems_person_agreement():
@@ -320,7 +293,9 @@ def test_options_204_allow_must_equal_expected():
 def test_hsr_link_problems_anchor_type_count():
     assert hsr_link_problems({"Link": HSR_LINK}) == []
     assert hsr_link_problems({"Link": HSR_LINK + '; anchor="#x"'})
-    assert hsr_link_problems({"Link": HSR_LINK.replace("application/json", "text/plain")})
+    assert hsr_link_problems(
+        {"Link": HSR_LINK.replace("application/json", "text/plain")}
+    )
     assert hsr_link_problems({"Link": f"{HSR_LINK}, {HSR_LINK}"})
     assert hsr_link_problems({"Link": HSR_LINK}, "https://h.example/other")
 

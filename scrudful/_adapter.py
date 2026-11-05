@@ -19,7 +19,6 @@ from scrudful.conditional import SAFE_METHODS, ConditionalResult, validator_head
 from scrudful.utils import (
     EXPOSE_HEADERS,
     join_links,
-    link_content,
     link_relations,
     merge_expose_headers,
 )
@@ -592,14 +591,6 @@ def merge_links(
     return join_links(existing, schema, context, hsr)
 
 
-def options_links() -> str:
-    """The Link field value of an OPTIONS response: the HTTP Schema Resource's
-    own schema and context."""
-    schema = link_content(HSR_SCHEMA_URL, SCHEMA_REL, SCHEMA_TYPE)
-    context = link_content(HSR_CONTEXT_URL, JSON_LD_CONTEXT_REL, CONTEXT_TYPE)
-    return f"{schema}, {context}"
-
-
 # --- OPTIONS descriptions ----------------------------------------------------
 #
 # The operations of an OPTIONS body (an HTTP Schema Resource: an OpenAPI Path
@@ -644,29 +635,6 @@ def describe_content(
         context_type = context_link_type(media_type, context_type)
         entry["x-rdf-context"] = {"href": context, "type": context_type}
     return {key: entry}
-
-
-def describe_options() -> dict[str, Any]:
-    """The ``options`` operation: a 200 whose content is the HTTP Schema Resource."""
-    return {
-        "responses": {
-            "200": {
-                "description": "OK",
-                "content": describe_content(
-                    "application/json",
-                    HSR_SCHEMA_URL,
-                    SCHEMA_TYPE,
-                    HSR_CONTEXT_URL,
-                    CONTEXT_TYPE,
-                ),
-            }
-        }
-    }
-
-
-def allow_header(body: Mapping[str, Any]) -> str:
-    """The ``Allow`` value for an HTTP Schema Resource ``body``: its methods."""
-    return ", ".join(key.upper() for key in body if key in METHOD_KEYS)
 
 
 def check_error_body_func(func: Any) -> None:

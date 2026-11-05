@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from scrudful._adapter import describe_content, merge_links, options_links
+from scrudful._adapter import describe_content, merge_links
 from scrudful._hsr import (
     HSR_LINK_REL,
     HsrConfigError,
@@ -49,8 +49,13 @@ def test_hsr_link():
     assert HSR_LINK_REL.endswith("#http-schema-resource-document")
 
 
-def test_hsr_response_links_matches_options_links():
-    assert hsr_response_links() == options_links()
+def test_hsr_response_links():
+    assert hsr_response_links() == (
+        "<https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json>;"
+        ' rel="describedby"; type="application/schema+json", '
+        "<https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld>;"
+        ' rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
+    )
 
 
 def test_serialize_and_etag_are_stable():

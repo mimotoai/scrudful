@@ -23,7 +23,6 @@ from scrudful._adapter import (
     METHOD_KEYS,
     RDF_CONTEXT_REL,
     SCHEMA_REL,
-    allow_header,
     essence,
     is_in_band,
     is_json,
@@ -169,8 +168,8 @@ def link_problems(
             problems += _context_problems(content_type, contexts)
     # An error answering OPTIONS is an error response, not the description.
     if method == "OPTIONS" and status < 400:
-        problems += _options_problems(
-            status, headers, content_type, schemas, contexts, hsr
+        problems += options_204_problems(
+            status, headers, b"x" if has_content else b""
         )
     if hsr is not None and (has_content or method == "HEAD"):
         problems += _agreement_problems(
@@ -200,37 +199,6 @@ def _context_problems(
         if not params.get("type"):
             return ["the context link has no type"]
     return []
-
-
-def _options_problems(
-    status: int,
-    headers: Mapping[str, str],
-    content_type: str | None,
-    schemas: list[tuple[str, dict[str, str]]],
-    contexts: list[tuple[str, dict[str, str]]],
-    hsr: dict | None,
-) -> list[str]:
-    problems = []
-    if status != 200:
-        problems.append(f"OPTIONS answered {status}, need 200")
-    if content_type is None or essence(content_type) != "application/json":
-        problems.append(f"OPTIONS Content-Type {content_type!r}, need JSON")
-    if [target for target, _ in schemas] != [HSR_SCHEMA_URL]:
-        problems.append("the OPTIONS describedby link is not the HTTP Schema Resource")
-    if [target for target, _ in contexts] != [HSR_CONTEXT_URL]:
-        problems.append("the OPTIONS context link is not the HTTP Schema Resource's")
-    allow = _header(headers, "allow")
-    if allow is None:
-        problems.append("OPTIONS without Allow")
-    if hsr is not None:
-        if allow is not None and allow != allow_header(hsr):
-            problems.append(f"Allow {allow!r} is not the body's {allow_header(hsr)!r}")
-        if "options" not in hsr:
-            problems.append("the OPTIONS body has no options entry")
-        for response in ((hsr.get("head") or {}).get("responses") or {}).values():
-            if "content" in response:
-                problems.append("a head response has content")
-    return problems
 
 
 def _select_entry(
@@ -294,7 +262,9 @@ def hsr_link_problems(
     target, params = links[0]
     problems = []
     if params.get("type") != "application/json":
-        problems.append(f"the HTTP Schema Resource link has type {params.get('type')!r}")
+        problems.append(
+            f"the HTTP Schema Resource link has type {params.get('type')!r}"
+        )
     if "anchor" in params:
         problems.append("the HTTP Schema Resource link has an anchor")
     if expected_target is not None and target != expected_target:

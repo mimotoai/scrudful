@@ -3,7 +3,6 @@ from django.utils.functional import lazy
 from starlette.datastructures import URL
 
 from scrudful.utils import (
-    EXPOSABLE_HEADERS,
     EXPOSE_HEADERS,
     join_links,
     link_content,
@@ -183,7 +182,6 @@ def test_join_links(values, expected):
 
 def test_expose_headers_constant():
     assert EXPOSE_HEADERS == ("ETag", "Link", "Location", "Allow")
-    assert EXPOSABLE_HEADERS is EXPOSE_HEADERS
 
 
 @pytest.mark.parametrize(

@@ -130,8 +130,8 @@ def absolute_for_hsr(url: str, base_url: str | None, what: str) -> str:
         return resolve_uri(url, base_url)
     raise HsrConfigError(
         f"{what} is the relative URL {url!r}; set a base URL "
-        "(SCRUDFUL['BASE_URL'] or base_url=) so the HTTP Schema Resource does "
-        "not depend on the request"
+        "(base_url=, or SCRUDFUL['BASE_URL'] for Django): the HTTP Schema "
+        "Resource must not depend on the request"
     )
 
 
