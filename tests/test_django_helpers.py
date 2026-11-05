@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import json
 import pathlib
@@ -6,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from django.core.exceptions import ImproperlyConfigured
 from django.http import Http404
-from django.test import RequestFactory
+from django.test import AsyncClient, Client, RequestFactory
 from django.urls import path, reverse_lazy
 from django.utils.functional import lazy
 from django.utils.safestring import SafeString
@@ -396,6 +397,50 @@ def test_a_failing_handler500_logs_the_error_it_was_answering(
     assert "handler500" in record.getMessage() and "/boom" in record.getMessage()
     assert isinstance(record.exc_info[1], RuntimeError)
     assert str(record.exc_info[1]) == "original bug"
+
+
+def _lazy_bug() -> str:
+    raise KeyError("lazy bug")
+
+
+class SharedBugURLconf:
+    """Both error handlers share a lazy link whose evaluation has a bug (an
+    error neither serves around)."""
+
+    urlpatterns = [path("boom", _original_bug)]
+    handler404 = error_handler(
+        404, Entity(lazy(_lazy_bug, str)(), context_link_or_func="https://x/c")
+    )
+    handler500 = error_handler(
+        500, Entity(lazy(_lazy_bug, str)(), context_link_or_func="https://x/c")
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "url, logged",
+    [("/boom", RuntimeError("original bug")), ("/missing", KeyError("lazy bug"))],
+)
+def test_failing_error_handlers_log_the_error_answered_once(
+    db, settings, caplog, url, logged, asynchronous
+):
+    """When the error handlers fail, the error the ``handler500`` first
+    answered is logged exactly once, across Django's call of it at each
+    middleware layer: the view's error, or the ``handler404``'s own
+    failure (a 404 needs no log of its own)."""
+    settings.ROOT_URLCONF = SharedBugURLconf
+    settings.SCRUDFUL = None
+    with caplog.at_level("ERROR"), pytest.raises(KeyError, match="lazy bug"):
+        if asynchronous:
+            client = AsyncClient(raise_request_exception=False)
+            asyncio.run(client.get(url, headers={"accept": "application/json"}))
+        else:
+            client = Client(raise_request_exception=False)
+            client.get(url, HTTP_ACCEPT="application/json")
+    [record] = [r for r in caplog.records if r.name == "scrudful._django"]
+    assert "handler500" in record.getMessage() and url in record.getMessage()
+    assert type(record.exc_info[1]) is type(logged)
+    assert record.exc_info[1].args == logged.args
 
 
 def test_a_failing_handler404_logs_nothing_of_its_own(

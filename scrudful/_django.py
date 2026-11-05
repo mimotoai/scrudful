@@ -6,10 +6,10 @@ can be used without the other.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import sys
-import traceback
 import types
 import warnings
 from collections.abc import Callable, Mapping
@@ -108,6 +108,9 @@ class ScrudfulSettings(TypedDict, total=False):
 
 
 logger = logging.getLogger(__name__)
+#: Marks the exception a failing handler500 raised, once it logged the error
+#: it was answering: Django's next call of it answers that exception.
+_ANSWERED_LOGGED = "_scrudful_answered_logged"
 
 #: The keys of the ``SCRUDFUL`` setting.
 SETTING_KEYS = frozenset(
@@ -518,22 +521,23 @@ def error_handler(
     def view(request: HttpRequest, exception: Exception | None = None) -> HttpResponse:
         # A handler500 is called while Django handles the error it answers,
         # which Django logs only once the handler returns. Django calls it
-        # again at each middleware layer, then answering what this view
-        # raised: logged once, at the first.
+        # again at each middleware layer, then answering what the handler500
+        # before raised, which is marked: logged once, at the first.
         answering = sys.exc_info()[1] if status == 500 else None
         try:
             return answer(request, exception)
-        except Exception:
-            if answering is not None and not any(
-                frame.f_code is view.__code__
-                for frame, _ in traceback.walk_tb(answering.__traceback__)
-            ):
-                logger.error(
-                    "scrudful handler500 failed answering the error of %s; the "
-                    "error it was answering",
-                    request.path,
-                    exc_info=answering,
-                )
+        except Exception as exc:
+            if answering is not None:
+                if not getattr(answering, _ANSWERED_LOGGED, False):
+                    logger.error(
+                        "scrudful handler500 failed answering the error of %s; "
+                        "the error it was answering",
+                        request.path,
+                        exc_info=answering,
+                    )
+                # An exception that takes no attribute is logged again.
+                with contextlib.suppress(AttributeError, TypeError):
+                    setattr(exc, _ANSWERED_LOGGED, True)
             raise
 
     def answer(request: HttpRequest, exception: Exception | None) -> HttpResponse:
