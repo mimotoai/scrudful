@@ -496,6 +496,9 @@ Behaviour change (FastAPI)
   ``add_options(app)`` leaves every resource of the app without the HSR link,
   on its responses and on OPTIONS, until ``add_options`` is called again; a
   ``RuntimeWarning`` says so, once, on the next request.
+* Each of these ``RuntimeWarning``\ s counts as given only once it was: one
+  raised as an error (``-W error``) is raised again by the next call
+  (``add_options`` again, or the next request), not dropped.
 
 New
 ---

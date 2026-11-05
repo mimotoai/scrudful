@@ -3688,6 +3688,52 @@ def test_a_security_annotation_raising_attribute_error_refuses_its_method(
         security_annotations.lookup.__annotations__["user"] = "str"
 
 
+def test_an_unchecked_route_warning_raised_as_an_error_warns_again():
+    """The route is recorded as announced only once the warning was given: a
+    warning raised as an error (``-W error``) leaves it unrecorded, so
+    calling ``add_options`` again warns (or fails) again, not silently."""
+    app = security_annotations.missing_attribute_app()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            with pytest.raises(RuntimeWarning, match=r"PUT '/notes/\{id\}'"):
+                add_options(app, base_url=BASE)
+        with pytest.warns(RuntimeWarning, match=r"PUT '/notes/\{id\}'"):
+            add_options(app, base_url=BASE)
+    finally:
+        security_annotations.lookup.__annotations__["user"] = "str"
+
+
+def test_a_removed_hsr_route_warning_raised_as_an_error_warns_again(make_client):
+    """An app's removed HSR route is announced again on the next request when
+    the warning was raised as an error (``-W error``): a retry isn't silent,
+    and once given, the warning isn't repeated."""
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {"id": id}
+
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    app.router.routes[:] = [
+        route
+        for route in app.router.routes
+        if not getattr(route, "path", "").startswith("/_hsr/")
+    ]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(RuntimeWarning, match="was removed from its routes"):
+            client.get("/notes/1")
+    with pytest.warns(RuntimeWarning, match="was removed from its routes"):
+        response = client.get("/notes/1")
+    assert response.status_code == 200
+    assert HSR_DOCUMENT_REL not in (response.headers.get("link") or "")
+    # Given once now (the suite runs with warnings as errors).
+    assert client.get("/notes/1").status_code == 200
+
+
 def unreadable_app() -> FastAPI:
     """:func:`tests.fastapi_security_annotations.unreadable_app`, skipping on
     a FastAPI that refuses the annotation itself, when the route is created

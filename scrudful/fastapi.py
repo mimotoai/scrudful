@@ -1046,6 +1046,9 @@ class _HsrOptions:
     #: The resource keys of a router announced as having no OPTIONS or HSR
     #: route (see :func:`_announce_unserved`), each once.
     announced: set[str] = field(default_factory=set, compare=False, repr=False)
+    #: Whether an app's HSR route was forgotten (see :func:`_forget_removed`)
+    #: and the warning saying so is still to be given.
+    removal_unannounced: bool = field(default=False, compare=False, repr=False)
     #: A router's routes as :func:`add_options` and the completions since
     #: left them (see :func:`_complete`).
     completion: _Completion | None = field(default=None, compare=False, repr=False)
@@ -1796,13 +1799,15 @@ def _paths_index(owner: FastAPI | APIRouter) -> _PathsIndex:
                 if key not in keys:
                     keys.append(key)
     index = _PathsIndex(fingerprint or (), paths, by_route, by_endpoint)
-    if fingerprint is not None:
-        options.index = index
     if options.explicit:
         _forget_removed(owner, options)
         _announce_unchecked_routes(options, paths)
         if not isinstance(owner, FastAPI):
             _announce_unserved(owner, options, paths)
+    # Kept once announced: a warning raised as an error (``-W error``) leaves
+    # it unkept, so the next call announces again.
+    if fingerprint is not None:
+        options.index = index
     return index
 
 
@@ -1816,7 +1821,8 @@ def _forget_removed(owner: FastAPI | APIRouter, options: _HsrOptions) -> None:
     which gives them their routes again, as calling :func:`add_options`
     again does. For an app, whose one HSR route serves all its resources,
     this warns (once for each route forgotten): only :func:`add_options`
-    adds it again."""
+    adds it again. The warning counts as given once it returned: one
+    raised as an error leaves it to give again, on the next call."""
     routes = owner.router.routes if isinstance(owner, FastAPI) else owner.routes
     present = {id(route) for route in routes}
     hsr = getattr(owner, _HSR_ROUTE_ATTRIBUTE, None)
@@ -1824,28 +1830,29 @@ def _forget_removed(owner: FastAPI | APIRouter, options: _HsrOptions) -> None:
     if isinstance(hsr, Route) and id(hsr) not in present:
         delattr(owner, _HSR_ROUTE_ATTRIBUTE)
         gone = True
-        if options.hsr_route and options.hsr_url is None:
-            warnings.warn(
-                f"the HTTP Schema Resource route of this FastAPI app "
-                f"('/{HSR_ROUTE_SEGMENT}/{{name}}') was removed from its routes, "
-                "or replaced, after add_options(app), so none of its resources "
-                "is described: their responses get no HSR link, and OPTIONS "
-                "answers without one; call add_options on the app again",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        options.removal_unannounced = options.hsr_route and options.hsr_url is None
     elif isinstance(hsr, dict):
         for key in [key for key, route in hsr.items() if id(route) not in present]:
             del hsr[key]
             gone = True
     completion = options.completion
-    if completion is None or not completion.simple:
-        return
-    if not gone:
-        current = {_entry_key(route) for route in _flat(routes)}
-        gone = any(key not in current for key in completion.seen)
-    if gone:
-        completion.simple = False
+    if completion is not None and completion.simple:
+        if not gone:
+            current = {_entry_key(route) for route in _flat(routes)}
+            gone = any(key not in current for key in completion.seen)
+        if gone:
+            completion.simple = False
+    if options.removal_unannounced:
+        warnings.warn(
+            f"the HTTP Schema Resource route of this FastAPI app "
+            f"('/{HSR_ROUTE_SEGMENT}/{{name}}') was removed from its routes, "
+            "or replaced, after add_options(app), so none of its resources "
+            "is described: their responses get no HSR link, and OPTIONS "
+            "answers without one; call add_options on the app again",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        options.removal_unannounced = False
 
 
 def _find_scrudful_paths(routes: Sequence[Any]) -> dict[str, _Resource]:
@@ -2883,7 +2890,6 @@ def _announce_unserved(
             continue
         if key in with_options and not (served and _hsr_route_of(router, key) is None):
             continue
-        options.announced.add(key)
         warnings.warn(
             f"{resource.template!r} of an APIRouter has no OPTIONS or HTTP "
             "Schema Resource route, so it isn't described: its route was "
@@ -2893,6 +2899,8 @@ def _announce_unserved(
             RuntimeWarning,
             stacklevel=2,
         )
+        # Once given: a warning raised as an error is given again.
+        options.announced.add(key)
 
 
 def _options_endpoint(router: APIRouter, path: str) -> Callable[[Request], Any]:
@@ -3266,8 +3274,6 @@ def _announce_unchecked(route: Any, why: str) -> None:
     original = getattr(route, "original_route", route)
     if getattr(original, _UNCHECKED_ANNOUNCED_ATTRIBUTE, False):
         return
-    with contextlib.suppress(AttributeError, TypeError):
-        setattr(original, _UNCHECKED_ANNOUNCED_ATTRIBUTE, True)
     methods = ", ".join(sorted(getattr(route, "methods", None) or ()))
     endpoint = _endpoint_name(getattr(route, "endpoint", None))
     remedy = (
@@ -3283,6 +3289,10 @@ def _announce_unchecked(route: Any, why: str) -> None:
         RuntimeWarning,
         stacklevel=2,
     )
+    # Once given: a warning raised as an error (``-W error``) leaves the route
+    # unmarked, so a retry warns (or fails) again.
+    with contextlib.suppress(AttributeError, TypeError):
+        setattr(original, _UNCHECKED_ANNOUNCED_ATTRIBUTE, True)
 
 
 def _announce_unchecked_routes(
