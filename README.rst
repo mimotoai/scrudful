@@ -250,7 +250,8 @@ order:
 5. ``Allow`` lists the allowed methods and ``OPTIONS``; ``HEAD`` only when the
    path serves it. A 405 keeps RFC 9110's ``Allow`` for django-ninja and DRF:
    every method the path serves, whoever asks (FastAPI's 405 is
-   Starlette's).
+   Starlette's). An error answering OPTIONS (a loader's 404, a 429) has no
+   entry of its own in the HSR, whose ``options`` entry is exactly the 204's.
 
 **Every response links the HSR**: the 2xx, 304 and HEAD responses, scrudful's
 own 400, 412 and 428, a 204 or an error your view returns, and the errors the
