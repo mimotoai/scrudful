@@ -97,8 +97,8 @@ Validators
     JSON content (e.g. ``application/problem+json``); the 304 has no body and
     gets none. Without ``error`` they carry the Links and media type of the
     entity ``responses=`` declares for their status, else of the serving
-    API's :func:`add_error_links` entity (link callables then get ``None``),
-    else no entity Links, and are ``application/json`` (on a
+    API's :func:`add_error_links` entity (link callables then get
+    ``obj=None``), else no entity Links, and are ``application/json`` (on a
     :class:`ScrudfulRouter`, each carries the HTTP Schema Resource link).
     Describe them in OpenAPI with
     ``openapi_extra={"responses": CONDITIONAL_READ_RESPONSES}`` (or
@@ -169,7 +169,7 @@ Error responses
     :func:`add_error_links`'s entity is set and differs from ``error``, that
     entity; else ``error``; else (an operation without ``error``) the Links
     of :func:`add_error_links`'s entity, which its wrapped handlers add;
-    else none. Link callables get ``None``. A response with JSON content
+    else none. Link callables get ``obj=None``. A response with JSON content
     (ninja's renderer's ``application/json``) is then served as that
     entity's media type when it is JSON content too, e.g.
     ``application/problem+json``, as the HTTP Schema Resource lists it.
@@ -1179,7 +1179,7 @@ def scrudful(
         as Links on them, and of the response to an ``HttpError`` or
         ``Http404`` the operation raises, unless ``responses`` declares its
         status (see "Error responses" in the module docstring; link
-        callables then get ``None``); a 401, 403, 422 or 429 instead
+        callables then get ``obj=None``); a 401, 403, 422 or 429 instead
         carries the API-wide :func:`add_error_links` entity when that is set
         and differs (as ninja's own do), and without one, ninja's own 401,
         403, 422 and 429 for the operation carry this entity too. Without
@@ -3383,8 +3383,8 @@ def _early_response(
     Resource describes them with (:func:`_early_entity`): ``config.error``
     (or the status's ``responses=`` entity), whose link callables get
     ``obj``, else the serving API's :func:`add_error_links` entity, whose
-    link callables get ``None`` (as for the errors its handlers answer); and
-    its media type as their Content-Type. The serving API's renderer writes
+    link callables get ``obj=None`` (as for the errors its handlers answer);
+    and its media type as their Content-Type. The serving API's renderer writes
     them (see :func:`_render`).
     """
     api = _SERVING_API.get()
@@ -4815,7 +4815,7 @@ def _raised_links(
     ``response`` is the API's answer to it; when it has content, it gets
     the entity :func:`_raised_entity` picks for its status (``api_error``
     is the serving API's :func:`add_error_links` entity), whose link
-    callables get ``None``, and its media type (see :func:`_error_links`).
+    callables get ``obj=None``, and its media type (see :func:`_error_links`).
     It exposes ``Link`` and ``Allow`` either way.
     """
     expose_headers(response)
@@ -4943,7 +4943,7 @@ def _error_links(
 ) -> _Flow[None]:
     """Give the error ``response`` the Links and media type of ``entity``.
 
-    Its link callables get ``None``. A response with JSON content, as
+    Its link callables get ``obj=None``. A response with JSON content, as
     ninja's renderer makes, is served as ``entity.media_type`` when that is
     JSON content too (an ``error`` entity's always is), with the charset its
     bytes are in, as scrudful's own error bodies are; other content keeps
@@ -5741,7 +5741,8 @@ _SAMPLE_VALUES = ("scrudful-sample", "0", "00000000-0000-0000-0000-000000000000"
 _FALLBACK_SAMPLES = tuple(char * size for size in range(1, 9) for char in "0aA-_")
 #: The most combinations of sample values checked per HSR route: every one
 #: for a prefix of up to 5 parameters (3**5); past it, each parameter's
-#: values with the others at their first (see :func:`_sample_urls`). Each
+#: values with the others at their first, then the first combinations up to
+#: it (see :func:`_sample_urls`). Each
 #: URL is matched against every path before the route in its API, once, when
 #: the API's URL patterns are built.
 _MAX_SAMPLE_URLS = 3**5
@@ -5881,8 +5882,9 @@ def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
     patterns, so the route is checked when the API's URL patterns are built,
     by matching the URLs it serves (:func:`_sample_urls`) against each
     earlier path of the API's mounts: at most :data:`_MAX_SAMPLE_URLS` URLs
-    (or 1 + 2k, for a prefix of k parameters, past it) times the number of
-    earlier paths, once per route and mount. Nothing is checked for a clone
+    (past the cap, every parameter's values first, then the first
+    combinations up to it) times the number of earlier paths, once per route
+    and mount. Nothing is checked for a clone
     without an API (not bound yet). When the URLs don't cover every
     combination of sample values (past the cap), or there are none (a prefix
     parameter whose converter accepts no sample value), a ``RuntimeWarning``

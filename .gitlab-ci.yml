@@ -53,10 +53,10 @@ floor-fastapi:
 # against, 1.7.0 to 1.7.3 (`_run_authentication` changed in 1.7.1,
 # `_get_bound_routers` in 1.7.2), and the locked `test` matrix installs 1.7.1
 # only: floor-ninja runs the oldest, latest-ninja the newest the extra allows
-# (the one `.floor` installs). Beside the ninja modules, the shared ones with
-# ninja cases (the HSR route under LoginRequiredMiddleware, the Django
-# helpers, the envelope); test_error_body.py also needs FastAPI's test client,
-# which `.floor` doesn't install.
+# (the one `.floor` installs). Beside the ninja modules, some of the shared
+# ones with ninja cases (the HSR route under LoginRequiredMiddleware, the
+# Django helpers, the envelope). test_error_body.py is left out: FastAPI's
+# test client needs httpx, which `.floor` doesn't install.
 .ninja:
   extends: .floor
   script:

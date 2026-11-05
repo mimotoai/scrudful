@@ -1,8 +1,8 @@
 """RFC 9457 problem details.
 
 For scrudful's own 400, 412 and 428 responses (:func:`problem_details`) and for
-framework errors (:func:`problem_from_errors`: validation errors and the 404
-and 500 bodies of the Django and FastAPI adapters).
+framework errors (:func:`problem_from_errors`: validation errors, the 404
+and 500 bodies of the Django adapters, and FastAPI's JSON 500).
 
 Framework-free (standard library and scrudful only). Pass
 :func:`problem_details` as ``error_body_func`` and, to serve the body as
