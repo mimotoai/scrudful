@@ -694,6 +694,66 @@ def test_router_stores_its_hsr_options():
     assert (defaults.hsr_cache_control, defaults.allowed) == (None, None)
 
 
+def test_router_options_are_checked_when_set():
+    def hsr_url(path):
+        return f"https://docs.example{path}"
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+    with pytest.raises(ConfigError, match="base_url"):
+        router.base_url = "not-absolute"
+    with pytest.raises(TypeError, match="hsr_route must be a bool"):
+        router.hsr_route = "no"
+    with pytest.raises(ConfigError, match=re.escape("hsr_route=False needs hsr_url=")):
+        router.hsr_route = False
+    with pytest.raises(TypeError, match="hsr_url must be a callable"):
+        router.hsr_url = "https://docs.example/"
+    with pytest.raises(ConfigError, match="hsr_cache_control"):
+        router.hsr_cache_control = ""
+    with pytest.raises(TypeError, match="hsr_cache_control must be a str"):
+        router.hsr_cache_control = 300
+    with pytest.raises(TypeError, match="allowed must be a callable"):
+        router.allowed = True
+    assert (router.base_url, router.hsr_route, router.hsr_url) == (BASE_URL, None, None)
+    assert (router.hsr_cache_control, router.allowed) == (None, None)
+    router.hsr_url = hsr_url
+    router.hsr_route = False
+    with pytest.raises(ConfigError, match=re.escape("hsr_route=False needs hsr_url=")):
+        router.hsr_url = None
+    assert (router.hsr_route, router.hsr_url) == (False, hsr_url)
+
+
+def test_a_new_base_url_discards_the_built_hsrs():
+    _, router = make_api()
+    assert "https://api.example/schemas/item" in json.dumps(
+        http_schema_resource(router, "/{pk}")
+    )
+    router.base_url = "https://other.example/"
+    assert "https://other.example/schemas/item" in json.dumps(
+        http_schema_resource(router, "/{pk}")
+    )
+
+
+def test_hsr_route_is_set_before_the_operations():
+    """A path's HSR route is added with its first operation: turning the
+    option over later would leave the router's paths half one way."""
+    _, router = make_api()
+    with pytest.raises(ConfigError, match="before adding"):
+        router.hsr_route = True
+    assert router.hsr_route is None
+
+
+def test_a_settings_change_discards_the_built_hsrs(settings):
+    settings.SCRUDFUL = {"BASE_URL": "https://one.example/"}
+    _, router = make_api(base_url=None)
+    assert "https://one.example/schemas/item" in json.dumps(
+        http_schema_resource(router, "/{pk}")
+    )
+    settings.SCRUDFUL = {"BASE_URL": "https://two.example/"}
+    assert "https://two.example/schemas/item" in json.dumps(
+        http_schema_resource(router, "/{pk}")
+    )
+
+
 @pytest.mark.parametrize(
     "options",
     [
@@ -1064,12 +1124,20 @@ def test_target_from_the_hsr_url_setting(settings):
     assert target == "https://docs.example/s/{pk}"
 
 
-def test_target_with_the_route_turned_off_later_is_config_error(settings):
+def test_the_route_a_path_got_stays_its_target(settings):
+    """Whether a path has an HSR route is decided when its first operation
+    is added: the setting turned off later neither removes the route nor
+    breaks the link to it, and one turned on later adds no route."""
     router = target_router("a")
     client = TestClient(mount(router))
     settings.SCRUDFUL = {"HSR_ROUTE": False}
-    with pytest.raises(ConfigError, match="hsr_url"):
-        client.get("/1/target")
+    assert client.get("/1/target").json() == {"target": "http://testlocation/_hsr/pk"}
+    assert client.get("/_hsr/pk").status_code == 200
+    settings.SCRUDFUL = {"HSR_ROUTE": False, "HSR_URL": lambda p: "https://x/"}
+    late = target_router("late")
+    settings.SCRUDFUL = {}
+    with pytest.raises(ConfigError, match="no HTTP Schema Resource route"):
+        TestClient(mount(late)).get("/1/target")
 
 
 def test_target_outside_an_operation_is_config_error(rf):

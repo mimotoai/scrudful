@@ -186,6 +186,17 @@ Behaviour change (ninja)
 * ``add_error_links``'s entity is also the HSR's API-wide error entity, and
   calling it discards the built HSRs; its link callables are called as
   ``(None, None)`` there.
+* A change of ``SCRUDFUL`` (``override_settings``) discards the built HSRs
+  (they kept the base URL they were built with), and so does setting
+  ``router.base_url``.
+* ``ScrudfulRouter``'s ``base_url``, ``hsr_route``, ``hsr_url``,
+  ``hsr_cache_control`` and ``allowed`` attributes are checked when set, as
+  the arguments are (any value was accepted); ``hsr_route`` can only be set
+  before the router's first operation.
+* Whether a path has an HSR route is decided once, when its first described
+  operation is added: a ``SCRUDFUL["HSR_ROUTE"]`` turned off later no longer
+  makes each response of a path with a route raise ``ConfigError`` (the
+  responses link to the route, which still serves the HSR).
 
 Behaviour change (DRF)
 ----------------------

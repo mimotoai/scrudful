@@ -751,7 +751,17 @@ optional ``SCRUDFUL`` Django setting, then to scrudful's default:
 ``SCRUDFUL`` must be a dict of those keys (``"ERROR"`` is DRF's; django-ninja's
 API-wide error entity is :func:`~scrudful.ninja.add_error_links`'s): another
 value, or an unknown key, raises ``ImproperlyConfigured``. A ``base_url`` that
-isn't absolute is a ``ConfigError``.
+isn't absolute is a ``ConfigError``, and so is an invalid value of one of the
+keys.
+
+Each argument is also an attribute of the router, checked as the argument is
+when it is set: ``router.base_url = "relative/"`` is a ``ConfigError``. A new
+``base_url`` discards the built HSRs, as a change of ``SCRUDFUL`` does
+(``override_settings``). ``hsr_route`` is read when a path's first scrudful or
+``@described`` operation is added, which adds the path's HSR route or not for
+good: set the attribute before adding operations (``ConfigError`` after), and
+a path that got a route keeps linking to it whatever ``SCRUDFUL["HSR_ROUTE"]``
+says later.
 
 **A nested router inherits none of them.** A ``ScrudfulRouter`` added to
 another with ``add_router`` keeps its own ``base_url``, ``hsr_route``,

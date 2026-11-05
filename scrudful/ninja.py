@@ -548,7 +548,14 @@ import textwrap
 import tokenize
 import types
 import weakref
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Generator,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
@@ -564,8 +571,9 @@ from typing import (
 
 import pydantic
 from asgiref.sync import async_to_sync, sync_to_async
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.core.serializers.json import DjangoJSONEncoder
+from django.core.signals import setting_changed
 from django.http import (
     Http404,
     HttpRequest,
@@ -630,10 +638,13 @@ from scrudful._django import (
     page_url,
     precondition_headers,
     scrudful_setting,
+    setting_base_url,
+    setting_hsr_cache_control,
+    setting_hsr_route,
+    setting_hsr_url,
     slice_page,
 )
 from scrudful._hsr import (
-    DEFAULT_HSR_CACHE_CONTROL,
     HSR_ROUTE_SEGMENT,
     absolute_for_hsr,
     allow_value,
@@ -1823,7 +1834,10 @@ class ScrudfulRouter(Router):
     hsr_route : bool, optional
         Whether the router serves each path's HTTP Schema Resource by GET
         (``SCRUDFUL["HSR_ROUTE"]``, default ``True``). Turning it off needs
-        an ``hsr_url``.
+        an ``hsr_url``. It is read when each path's first scrudful or
+        :func:`described` operation is added, which adds the path's route
+        or not for good: the responses of a path with a route link to it,
+        whatever the setting says later.
     hsr_url : callable, optional
         ``hsr_url(path)``: the URL of the HTTP Schema Resource of ``path``
         (``SCRUDFUL["HSR_URL"]``), for one served elsewhere; the responses
@@ -1843,6 +1857,11 @@ class ScrudfulRouter(Router):
         Without a hook, the operations' ``auth=`` callbacks and ``before``
         decide (see "OPTIONS" in the module docstring).
 
+    Each is also an attribute of the router, checked as the argument is
+    when set (``hsr_route`` only before the router's first operation); a
+    new ``base_url`` discards the built HTTP Schema Resources, as a change
+    of ``SCRUDFUL`` (``override_settings``) does.
+
     Raises
     ------
     TypeError
@@ -1860,47 +1879,122 @@ class ScrudfulRouter(Router):
         hsr_route: bool | None = None,
         hsr_url: Callable[[str], str] | None = None,
         hsr_cache_control: str | None = None,
-        allowed: Callable[[HttpRequest, str, Any], bool] | None = None,
+        allowed: (
+            Callable[[HttpRequest, str, Any], bool | Awaitable[bool]] | None
+        ) = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        for name, value, kind, accepted in (
-            ("hsr_route", hsr_route, "a bool", bool),
-            ("hsr_cache_control", hsr_cache_control, "a str", str),
-        ):
-            if value is not None and not isinstance(value, accepted):
-                raise TypeError(
-                    f"{name} must be {kind} or None, not {type(value).__name__}"
-                )
-        for name, value in (("hsr_url", hsr_url), ("allowed", allowed)):
-            if value is not None and not callable(value):
-                raise TypeError(
-                    f"{name} must be a callable or None, not {type(value).__name__}"
-                )
-        if base_url is not None:
-            _check_base_url(base_url, "base_url")
-        if hsr_cache_control is not None:
-            _check_hsr_cache_control(hsr_cache_control, "hsr_cache_control")
-        self.base_url = base_url
-        self.hsr_route = hsr_route
-        self.hsr_url = hsr_url
-        self.hsr_cache_control = hsr_cache_control
-        self.allowed = allowed
-        # Both read now, so that a wrong setting fails here.
-        route_on, url = self._hsr_route_on(), self._hsr_url()
-        if not route_on and url is None:
-            raise ConfigError("hsr_route=False needs hsr_url=")
         #: The ``PathView`` of each path, as given to the operation decorator.
         self._scrudful_paths: dict[str, Any] = {}
         #: The HTTP Schema Resource of each path, once built.
-        self._scrudful_hsrs: dict[str, dict[str, Any]] = {}
+        self._scrudful_hsrs: dict[Any, dict[str, Any]] = {}
         #: The URL name of the HSR route of each path that has one.
         self._scrudful_hsr_url_names: dict[str, str] = {}
         #: The path of each HSR route name, to refuse two paths one name.
         self._scrudful_hsr_names: dict[str, str] = {}
         #: Unique for the process, so the HSR routes' URL names are too.
         self._scrudful_serial = next(_ROUTER_SERIALS)
+        # The options, each checked by its property's setter; hsr_route last,
+        # once hsr_url is set, since the route off needs an hsr_url.
+        self._scrudful_base_url: str | None = None
+        self._scrudful_hsr_route: bool | None = None
+        self._scrudful_hsr_url: Callable[[str], str] | None = None
+        self._scrudful_hsr_cache_control: str | None = None
+        self._scrudful_allowed: Any = None
+        _check_option_types(
+            hsr_route=hsr_route,
+            hsr_cache_control=hsr_cache_control,
+            hsr_url=hsr_url,
+            allowed=allowed,
+        )
+        self.base_url = base_url
+        self.hsr_cache_control = hsr_cache_control
+        self.allowed = allowed
+        self._scrudful_hsr_url = hsr_url
+        # Reads both settings, so that a wrong one fails here.
+        self.hsr_route = hsr_route
         _SCRUDFUL_ROUTERS.add(self)
+
+    @property
+    def base_url(self) -> str | None:
+        """The ``base_url`` option (see the class docstring); ``None`` reads
+        ``SCRUDFUL["BASE_URL"]``. Setting it is checked as the argument is,
+        and discards the built HTTP Schema Resources."""
+        return self._scrudful_base_url
+
+    @base_url.setter
+    def base_url(self, value: str | None) -> None:
+        if value is not None:
+            _check_base_url(value, "base_url")
+        self._scrudful_base_url = value
+        self._scrudful_hsrs.clear()
+
+    @property
+    def hsr_route(self) -> bool | None:
+        """The ``hsr_route`` option; ``None`` reads ``SCRUDFUL["HSR_ROUTE"]``.
+
+        A path's HSR route is added with its first scrudful or
+        :func:`described` operation, as the option (or the setting) is then,
+        and stays: setting the option once the router has a path is a
+        ``ConfigError``, and so is turning the route off without an
+        ``hsr_url``.
+        """
+        return self._scrudful_hsr_route
+
+    @hsr_route.setter
+    def hsr_route(self, value: bool | None) -> None:
+        _check_option_types(hsr_route=value)
+        if self._scrudful_paths:
+            raise ConfigError(
+                "set a ScrudfulRouter's hsr_route before adding operations: a "
+                "path's HTTP Schema Resource route is added (or not) with its "
+                "first operation"
+            )
+        _check_route_and_url(value, self._scrudful_hsr_url)
+        self._scrudful_hsr_route = value
+
+    @property
+    def hsr_url(self) -> Callable[[str], str] | None:
+        """The ``hsr_url`` option; ``None`` reads ``SCRUDFUL["HSR_URL"]``.
+        Setting it is checked as the argument is (the route off needs one)."""
+        return self._scrudful_hsr_url
+
+    @hsr_url.setter
+    def hsr_url(self, value: Callable[[str], str] | None) -> None:
+        _check_option_types(hsr_url=value)
+        _check_route_and_url(self._scrudful_hsr_route, value)
+        self._scrudful_hsr_url = value
+
+    @property
+    def hsr_cache_control(self) -> str | None:
+        """The ``hsr_cache_control`` option; ``None`` reads
+        ``SCRUDFUL["HSR_CACHE_CONTROL"]``. Setting it is checked as the
+        argument is."""
+        return self._scrudful_hsr_cache_control
+
+    @hsr_cache_control.setter
+    def hsr_cache_control(self, value: str | None) -> None:
+        _check_option_types(hsr_cache_control=value)
+        if value is not None:
+            _check_hsr_cache_control(value, "hsr_cache_control")
+        self._scrudful_hsr_cache_control = value
+
+    @property
+    def allowed(
+        self,
+    ) -> Callable[[HttpRequest, str, Any], bool | Awaitable[bool]] | None:
+        """The ``allowed`` hook of the router's paths, or ``None``. Setting it
+        is checked as the argument is."""
+        return self._scrudful_allowed  # type: ignore[no-any-return]
+
+    @allowed.setter
+    def allowed(
+        self,
+        value: Callable[[HttpRequest, str, Any], bool | Awaitable[bool]] | None,
+    ) -> None:
+        _check_option_types(allowed=value)
+        self._scrudful_allowed = value
 
     def add_api_operation(
         self,
@@ -2053,34 +2147,20 @@ class ScrudfulRouter(Router):
 
     def _hsr_route_on(self) -> bool:
         """``hsr_route``, else ``SCRUDFUL["HSR_ROUTE"]``, else ``True``."""
-        if self.hsr_route is not None:
-            return self.hsr_route
-        value = scrudful_setting("HSR_ROUTE", True)
-        if not isinstance(value, bool):
-            raise ConfigError(
-                f'SCRUDFUL["HSR_ROUTE"] must be a bool, not {type(value).__name__}'
-            )
-        return value
+        return _route_on(self._scrudful_hsr_route)
 
     def _hsr_url(self) -> Callable[[str], str] | None:
         """``hsr_url``, else ``SCRUDFUL["HSR_URL"]``, else ``None``."""
-        if self.hsr_url is not None:
-            return self.hsr_url
-        value = scrudful_setting("HSR_URL", None)
-        if value is not None and not callable(value):
-            raise ConfigError(
-                'SCRUDFUL["HSR_URL"] must be a callable, '
-                f"hsr_url(path), not {type(value).__name__}"
-            )
-        return value
+        if self._scrudful_hsr_url is not None:
+            return self._scrudful_hsr_url
+        return _setting(setting_hsr_url)  # type: ignore[no-any-return]
 
     def _hsr_cache_control(self) -> str:
         """``hsr_cache_control``, else ``SCRUDFUL["HSR_CACHE_CONTROL"]``, else
         ``public, max-age=300``."""
-        if self.hsr_cache_control is not None:
-            return self.hsr_cache_control
-        value = scrudful_setting("HSR_CACHE_CONTROL", DEFAULT_HSR_CACHE_CONTROL)
-        return _check_hsr_cache_control(value, 'SCRUDFUL["HSR_CACHE_CONTROL"]')
+        if self._scrudful_hsr_cache_control is not None:
+            return self._scrudful_hsr_cache_control
+        return _setting(setting_hsr_cache_control)  # type: ignore[no-any-return]
 
     def _hsr(self, path: str) -> dict[str, Any]:
         """The HTTP Schema Resource of ``path``, built once (not a copy)."""
@@ -2098,8 +2178,8 @@ class ScrudfulRouter(Router):
 
     def _base_url(self) -> str | None:
         """``base_url``, else ``SCRUDFUL["BASE_URL"]``, else ``None``."""
-        if self.base_url is not None:
-            return self.base_url
+        if self._scrudful_base_url is not None:
+            return self._scrudful_base_url
         return _setting_base_url()
 
     def _describes(self, path: str) -> bool:
@@ -2117,6 +2197,17 @@ class ScrudfulRouter(Router):
 #: Every ``ScrudfulRouter``, whose built HTTP Schema Resources
 #: :func:`add_error_links` discards.
 _SCRUDFUL_ROUTERS: weakref.WeakSet[ScrudfulRouter] = weakref.WeakSet()
+
+
+def _forget_router_hsrs(setting: str, **kwargs: Any) -> None:
+    """Discard every router's built HTTP Schema Resources when ``SCRUDFUL``
+    changes (``override_settings``): they hold its base URL."""
+    if setting == "SCRUDFUL":
+        for router in list(_SCRUDFUL_ROUTERS):
+            router._scrudful_hsrs.clear()
+
+
+setting_changed.connect(_forget_router_hsrs)
 
 #: The serial number of each ``ScrudfulRouter``, in its HSR routes' URL names.
 _ROUTER_SERIALS = itertools.count(1)
@@ -2162,10 +2253,70 @@ def _check_hsr_cache_control(value: Any, what: str) -> str:
 
 def _setting_base_url() -> str | None:
     """``SCRUDFUL["BASE_URL"]``, checked, or ``None``."""
-    base_url = scrudful_setting("BASE_URL", None)
-    if base_url is not None:
-        _check_base_url(base_url, 'SCRUDFUL["BASE_URL"]')
-    return base_url
+    return _setting(setting_base_url)  # type: ignore[no-any-return]
+
+
+def _setting(accessor: Callable[[], Any]) -> Any:
+    """What ``accessor``, one of :mod:`scrudful._django`'s checked accessors
+    of a ``SCRUDFUL`` key, returns.
+
+    Raises
+    ------
+    django.core.exceptions.ImproperlyConfigured
+        If ``SCRUDFUL`` itself is not a dict of scrudful's keys.
+    ConfigError
+        If the key's value is invalid (chained to the accessor's
+        ``ImproperlyConfigured``), as for the router's own arguments.
+    """
+    # The setting's shape first: that error is the setting's own, as is.
+    scrudful_setting("BASE_URL", None)
+    try:
+        return accessor()
+    except ImproperlyConfigured as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _route_on(hsr_route: bool | None) -> bool:
+    """``hsr_route``, else ``SCRUDFUL["HSR_ROUTE"]`` (default ``True``)."""
+    if hsr_route is not None:
+        return hsr_route
+    return _setting(setting_hsr_route)  # type: ignore[no-any-return]
+
+
+def _check_route_and_url(
+    hsr_route: bool | None, hsr_url: Callable[[str], str] | None
+) -> None:
+    """Raise ``ConfigError`` if the route is off (``hsr_route``, else the
+    setting) without an ``hsr_url`` (``hsr_url``, else the setting). Reads
+    both settings, so that a wrong one fails."""
+    route_on = _route_on(hsr_route)
+    url = hsr_url if hsr_url is not None else _setting(setting_hsr_url)
+    if not route_on and url is None:
+        raise ConfigError("hsr_route=False needs hsr_url=")
+
+
+#: The type of each :class:`ScrudfulRouter` option that isn't callable.
+_OPTION_TYPES = {"hsr_route": ("a bool", bool), "hsr_cache_control": ("a str", str)}
+
+
+def _check_option_types(**options: Any) -> None:
+    """Raise ``TypeError`` unless each of the :class:`ScrudfulRouter`
+    ``options`` given is ``None`` or of its type (``hsr_url`` and
+    ``allowed``: a callable)."""
+    for name, value in options.items():
+        if value is None:
+            continue
+        if name not in _OPTION_TYPES:
+            if not callable(value):
+                raise TypeError(
+                    f"{name} must be a callable or None, not {type(value).__name__}"
+                )
+            continue
+        kind, accepted = _OPTION_TYPES[name]
+        if not isinstance(value, accepted):
+            raise TypeError(
+                f"{name} must be {kind} or None, not {type(value).__name__}"
+            )
 
 
 def _operation_entity(
@@ -2402,8 +2553,6 @@ def _hsr_target(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
             return check_hsr_url_result(hsr_url(path), f"hsr_url({path!r})")
         except HsrConfigError as exc:
             raise ConfigError(str(exc)) from exc
-    if not router._hsr_route_on():
-        raise ConfigError("hsr_route=False needs hsr_url=")
     route = _hsr_route_path(request, router, path)
     base_url = router._base_url()
     if base_url is not None:
