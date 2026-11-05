@@ -4013,6 +4013,37 @@ def test_options_needs_ninjas_internals(monkeypatch, fresh_ninja_code, owner, me
         send(api, "/1")
 
 
+@pytest.mark.parametrize("with_loader", [True, False], ids=["loader", "no-loader"])
+@pytest.mark.parametrize(
+    "owner, method",
+    [("ParamModel", "resolve"), ("PathModel", "get_request_data")],
+)
+def test_the_path_checks_need_ninjas_internals(
+    monkeypatch, fresh_ninja_code, caplog, owner, method, with_loader
+):
+    """The loader's path validation, and each method's path check without a
+    loader, refuse a ninja whose path validation differs with
+    ``ConfigError``: a release scrudful doesn't know isn't taken for a
+    validator's error, logged and left out (or loading no object)."""
+    router = ScrudfulRouter(base_url=BASE_URL)
+    load = {"load": Store().load} if with_loader else {}
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(**load, **LINKS)
+    def get_item(request, pk: int, obj=None):
+        return {"id": pk, "name": "x", "version": 1}  # pragma: no cover
+
+    client = TestClient(mount(router))
+    assert options(client, "/1").headers["Allow"] == "GET, OPTIONS"
+    cls = getattr(ninja.params.models, owner)
+    original = vars(cls)[method]
+    monkeypatch.setattr(cls, method, classmethod(wrapping(original.__func__)))
+    caplog.set_level(logging.DEBUG, logger="scrudful.ninja")
+    with pytest.raises(ConfigError, match=rf"relies on ninja's {owner}\.{method} "):
+        options(client, "/1")
+    assert [r for r in caplog.records if r.name == "scrudful.ninja"] == []
+
+
 @pytest.mark.parametrize(
     "owner, method",
     [
