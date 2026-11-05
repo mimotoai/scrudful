@@ -341,6 +341,16 @@ protection, re-check in the write: ``select_for_update()`` in ``load`` inside a
 transaction, or ``UPDATE ... WHERE etag = <loaded etag>`` as the example's
 ``save_role`` does.
 
+OPTIONS runs that ``load`` too (see `OPTIONS`_), on a copy of the request
+whose ``method`` is the method checked (``"PUT"``): with a transaction open
+(``ATOMIC_REQUESTS``), it holds the row lock until the OPTIONS response ends.
+Lock only for the write: test ``request.META.get("REQUEST_METHOD") !=
+"OPTIONS"`` (the request line's method, which the copy keeps), or give the
+path an ``allowed`` hook, which runs no method's own ``load`` (step 3's
+still runs). Without a transaction, ``select_for_update()`` raises
+``TransactionManagementError`` for the write as well: that is a
+misconfiguration, not an OPTIONS matter.
+
 Create
 ------
 
@@ -1064,7 +1074,9 @@ Things to know:
 * ``load`` runs on OPTIONS: step 3's, and each other item operation's own in
   step 4. Keep it free of side effects (no writes, no audit records): an
   OPTIONS calls it as that method's request would, without the handler that
-  follows it there.
+  follows it there. A ``select_for_update()`` in it locks the row on OPTIONS
+  too, inside a transaction: see `Choosing what load returns`_ for how to
+  lock only for the write.
 
 CORS
 ~~~~

@@ -114,7 +114,12 @@ Validators
     requests carrying the same If-Match can both pass. Strict lost-update
     protection needs an atomic re-check in the handler's storage layer (e.g.
     ``select_for_update()`` in ``load`` inside a transaction, or
-    ``UPDATE ... WHERE version = <expected>``).
+    ``UPDATE ... WHERE version = <expected>``). OPTIONS runs a method's own
+    ``load`` too, on a copy of the request with that method: inside a
+    transaction, lock only when ``request.META.get("REQUEST_METHOD") !=
+    "OPTIONS"`` (the request line's method, which the copy keeps), or the
+    OPTIONS holds the lock until it ends. Without a transaction,
+    ``select_for_update()`` fails the write itself.
 
     After the handler runs, 2xx responses to GET/HEAD get the validators
     computed for the precondition check, and 2xx responses to PUT/PATCH get

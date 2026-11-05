@@ -2945,6 +2945,47 @@ def test_options_shares_the_loaders_load():
     assert calls == ["GET"]
 
 
+#: What PUT's own ``load`` saw of each request reaching it: ``request.method``
+#: and the request line's method (``request.META["REQUEST_METHOD"]``).
+LOCK_SEEN: list[tuple[str, str]] = []
+
+
+def _locking_api() -> NinjaAPI:
+    store = Store()
+
+    def lock_for_writes(request, pk, **params):
+        LOCK_SEEN.append((request.method, request.META["REQUEST_METHOD"]))
+        return store.load(request, pk, **params)
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(load=store.load, etag_func=etag, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj  # pragma: no cover
+
+    @router.put("/{pk}", response=ItemOut)
+    @scrudful(load=lock_for_writes, etag_func=etag, **LINKS)
+    def put_item(request, pk: int, payload: ItemIn, obj):
+        return obj  # pragma: no cover
+
+    return mount(router)
+
+
+urlpatterns.append(path("lock/", _locking_api().urls))
+
+
+@pytest.mark.urls(__name__)
+def test_a_methods_own_load_tells_options_by_the_request_line(client, db):
+    """On OPTIONS, PUT's own ``load`` gets a request whose ``method`` is
+    ``"PUT"``, while ``request.META["REQUEST_METHOD"]`` stays ``"OPTIONS"``:
+    the docs tell a ``load`` that locks its row (``select_for_update()``) to
+    check the latter, so that an OPTIONS doesn't take the lock."""
+    LOCK_SEEN.clear()
+    assert client.options("/lock/1").status_code == 204
+    assert LOCK_SEEN == [("PUT", "OPTIONS")]
+
+
 def test_options_with_an_allowed_hook_runs_no_methods_own_load():
     """An ``allowed`` hook alone decides: a method's own ``load`` doesn't
     run, and the hook gets the loader's object."""

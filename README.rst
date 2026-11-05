@@ -167,7 +167,15 @@ the write itself must re-check atomically: with Django, run the request in a
 transaction (``ATOMIC_REQUESTS = True`` or ``transaction.atomic``) and lock the
 row with ``select_for_update()`` (the example project does it in its validator
 callbacks); with any storage, make the write conditional, for example
-``UPDATE ... WHERE version = <expected>``.
+``UPDATE ... WHERE version = <expected>``. OPTIONS runs the loaders too (DRF's
+``get_object()``, django-ninja's ``load``; step 3 below), on a request whose
+``method`` is the method checked: a lock taken there is held until the
+OPTIONS response ends. Lock only for the write: test
+``request.META.get("REQUEST_METHOD") != "OPTIONS"`` (the request line's
+method), or, with django-ninja, decide the method with an ``allowed`` hook
+(DRF loads for every method with an ``allowed_func``). Without a transaction,
+``select_for_update()`` raises ``TransactionManagementError`` for the write as
+well: a misconfiguration, not an OPTIONS matter.
 
 OPTIONS and the HTTP Schema Resource
 ------------------------------------
@@ -256,9 +264,10 @@ order:
      security dependencies (every method does with ``allowed=``).
 
    Since they run on OPTIONS, loaders must be free of side effects (no
-   writes, no audit records): an OPTIONS runs each one it calls as the
-   method's own request would. Without an object (a collection, a loader returning ``None``, or a gate
-   that refused) the object-level checks get ``obj=None``; a 404 the loader
+   writes, no audit records, no row lock: see "Concurrency"): an OPTIONS
+   runs each one it calls as the method's own request would. Without an
+   object (a collection, a loader returning ``None``, or a gate that
+   refused) the object-level checks get ``obj=None``; a 404 the loader
    raises is the answer, with the error entity's Links and the HSR link.
 4. Each method the path serves is checked for this requester, on a copy of
    the request with that method. A hook, when given, alone decides; without
