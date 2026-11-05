@@ -312,10 +312,11 @@ def scrudful(
     call covering the endpoint, as in its HTTP Schema Resource, else against
     the request's URL (``str(request.url)``), so a relative value such as
     ``"/schemas/item"`` is sent absolute.
-    ``Access-Control-Expose-Headers`` is extended with whichever of
-    ``ETag``, ``Link`` and ``Location`` the response carries. Starlette's
-    ``CORSMiddleware`` replaces that header on cross-origin requests, so if
-    you use it, list these names in its ``expose_headers`` instead.
+    ``Access-Control-Expose-Headers`` is extended with ``Link`` and
+    ``Allow``, and whichever of ``ETag`` and ``Location`` the response
+    carries. Starlette's ``CORSMiddleware`` replaces that header on
+    cross-origin requests, so if you use it, give it
+    ``expose_headers=list(scrudful.utils.EXPOSE_HEADERS)`` instead.
 
     When an :func:`add_options` call describes the endpoint's path (the
     app's, or that of the router the endpoint is on), every response the

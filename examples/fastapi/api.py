@@ -11,9 +11,11 @@ Run it with ``python examples/fastapi/api.py`` and try, for example::
 Every response with content carries the ``Link`` headers of its schema and
 JSON-LD context (Semantic HTTP 0.1): the user's on success, the error's on
 scrudful's own 400, 412 and 428 and on the errors FastAPI answers (404, 405,
-422, and a JSON 500). OPTIONS answers with a 204 linking to the path's HTTP
-Schema Resource (served at ``/_hsr/users.user_id`` and ``/_hsr/users``), and
-every response of ``/users`` and ``/users/{user_id}`` carries that link too. Set
+422, and a JSON 500). OPTIONS answers with a 204 whose ``Allow`` lists the
+methods, linking to the path's HTTP Schema Resource (served by GET at
+``/_hsr/users.user_id`` and ``/_hsr/users``); OPTIONS of a missing user is a 404,
+from ``load_user``. Every response of ``/users`` and ``/users/{user_id}`` carries
+that link too. Set
 ``SCRUDFUL_BASE_URL`` to the URL the app is served at (default
 ``http://localhost:8000/``): the relative link URLs resolve against it.
 """
@@ -262,10 +264,26 @@ async def delete_user(user_id: int) -> None:
     del _records[user_id]
 
 
-# Before the app serves requests: the errors FastAPI answers get ERROR's Links,
-# and every path with a scrudful endpoint answers OPTIONS.
+def load_user(request: Request, user_id: str) -> _Record:
+    """OPTIONS's loader: the user ``/users/{user_id}`` names, else a 404.
+
+    ``add_options`` calls it with the URL's path parameters as Starlette
+    matched them (strings: the route has no convertor), for a URL that has
+    some. A missing user is the OPTIONS's 404, as for GET. With an ``allowed``
+    hook, the object it returns would decide each method; without one,
+    ``Allow`` comes from the routes' security dependencies (here none, so every
+    method is listed).
+    """
+    if not user_id.isdigit():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    return _get_record(int(user_id))
+
+
+# Before the app serves requests: the errors FastAPI answers get ERROR's Links
+# (and a JSON 500), and every path with a scrudful endpoint answers OPTIONS
+# and serves its HTTP Schema Resource under /_hsr/.
 add_error_links(app, ERROR)
-add_options(app, base_url=BASE_URL)
+add_options(app, base_url=BASE_URL, load=load_user)
 
 
 if __name__ == "__main__":

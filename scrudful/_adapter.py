@@ -508,7 +508,7 @@ def context_link_type(media_type: str, value: Any) -> str:
 
     ``value``, the evaluated ``context_type_or_func``, unless it is empty;
     else the default of :func:`context_defaults` (JSON-LD, for JSON content).
-    The Link header and the OPTIONS body both take the type from here, so
+    The Link header and the HTTP Schema Resource both take the type from here, so
     they agree, and fail alike.
 
     Raises
@@ -591,10 +591,10 @@ def merge_links(
     return join_links(existing, schema, context, hsr)
 
 
-# --- OPTIONS descriptions ----------------------------------------------------
+# --- HTTP Schema Resource descriptions ---------------------------------------
 #
-# The operations of an OPTIONS body (an HTTP Schema Resource: an OpenAPI Path
-# Item), shared by the DRF and django-ninja adapters. ``content`` is a Media
+# The operations of an HTTP Schema Resource (an OpenAPI Path Item), shared by
+# the DRF and django-ninja adapters. ``content`` is a Media
 # Type map as built by :func:`describe_content`; falsy means none.
 # ``conditional``: whether the method's preconditions are evaluated.
 

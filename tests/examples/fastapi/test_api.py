@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from examples.fastapi import api
 from scrudful._hsr import hsr_link, options_operation
 from scrudful.fastapi import add_options
+from tests import test_wire_fastapi as wire
 from tests.semantic_http import (
     HSR_DOCUMENT_REL,
     hsr_get_problems,
@@ -18,6 +19,7 @@ from tests.semantic_http import (
     link_problems,
     options_204_problems,
     parse_links,
+    undescribed_problems,
     validate_http_schema_resource,
 )
 
@@ -52,10 +54,13 @@ JOHN = {
 
 @pytest.fixture(autouse=True, scope="module")
 def test_base_url():
-    """The test client's URL as the base URL (the example's is localhost:8000)."""
-    add_options(api.app, base_url=f"{BASE}/")
+    """The test client's URL as the base URL (the example's is localhost:8000).
+
+    Calling ``add_options`` again replaces its options: give the example's
+    ``load`` again."""
+    add_options(api.app, base_url=f"{BASE}/", load=api.load_user)
     yield
-    add_options(api.app, base_url=api.BASE_URL)
+    add_options(api.app, base_url=api.BASE_URL, load=api.load_user)
 
 
 @pytest.fixture(autouse=True)
@@ -489,6 +494,8 @@ def test_options_user(client):
 
 USER = "/users/2"
 USERS = "/users"
+#: The HSR route of the item (any /users/<id>) and of the collection.
+HSR_ROUTES = {"/users/": "/_hsr/users.user_id", USERS: "/_hsr/users"}
 IF_MATCH = {"If-Match": '"user-2-v1"'}
 IF_MATCH_STALE = {"If-Match": '"user-2-v0"'}
 NOT_MODIFIED = {"If-None-Match": "*"}
@@ -546,8 +553,8 @@ NO_ENTRY = {304, 405}
 def test_example_links_everywhere(client, method, path, arguments, status):
     """Every response, a HEAD included, follows the Semantic HTTP 0.1 Link rules
     and agrees with the OPTIONS body of its path."""
-    options = client.options(path)
-    hsr = hsr_of(client, path) if options.status_code == 204 else None
+    route = HSR_ROUTES.get("/users/" if path.startswith("/users/") else path)
+    hsr = None if route is None else client.get(route).json()
     response = client.request(method.upper(), path, **arguments)
     assert response.status_code == status
     content = method != "head" and bool(response.content)
@@ -588,3 +595,87 @@ def test_example_links_are_served_with_the_documents(client):
     links += parse_links(client.post(USERS, json=BODY).headers["link"])
     for target, _ in links:
         assert client.get(target.removeprefix(BASE)).status_code == 200
+
+
+def test_options_of_a_missing_user_is_load_users_404(client):
+    """``add_options(load=load_user)``: OPTIONS of a missing user is the 404
+    a GET gets (a non-integer id too), with the error Links and the HSR link;
+    a preflight loads nothing."""
+    for path in ("/users/99", "/users/x"):
+        response = client.options(path)
+        headers = dict(response.headers)
+        assert response.status_code == 404
+        assert "allow" not in headers
+        assert link_problems("OPTIONS", 404, headers, True) == []
+        assert response.headers["link"] == f"{ERROR_LINKS}, {USER_HSR_LINK}"
+    preflight = {"Origin": "https://a.example", "Access-Control-Request-Method": "PUT"}
+    assert client.options("/users/99", headers=preflight).status_code == 204
+
+
+# --- The wire-conformance suite, on the example --------------------------------
+#
+# The exchanges of tests/test_wire_fastapi.py with the example app, checked as
+# that suite checks them (tests/semantic_http.py).
+
+
+@pytest.mark.parametrize("exchange", wire.example_exchanges(), ids=lambda e: e.id)
+def test_wire_exchanges(client, exchange):
+    """Every response has its content Links, the HSR link of its resource
+    (none for an unknown URL) and agrees with its HSR entry."""
+    response = wire.send({"example": client}, exchange)
+    headers = wire.headers_of(response)
+    content = wire.has_content(exchange, response)
+    hsr = None
+    if exchange.kind is not None and exchange.status not in (304, 405):
+        hsr = client.get(wire.KINDS[exchange.kind].hsr).json()
+    problems = link_problems(exchange.method, exchange.status, headers, content, hsr)
+    assert problems == []
+    if exchange.kind is None:
+        assert HSR_DOCUMENT_REL not in headers.get("link", "")
+    else:
+        target = BASE + wire.KINDS[exchange.kind].hsr
+        assert hsr_link_problems(headers, target) == []
+
+
+@pytest.mark.parametrize(
+    "path, allow",
+    [
+        ("/users/1", "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"),
+        ("/users", "POST, OPTIONS"),
+    ],
+)
+def test_wire_options_and_hsr(client, path, allow):
+    """The OPTIONS 204 and its HSR, as the wire suite checks them."""
+    response = client.options(path)
+    headers = wire.headers_of(response)
+    expected = {method.strip() for method in allow.split(",")}
+    problems = options_204_problems(
+        response.status_code, headers, response.content, expected
+    )
+    assert problems == []
+    (target,) = [
+        target
+        for target, params in parse_links(headers["link"])
+        if params.get("rel") == HSR_DOCUMENT_REL
+    ]
+    document = client.get(target)
+    headers = wire.headers_of(document)
+    assert hsr_get_problems(document.status_code, headers, document.content) == []
+
+
+@pytest.mark.parametrize("accept", [None, "application/json"], ids=["absent", "json"])
+@pytest.mark.parametrize(
+    "method, path",
+    [("GET", "/nope"), ("GET", "/users/99"), ("POST", "/users/1"), ("GET", "/users/x")],
+)
+def test_wire_no_undescribed_content(accept, method, path):
+    """No error is content the HSR doesn't describe, for an absent ``Accept``
+    or ``Accept: application/json``."""
+    with TestClient(api.app) as client:
+        del client.headers["accept"]
+        hsr = client.get("/_hsr/users.user_id").json()
+        headers = {} if accept is None else {"Accept": accept}
+        response = client.request(method, path, headers=headers)
+    assert response.status_code >= 400
+    headers = wire.headers_of(response)
+    assert undescribed_problems(accept, headers, hsr) == []

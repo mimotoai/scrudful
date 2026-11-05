@@ -168,6 +168,8 @@ def link_problems(
             problems += _context_problems(content_type, contexts)
     # An error answering OPTIONS is an error response, not the description.
     if method == "OPTIONS" and status < 400:
+        # options_204_problems only tests whether the body is empty: a
+        # stand-in body says whether the response had content.
         problems += options_204_problems(
             status, headers, b"x" if has_content else b""
         )

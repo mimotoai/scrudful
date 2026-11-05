@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import jsonschema
 import pytest
 from asgiref.sync import async_to_sync
-from django.test import AsyncClient
+from django.test import AsyncClient, Client
 from django.utils.http import http_date
 from referencing import Registry, Resource
 from ninja.errors import HttpError
@@ -24,11 +24,13 @@ from roles.models import Role
 from scrudful._hsr import hsr_link, options_operation
 from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS
 from scrudful_ninja.api import api
+from tests import test_wire_ninja as wire
 from tests.semantic_http import (
     hsr_get_problems,
     hsr_link_problems,
     link_problems,
     options_204_problems,
+    undescribed_problems,
     validate_http_schema_resource,
 )
 
@@ -881,3 +883,99 @@ def test_openapi():
         assert [p["name"] for p in operation["parameters"]] == ["pk"]
     # OPTIONS is not in the OpenAPI document.
     assert all("options" not in path for path in paths.values())
+
+
+# --- The wire-conformance suite, on the example ----------------------------------
+#
+# The exchanges of tests/test_wire_ninja.py with the example's API, through the
+# example's own URLconf (its handler404 / handler500), with DEBUG off, checked
+# as that suite checks them (tests/semantic_http.py).
+
+
+@pytest.fixture
+def wire_client(settings):
+    settings.DEBUG = False
+    return Client(raise_request_exception=False)
+
+
+@pytest.mark.parametrize("exchange", wire.example_exchanges(), ids=lambda e: e.id)
+def test_wire_exchanges(wire_client, exchange):
+    """Every response has its content Links and the HSR link of its path, and
+    agrees with its HSR entry."""
+    world = wire.World(wire_client)
+    response = wire.send(wire_client, world, exchange)
+    headers = wire.headers_of(response)
+    content = wire.has_content(exchange, response)
+    hsr = None
+    if exchange.status not in (304, 405):
+        hsr = wire.hsr_of(wire_client, exchange.kind)
+    problems = link_problems(exchange.method, exchange.status, headers, content, hsr)
+    assert problems == []
+    assert hsr_link_problems(headers, wire.target(exchange.kind)) == []
+
+
+@pytest.mark.parametrize(
+    "kind, url, headers, allow",
+    [
+        ("item", "/api/roles/{pk}", {}, {"OPTIONS"}),
+        ("item", "/api/roles/{pk}", ACME, set(ITEM_ALLOW.split(", "))),
+        ("collection", "/api/roles", ACME, set(COLLECTION_ALLOW.split(", "))),
+        ("search", "/api/roles/search", ACME, {"POST", "OPTIONS"}),
+    ],
+)
+def test_wire_options_and_hsr(wire_client, kind, url, headers, allow):
+    """The OPTIONS 204 (its ``Allow`` and HSR link) and the HSR route."""
+    url = wire.World(wire_client).format(url)
+    response = wire_client.options(url, headers=headers)
+    response_headers = wire.headers_of(response)
+    problems = options_204_problems(
+        response.status_code, response_headers, response.content, allow
+    )
+    assert problems == []
+    assert hsr_link_problems(response_headers, wire.target(kind)) == []
+    document = wire_client.get(wire.HSR_ROUTES[kind])
+    document_headers = wire.headers_of(document)
+    problems = hsr_get_problems(
+        document.status_code, document_headers, document.content
+    )
+    assert problems == []
+
+
+@pytest.mark.parametrize("accept", [None, "application/json"], ids=["absent", "json"])
+@pytest.mark.parametrize(
+    "method, url, headers",
+    [
+        ("GET", "/nope", {}),
+        ("GET", "/api/nope", ACME),
+        ("TRACE", "/api/roles/{pk}", ACME),
+        ("POST", "/api/roles/_hsr/pk", {}),
+    ],
+)
+def test_wire_no_undescribed_content(wire_client, accept, method, url, headers):
+    """No error is content the HSR doesn't describe, for an absent ``Accept``
+    or ``Accept: application/json``: the example's handler404 answers a URL
+    no pattern matches with JSON, and the router a method no operation of
+    the path routes with a JSON 405."""
+    hsr = wire.hsr_of(wire_client, "item")
+    extra = {} if accept is None else {"Accept": accept}
+    url = wire.World(wire_client).format(url)
+    response = wire_client.generic(method, url, headers={**headers, **extra})
+    assert response.status_code >= 400
+    response_headers = wire.headers_of(response)
+    assert undescribed_problems(accept, response_headers, hsr) == []
+    content = bool(response.content)
+    status = response.status_code
+    assert link_problems(method, status, response_headers, content) == []
+
+
+def test_wire_django_404_is_html_only_when_preferred(wire_client):
+    """The example's handler404: Django's HTML page for a browser, with
+    ``Vary: Accept``; JSON with the error Links otherwise."""
+    accept = "text/html,application/xhtml+xml,*/*;q=0.8"
+    response = wire_client.get("/nope", headers={"Accept": accept})
+    assert response["Content-Type"].startswith("text/html")
+    assert "Accept" in response["Vary"]
+    response = wire_client.get("/nope")
+    assert response["Content-Type"] == "application/json"
+    assert "Accept" in response["Vary"]
+    assert link_problems("GET", 404, wire.headers_of(response), True) == []

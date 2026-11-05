@@ -2846,7 +2846,8 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
     that entity's Links and is served as JSON with the entity's ``media_type``
     whatever renderer DRF's content negotiation picked, rendered by the view's
     first JSON renderer as scrudful's own 400, 412 and 428 are (see
-    :class:`ScrudfulViewFunc`), so that it agrees with the OPTIONS body.
+    :class:`ScrudfulViewFunc`), so that it agrees with the HTTP Schema
+    Resource.
     Without an ``error`` entity, or when the view has no such handler,
     the response is DRF's, unchanged; so is ``None`` for an exception DRF does
     not handle.

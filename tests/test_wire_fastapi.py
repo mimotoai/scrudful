@@ -610,10 +610,11 @@ AGREEING = [
 @pytest.fixture(autouse=True, scope="module")
 def example_base_url():
     """The test client's URL as the example's base URL (its own is
-    localhost:8000), as in the example's tests."""
-    add_options(example.app, base_url=f"{BASE}/")
+    localhost:8000), as in the example's tests, with its ``load``
+    (``add_options`` replaces the options)."""
+    add_options(example.app, base_url=f"{BASE}/", load=example.load_user)
     yield
-    add_options(example.app, base_url=example.BASE_URL)
+    add_options(example.app, base_url=example.BASE_URL, load=example.load_user)
 
 
 @pytest.fixture(autouse=True)
