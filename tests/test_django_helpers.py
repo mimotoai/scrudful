@@ -212,6 +212,14 @@ def test_handler_lets_an_unexpected_error_propagate(rf, settings, monkeypatch):
         view(rf.get("/nowhere", HTTP_ACCEPT="application/json"), Http404())
 
 
+@pytest.mark.parametrize("status", [403, 400, "404", 404.0, None])
+def test_handler_is_a_404_or_500_handler(status):
+    """Its HTML answer is Django's page of 404 or 500: another status would
+    answer a browser with the 500 page."""
+    with pytest.raises(ValueError, match="404 or 500"):
+        error_handler(status, PROBLEM_ERROR)
+
+
 @pytest.mark.parametrize("error", [None, "https://x/s", {"media_type": "x"}])
 def test_handler_needs_an_entity(error):
     with pytest.raises(TypeError, match="must be an Entity, not"):
