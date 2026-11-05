@@ -206,11 +206,22 @@ System checks
       ``hsr_url``;
     - ``scrudful.E005``: a view whose HTTP Schema Resource can't be built
       (a relative link URL without a base URL, a schema without an RDF
-      context, a link callable failing when called as ``func(view, None)``);
+      context, content that isn't JSON without a context type, or anything
+      else building it raises but a link callable);
     - ``scrudful.E006``: an invalid ``SCRUDFUL`` setting: not a dict of its
       keys, or a key whose value is invalid (one error for each). While the
       setting is invalid, what depends on it is not checked (no document
       is built).
+
+    and as a warning:
+
+    - ``scrudful.W001``: a link callable raising when called as
+      ``func(view, None)``, naming the route, the callable and the
+      exception. A warning, not an error, as ``migrate`` runs the checks
+      first: a callable that reads the database fails on a database not
+      migrated yet, and must not stop ``migrate``. The document is built
+      again, the callable called again, when it is first served; one that
+      can't work then (it needs the request, say) fails that request.
 
     Each would otherwise fail on a request. The check builds each document
     as :func:`http_schema_resource` does (no request, no database access by
@@ -2449,20 +2460,48 @@ def _hsr_url_errors(
     if not settings_valid:
         return errors
     for view_name, view_func in scan.views.items():
-        try:
-            # Built as the route builds it, but not kept (the settings may
-            # change before a request).
-            _describe_view(_describe_mode_view(view_func))
-        except ImproperlyConfigured as exc:
-            errors.append(
-                checks.Error(
-                    f"the HTTP Schema Resource of the route {view_name!r} can't "
-                    f"be built: {exc}",
-                    obj=view_func.cls,
-                    id="scrudful.E005",
-                )
-            )
+        errors.extend(_hsr_build_messages(view_name, view_func))
     return errors
+
+
+def _hsr_build_messages(
+    view_name: str, view_func: Callable[..., Any]
+) -> list[checks.CheckMessage]:
+    """Build the HTTP Schema Resource of the route ``view_name`` as the route
+    builds it, without keeping it (the settings may change before a
+    request), and report why it can't be.
+
+    A link callable that raises is the warning ``scrudful.W001``: what it
+    does may work only later (a callable reading the database fails before
+    ``migrate`` has created its tables, and ``migrate`` runs this check
+    first), and the document is built again when it is first served. Any
+    other failure, scrudful's configuration errors and whatever else the
+    build raises, is the error ``scrudful.E005``, so that one view never
+    stops the check of the others.
+    """
+    where = f"the HTTP Schema Resource of the route {view_name!r} can't be built"
+    try:
+        _describe_view(_describe_mode_view(view_func))
+    except _LinkCallableError as exc:
+        return [
+            checks.Warning(
+                f"{where} now: {exc}",
+                hint=(
+                    "It is built when it is first served, calling the "
+                    "callable again: if it can't work by then (it needs the "
+                    "request or a URL kwarg, say), that request fails."
+                ),
+                obj=view_func.cls,
+                id="scrudful.W001",
+            )
+        ]
+    except ImproperlyConfigured as exc:
+        return [checks.Error(f"{where}: {exc}", obj=view_func.cls, id="scrudful.E005")]
+    except Exception as exc:
+        return [
+            checks.Error(f"{where}: {exc!r}", obj=view_func.cls, id="scrudful.E005")
+        ]
+    return []
 
 
 def _join_route(prefix: str, route: str) -> str:
@@ -2723,6 +2762,13 @@ def _describe_view(view: APIView) -> dict[str, Any]:
     return body
 
 
+class _LinkCallableError(ImproperlyConfigured):
+    """A link callable raised when called in describe mode, as
+    ``func(view, None)`` (see :meth:`_Describing.value`); its ``__cause__``
+    is what it raised. The system check tells it from scrudful's own
+    configuration errors (see :func:`_hsr_build_messages`)."""
+
+
 class _Describing:
     """Evaluates link values in describe mode, for one method of a view."""
 
@@ -2742,7 +2788,8 @@ class _Describing:
         Raises
         ------
         ImproperlyConfigured
-            If the callable raises.
+            If the callable raises (a :class:`_LinkCallableError`, naming
+            the callable, this method and the exception, chained to it).
         """
         if not callable(value_or_func):
             return value_or_func
@@ -2750,7 +2797,7 @@ class _Describing:
             return value_or_func(self.view, None)
         except Exception as exc:
             func = getattr(value_or_func, "__qualname__", repr(value_or_func))
-            raise ImproperlyConfigured(
+            raise _LinkCallableError(
                 f"{func}, a link callable of {self.name}, must work without a "
                 "request when the HTTP Schema Resource is built (called as "
                 f"func(view, None)): {exc!r}"
@@ -2772,8 +2819,10 @@ class _Describing:
         Raises
         ------
         ImproperlyConfigured
-            If a URL is relative and there is no base URL, or a schema has no
-            RDF context (:class:`~scrudful._hsr.HsrConfigError`'s message).
+            If a URL is relative and there is no base URL, a schema has no
+            RDF context, or content that is not JSON gets no context type
+            (:class:`~scrudful.entity.HsrConfigError`'s message, naming the
+            view, the method and the entry); or a link callable raises.
         """
         if source is None:
             return None
@@ -2814,7 +2863,10 @@ class _Describing:
                     context_url,
                     None if context_type is None else str(context_type),
                 )
-            except HsrConfigError as exc:
+            except ValueError as exc:
+                # HsrConfigError, or context_link_type's ValueError (a
+                # context_type_or_func returning nothing for non-JSON
+                # content): either is this entry's configuration error.
                 raise HsrConfigError(f"{where}: {exc}") from exc
         except HsrConfigError as exc:
             raise ImproperlyConfigured(str(exc)) from exc

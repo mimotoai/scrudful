@@ -5,6 +5,7 @@ The module is its own URLconf (``pytestmark`` below); the ``hsr_urls()``
 tests use ``tests/drf_hsr_urls.py`` (the ``urls`` fixture) or a URLconf class.
 """
 
+import io
 import json
 import os
 import pathlib
@@ -18,6 +19,8 @@ from django.core import checks
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
+from django.core.management import call_command
+from django.db import OperationalError
 from django.http import Http404
 from django.test import Client, RequestFactory
 from django.urls import ResolverMatch, include, path, resolve, reverse
@@ -1241,9 +1244,7 @@ def test_system_check_reports_an_invalid_setting(urls, settings):
         ("HSR_URL", "https://x/"),
     ],
 )
-def test_system_check_reports_each_invalid_setting_key_once(
-    urls, settings, key, value
-):
+def test_system_check_reports_each_invalid_setting_key_once(urls, settings, key, value):
     """One E006 naming the key, whichever it is, and no E005 per view for a
     cause that is the setting's."""
     settings.SCRUDFUL = {"BASE_URL": BASE_URL, key: value}
@@ -1317,6 +1318,212 @@ def test_system_check_runs_in_a_fresh_process():
         cwd=pathlib.Path(__file__).resolve().parent.parent,
     )
     assert result.stdout.strip() == "['scrudful.E005']"
+
+
+def database_schema(view, request, **kwargs):
+    """A link callable reading the database, as on a database not migrated."""
+    raise OperationalError("no such table: items_item")
+
+
+@scrudful_viewset
+class DatabaseLinkViewSet(ItemViewSetBase):
+    class Meta:
+        schema_link_or_func = database_schema
+        context_link_or_func = "https://api.example/contexts/item"
+
+
+@scrudful_viewset
+class RelativeLinkViewSet(ItemViewSetBase):
+    class Meta:
+        schema_link_or_func = "/schemas/item"
+        context_link_or_func = "/contexts/item"
+
+
+class DatabaseLinkURLconf:
+    urlpatterns = [
+        path(
+            "db-items/<str:pk>/",
+            DatabaseLinkViewSet.as_view({"get": "retrieve"}),
+            name="db-item",
+        ),
+        path(
+            "relative-items/<str:pk>/",
+            RelativeLinkViewSet.as_view({"get": "retrieve"}),
+            name="relative-item",
+        ),
+        path("", include(hsr_urls())),
+    ]
+
+
+def test_a_link_callable_raising_is_a_warning(settings):
+    """A link callable that fails when the check calls it (one reading a
+    database not migrated yet) is the warning W001, naming the route, the
+    callable and the exception; an HSR that can't be built for a reason of
+    its own is still E005."""
+    settings.ROOT_URLCONF = DatabaseLinkURLconf
+    settings.SCRUDFUL = None
+    messages = scrudful_check_errors()
+    assert sorted(message.id for message in messages) == [
+        "scrudful.E005",
+        "scrudful.W001",
+    ]
+    [warning] = [message for message in messages if message.id == "scrudful.W001"]
+    assert type(warning) is checks.Warning
+    assert warning.obj is DatabaseLinkViewSet
+    assert "'db-item'" in warning.msg
+    assert "database_schema" in warning.msg
+    assert "OperationalError('no such table: items_item')" in warning.msg
+    [error] = [message for message in messages if message.id == "scrudful.E005"]
+    assert type(error) is checks.Error
+    assert "'relative-item'" in error.msg and "relative" in error.msg
+
+
+def test_manage_py_check_passes_a_link_callable_raising(settings):
+    settings.ROOT_URLCONF = DatabaseLinkURLconf
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL}
+    out, err = io.StringIO(), io.StringIO()
+    call_command("check", stdout=out, stderr=err)
+    assert "scrudful.W001" in err.getvalue()
+    assert "database_schema" in err.getvalue()
+
+
+#: ``migrate`` on a fresh database, in a fresh process, of a project whose
+#: link callable queries the ORM (``auth_group`` doesn't exist yet).
+FRESH_MIGRATE = """
+import io, sys, types
+import django
+from django.conf import settings
+settings.DATABASES = {
+    "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": sys.argv[1]}
+}
+settings.SCRUDFUL = {"BASE_URL": "https://api.example/"}
+django.setup()
+from django.contrib.auth.models import Group
+from django.core.management import call_command
+from django.urls import include, path
+from rest_framework import viewsets
+from rest_framework.response import Response
+from scrudful.rest_framework import hsr_urls, scrudful_viewset
+
+def schema(view, request, **kwargs):
+    return f"/schemas/group-{Group.objects.count()}"
+
+@scrudful_viewset
+class GroupViewSet(viewsets.ViewSet):
+    class Meta:
+        schema_link_or_func = schema
+        context_link_or_func = "/contexts/group"
+
+    def retrieve(self, request, pk):
+        return Response({})
+
+urls = types.ModuleType("fresh_urls")
+urls.urlpatterns = [
+    path("groups/<str:pk>/", GroupViewSet.as_view({"get": "retrieve"}), name="g"),
+    path("", include(hsr_urls())),
+]
+sys.modules["fresh_urls"] = urls
+settings.ROOT_URLCONF = "fresh_urls"
+err = io.StringIO()
+# As manage.py runs it: call_command skips the checks by default.
+call_command("migrate", verbosity=0, stderr=err, skip_checks=False)
+warned = err.getvalue()
+print("migrated", "scrudful.W001" in warned, "OperationalError" in warned)
+err = io.StringIO()
+call_command("check", stdout=io.StringIO(), stderr=err)
+print("checked", "scrudful.W001" in err.getvalue())
+"""
+
+
+def test_migrate_runs_on_a_fresh_database_whose_link_callable_queries_it(tmp_path):
+    env = {
+        **os.environ,
+        "DJANGO_SETTINGS_MODULE": "tests.settings",
+        "PYTHONPATH": os.pathsep.join([".", "examples/scrudful_rest_framework"]),
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", FRESH_MIGRATE, str(tmp_path / "fresh.sqlite3")],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=pathlib.Path(__file__).resolve().parent.parent,
+    )
+    assert result.returncode == 0, result.stderr
+    # The check warned while auth_group didn't exist, and not once it did.
+    assert result.stdout.split("\n")[:2] == ["migrated True True", "checked False"]
+
+
+def test_a_context_type_callable_returning_nothing_is_improperly_configured():
+    """Its ValueError names the view, and is the system check's E005 rather
+    than an exception that stops the check."""
+    csv = Entity(
+        schema_link_or_func="https://x/table.csvm.json",
+        schema_type_or_func="application/csvm+json",
+        context_link_or_func="https://x/table.csvm.json",
+        context_type_or_func=lambda view, request: None,
+        media_type="text/csv",
+    )
+
+    class NoTypeView(APIView):
+        @scrudful(entity=csv)
+        def get(self, request):
+            return Response("a,b\r\n")
+
+    with pytest.raises(ImproperlyConfigured, match="NoTypeView GET.*needs a type"):
+        http_schema_resource(NoTypeView.as_view())
+
+
+def test_the_check_reports_each_view_whatever_its_build_raises(settings):
+    def raising_init(self, **kwargs):
+        raise RuntimeError("broken view")
+
+    BrokenInit = type(
+        "BrokenInit",
+        (DatabaseLinkViewSet,),
+        {"__init__": raising_init},
+    )
+    no_type = Entity(
+        schema_link_or_func="https://x/table.csvm.json",
+        context_link_or_func="https://x/table.csvm.json",
+        context_type_or_func=lambda view, request: None,
+        media_type="text/csv",
+    )
+
+    class NoTypeURLconf:
+        urlpatterns = [
+            path(
+                "no-type/<str:pk>/",
+                scrudful_viewset(
+                    type(
+                        "NoType",
+                        (ItemViewSetBase,),
+                        {"Meta": type("Meta", (), {"entity": no_type})},
+                    )
+                ).as_view({"get": "retrieve"}),
+                name="no-type",
+            ),
+            path(
+                "broken/<str:pk>/",
+                BrokenInit.as_view({"get": "retrieve"}),
+                name="broken",
+            ),
+            *DatabaseLinkURLconf.urlpatterns,
+        ]
+
+    settings.ROOT_URLCONF = NoTypeURLconf
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL}
+    messages = scrudful_check_errors()
+    by_route = {
+        name: [m.id for m in messages if f"'{name}'" in m.msg]
+        for name in ("no-type", "broken", "db-item", "relative-item")
+    }
+    assert by_route == {
+        "no-type": ["scrudful.E005"],
+        "broken": ["scrudful.E005"],
+        "db-item": ["scrudful.W001"],
+        "relative-item": [],
+    }
+    assert any("RuntimeError('broken view')" in m.msg for m in messages)
 
 
 def test_hsr_target_is_the_route_resolved_against_the_base_url(urls):

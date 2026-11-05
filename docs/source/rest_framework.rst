@@ -58,11 +58,25 @@ misconfigurations before any request, as errors of Django's URL system check:
   or ``SCRUDFUL["HSR_URL"]``) and the ``hsr_urls()`` include is missing;
 * ``scrudful.E004``: a view's HSR route is turned off without an ``hsr_url``;
 * ``scrudful.E005``: a view's HSR can't be built (a relative link URL without
-  a base URL, a schema link without an RDF context, a link callable failing
-  when called as ``func(view, None)``);
+  a base URL, a schema link without an RDF context, content that isn't JSON
+  without a context type, or anything else building it raises but a link
+  callable);
 * ``scrudful.E006``: the ``SCRUDFUL`` setting is invalid: it isn't a dict of
   its keys, or a key's value is invalid (one error for each key). While it is,
   the checks that depend on it are skipped (no HSR is built).
+
+and, as a warning:
+
+* ``scrudful.W001``: a link callable raises when called as ``func(view,
+  None)``; the warning names the route, the callable and the exception.
+
+A link callable's failure is only a warning because ``migrate`` runs the checks
+before it migrates: a callable that reads the database fails on a database
+not migrated yet, and an error would stop ``migrate`` (and ``makemigrations``
+and ``runserver``) on a fresh database. The HSR is built again, and the
+callable called again, when it is first served; a callable that can't work
+then either (one that needs the request or a URL kwarg) fails that request,
+so don't leave the warning standing.
 
 The check builds each view's HSR as the route does (without a request; link
 callables are called) and keeps none. With the include, it runs in Django's own
