@@ -342,11 +342,13 @@ def scrudful(
     it, otherwise to the response FastAPI builds. ``HTTPException`` raised by
     the endpoint propagates unchanged; :func:`add_error_links` gives the
     app's error responses Links (this endpoint's ``error`` ones, when it has
-    one), and :func:`add_options` answers OPTIONS with the path's HTTP Schema
-    Resource. FastAPI does not route HEAD to a ``@app.get`` endpoint (it
-    answers 405); use ``@app.api_route(..., methods=["GET", "HEAD"])`` to
-    serve HEAD, or stack ``@app.get(...)`` and ``@app.head(...)`` above
-    ``@scrudful(...)``: FastAPI gives both methods of one ``api_route`` the
+    one), and :func:`add_options` answers OPTIONS with a 204 whose ``Allow``
+    lists the requester's methods, links every response to the path's HTTP
+    Schema Resource and serves that document by GET. FastAPI does not route
+    HEAD to a ``@app.get`` endpoint (it answers 405); use
+    ``@app.api_route(..., methods=["GET", "HEAD"])`` to serve HEAD, or stack
+    ``@app.get(...)`` and ``@app.head(...)`` above ``@scrudful(...)``:
+    FastAPI gives both methods of one ``api_route`` the
     same OpenAPI operation id, and warns about the duplicate.
 
     Parameters
@@ -1176,10 +1178,11 @@ def add_options(
        each method.
     5. The 204 answers, ``Allow`` listing the methods allowed and OPTIONS.
 
-    An ``HTTPException`` raised by ``load`` or ``allowed`` (a 404 for a
-    missing object, or any other status), or by a check with a status other
-    than 401, 403 and 404 (a throttle's 429), is answered by the app's
-    exception handlers (those of :func:`add_error_links` add the error
+    An ``HTTPException`` raised by ``load`` (a 404 for a missing object, or
+    any other status), by ``allowed`` with a status other than 401 and 403
+    (which refuse the method), or by a check with a status other than 401,
+    403 and 404 (a throttle's 429), is answered by the app's exception
+    handlers (those of :func:`add_error_links` add the error
     entity's Links), with the HSR link; anything else raised propagates (a
     500). Without ``allowed``, object-level rules (who may change *this*
     object) can't show in ``Allow``: give ``allowed`` (and ``load``) for an
