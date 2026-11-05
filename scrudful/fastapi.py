@@ -15,6 +15,7 @@ import inspect
 import itertools
 import re
 import types
+import warnings
 import weakref
 from collections.abc import (
     Awaitable,
@@ -988,6 +989,9 @@ class _HsrOptions:
     )
     #: The owner's resources, indexed (see :func:`_scrudful_paths`).
     index: _PathsIndex | None = field(default=None, compare=False, repr=False)
+    #: The resource keys of a router announced as having no OPTIONS or HSR
+    #: route (see :func:`_announce_unserved`), each once.
+    announced: set[str] = field(default_factory=set, compare=False, repr=False)
 
 
 @dataclass(eq=False)
@@ -1178,9 +1182,9 @@ def add_options(
     cover ``/_hsr/`` with the resources' origins. Given an ``APIRouter``,
     as for its OPTIONS routes, each of its resources gets its own route,
     ``/_hsr/<name>``, on the router (call this before including the
-    router, and again after adding a resource to it), so the prefix it is
-    included under applies: ``/v1/_hsr/items.id`` for its ``/items/{id}``
-    included with ``prefix="/v1"``. Paths under ``/_hsr/`` are reserved,
+    router), so the prefix it is included under applies:
+    ``/v1/_hsr/items.id`` for its ``/items/{id}`` included with
+    ``prefix="/v1"``. Paths under ``/_hsr/`` are reserved,
     and two resources can't have one name (``/a.b`` beside ``/a/b``): this
     raises ``ValueError`` for the paths there are, and an app's HSR route
     raises it on a request for paths added since.
@@ -1254,13 +1258,21 @@ def add_options(
     Every response of a resource it describes links to the resource's
     document as its OPTIONS does: those the :func:`scrudful` endpoints
     return, and the errors :func:`add_error_links`'s handlers answer for it
-    (see there). A router's resource added after this call has no HSR route
-    and no OPTIONS route until it is called again: it is not described, and
-    its responses get no HSR link (a link would lead to a 404).
+    (see there).
 
-    Call it once the routes are added (the endpoints added later are
-    described, but their callables are not checked); calling it again adds
-    no route, and replaces the options.
+    Call it once the routes are added. Routes added later are described
+    too. On an app, as they are found (their callables are not checked). On
+    a router, as they are added with its route decorators (``get`` ...),
+    ``add_api_route`` or ``include_router``, its own or those of a router
+    included in it: they get their OPTIONS and HSR routes then, and their
+    callables are checked then (this ``ValueError`` is raised by the call
+    adding them). A route added to a router otherwise (appended to its
+    ``routes``) gets neither, so it isn't described and its responses get no
+    HSR link (it would lead to a 404): a ``RuntimeWarning`` names it, once,
+    when the router's resources are next indexed; call this again. Calling
+    it again replaces the options, and adds the routes still missing: the
+    HSR route on an app (when ``hsr_route`` is now on), the OPTIONS and HSR
+    routes of a router's resources.
 
     Parameters
     ----------
@@ -1333,7 +1345,8 @@ def add_options(
     )
     routes = app.router.routes if isinstance(app, FastAPI) else app.routes
     _check_options_callables(routes)
-    paths = _scrudful_paths(app)
+    # Found afresh, not indexed: the index belongs to the options.
+    paths = _find_scrudful_paths(routes)
     _check_reserved(paths)
     names = _hsr_names(paths) if options.hsr_route else {}
     setattr(app, _OPTIONS_ATTRIBUTE, options)
@@ -1342,13 +1355,13 @@ def add_options(
             # First, so that it sees every OPTIONS request, including those
             # under a Mount; it matches only those it answers.
             routes.insert(0, _OptionsRoute(app))
-    if options.hsr_route:
-        _add_hsr_routes(app, routes, paths, names)
-    if not isinstance(app, FastAPI):
-        _add_path_options(app)
-        for endpoint, _, _ in _endpoints(routes, for_options=True):
-            with contextlib.suppress(TypeError):  # not weakly referenceable
-                _ROUTER_ENDPOINTS[endpoint] = weakref.ref(app)
+        if options.hsr_route:
+            _add_hsr_routes(app, routes, paths, names)
+    else:
+        _add_router_routes(app, paths, names)
+        _watch(app)
+    # Indexed now, at startup: what indexing reports is reported here.
+    _paths_index(app)
 
 
 def _check_hsr_options(
@@ -1629,6 +1642,8 @@ def _paths_index(owner: FastAPI | APIRouter) -> _PathsIndex:
     index = _PathsIndex(fingerprint or (), paths, by_route, by_endpoint)
     if fingerprint is not None:
         options.index = index
+    if options.explicit and not isinstance(owner, FastAPI):
+        _announce_unserved(owner, options, paths)
     return index
 
 
@@ -2226,6 +2241,139 @@ def _add_path_options(router: APIRouter) -> None:
                 name="scrudful_options",
                 include_in_schema=False,
             )
+
+
+def _add_router_routes(
+    router: APIRouter, paths: Mapping[str, _Resource], names: Mapping[str, str]
+) -> None:
+    """The routes :func:`add_options` adds to ``router``, whose resources are
+    ``paths`` (their HSR route ``names``): the HSR routes (with
+    ``hsr_route``) and OPTIONS routes of the resources that have none yet,
+    and the router of each scrudful endpoint (see :func:`_live_base`)."""
+    if _hsr_options(router).hsr_route:
+        _add_hsr_routes(router, router.routes, paths, names)
+    _add_path_options(router)
+    for endpoint, _, _ in _endpoints(router.routes, for_options=True):
+        with contextlib.suppress(TypeError):  # not weakly referenceable
+            _ROUTER_ENDPOINTS[endpoint] = weakref.ref(router)
+
+
+def _complete(router: APIRouter) -> None:
+    """Give the resources added to ``router`` since its :func:`add_options`
+    their routes, checked as :func:`add_options` checks them.
+
+    Raises
+    ------
+    ValueError
+        As :func:`add_options`.
+    """
+    routes = router.routes
+    _check_options_callables(routes)
+    paths = _find_scrudful_paths(routes)
+    _check_reserved(paths)
+    names = _hsr_names(paths) if _hsr_options(router).hsr_route else {}
+    _add_router_routes(router, paths, names)
+    _watch(router)
+
+
+#: The attribute of a router holding weak references to the routers whose
+#: :func:`add_options` covers its routes: the router itself, and those it is
+#: included in (see :func:`_watch`).
+_WATCHERS_ATTRIBUTE = "_scrudful_watchers"
+#: The attribute of a router counting the calls of its route-adding methods
+#: in progress (an ``include_router`` calls ``add_api_route`` on older
+#: FastAPI versions).
+_ADDING_ATTRIBUTE = "_scrudful_adding"
+#: The methods of an ``APIRouter`` that add routes to it: its route
+#: decorators (``get``, ``api_route`` ...) call ``add_api_route``.
+_ADDING_METHODS = ("add_api_route", "include_router")
+
+
+def _watch(owner: APIRouter) -> None:
+    """Have the routes added later to ``owner``, or to a router included in
+    it, at any depth, get their OPTIONS and HSR routes as they are added
+    (:func:`_complete`), as an app's routes added later are described.
+
+    Each of those routers' route-adding methods (:data:`_ADDING_METHODS`)
+    is wrapped, once, on the router itself: after a call adds routes, the
+    routers watching it are completed. A route added otherwise (appended to
+    ``routes``) is not seen: :func:`_announce_unserved` warns of it.
+    """
+    pending: list[Any] = [owner]
+    seen: set[int] = set()
+    while pending:
+        router = pending.pop()
+        if id(router) in seen:
+            continue
+        seen.add(id(router))
+        watchers = vars(router).get(_WATCHERS_ATTRIBUTE)
+        if watchers is None:
+            watchers = []
+            setattr(router, _WATCHERS_ATTRIBUTE, watchers)
+            for name in _ADDING_METHODS:
+                setattr(router, name, _completing(router, getattr(router, name)))
+        if not any(ref() is owner for ref in watchers):
+            watchers.append(weakref.ref(owner))
+        for route in router.routes:
+            # A router FastAPI includes lazily (older versions copy its
+            # routes, so the routes added to it later aren't served).
+            inner = getattr(route, "original_router", None)
+            if isinstance(inner, APIRouter):
+                pending.append(inner)
+
+
+def _completing(router: APIRouter, method: Callable[..., T]) -> Callable[..., T]:
+    """``method``, a route-adding method of ``router``, completing the
+    routers watching it (see :func:`_watch`) once it has added the routes."""
+
+    @functools.wraps(method)
+    def adding(*args: Any, **kwargs: Any) -> T:
+        depth = vars(router).get(_ADDING_ATTRIBUTE, 0)
+        setattr(router, _ADDING_ATTRIBUTE, depth + 1)
+        try:
+            result = method(*args, **kwargs)
+        finally:
+            setattr(router, _ADDING_ATTRIBUTE, depth)
+        if depth == 0:
+            for ref in list(vars(router).get(_WATCHERS_ATTRIBUTE) or ()):
+                owner = ref()
+                if owner is not None and _hsr_options(owner).explicit:
+                    _complete(owner)
+        return result
+
+    return adding
+
+
+def _announce_unserved(
+    router: APIRouter, options: _HsrOptions, paths: Mapping[str, _Resource]
+) -> None:
+    """Warn, once per resource, of each resource of ``router`` (its
+    ``paths``) that has no OPTIONS route, or no HSR route while the router
+    serves them: one whose route was added otherwise than with the router's
+    methods (see :func:`_watch`), after :func:`add_options`. It is not
+    described: its responses get no HSR link."""
+    with_options = {
+        _template_key(route.path)
+        for route in _flat(router.routes)
+        if isinstance(getattr(route, "original_route", route), Route)
+        and (route.methods is None or "OPTIONS" in route.methods)
+    }
+    served = options.hsr_route and options.hsr_url is None
+    for key, resource in paths.items():
+        if key in options.announced:
+            continue
+        if key in with_options and not (served and _hsr_route_of(router, key) is None):
+            continue
+        options.announced.add(key)
+        warnings.warn(
+            f"{resource.template!r} of an APIRouter has no OPTIONS or HTTP "
+            "Schema Resource route, so it isn't described: its route was "
+            "added to the router after add_options(router) otherwise than "
+            "with the router's route decorators, add_api_route or "
+            "include_router; call add_options on the router again",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _options_endpoint(router: APIRouter, path: str) -> Callable[[Request], Any]:
@@ -3060,11 +3208,13 @@ def _response_hsr_link(request: Request) -> str | None:
       route is on no resource it describes (a path without a scrudful
       endpoint, or under a mounted app or a Mount with middleware); and a
       CORS preflight (it carries no Links).
-    - So does one of a router's resource added after its :func:`add_options`
-      (and before calling it again), which has no HSR route: the router
-      serves neither its document nor its OPTIONS, so it is not described,
-      and a link would lead to a 404. Failing each of its responses instead
-      would turn a call made too early into an outage of the resource.
+    - So does one of a router's resource that has no HSR route (its route
+      appended to the router's ``routes`` after its :func:`add_options`, and
+      before calling it again; :func:`_announce_unserved` warns of it): the
+      router serves neither its document nor its OPTIONS, so it is not
+      described, and a link would lead to a 404. Failing each of its
+      responses instead would turn a call made too early into an outage of
+      the resource.
     - Otherwise the link targets :func:`_hsr_target`, whose ``ValueError``
       (two resources with one HSR route name) propagates.
     """
@@ -3191,8 +3341,9 @@ def _hsr_target(
         If no :func:`add_options` covers the request; no scrudful endpoint
         of ``owner`` serves ``path``; the route is off and there is no
         ``hsr_url``; the resource has no HSR route (a router's resource
-        added after its :func:`add_options`, whose responses therefore get
-        no HSR link, see :func:`_response_hsr_link`); two resources have one
+        whose route was appended after its :func:`add_options`, whose
+        responses therefore get no HSR link, see
+        :func:`_response_hsr_link`); two resources have one
         route name, or a path is under ``/_hsr/``; or the request isn't to
         a URL of ``path``.
     """

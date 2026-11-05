@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
+import warnings
 from typing import Any
 
 import pytest
@@ -1857,18 +1858,22 @@ def test_router_resource_added_later_has_no_route_until_add_options(make_client)
         return {}
 
     add_options(router, base_url=BASE)
+    from fastapi.routing import APIRoute
 
-    @router.get("/things/{id}")
-    @scrudful(**links)
     async def get_thing(id: int, request: Request):
         return {"target": _hsr_target(request, "/things/{id}", owner=router)}
 
+    # Appended, not added with the router's methods: no route of its own.
+    router.routes.append(
+        APIRoute("/things/{id}", scrudful(**links)(get_thing), methods=["GET"])
+    )
     app = FastAPI()
     app.include_router(router)
     client = make_client(app)
     assert client.get("/_hsr/things.id").status_code == 404
     with pytest.raises(ValueError, match="no HTTP Schema Resource route"):
-        client.get("/things/1")
+        with pytest.warns(RuntimeWarning, match="no OPTIONS or HTTP Schema"):
+            client.get("/things/1")
     add_options(router, base_url=BASE)
     app = FastAPI()
     app.include_router(router)
@@ -1879,10 +1884,10 @@ def test_router_resource_added_later_has_no_route_until_add_options(make_client)
     assert client.get("/_hsr/things.id").status_code == 200
 
 
-def test_router_resource_added_later_is_undescribed_until_add_options(make_client):
-    """A router resource added after :func:`add_options` has neither an HSR
-    route nor an OPTIONS route: it isn't described, so its responses carry no
-    HSR link (rather than each failing), until add_options is called again."""
+def test_router_resource_added_later_is_described_as_it_is_added(make_client):
+    """A resource added to a router after its :func:`add_options` (with its
+    route decorators) gets its OPTIONS and HSR routes as it is added, as an
+    app's later routes are described: its responses link to its HSR."""
     router = APIRouter()
     links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
 
@@ -1894,43 +1899,123 @@ def test_router_resource_added_later_is_undescribed_until_add_options(make_clien
     add_options(router, base_url=BASE)
 
     @router.get("/things/{id}")
+    @router.put("/things/{id}")
     @scrudful(etag_func=lambda **kwargs: "v1", **links, error=APP_ERROR)
     async def get_thing(id: int):
         if id == 404:
             raise HTTPException(404)
         return {}
 
-    def client_of() -> TestClient:
-        app = FastAPI()
-        app.include_router(router)
-        add_error_links(app, APP_ERROR)
-        return make_client(app)
-
-    client = client_of()
-    for url, headers, status in [
-        ("/things/1", {}, 200),
-        ("/things/1", {"If-None-Match": '"v1"'}, 304),
-        ("/things/1", {"If-Match": '"no"'}, 412),
-        ("/things/404", {}, 404),
+    app = FastAPI()
+    app.include_router(router)
+    add_error_links(app, APP_ERROR)
+    client = make_client(app)
+    target = "https://api.example/_hsr/things.id"
+    for method, url, headers, status in [
+        ("GET", "/things/1", {}, 200),
+        ("GET", "/things/1", {"If-None-Match": '"v1"'}, 304),
+        ("GET", "/things/1", {"If-Match": '"no"'}, 412),
+        ("PUT", "/things/1", {}, 428),
+        ("GET", "/things/404", {}, 404),
     ]:
-        response = client.get(url, headers=headers)
+        response = client.request(method, url, headers=headers)
         assert response.status_code == status
-        assert HSR_DOCUMENT_REL not in response.headers.get("link", "")
-    assert client.options("/things/1").status_code == 405
-    assert (
-        hsr_link_problems(
-            client.get("/items/1").headers, "https://api.example/_hsr/items.id"
-        )
-        == []
-    )
+        assert hsr_link_problems(response.headers, target) == [], (method, status)
+    options_204(client, "/things/1", "GET, PUT, OPTIONS", target)
+    assert hsr_problems(client.get("/_hsr/things.id")) == []
+    # Calling it again adds nothing more.
+    count = len(router.routes)
     add_options(router, base_url=BASE)
-    client = client_of()
-    assert (
-        hsr_link_problems(
-            client.get("/things/1").headers, "https://api.example/_hsr/things.id"
+    assert len(router.routes) == count
+
+
+def test_router_resource_added_later_to_a_nested_router_is_described(make_client):
+    """Also when the route is added to a router already included in the
+    router, or the router is included after the call."""
+    child, other, router = APIRouter(), APIRouter(), APIRouter()
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+
+    @router.get("/items/{id}")
+    @scrudful(**links)
+    async def get_item(id: int):
+        return {}
+
+    router.include_router(child, prefix="/c")
+    add_options(router, base_url=BASE)
+
+    @child.get("/late/{id}")
+    @scrudful(**links)
+    async def late(id: int):
+        return {}
+
+    @other.get("/notes/{id}")
+    @scrudful(**links)
+    async def note(id: int):
+        return {}
+
+    router.include_router(other, prefix="/o")
+    app = FastAPI()
+    app.include_router(router, prefix="/v1")
+    client = make_client(app)
+    for url, name in [("/v1/c/late/1", "c.late.id"), ("/v1/o/notes/1", "o.notes.id")]:
+        target = f"https://api.example/v1/_hsr/{name}"
+        assert hsr_link_problems(client.get(url).headers, target) == [], url
+        options_204(client, url, "GET, OPTIONS", target)
+        assert client.get(target).status_code == 200
+
+
+def test_router_resource_added_later_is_checked_as_add_options_checks(make_client):
+    router = APIRouter()
+    add_options(router, base_url=BASE)
+    with pytest.raises(ValueError, match="called as func"):
+
+        @router.get("/things/{id}")
+        @scrudful(
+            schema_link_or_func=lambda request: "/s.json",
+            context_link_or_func="/c.jsonld",
         )
-        == []
+        async def get_thing(id: int):  # pragma: no cover
+            return {}
+
+
+def test_router_resource_the_hooks_miss_is_announced(make_client):
+    """A route the router's methods don't add (appended to its ``routes``)
+    has no OPTIONS or HSR route: a ``RuntimeWarning`` names it, once, when
+    the router's resources are next indexed."""
+    from fastapi.routing import APIRoute
+
+    router = APIRouter()
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+
+    @router.get("/items/{id}")
+    @scrudful(**links)
+    async def get_item(id: int):
+        return {}
+
+    add_options(router, base_url=BASE)
+
+    async def thing(id: int):
+        return {}
+
+    router.routes.append(
+        APIRoute("/things/{id}", scrudful(**links)(thing), methods=["GET"])
     )
+    app = FastAPI()
+    app.include_router(router)
+    client = make_client(app)
+    with pytest.warns(RuntimeWarning, match=r"'/things/\{id\}'.*add_options"):
+        client.get("/items/1")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        client.get("/items/1")
+        response = client.get("/things/1")
+    assert response.status_code == 200
+    assert HSR_DOCUMENT_REL not in response.headers.get("link", "")
+    add_options(router, base_url=BASE)
+    target = "https://api.example/_hsr/things.id"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert hsr_link_problems(client.get("/things/1").headers, target) == []
 
 
 def test_target_needs_a_request_to_a_url_of_the_path(make_client):

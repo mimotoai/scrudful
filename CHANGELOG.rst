@@ -377,8 +377,14 @@ Behaviour change (FastAPI)
 * The callables ``add_options`` calls outside the endpoint are called as
   ``func()`` (were given the URL's path parameters and the request);
   ``add_error_links``' calls are unchanged.
-* A router's resource added after its ``add_options`` call has no OPTIONS or
-  HSR route, and its responses no HSR link, until it is called again.
+* A router's resource added after its ``add_options`` call, with the router's
+  route decorators, ``add_api_route`` or ``include_router`` (its own or those
+  of a router included in it), gets its OPTIONS and HSR routes as it is added,
+  its callables checked then (it had none, and its responses no HSR link,
+  silently, until ``add_options`` was called again): ``add_options(router)``
+  wraps those methods on the routers. A route appended to the router's
+  ``routes`` still gets none until ``add_options`` is called again, and a
+  ``RuntimeWarning`` now names it.
 
 New
 ---

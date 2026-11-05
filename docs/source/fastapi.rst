@@ -63,8 +63,8 @@ details; this page summarizes them.
 The options of ``add_options``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-All keyword-only; calling it again adds no route and replaces the options (so
-give them all again):
+All keyword-only; calling it again replaces the options (so give them all
+again), and adds the routes still missing:
 
 .. list-table::
    :header-rows: 1
@@ -183,9 +183,13 @@ it is not in the OpenAPI document.
   on to your routes.
 * Given an ``APIRouter``, each of its resources gets its own route on the
   router, so the prefix it is included under applies (``/v1/_hsr/items.id``):
-  call ``add_options`` before including the router, and again after adding a
-  resource to it. A resource added since has no HSR route, no OPTIONS route
-  and no HSR link.
+  call ``add_options`` before including the router. A resource added to the
+  router later, with its route decorators, ``add_api_route`` or
+  ``include_router`` (its own or those of a router included in it), gets its
+  OPTIONS and HSR routes as it is added, and its callables are checked then.
+  One whose route is appended to the router's ``routes`` gets neither, and no
+  HSR link: a ``RuntimeWarning`` names it, once, when the router's resources
+  are next indexed; call ``add_options`` again.
 * **Paths under** ``/_hsr/`` **are reserved**, and two resources can't share a
   name (``/a.b`` beside ``/a/b``): ``add_options`` raises ``ValueError`` for
   the paths there are, and the app's HSR route raises it on a request for
