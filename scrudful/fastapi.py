@@ -1625,8 +1625,10 @@ def _routes_fingerprint(routes: list[Any]) -> tuple[Any, ...] | None:
     ``routes``, those of the ``Mount``\\ s and ``Host``\\ s it looks into and
     those of the routers FastAPI includes lazily (``original_router``, the
     included ``APIRouter``, of the entries :func:`_flat` expands); ``None``
-    when one of those entries can't be seen into (another FastAPI's), so the
-    caller walks the routes each time, as before the index.
+    when one of those entries can't be seen into (a FastAPI whose included
+    routers have no ``original_router``), so the caller walks the routes
+    each time, as before the index: reading ``original_router`` needs no
+    version guard, since without it nothing is kept, so nothing goes stale.
 
     It walks the lists, not the routes' templates and endpoints, so it is
     cheap next to :func:`_find_scrudful_paths`; a route replaced in place,
@@ -1650,12 +1652,15 @@ def _routes_fingerprint(routes: list[Any]) -> tuple[Any, ...] | None:
                 if contents is not _OPAQUE:
                     pending.append(contents)
                 continue
-            if _iter_route_contexts is None or _is_leaf(route):
+            if _iter_route_contexts is None:
                 continue
             inner = getattr(getattr(route, "original_router", None), "routes", None)
-            if not isinstance(inner, list):
+            if isinstance(inner, list):
+                pending.append(inner)
+            elif not _is_leaf(route):
+                # An entry _flat expands that this can't see into: a FastAPI
+                # whose included routers differ. Not kept, so never stale.
                 return None
-            pending.append(inner)
     return tuple(parts)
 
 

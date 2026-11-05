@@ -303,6 +303,34 @@ def test_requests_dont_walk_the_routes_again(make_client, monkeypatch):
     assert client.get(f"/_hsr/{name}").status_code == 200
 
 
+def test_routes_it_cant_fingerprint_are_walked_each_time(make_client, monkeypatch):
+    """Without a fingerprint (an included router it can't see into), nothing
+    is kept: each request walks the routes, as before the index."""
+    import scrudful.fastapi as module
+
+    monkeypatch.setattr(module, "_routes_fingerprint", lambda routes: None)
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    app = FastAPI()
+
+    @app.get("/items/{id}")
+    @scrudful(**links)
+    async def get_item(id: int):
+        return {}
+
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    assert client.get("/items/1").status_code == 200
+    assert module._hsr_options(app).index is None
+
+    @app.get("/later/{id}")
+    @scrudful(**links)
+    async def get_later(id: int):
+        return {}
+
+    response = client.get("/later/1")
+    assert hsr_link_problems(response.headers, f"{BASE}_hsr/later.id") == []
+
+
 def test_unknown_path_raises():
     app = make_app()
     with pytest.raises(ValueError, match=r"'/people/\{id\}'.*'/users/\{id\}'"):
