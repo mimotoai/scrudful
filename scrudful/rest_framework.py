@@ -236,16 +236,18 @@ System checks
     and as a warning:
 
     - ``scrudful.W001``: what may depend on the data: a link callable
-      raising a ``django.db.DatabaseError`` when called as ``func(view,
-      None)`` (naming the route, the callable and the exception), or
-      returning nothing for a context link (beside a schema link) or for
-      its type. A warning, not
-      an error, as ``migrate`` runs the checks first: a callable that reads
-      the database fails on a database not migrated yet, and must not stop
-      ``migrate``. The document is built again, the callables called again,
-      when it is first served; if it fails then, that request fails. Any
-      other exception a callable raises (a ``NoReverseMatch``, a
-      ``TypeError`` of its signature) is ``scrudful.E005``.
+      raising a ``django.db.DatabaseError``, a ``django.http.Http404`` or a
+      ``django.core.exceptions.ObjectDoesNotExist`` (subclasses included)
+      when called as ``func(view, None)`` (naming the route, the callable
+      and the exception), or returning nothing for a context link (beside a
+      schema link) or for its type. A warning, not an error, as ``migrate``
+      runs the checks first: a callable that reads the database fails on a
+      database not migrated yet, or on a table not filled yet (a
+      ``get_list_or_404`` or a ``.get()``), and must not stop ``migrate``.
+      The document is built again, the callables called again, when it is
+      first served; if it fails then, that request fails. Any other
+      exception a callable raises (a ``NoReverseMatch``, a ``TypeError`` of
+      its signature, an ``AttributeError``) is ``scrudful.E005``.
 
     Each would otherwise fail on a request. The check builds each document
     as :func:`http_schema_resource` does (no request, no database access by
@@ -265,7 +267,11 @@ from typing import Any, NamedTuple
 
 from django.conf import settings
 from django.core import checks
-from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+from django.core.exceptions import (
+    ImproperlyConfigured,
+    ObjectDoesNotExist,
+    PermissionDenied,
+)
 from django.core.signals import setting_changed
 from django.db import DatabaseError
 from django.http import (
@@ -2660,12 +2666,14 @@ def _hsr_build_messages(
     request), and report why it can't be.
 
     A failure that may depend on the data (:class:`_DataDependentError`:
-    a link callable raising a ``django.db.DatabaseError``, or returning
-    nothing for a context link or its type) is the warning
+    a link callable raising a ``django.db.DatabaseError``, a
+    ``django.http.Http404`` or a ``django.core.exceptions.ObjectDoesNotExist``,
+    or returning nothing for a context link or its type) is the warning
     ``scrudful.W001``: it may not happen later (a callable reading the
     database fails before ``migrate`` has created its tables, and
-    ``migrate`` runs this check first; one returning a row's URL returns
-    nothing while the table is empty), and the document is built again when
+    ``migrate`` runs this check first; one reading a row raises a 404 or a
+    ``DoesNotExist``, or returns nothing, while the table is empty), and the
+    document is built again when
     it is first served. Any other failure (whatever else a callable raises,
     such as a ``NoReverseMatch`` or a ``TypeError`` of its signature;
     scrudful's configuration errors; whatever else the build raises) is the
@@ -3027,11 +3035,18 @@ def _describe_view(view: APIView) -> dict[str, Any]:
     return body
 
 
+#: What a link callable raises that may be the data's: a database error (a
+#: table not migrated yet), or a row that isn't there yet (a lookup's 404 or
+#: ``DoesNotExist`` on an empty table), subclasses included.
+_DATA_DEPENDENT = (DatabaseError, Http404, ObjectDoesNotExist)
+
+
 class _DataDependentError(ImproperlyConfigured):
     """A describe-mode failure that may depend on the data, so may not
     happen later: a link callable called as ``func(view, None)`` raised a
-    database error (``django.db.DatabaseError``, its ``__cause__``), or
-    returned nothing for a context link (beside a schema link) or for its
+    database error (``django.db.DatabaseError``), a ``django.http.Http404``
+    or a ``django.core.exceptions.ObjectDoesNotExist`` (its ``__cause__``),
+    or returned nothing for a context link (beside a schema link) or for its
     type, as one reading a row may while the table is empty. The system
     check reports it as a warning (see :func:`_hsr_build_messages`); any
     other error of a callable is a plain ``ImproperlyConfigured``."""
@@ -3058,7 +3073,8 @@ class _Describing:
         ImproperlyConfigured
             If the callable raises, naming the callable, this method and the
             exception, chained to it: a :class:`_DataDependentError` for a
-            ``django.db.DatabaseError``.
+            ``django.db.DatabaseError``, a ``django.http.Http404`` or a
+            ``django.core.exceptions.ObjectDoesNotExist``.
         """
         if not callable(value_or_func):
             return value_or_func
@@ -3068,7 +3084,7 @@ class _Describing:
             func = getattr(value_or_func, "__qualname__", repr(value_or_func))
             error = (
                 _DataDependentError
-                if isinstance(exc, DatabaseError)
+                if isinstance(exc, _DATA_DEPENDENT)
                 else ImproperlyConfigured
             )
             raise error(

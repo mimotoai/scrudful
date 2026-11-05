@@ -257,9 +257,11 @@ Behaviour change (DRF)
   beside the routes' errors) and ``E007`` (an action of a
   ``scrudful_viewset`` class without ``@scrudful``); and, as the warning
   ``scrudful.W001``, what may depend on the data: a link callable raising a
-  ``django.db.DatabaseError`` when called as ``func(view, None)``, or
-  returning nothing for a context link or its type, so that ``migrate``
-  runs on a fresh database whose tables a callable reads. Any other
+  ``django.db.DatabaseError``, a ``django.http.Http404`` or a
+  ``django.core.exceptions.ObjectDoesNotExist`` (subclasses included) when
+  called as ``func(view, None)``, or returning nothing for a context link or
+  its type, so that ``migrate`` runs on a fresh database whose tables a
+  callable reads, and on one whose tables are still empty. Any other
   exception a callable raises (``NoReverseMatch``, a signature's
   ``TypeError``) is ``E005``. The errors fail ``manage.py check`` and the
   commands that run it (``runserver``, ``migrate``, Django's test runner).

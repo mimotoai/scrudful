@@ -1038,10 +1038,12 @@ this release, also need the 0.9.0 changes in the changelog):
      ``mapping`` adds: decorate it, with ``entity=`` or link options). Only
      what may depend on the data is the warning ``scrudful.W001``, so that
      ``migrate`` runs on a fresh database: a link callable raising a
-     ``django.db.DatabaseError`` when called as ``func(view, None)``, or
-     returning nothing for a context link or its type. Anything else a
-     callable raises (a ``NoReverseMatch``, a ``TypeError`` of its
-     signature) is ``E005``. Run ``manage.py check`` before deploying;
+     ``django.db.DatabaseError``, a ``django.http.Http404`` or a
+     ``django.core.exceptions.ObjectDoesNotExist`` (a table not created or
+     not filled yet) when called as ``func(view, None)``, or returning
+     nothing for a context link or its type. Anything else a callable raises
+     (a ``NoReverseMatch``, a ``TypeError`` of its signature) is ``E005``.
+     Run ``manage.py check`` before deploying;
    * DRF: ``Meta.hsr_route = False`` without ``Meta.hsr_url`` or
      ``SCRUDFUL["HSR_URL"]`` raises ``ImproperlyConfigured`` when the class
      is decorated;

@@ -17,12 +17,13 @@ import pytest
 from django.contrib.auth.models import Group, User
 from django.core import checks
 from django.core.cache import cache
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.core.management import call_command
 from django.db import DatabaseError, OperationalError, ProgrammingError
 from django.urls import NoReverseMatch
 from django.http import Http404
+from django.shortcuts import get_list_or_404
 from django.test import Client, RequestFactory
 from django.urls import ResolverMatch, include, path, resolve, reverse
 from rest_framework import viewsets
@@ -1552,17 +1553,27 @@ def needs_the_request(view, request, pk, **kwargs):
     return f"https://api.example/schemas/{pk}"
 
 
+class MissingType(Http404):
+    """An application's own 404, as a lookup helper may raise."""
+
+
 @pytest.mark.parametrize(
     "links, media_type, expected",
     [
-        # Raised: a database error may be the data's (W001), anything else
-        # is a misconfiguration (E005).
+        # Raised: a database error, or a row that isn't there (an empty
+        # table), may be the data's (W001); anything else is a
+        # misconfiguration (E005).
         ({"schema_link_or_func": raising(OperationalError("x"))}, None, "W001"),
         ({"schema_link_or_func": raising(ProgrammingError("x"))}, None, "W001"),
         ({"schema_link_or_func": raising(DatabaseError("x"))}, None, "W001"),
+        ({"schema_link_or_func": raising(Http404("x"))}, None, "W001"),
+        ({"schema_link_or_func": raising(MissingType("x"))}, None, "W001"),
+        ({"schema_link_or_func": raising(ObjectDoesNotExist("x"))}, None, "W001"),
+        ({"schema_link_or_func": raising(Group.DoesNotExist("x"))}, None, "W001"),
         ({"schema_link_or_func": raising(NoReverseMatch("x"))}, None, "E005"),
         ({"schema_link_or_func": needs_the_request}, None, "E005"),
         ({"schema_link_or_func": raising(LookupError("x"))}, None, "E005"),
+        ({"schema_link_or_func": raising(AttributeError("x"))}, None, "E005"),
         # Returned nothing for the context or its type: may be the data's.
         ({"context_link_or_func": returning(None)}, None, "W001"),
         ({"context_link_or_func": returning("")}, None, "W001"),
@@ -1616,6 +1627,49 @@ def test_manage_py_check_passes_a_link_callable_raising(settings):
     call_command("check", stdout=out, stderr=err)
     assert "scrudful.W001" in err.getvalue()
     assert "database_schema" in err.getvalue()
+
+
+def group_list_schema(view, request, **kwargs):
+    """A link callable needing a row: ``get_list_or_404`` on its table."""
+    return f"https://api.example/schemas/{get_list_or_404(Group)[0].name}"
+
+
+def group_schema(view, request, **kwargs):
+    """A link callable needing a row: ``.get()`` on its table."""
+    return f"https://api.example/schemas/{Group.objects.get(name='types').name}"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("schema", [group_list_schema, group_schema])
+def test_a_link_callable_reading_an_empty_table_is_a_warning(settings, schema):
+    """On a migrated database whose table is still empty (a data migration
+    or a fixture would fill it), the callable's 404 or ``DoesNotExist`` may
+    be the data's: W001, not E005, so ``migrate`` and ``runserver`` still
+    run; once the row is there the check is clean."""
+    meta = type(
+        "Meta",
+        (),
+        {
+            "schema_link_or_func": schema,
+            "context_link_or_func": "https://api.example/contexts/group",
+        },
+    )
+    view = scrudful_viewset(type("Grouped", (ItemViewSetBase,), {"Meta": meta}))
+
+    class GroupURLconf:
+        urlpatterns = [
+            path("groups/<str:pk>/", view.as_view({"get": "retrieve"}), name="g"),
+            path("", include(hsr_urls())),
+        ]
+
+    settings.ROOT_URLCONF = GroupURLconf
+    settings.SCRUDFUL = None
+    [message] = scrudful_check_errors()
+    assert message.id == "scrudful.W001"
+    assert type(message) is checks.Warning
+    assert schema.__name__ in message.msg
+    Group.objects.create(name="types")
+    assert scrudful_check_errors() == []
 
 
 #: ``migrate`` on a fresh database, in a fresh process, of a project whose

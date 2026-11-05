@@ -82,13 +82,17 @@ and, as a warning:
 
 * ``scrudful.W001``: a failure that may depend on the data: a link callable
   raises a ``django.db.DatabaseError`` (``OperationalError``,
-  ``ProgrammingError`` ...) when called as ``func(view, None)``, or returns
-  nothing for a context link (beside a schema link) or for its type. The
-  warning names the route, the callable or entry, and the error.
+  ``ProgrammingError`` ...), a ``django.http.Http404`` (``get_object_or_404``,
+  ``get_list_or_404``) or a ``django.core.exceptions.ObjectDoesNotExist`` (a
+  model's ``DoesNotExist``), subclasses included, when called as
+  ``func(view, None)``, or returns nothing for a context link (beside a
+  schema link) or for its type. The warning names the route, the callable or
+  entry, and the error.
 
 These are only a warning because ``migrate`` runs the checks before it
 migrates: a callable that reads the database fails on a database not migrated
-yet, and returns nothing from an empty table, and an error would stop
+yet, and finds no row in a table not filled yet (by a data migration or a
+fixture), and an error would stop
 ``migrate`` (and ``makemigrations`` and ``runserver``) on a fresh database.
 The HSR is built again, and the callables called again, when it is first
 served; if it fails then too, that request fails, so don't leave the warning
