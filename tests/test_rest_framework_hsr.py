@@ -1198,6 +1198,19 @@ def test_system_check_reports_an_unnamed_route(settings):
     assert scrudful_check_errors() == []
 
 
+class TwiceIncludedURLconf:
+    urlpatterns = [
+        *UnnamedURLconf.urlpatterns,
+        path("again/", include(hsr_urls())),
+    ]
+
+
+def test_system_check_reports_once_with_hsr_urls_included_twice(settings):
+    """Each hsr_urls() pattern runs the check; only the first reports."""
+    settings.ROOT_URLCONF = TwiceIncludedURLconf
+    assert [error.id for error in scrudful_check_errors()] == ["scrudful.E001"]
+
+
 def test_system_check_reports_a_name_clash(settings):
     settings.ROOT_URLCONF = ClashURLconf
     [error] = scrudful_check_errors()
