@@ -4,14 +4,16 @@ django-ninja
 ``scrudful.ninja`` makes django-ninja operations SCRUDful: conditional requests
 (304, 400, 412, 428), ``ETag`` / ``Last-Modified``, the schema and JSON-LD
 context ``Link`` headers of the semantic-http spec, collections in the scrud
-list envelope, and an automatic OPTIONS answer (the spec's "HTTP Schema
-Resource"). Install it with ``pip install "scrudful[ninja]"`` (django-ninja
+list envelope, an automatic OPTIONS answer with a per-requester ``Allow``, and
+each path's "HTTP Schema Resource", served by GET and linked from every
+response. Install it with ``pip install "scrudful[ninja]"`` (django-ninja
 1.7 or newer, below 2: the adapter relies on django-ninja internals). It does
 not need Django REST Framework.
 
 The example project in ``examples/ninja`` uses the three decorators, entities,
-error Links and OPTIONS on a ``Role`` resource scoped by an ``rbac_context``;
-its tests (``examples/ninja/tests``) show the HTTP exchanges.
+error Links, OPTIONS and the 404 and 500 handlers on a ``Role`` resource scoped
+by an ``rbac_context``; its tests (``examples/ninja/tests``) show the HTTP
+exchanges and run the wire-conformance suite's checks.
 
 The rule everything follows: **no precondition result and no validator is
 computed from anything but the object (or queryset) authorization already
@@ -23,11 +25,15 @@ Setup
 -----
 
 Declare scrudful operations on a :class:`~scrudful.ninja.ScrudfulRouter`: it
-adds an OPTIONS operation to every path that has one. For operations declared
-on the API itself, make the API's default router one too:
+adds an OPTIONS operation and an HTTP Schema Resource route to every path that
+has one (see `OPTIONS and the HTTP Schema Resource`_). For operations declared
+on the API itself, make the API's default router one too. Set the base URL the
+relative link URLs resolve against, and install the 404 and 500 handlers in
+the root URLconf:
 
 .. code-block:: python
 
+    # api.py
     from ninja import NinjaAPI
 
     from scrudful.ninja import ScrudfulRouter, add_error_links
@@ -37,13 +43,36 @@ on the API itself, make the API's default router one too:
     api.add_router("/roles", roles)
     add_error_links(api, ERROR)  # see "Error responses"
 
-Scrudful operations on a plain ``ninja.Router`` work, but get no OPTIONS
-operation (ninja answers 405).
+    # settings.py
+    SCRUDFUL = {"BASE_URL": "https://api.example.com/"}
 
-The Links of the OPTIONS response are fixed: the published JSON Schema and
-JSON-LD context of the Semantic HTTP 0.1 HTTP Schema Resource, at
-``https://w3id.org/semantic-http/0.1/``. The OPTIONS body follows that
-revision (see the "Semantic HTTP conformance" section of :doc:`usage`).
+    # urls.py
+    import scrudful.ninja
+
+    urlpatterns = [path("api/", api.urls)]
+    PAGE_ERROR = scrudful.ninja.Entity(
+        "/api/schemas/error", context_link_or_func="/api/contexts/error"
+    )
+    handler404 = scrudful.ninja.handler404(PAGE_ERROR)
+    handler500 = scrudful.ninja.handler500(PAGE_ERROR)
+
+Scrudful operations on a plain ``ninja.Router`` work, but get no OPTIONS
+operation (ninja answers 405), no HTTP Schema Resource and no HSR link.
+
+Every operation on a ``ScrudfulRouter`` is described in its path's HTTP Schema
+Resource, so each needs an entity: a scrudful decorator's, or, for a plain
+operation, the one :func:`~scrudful.ninja.described` gives it. Adding a plain
+operation without one raises ``ConfigError``:
+
+.. code-block:: python
+
+    @roles.get("/health")
+    @described(Entity("/schemas/health", context_link_or_func="/contexts/health"))
+    def health(request): ...
+
+A ``@described`` operation's responses get the entity's Links and the HSR
+link, as a scrudful operation's do; its link callables get ``(request,
+None)``.
 
 HEAD is routed like any method: ninja answers 405 to HEAD on an operation
 declared with ``get``. Declare ``api_operation(["GET", "HEAD"], ...)`` for the
@@ -54,8 +83,8 @@ paths that should serve it, as the example does for the item and the list.
    The schema Link's default relation is ``describedby``, which is what
    Semantic HTTP 0.1 requires of a Schema Link Header. If you override it
    (``schema_rel_or_func="profile"``), the response's Link is no longer a Schema
-   Link Header, while the OPTIONS body still describes that schema as the
-   response's schema: the API is then not conformant. Use the default.
+   Link Header, while the HTTP Schema Resource still describes that schema
+   as the response's schema: the API is then not conformant. Use the default.
 
 Single resources
 ----------------
@@ -125,7 +154,8 @@ required when ``etag_func`` or ``last_modified_func`` is set.
 The ``schema_*`` / ``context_*`` arguments are the default entity: its Links go
 on 2xx responses, except a 204, which has no body (so a DELETE answering 204
 gets none), and except those to TRACE, whose content is the echoed request
-(``message/http``), not the item: OPTIONS describes them without content.
+(``message/http``), not the item: the HTTP Schema Resource describes them
+without content.
 ``responses={204: Entity(...)}`` (``responses={200: Entity(...)}`` for a TRACE)
 or ``ScrudfulResponse.entity`` still put Links on them if you want them.
 
@@ -366,8 +396,8 @@ list's ETag is a **412**, a malformed ``If-Match`` or ``If-None-Match`` a
 created. A ``list_load`` returning ``None`` means there is no collection (e.g.
 its parent is missing): no precondition can fail and the handler answers, as
 with ``load``, though a malformed header is still a 400. A create without a
-precondition proceeds without calling ``list_load``: never a 428. OPTIONS lists
-the 400 and 412. The list validators are evaluated for a POST only, so an
+precondition proceeds without calling ``list_load``: never a 428. The HTTP
+Schema Resource lists the 400 and 412. The list validators are evaluated for a POST only, so an
 operation without POST raises ``ConfigError`` when it is built. ``list_load``
 must apply the list operation's authorization: the check runs before the
 handler, so before any authorization the handler decides from the body.
@@ -428,13 +458,16 @@ another decorator goes decides what it runs before:
   preconditions: a 304, 412 or 428, or an ``ETag``, may already be decided
   (e.g. an unauthorized ``If-None-Match`` would get a 304 with the real
   entity-tag).
-* **Per-operation authorization** goes in ``load`` (fetch-if-allowed) or in
-  ninja's ``auth=``.
+* **Per-operation authorization** goes in ``load`` (fetch-if-allowed),
+  ``before=`` or ninja's ``auth=``: OPTIONS's ``Allow`` sees the last two.
 * **A decorator for every operation of a router or the API**:
   ``router.add_decorator(decorator, mode="operation")`` (or the API's). It
   wraps ``view_func``, so it runs inside ``Operation.run``, after ninja's
   authentication and throttling and before ``load``, and its exceptions go
-  through ninja's exception handlers.
+  through ninja's exception handlers. It also wraps the HTTP Schema Resource
+  route, and OPTIONS's ``Allow`` doesn't see it: authorization done there
+  needs an ``allowed=`` hook too (see `OPTIONS and the HTTP Schema
+  Resource`_).
 * **A wrapper for one operation**, in that same place: a callback registered
   with ``ninja.utils.contribute_operation_callback`` that wraps
   ``operation.view_func``, contributed by a decorator applied *above* the
@@ -482,8 +515,8 @@ General POST
 
 A POST that is not a create, e.g. ``POST /roles/search``, is a plain
 ``@scrudful``: 200 with the result's Links, no ``Location`` and no validators.
-``request=Entity(...)`` describes the query body (for OPTIONS), separately from
-the result:
+``request=Entity(...)`` describes the query body (in the HTTP Schema
+Resource), separately from the result:
 
 .. code-block:: python
 
@@ -665,50 +698,243 @@ JSON-LD context of the envelope, from the item's schema and context URIs.
 Serving them is the application's job (``examples/ninja/roles/documents.py``
 serves them next to the item documents).
 
+OPTIONS and the HTTP Schema Resource
+------------------------------------
+
+A :class:`~scrudful.ninja.ScrudfulRouter` gives every path with a scrudful (or
+``@described``) operation an HTTP Schema Resource (HSR), serves it by GET on a
+route of its own, links it from every response of the path, and answers the
+path's OPTIONS with a 204 whose ``Allow`` lists what the requester may use.
+:doc:`usage` describes the model shared by the three adapters ("OPTIONS and
+the HTTP Schema Resource"); this section is django-ninja's part.
+
+Settings
+~~~~~~~~
+
+Each argument of ``ScrudfulRouter`` defaults (``None``) to the key of the
+optional ``SCRUDFUL`` Django setting, then to scrudful's default:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 22 56
+
+   * - ``ScrudfulRouter(...)``
+     - ``SCRUDFUL[...]``
+     - Meaning
+   * - ``base_url``
+     - ``"BASE_URL"``
+     - The absolute URL relative link URLs resolve against, in the HSR and on
+       the Link headers (see "The base URL" in :doc:`usage`). Without one, a
+       relative link URL is a ``ConfigError`` when the HSR is built, and the
+       Link headers and the HSR link resolve against the request.
+   * - ``hsr_route``
+     - ``"HSR_ROUTE"``
+     - Whether the router serves each path's HSR (default ``True``).
+       ``False`` needs an ``hsr_url`` (``ConfigError`` when the router is
+       created).
+   * - ``hsr_url``
+     - ``"HSR_URL"``
+     - ``hsr_url(path)``: the absolute URL of the HSR of ``path`` (the
+       router's path, as given to the operation decorator), for a document
+       served elsewhere. The responses link to it as it returns it, even when
+       the router serves the route too.
+   * - ``hsr_cache_control``
+     - ``"HSR_CACHE_CONTROL"``
+     - The ``Cache-Control`` of the HSR route (default ``public,
+       max-age=300``).
+   * - ``allowed``
+     - (none)
+     - ``allowed(request, method, obj)``, the ``Allow`` hook of the router's
+       paths (see `OPTIONS`_ below).
+
+``SCRUDFUL`` must be a dict of those keys (``"ERROR"`` is DRF's; django-ninja's
+API-wide error entity is :func:`~scrudful.ninja.add_error_links`'s): another
+value, or an unknown key, raises ``ImproperlyConfigured``. A ``base_url`` that
+isn't absolute is a ``ConfigError``.
+
+The document
+~~~~~~~~~~~~
+
+The HSR of a path (an OpenAPI 3.1 Path Item, see
+:func:`~scrudful.ninja.http_schema_resource`) describes each method the path
+serves, in the order ``get``, ``put``, ``post``, ``delete``, ``options``,
+``head``, ``patch``, ``trace``, in the shape DRF's
+:func:`~scrudful.rest_framework.http_schema_resource` gives too: the request
+and response ``content`` (per media type, a ``schema`` ``$ref`` and, for a
+non-in-band type, an ``x-rdf-context`` ``href``), the statuses and the
+precondition headers of conditional writes. The statuses are those the
+operation answers: the ones it declares in ``response=`` (200 without one),
+plus 201 for a ``@scrudful_create`` operation, and scrudful's early responses
+(304, 400, 412, 428) when it evaluates preconditions. So ``POST
+/roles/search`` lists 200, where DRF lists 201 for a POST without
+``statuses=``. Each method also has a ``default`` entry for its errors, with
+the content of the operation's ``error``, else of the API-wide entity
+(:func:`~scrudful.ninja.add_error_links`); when the operation's ``error``
+differs from the API-wide one, the 401, 422 and 429 that ninja answers itself,
+with the API-wide entity, have entries of their own. ``head`` (where an
+operation routes it) is described like ``get``, without content, and
+``options`` is exactly ``{"responses": {"204": {"description": "No
+Content"}}}``.
+
+* It is built once per path template, without a request: on the first GET of
+  its route (or :func:`~scrudful.ninja.http_schema_resource` call), and again
+  after an operation is added to the router or ``add_error_links`` is
+  called. It is the same for every requester and ``Host``.
+* Link callables are called in *describe* mode, ``func(None, None)``: they
+  must return the target they return on the responses, without request or
+  object, or the HSR disagrees with the Links. One that raises is a
+  ``ConfigError`` naming the operation. Those of an async operation may be
+  ``async def``; they are awaited with ``asgiref.sync.async_to_sync``. The
+  entity of ``add_error_links`` is described the same way.
+* Relative link URLs resolve against the router's base URL; without one, a
+  relative URL is a ``ConfigError`` when the HSR is built.
+* A schema link without an RDF context link, for a non-in-band media type,
+  would give a Media Type Object without ``x-rdf-context``, which the spec's
+  JSON Schema rejects: ``Entity(...)`` and the decorators raise
+  ``scrudful._hsr.HsrConfigError`` (a ``ValueError``) for a plain value, and
+  building the HSR raises ``ConfigError`` for a callable one.
+* The reason phrases of extra statuses are ``http.HTTPStatus(code).phrase``,
+  which can differ between Python versions (e.g. for 422).
+* A path whose HSR link can't be computed (no route and no ``hsr_url``, a
+  route that can't be reversed) raises ``ConfigError`` on every response of
+  the path, not only on OPTIONS.
+
+The HSR route
+~~~~~~~~~~~~~
+
+The router serves each path's document by GET and HEAD at ``/_hsr/<name>``
+under its prefix, ``<name>`` being the path's segments joined with ``.``:
+``"/{pk}"`` gives ``/roles/_hsr/pk`` on a router added at ``/roles``,
+``"/{kind}/{pk}"`` gives ``_hsr/kind.pk``, ``"/search"`` gives
+``_hsr/search`` and ``""`` gives ``_hsr/_root``. It answers ``application/json``
+(the compact JSON of the document, whatever the API's renderer), the Links of
+the HSR's own JSON Schema and JSON-LD context, a strong ``ETag`` (304 for a
+matching ``If-None-Match``) and the router's ``Cache-Control``; another method
+gets the router's JSON 405 (``Allow: GET, HEAD``). It has ``auth=None`` and no
+throttles, is CSRF-exempt and is not in the OpenAPI document.
+
+* **The** ``_hsr`` **segment is reserved.** The routes come before the
+  router's other paths, so ``"/{kind}/{pk}"`` doesn't match them; an
+  operation under ``/_hsr/``, or two paths with one name (``"/a/{x}"`` and
+  ``"/a/{x}/"``), is a ``ConfigError``. The routes' URL names are private:
+  don't ``reverse()`` them.
+* **The** ``add_decorator`` **decorators still wrap it.** ninja applies the
+  API's and routers' ``add_decorator`` decorators (either mode) to every
+  operation, the HSR route included: a gate added that way (a permission
+  check, a throttle) also gates the HSR, which then is no longer public.
+  Put such checks in ``auth=``, ``before=`` or ``load``, or serve the HSR
+  elsewhere.
+* **Serving it elsewhere.** With ``hsr_route=False`` and an ``hsr_url``,
+  mount :func:`~scrudful.ninja.http_schema_resource_view`, which answers as
+  the route does::
+
+      HSR_URLS = {
+          "/{pk}": "https://api.example.com/schemas/items/item",
+          "": "https://api.example.com/schemas/items/list",
+      }
+      items = ScrudfulRouter(hsr_route=False, hsr_url=HSR_URLS.__getitem__)
+
+      urlpatterns = [
+          path("api/", api.urls),
+          path("schemas/items/item", http_schema_resource_view(items, "/{pk}")),
+          path("schemas/items/list", http_schema_resource_view(items, "")),
+      ]
+
+  Like the route, the view runs no authentication, permission check or
+  throttle, and is CSRF-exempt; ``path`` is checked on its first request.
+
 OPTIONS
--------
+~~~~~~~
 
-The automatic OPTIONS operation answers, for each method the path serves, an
-HTTP Schema Resource (Semantic HTTP 0.1), the shape DRF's ``ScrudfulMetadata``
-produces too: the request and response ``content`` (per media type, a
-``schema`` ``$ref`` and, for a non-in-band type, an ``x-rdf-context`` ``href``),
-the statuses and the precondition headers of conditional writes. The statuses
-are those the operation answers: the ones it declares in ``response=`` (200
-without one), plus 201 for a ``@scrudful_create`` operation, and scrudful's
-early responses (304, 400, 412, 428) when it evaluates preconditions. So
-``POST /roles/search`` lists 200, where DRF's ``ScrudfulMetadata`` lists 201 for
-every POST. It is the same for everyone:
+The router adds an OPTIONS operation to every path with a scrudful (or
+``@described``) operation, unless the path has one; an operation you add later
+whose methods include ``"OPTIONS"`` replaces it. It is registered with
+``auth=None``, ``throttle=[]`` and ``include_in_schema=False``, is CSRF-exempt,
+and has the URL name ``scrudful_options`` on every path (don't ``reverse()``
+it). It is answered by an ``Operation.run`` decorator, before ninja's checks:
+the ``add_decorator(mode="operation")`` decorators never gate it, while the
+``add_decorator(mode="view")`` ones wrap ``Operation.run`` and so run first,
+for a preflight too. In this order:
 
-* it runs no ``load``, handler or validator callback, ignores the API's and
-  the router's ``auth``, and scrudful runs no permission check for it, so it
-  reveals nothing about which items exist;
-* ninja still applies the decorators added with ``add_decorator`` on the API
-  or a router, and the API's and routers' throttles: "no permission check"
-  means scrudful runs none, and a permission decorator added that way gates
-  OPTIONS too;
-* every automatic OPTIONS operation has the URL name ``scrudful_options``, so
-  the name can't be reversed to one path;
-* the reason phrases of extra statuses are ``http.HTTPStatus(code).phrase``,
-  which can differ between Python versions (e.g. for 422);
-* link callables are called with the request and ``obj=None`` (there is no
-  loaded object, queryset or created item), so they must accept ``None``;
-* the response always has the two fixed HTTP Schema Resource Links, an
-  ``Allow`` header listing the body's methods and, for the paths that serve
-  it, a ``head`` entry without content;
-* the body is written by the API's renderer and served as
-  ``application/json`` with the renderer's charset (see "The API's renderer"
-  under `Error responses`_).
+1. **A CORS preflight** (``Origin`` and ``Access-Control-Request-Method``) is
+   answered 204, without content or Links, before any auth, throttle, hook or
+   load.
+2. **The request is throttled once**, as ninja would throttle the operation:
+   with the API's throttles, or the mount's (the router's, or
+   ``add_router(..., throttle=...)``'s). A refused one is ninja's 429.
+3. **On an item path, the object is loaded**, with the ``load`` of the GET
+   operation, else of the first ``@scrudful`` operation with one: on a copy of
+   the request with that operation's method, only once its ``auth=`` callbacks
+   and ``before`` allow the requester (so a requester refused there can't
+   learn which objects exist), with the path parameters validated as the
+   operation validates them (no object for one it would refuse with a 422),
+   and only them: give ``load``'s other parameters defaults, or take
+   ``**kwargs``. ``None`` is no object, and the object-level checks are
+   skipped. An ``HttpError`` or ``Http404`` it raises (the 404 of a missing
+   or hidden object) is the answer, by the API's exception handler, with
+   ``add_error_links``'s Links and the HSR link: return ``None`` for a 204 on
+   a missing object (a PUT that may create, say).
+4. **Each method is checked**, on a copy of the request with that method:
+
+   * with an ``allowed`` hook (the operation's ``allowed=``, else the
+     router's), ``allowed(request, method, obj)`` alone decides. It returns a
+     ``bool`` (``TypeError`` otherwise) and may be ``async def``. The copy is
+     authenticated by the operation's ``auth=`` callbacks when they
+     authenticate the requester (``request.auth``), and as it came otherwise;
+   * without one, the method is allowed when the operation's ``auth=``
+     callbacks authenticate the requester and its ``before`` (if any) returns
+     ``None``.
+
+   A raised ``HttpError`` with status 401, 403 or 404 (as ninja's
+   ``AuthenticationError`` and ``AuthorizationError`` are), ``Http404`` or
+   ``PermissionDenied`` refuses the method: a ``before`` that signals denial
+   with a 404 refuses it, it doesn't answer the OPTIONS. Anything else raised
+   is answered by the API's exception handler. Throttles, ``after_throttles``
+   and the handlers never run, so computing ``Allow`` uses no throttle quota;
+   the CSRF check of a cookie ``auth`` is skipped (the request using the
+   method is checked).
+5. **The answer** is a 204 without content or ``Content-Type``, with ``Allow``
+   (those methods and ``OPTIONS``; ``HEAD`` only where an operation lists it,
+   since ninja answers an unrouted HEAD with 405), one HSR link and
+   ``Access-Control-Expose-Headers``.
+
+Things to know:
+
+* OPTIONS isn't gated: an anonymous requester of a locked path gets a 204
+  with ``Allow: OPTIONS``, not a 401. Bad credentials make the requester
+  anonymous (ninja's auth callbacks return ``None`` for them, without telling
+  them from missing ones), so they get the anonymous ``Allow``, not a 401.
+* ``Allow`` sees only ``auth=``, ``before=`` and ``allowed=``: authorization
+  done in an ``add_decorator`` decorator, in ``after_throttles`` or in the
+  handler doesn't show in it (OPTIONS can list a GET that then answers 403).
+  Give the router or operation ``allowed=`` for such checks.
+* The ``auth=`` callbacks are those of the mount the request came through: a
+  router mounted twice with different ``auth`` gets each mount's ``Allow``.
+* An error answering OPTIONS (the 404 of ``load``, a 429) has no entry of its
+  own in the HSR, whose ``options`` entry is exactly the 204's.
 
 CORS
 ~~~~
 
-Browsers send CORS preflight requests (an OPTIONS with
-``Access-Control-Request-Method``) without credentials. django-cors-headers
-answers them in its middleware, before the view runs. scrudful's OPTIONS is the
-non-preflight case: a preflight that does reach it gets the description like
-any other OPTIONS. With django-cors-headers, list ``ETag``, ``Link`` and
-``Location`` in ``CORS_EXPOSE_HEADERS``: it replaces the
-``Access-Control-Expose-Headers`` scrudful sets.
+Browsers send CORS preflights (an OPTIONS with ``Access-Control-Request-Method``)
+without credentials. django-cors-headers answers them in its middleware,
+before the view runs; one that reaches scrudful's OPTIONS gets the 204
+without Links, before any check. For conformance, configure
+django-cors-headers as "CORS" in :doc:`usage` says:
+
+.. code-block:: python
+
+    from scrudful.utils import EXPOSE_HEADERS
+
+    CORS_EXPOSE_HEADERS = list(EXPOSE_HEADERS)  # it replaces scrudful's
+    CORS_ALLOW_CREDENTIALS = True  # Allow depends on the credentials
+    # CORS_ALLOW_METHODS keeps OPTIONS (its default has it), and a
+    # CORS_URLS_REGEX must also match the HSR routes (/_hsr/).
+
+The HSR route sets no CORS headers of its own and answers OPTIONS (a preflight
+too) with the router's JSON 405, so the middleware must cover it. On a plain
+``Router``, or behind an ``add_decorator(mode="view")`` gate, scrudful's
+OPTIONS never sees the preflight: let the middleware answer it.
 
 The runtime response
 --------------------
@@ -736,7 +962,8 @@ with content, error responses included. scrudful adds them in two places.
 ``add_decorator(mode="operation")`` decorators (so a transaction still rolls
 back), and ninja answers it with the API's exception handler: the status and
 body are the API's, custom handlers included. That response then gets the Links
-of the entity the operation's OPTIONS describes for its status:
+of the entity the operation's HTTP Schema Resource describes for its
+status:
 ``responses[status]`` if declared (``error`` first for scrudful's own 400, 412
 and 428 when the operation evaluates the ``If-*`` headers), else ``error``. So a
 404 a client gets agrees with the HTTP Schema Resource:
@@ -804,7 +1031,8 @@ no exception handler sees them: they carry Links only from the decorator's
 ``application/problem+json``), other than JSON-LD; anything else raises
 ``ValueError``, from the decorators and from
 :func:`~scrudful.ninja.add_error_links`. An error response is served with the
-media type of the entity whose Links it carries, as the OPTIONS body lists it:
+media type of the entity whose Links it carries, as the HTTP Schema Resource
+lists it:
 scrudful's own 400, 412 and 428, and the responses the API's exception
 handlers make for the errors raised inside a scrudful operation and for those
 :func:`~scrudful.ninja.add_error_links` covers. ninja renders those
@@ -815,17 +1043,16 @@ names is replaced), so every wrapped handler's JSON bodies must be content
 the entity describes. A handler's response with
 other content (e.g. ``text/plain``) keeps its ``Content-Type``.
 
-**The API's renderer.** scrudful's own bodies (the OPTIONS HTTP Schema
-Resource and the 400, 412 and 428) are written by the renderer of the API
+**The API's renderer.** scrudful's own bodies (the 400, 412 and 428) are
+written by the renderer of the API
 serving the request (``NinjaAPI(renderer=...)``), as every other response, so
 a renderer with other separators or escapes gives them the same bytes (a
 JSON-LD renderer, ``application/ld+json``, too). The renderer writes them as
 it writes the API's other data: one that changes the data's shape (renames
 keys, e.g. to camelCase, or wraps each body, e.g. in ``{"data": ...}``)
-changes them too, as it changes ninja's own 422 bodies, and the HTTP Schema
-Resource then no longer has the shape the semantic-http spec gives it (nor
-names the parameters as the API reads them). Use a renderer that changes
-only how the data is written. Their
+changes them too, as it changes ninja's own 422 bodies. Use a renderer that
+changes only how the data is written. (The HTTP Schema Resource route writes
+its compact JSON itself, whatever the renderer.) Their
 ``Content-Type`` is still the media type described here (``application/json``,
 or the ``error`` entity's media type), not the renderer's, with the
 renderer's ``charset`` parameter, as ninja's own responses carry it
@@ -856,15 +1083,31 @@ pair it with an ``error`` entity of media type ``PROBLEM_JSON``:
     @scrudful(error_body_func=problem_details,
               error=Entity(media_type=PROBLEM_JSON), **ROLE)
 
-Not covered, since no ninja exception handler makes them:
+**Problem details.** With an ``application/problem+json`` entity, ninja's
+request validation 422 (``{"detail": [errors]}``, whose ``detail`` problem
+details want a string) is rewritten as RFC 9457 problem details, ninja's
+errors as the ``errors`` member:
+``problem_from_errors(422, errors, "Request validation failed")``
+(:func:`scrudful.problem.problem_from_errors`). The w3id problem-details
+context doesn't map ``errors``: publish a context that imports it
+(``@import``) and maps ``errors``, and link that one.
 
-* ninja's own 405 for a method that no operation of the path routes (e.g. a
-  POST on a path with only a GET);
-* Django's 404 for a URL no pattern matches, and Django's 500 page (or ninja's
-  traceback page for other exceptions with ``DEBUG = True``).
-
-Give those Links in Django: custom ``handler404`` / ``handler500`` views, or a
-middleware adding them to error responses.
+**Responses no exception handler makes.** A method no operation of a
+``ScrudfulRouter`` path routes (e.g. a POST on a path with only a GET) gets a
+JSON 405 instead of ninja's ``text/html`` one: the API's exception handler's
+answer to ``HttpError(405, "Method not allowed")``, so it carries
+:func:`~scrudful.ninja.add_error_links`'s Links and media type, with RFC
+9110's ``Allow`` (every method the path serves) and the HSR link. A plain
+``Router``'s 405 stays ninja's. Django's 404 for a URL no pattern matches and
+its 500 page come from Django: install :func:`~scrudful.ninja.handler404` and
+:func:`~scrudful.ninja.handler500` in the root URLconf (see `Setup`_). They
+take an ``Entity`` of plain (non-callable) link values, answer JSON (problem
+details for an ``application/problem+json`` entity, else ``{"detail":
+<reason phrase>}``) with its Links, resolved against
+``SCRUDFUL["BASE_URL"]``, unless ``Accept`` prefers ``text/html``, and always
+send ``Vary: Accept``. Django uses them with ``DEBUG`` off; with ``DEBUG =
+True`` it shows its debug pages (and ninja its traceback page). They get no
+HSR link: a URL no route serves is no described path.
 
 Async operations
 ----------------
