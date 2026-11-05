@@ -124,7 +124,6 @@ from django.http import (
     Http404,
     HttpRequest,
     HttpResponseBase,
-    HttpResponseNotAllowed,
     JsonResponse,
 )
 from django.urls import (
@@ -188,6 +187,7 @@ from scrudful._adapter import (
 from scrudful._django import (
     aware,
     error_handler,
+    hsr_not_allowed,
     hsr_response,
     page_url,
     scrudful_setting,
@@ -228,6 +228,7 @@ __all__ = [
     "handler500",
     "hsr_urls",
     "http_schema_resource",
+    "http_schema_resource_view",
     "scrudful",
     "scrudful_api_view",
     "scrudful_viewset",
@@ -1630,15 +1631,76 @@ def hsr_urls() -> list[URLPattern]:
 def _hsr_view(request: HttpRequest, view_name: str) -> HttpResponseBase:
     """The view of :func:`hsr_urls`."""
     if request.method not in ("GET", "HEAD"):
-        response = HttpResponseNotAllowed(["GET", "HEAD"])
-        expose_headers(response)
-        return response
+        return hsr_not_allowed()
     view_func = _scrudful_views().get(view_name)
     if view_func is None or not _hsr_route_on(view_func.cls):
         return JsonResponse({"detail": "Not found."}, status=404)
     return hsr_response(
         request, _built_hsr(view_func), _hsr_cache_control(view_func.cls)
     )
+
+
+def http_schema_resource_view(
+    view_func: Callable[..., Any],
+) -> Callable[[HttpRequest], HttpResponseBase]:
+    """A plain Django view serving the HTTP Schema Resource of ``view_func``.
+
+    ``view_func`` is the view function of a scrudful view, as a URL pattern
+    routes to it: what ``as_view(...)`` of a :func:`scrudful_viewset` class
+    (or of a view with :class:`ScrudfulViewFunc` handlers) or
+    :func:`scrudful_api_view` returns; for a router's route, the pattern's
+    ``callback``. The view answers GET and HEAD as the :func:`hsr_urls` route
+    does (the document, Links, strong ``ETag``, the view's ``Cache-Control``
+    and a 304 for a matching ``If-None-Match``), and any other method with a
+    405 (``Allow: GET, HEAD``). Like the route, it runs no authentication,
+    permission check or throttle, and is CSRF-exempt. The document is built
+    on the first request, as :func:`http_schema_resource` builds it.
+
+    It is for serving the document elsewhere than :func:`hsr_urls`, with the
+    route turned off and ``hsr_url`` naming where it is mounted, as
+    scrud-django puts it beside ``collections-json-schema/<slug>/``::
+
+        @scrudful_viewset
+        class CollectionViewSet(viewsets.ModelViewSet):
+            class Meta:
+                hsr_route = False  # or SCRUDFUL["HSR_ROUTE"] = False
+
+                def hsr_url(view_name):  # or SCRUDFUL["HSR_URL"]
+                    return f"https://api.example/collections-hsr/{view_name}/"
+
+        collection = CollectionViewSet.as_view(
+            {"get": "retrieve", "put": "update", "delete": "destroy"}
+        )
+        urlpatterns = [
+            path("collections/<slug>/", collection, name="collection"),
+            path(
+                "collections-hsr/collection/",
+                http_schema_resource_view(collection),
+            ),
+        ]
+
+    Raises
+    ------
+    TypeError
+        If ``view_func`` is not the view function of a scrudful view.
+    """
+    if not _is_scrudful_view_func(view_func):
+        raise TypeError(
+            "http_schema_resource_view() takes the view function of a scrudful "
+            "view (what as_view() of a scrudful_viewset class or of a view with "
+            f"@scrudful handlers, or scrudful_api_view, returns), not {view_func!r}"
+        )
+
+    def scrudful_hsr_view(
+        request: HttpRequest, *args: Any, **kwargs: Any
+    ) -> HttpResponseBase:
+        if request.method not in ("GET", "HEAD"):
+            return hsr_not_allowed()
+        return hsr_response(
+            request, _built_hsr(view_func), _hsr_cache_control(view_func.cls)
+        )
+
+    return csrf_exempt(scrudful_hsr_view)
 
 
 #: The scrudful view function of each URL name, per URL resolver (see

@@ -16,6 +16,7 @@ from rest_framework.views import APIView
 
 from scrudful.rest_framework import (
     hsr_urls,
+    http_schema_resource_view,
     scrudful,
     scrudful_api_view,
     scrudful_viewset,
@@ -156,8 +157,17 @@ router.register("elsewhere", ElsewhereViewSet, basename="elsewhere")
 thing_router = SimpleRouter()
 thing_router.register("things", ThingViewSet, basename="thing")
 
+#: ElsewhereViewSet's detail route, whose HSR is mounted by hand at its
+#: Meta.hsr_url, ``https://schemas.example/hsr/elsewhere-detail.json``.
+elsewhere_detail = next(p.callback for p in router.urls if p.name == "elsewhere-detail")
+
 urlpatterns = [
     path("", include(router.urls)),
+    path(
+        "hsr/elsewhere-detail.json",
+        http_schema_resource_view(elsewhere_detail),
+        name="elsewhere-detail-hsr",
+    ),
     path("notes/<int:pk>", NoteView.as_view(), name="notes"),
     path("stats", stats, name="stats"),
     path("report", report, name="report"),

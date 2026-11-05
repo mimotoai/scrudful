@@ -567,7 +567,6 @@ from django.http import (
     HttpRequest,
     HttpResponse,
     HttpResponseBase,
-    HttpResponseNotAllowed,
 )
 from django.urls import NoReverseMatch, URLResolver, reverse
 from django.urls.resolvers import RegexPattern
@@ -621,6 +620,7 @@ from scrudful._django import (
     aware,
     conditional_response,
     error_handler,
+    hsr_not_allowed,
     hsr_response,
     page_url,
     precondition_headers,
@@ -2293,9 +2293,7 @@ def http_schema_resource_view(
         request: HttpRequest, *args: Any, **kwargs: Any
     ) -> HttpResponseBase:
         if request.method not in ("GET", "HEAD"):
-            response = HttpResponseNotAllowed(["GET", "HEAD"])
-            expose_headers(response)
-            return response
+            return hsr_not_allowed()
         return _hsr_response(request, router, path)
 
     scrudful_hsr_view.csrf_exempt = True  # type: ignore[attr-defined]

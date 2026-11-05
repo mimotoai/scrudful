@@ -6,6 +6,7 @@ tests use ``tests/drf_hsr_urls.py`` (the ``urls`` fixture) or a URLconf class.
 """
 
 import json
+from urllib.parse import urlsplit
 
 import pytest
 from django.contrib.auth.models import User
@@ -36,6 +37,7 @@ from scrudful.rest_framework import (
     _hsr_target,
     hsr_urls,
     http_schema_resource,
+    http_schema_resource_view,
     scrudful,
     scrudful_api_view,
     scrudful_viewset,
@@ -1151,3 +1153,69 @@ def test_a_root_urlconf_change_rebuilds_the_documents_and_the_scan(
         schema_ref(client.get("/_hsr/stats")) == "https://api.example/v2/schemas/stats"
     )
     assert client.get("/_hsr/item-detail").status_code == 404
+
+
+# --- http_schema_resource_view() ------------------------------------------------
+
+
+def test_http_schema_resource_view_serves_a_view_mounted_elsewhere(urls, client):
+    """Meta.hsr_route = False + Meta.hsr_url, the document mounted at that URL
+    with http_schema_resource_view (``tests/drf_hsr_urls.py``)."""
+    hsr_target = target("/elsewhere/1/")
+    assert hsr_target == "https://schemas.example/hsr/elsewhere-detail.json"
+    mounted = urlsplit(hsr_target).path
+    response = client.get(mounted)
+    assert get_problems(response) == []
+    view_func = resolve("/elsewhere/1/").func
+    assert view_func is drf_hsr_urls.elsewhere_detail
+    assert json.loads(response.content) == http_schema_resource(view_func)
+    assert response["ETag"] == hsr_etag(response.content)
+    assert response["Link"] == hsr_response_links()
+    assert response["Cache-Control"] == "public, max-age=300"
+    # The route doesn't serve it.
+    assert client.get("/_hsr/elsewhere-detail").status_code == 404
+    not_modified = client.get(mounted, HTTP_IF_NONE_MATCH=f"W/{response['ETag']}")
+    assert not_modified.status_code == 304
+    assert not_modified.content == b""
+    assert not_modified["ETag"] == response["ETag"]
+    assert not_modified["Cache-Control"] == "public, max-age=300"
+    head = client.head(mounted)
+    assert head.status_code == 200 and head.content == b""
+
+
+def test_http_schema_resource_view_has_the_views_cache_control(urls, rf, settings):
+    # Called directly, without URL resolution (stats's link callable reverses).
+    settings.SCRUDFUL = {"BASE_URL": BASE_URL, "HSR_CACHE_CONTROL": "public"}
+    thing = http_schema_resource_view(
+        drf_hsr_urls.ThingViewSet.as_view({"get": "retrieve"})
+    )
+    assert thing(rf.get("/anywhere"))["Cache-Control"] == "public, max-age=3600"
+    stats = http_schema_resource_view(drf_hsr_urls.stats)
+    response = stats(rf.get("/anywhere"))
+    assert get_problems(response) == []
+    assert response["Cache-Control"] == "public"
+    assert json.loads(response.content) == http_schema_resource(drf_hsr_urls.stats)
+
+
+@pytest.mark.parametrize("method", ["post", "put", "patch", "delete", "options"])
+def test_http_schema_resource_view_answers_other_methods_405(urls, method):
+    # CSRF-exempt: an unsafe method gets the 405, not CSRF's 403.
+    client = Client(enforce_csrf_checks=True)
+    response = getattr(client, method)("/hsr/elsewhere-detail.json")
+    assert response.status_code == 405
+    assert response["Allow"] == "GET, HEAD"
+    assert "Allow" in response["Access-Control-Expose-Headers"]
+
+
+@pytest.mark.parametrize(
+    "view_func",
+    [
+        drf_hsr_urls.PlainViewSet.as_view({"get": "retrieve"}),
+        APIView.as_view(),
+        drf_hsr_urls.schema,
+        None,
+    ],
+)
+def test_http_schema_resource_view_of_no_scrudful_view_is_a_type_error(view_func):
+    with pytest.raises(TypeError, match="scrudful view"):
+        http_schema_resource_view(view_func)

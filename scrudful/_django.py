@@ -21,6 +21,7 @@ from django.http import (
     HttpRequest,
     HttpResponse,
     HttpResponseBase,
+    HttpResponseNotAllowed,
     HttpResponseNotModified,
     JsonResponse,
     QueryDict,
@@ -41,6 +42,8 @@ __all__ = [
     "aware",
     "conditional_response",
     "error_handler",
+    "hsr_not_allowed",
+    "hsr_response",
     "json_response",
     "page_url",
     "precondition_headers",
@@ -157,6 +160,14 @@ def hsr_response(
     response["Link"] = hsr_response_links()
     response["ETag"] = etag
     response["Cache-Control"] = cache_control
+    _adapter.expose_headers(response)
+    return response
+
+
+def hsr_not_allowed() -> HttpResponseBase:
+    """The 405 of an HTTP Schema Resource view to a method but GET and HEAD:
+    ``Allow: GET, HEAD``, with the expose headers."""
+    response = HttpResponseNotAllowed(["GET", "HEAD"])
     _adapter.expose_headers(response)
     return response
 
