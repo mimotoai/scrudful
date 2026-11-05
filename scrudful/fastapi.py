@@ -1658,18 +1658,19 @@ def _hsr_flow(
     paths: Mapping[str, _Resource] | None = None,
     *,
     for_app: Any = None,
+    routed: bool = False,
 ) -> _Flow[_Built]:
     """The HTTP Schema Resource of ``path`` on ``owner`` (its document not a
-    copy) for the app ``for_app`` (see :func:`_owner_error`): the one built
-    for that app's error entity, unless the routes of ``path`` changed.
-    ``paths`` is ``owner``'s :func:`_scrudful_paths`, when the caller has
-    them."""
+    copy) for the app ``for_app`` (see :func:`_owner_error`, ``routed`` as
+    there): the one built for that app's error entity, unless the routes of
+    ``path`` changed. ``paths`` is ``owner``'s :func:`_scrudful_paths`, when
+    the caller has them."""
     options = _hsr_options(owner)
     if paths is None:
         paths = _scrudful_paths(owner)
     resource = _resource(owner, paths, path)
     routes = resource.routes
-    api_error = _owner_error(owner, for_app)
+    api_error = _owner_error(owner, for_app, routed=routed)
     cache_key = (_template_key(path), id(api_error))
     originals = tuple(getattr(route, "original_route", route) for route in routes)
     built = options.built.get(cache_key)
@@ -1890,8 +1891,9 @@ def _routes_fingerprint(routes: list[Any]) -> tuple[Any, ...] | None:
         if id(current) in seen:
             continue
         seen.add(id(current))
-        parts.append((id(current), tuple(current)))
-        for route in current:
+        entries = tuple(current)
+        parts.append((id(current), entries))
+        for route in entries:
             if isinstance(route, Route):
                 continue
             contents = _contents(route)
@@ -1990,18 +1992,22 @@ def _mount_path(route: Any) -> str:
     return str(original.path) if isinstance(original, Mount) else ""
 
 
-def _owner_error(owner: FastAPI | APIRouter, for_app: Any) -> Entity | None:
+def _owner_error(
+    owner: FastAPI | APIRouter, for_app: Any, *, routed: bool = False
+) -> Entity | None:
     """The :func:`add_error_links` entity the HTTP Schema Resources of
     ``owner``'s paths describe: an app's own; for a router, that of the app
     ``for_app`` (the app serving the request, or the one named), whose
     handlers answer its errors there, when it includes the router's
     endpoints; else :func:`_api_error`'s (an app serving the HTTP Schema
     Resource with :func:`http_schema_resource_endpoint` alone, such as a
-    separate docs app, answers none of the router's errors)."""
+    separate docs app, answers none of the router's errors). ``routed``:
+    the request reached the router's own HSR route through ``for_app``,
+    which so includes the router (and is not walked to tell)."""
     if (
         isinstance(owner, APIRouter)
         and isinstance(for_app, FastAPI)
-        and _includes(for_app, _router_endpoints(owner))
+        and (routed or _includes(for_app, _router_endpoints(owner)))
     ):
         return _APP_ERRORS.get(for_app)
     return _api_error(owner)
@@ -3842,7 +3848,7 @@ async def _hsr_route_response(
             key = names.get(request.path_params.get(_HSR_PARAMETER))
     if key is None or key not in paths:
         return _hsr_not_found()
-    return await _hsr_get(request, owner, key, paths)
+    return await _hsr_get(request, owner, key, paths, routed=True)
 
 
 async def _hsr_get(
@@ -3850,12 +3856,17 @@ async def _hsr_get(
     owner: FastAPI | APIRouter,
     path: str,
     paths: Mapping[str, _Resource] | None = None,
+    *,
+    routed: bool = False,
 ) -> Response:
     """The answer to a GET or HEAD of ``path``'s HTTP Schema Resource on
     ``owner``, with ``owner``'s ``Cache-Control`` (see :func:`_hsr_response`).
-    A router's describes the error entity of the app serving ``request``."""
+    A router's describes the error entity of the app serving ``request``
+    (``routed``: by the router's own HSR route, see :func:`_owner_error`)."""
     app = request.scope.get("app")
-    built = await _run_describing_async(_hsr_flow(owner, path, paths, for_app=app))
+    built = await _run_describing_async(
+        _hsr_flow(owner, path, paths, for_app=app, routed=routed)
+    )
     document = built.document
     options = _hsr_options(owner)
     key = (_template_key(path), id(built.error))
