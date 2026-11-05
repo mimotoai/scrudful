@@ -27,6 +27,7 @@ from django.urls import ResolverMatch, include, path, resolve, reverse
 from rest_framework import viewsets
 from rest_framework.authentication import BasicAuthentication
 from rest_framework.decorators import action
+from rest_framework.generics import GenericAPIView, ListAPIView
 from rest_framework.exceptions import (
     APIException,
     AuthenticationFailed,
@@ -2524,6 +2525,9 @@ def test_a_view_level_check_raising_a_404_is_the_answer(settings, client):
 
 #: The action (or method) each loader below was called under.
 SEEN_ACTIONS = []
+#: ``(action, request method, own check_object_permissions)`` of the view
+#: when ``handle_exception`` answers (``ByActionViewSet``).
+SEEN_STATE = []
 GROUP = Entity(
     "https://api.example/schemas/group",
     context_link_or_func="https://api.example/contexts/group",
@@ -2563,6 +2567,13 @@ class ByActionViewSet(viewsets.ModelViewSet):
 
     def retrieve(self, request, pk):
         return Response({"pk": self.get_object().pk})
+
+    def handle_exception(self, exc):
+        # The view's state when DRF answers an error of the load.
+        SEEN_STATE.append(
+            (self.action, self.request.method, "check_object_permissions" in vars(self))
+        )
+        return super().handle_exception(exc)
 
 
 @scrudful_viewset
@@ -2612,8 +2623,9 @@ class SlugViewSet(viewsets.GenericViewSet):
         return Response({"pk": self.get_object().pk})
 
 
-class SlugView(APIView):
-    """An ``APIView`` (no ``lookup_field``) with a ``get_object`` of its own."""
+class SlugView(GenericAPIView):
+    """A generic view overriding ``get_object``, looking the object up by the
+    URL's ``slug`` (``lookup_field`` stays ``pk``)."""
 
     permission_classes = [WritesForNobody]
 
@@ -2634,6 +2646,58 @@ class SlugView(APIView):
         return Response({"pk": self.get_object().pk})
 
 
+class SlugLookupView(APIView):
+    """An ``APIView`` declaring its lookup kwarg, with a ``get_object``."""
+
+    permission_classes = [WritesForNobody]
+    lookup_url_kwarg = "slug"
+    get_object = SlugView.get_object
+    get = SlugView.get
+    put = SlugView.put
+
+
+class OwnGetObjectView(APIView):
+    """An ``APIView`` (no lookup kwarg) with a ``get_object`` of its own for
+    its item routes, also mounted on a nested collection route: OPTIONS
+    there must not call it (the reviewer's probe)."""
+
+    def get_object(self):
+        SEEN_ACTIONS.append(("own", self.kwargs["pk"]))
+        return SlugThing()
+
+    @scrudful(entity=GROUP)
+    def get(self, request, **kwargs):
+        return Response([])
+
+
+class StockCollectionView(ListAPIView):
+    """DRF's own ``get_object`` (it needs the lookup kwarg), on a nested
+    collection route."""
+
+    queryset = Group.objects.all()
+
+    def get_queryset(self):
+        SEEN_ACTIONS.append(("stock", self.request.method))
+        return Group.objects.none()
+
+    @scrudful(entity=GROUP)
+    def get(self, request, **kwargs):
+        return Response([])
+
+
+class FormatOnlyView(GenericAPIView):
+    """A ``get_object`` override, on a route whose only kwarg is DRF's
+    ``format``: a collection."""
+
+    def get_object(self):
+        SEEN_ACTIONS.append(("format", self.kwargs))
+        return SlugThing()
+
+    @scrudful(entity=GROUP)
+    def get(self, request, **kwargs):
+        return Response([])
+
+
 slug_detail = SlugViewSet.as_view({"get": "retrieve", "put": "update"})
 slug_extra = SlugViewSet.as_view({"get": "extra", "put": "extra"})
 
@@ -2647,6 +2711,14 @@ class LoadingURLconf:
         path("slugs/<slug:slug>/", slug_detail, name="slug-detail"),
         path("slugs/<slug:slug>/extra/", slug_extra, name="slug-extra"),
         path("slug-view/<slug:slug>", SlugView.as_view(), name="slug-view"),
+        path("slug-lookup/<slug:slug>", SlugLookupView.as_view(), name="slug-lookup"),
+        path("orgs/<int:org>/items", OwnGetObjectView.as_view(), name="org-items"),
+        path(
+            "orgs/<int:org>/groups",
+            StockCollectionView.as_view(),
+            name="org-groups",
+        ),
+        path("format-only.<str:format>", FormatOnlyView.as_view(), name="format-only"),
         path("", include(hsr_urls())),
     ]
 
@@ -2655,8 +2727,10 @@ class LoadingURLconf:
 def loading(settings):
     settings.ROOT_URLCONF = LoadingURLconf
     SEEN_ACTIONS.clear()
+    SEEN_STATE.clear()
     yield
     SEEN_ACTIONS.clear()
+    SEEN_STATE.clear()
 
 
 def test_options_loads_the_object_under_the_get_action(loading, client):
@@ -2674,8 +2748,11 @@ def test_options_loads_the_object_under_the_get_action(loading, client):
     assert view.action == "metadata"
     assert view.request is request and request.method == "OPTIONS"
     assert "check_object_permissions" not in vars(view)
-    # A missing object is the 404 a GET gives, for the same reason.
+    # A missing object is the 404 a GET gives, for the same reason; the
+    # view's state is put back before DRF answers it (exception_handler
+    # picks the error entity by view.action).
     assert client.options("/by-action/999999/").status_code == 404
+    assert SEEN_STATE == [("metadata", "OPTIONS", False)]
     assert client.get("/by-action/999999/").status_code == 404
 
 
@@ -2703,6 +2780,7 @@ def test_options_of_a_collection_loads_nothing(loading, client):
         ("/slugs/thing/", ["retrieve"]),
         ("/slugs/thing/extra/", ["extra"]),
         ("/slug-view/thing", ["GET"]),
+        ("/slug-lookup/thing", ["GET"]),
     ],
 )
 def test_options_loads_with_the_views_own_get_object_whatever_the_kwarg(
@@ -2719,3 +2797,19 @@ def test_options_loads_with_the_views_own_get_object_whatever_the_kwarg(
     missing = url.replace("thing", "nothing")
     assert client.options(missing).status_code == 404
     assert client.get(missing).status_code == 404
+
+
+@pytest.mark.parametrize(
+    "url", ["/orgs/1/items", "/orgs/1/groups", "/format-only.json"]
+)
+def test_options_of_a_collection_of_another_view_loads_nothing(loading, client, url):
+    """A view that isn't a viewset loads only on its lookup kwarg, or with a
+    ``get_object`` overriding DRF's on a route with a kwarg but ``format``:
+    neither an ``APIView``'s own ``get_object`` without a lookup kwarg nor
+    DRF's stock one (which needs the lookup kwarg) runs on a collection."""
+    assert client.get(url).status_code == 200
+    SEEN_ACTIONS.clear()
+    r = client.options(url)
+    assert r.status_code == 204
+    assert r["Allow"] == "GET, OPTIONS, HEAD"
+    assert SEEN_ACTIONS == []

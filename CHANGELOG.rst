@@ -227,8 +227,13 @@ Behaviour change (DRF)
   viewset, its action (``retrieve``), not OPTIONS's ``metadata``, so a
   ``get_queryset`` scoped by ``self.action`` scopes it as a GET does. A
   ``get_object`` of the view's own is called whatever the URL kwarg is named
-  (on a viewset's item action, or an ``APIView`` route with a URL kwarg), so
-  its object checks run; only the lookup kwarg did.
+  (on a viewset's item action, or on a route with a URL kwarg of a generic
+  view overriding ``get_object``), so its object checks run; only the lookup
+  kwarg did. **Migration:** OPTIONS on such an item route now calls your
+  ``get_object``; it must handle each route it serves (raise ``Http404`` for
+  a missing object), since anything else it raises is the OPTIONS's answer.
+  A plain ``APIView`` is loaded only on its lookup kwarg
+  (``lookup_url_kwarg``), so its collection routes load nothing.
 * The view class's ``finalize_response`` adds the HSR link to every response
   of a routed scrudful view, OPTIONS's 401, 406 and 429 included; a view with
   a renderer that isn't JSON (the browsable API) also sends ``Vary: Accept``.

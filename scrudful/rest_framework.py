@@ -155,8 +155,10 @@ OPTIONS
        ``lookup_url_kwarg``, else ``lookup_field``, is in the URL kwargs;
        with a ``get_object`` of the view's own, whatever its URL kwarg is
        named, a viewset route whose action is ``retrieve``, ``update``,
-       ``partial_update``, ``destroy`` or an ``@action(detail=True)``, or
-       another view's route with a URL kwarg (but ``format``). So on a view
+       ``partial_update``, ``destroy`` or an ``@action(detail=True)``, or,
+       for a generic view (``GenericAPIView``) overriding ``get_object``, a
+       route with a URL kwarg (but ``format``); an ``APIView`` declares its
+       lookup kwarg with ``lookup_url_kwarg``. So on a view
        whose methods are all gated by permissions, a requester refused every
        method gets ``Allow: OPTIONS`` whether the object exists or not, as a
        GET of either is refused alike: OPTIONS is no existence oracle for
@@ -1851,7 +1853,13 @@ def _loads_object(view: APIView, action: str | None) -> bool:
     - on a viewset, ``action`` (the checked method's) is an item action:
       ``retrieve``, ``update``, ``partial_update``, ``destroy``, or an
       ``@action(detail=True)``;
-    - on another view, the route has a URL kwarg (but DRF's ``format``).
+    - on another view, a generic one (``GenericAPIView``) overriding
+      ``get_object``, the route has a URL kwarg (but DRF's ``format``).
+
+    So an ``APIView``'s ``get_object`` (it overrides none) is called only
+    on its lookup kwarg, which it declares with ``lookup_url_kwarg``: a
+    nested collection route (``orgs/<int:org>/items``) loads nothing. What
+    a ``get_object`` that is called raises propagates.
     """
     if not callable(getattr(view, "get_object", None)):
         return False
@@ -1868,7 +1876,7 @@ def _loads_object(view: APIView, action: str | None) -> bool:
             return True
         handler = getattr(type(view), action, None) if action else None
         return getattr(handler, "detail", None) is True
-    return any(name != "format" for name in kwargs)
+    return isinstance(view, GenericAPIView) and any(name != "format" for name in kwargs)
 
 
 #: What a per-method check of OPTIONS raises for "not allowed", besides an

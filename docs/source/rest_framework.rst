@@ -327,9 +327,13 @@ With ``ScrudfulMetadata`` installed, OPTIONS is answered in this order:
    else ``lookup_field``, is in the URL kwargs; with a ``get_object`` of the
    view's own, whatever the URL kwarg is named: on a viewset, a route whose
    action is ``retrieve``, ``update``, ``partial_update``, ``destroy`` or an
-   ``@action(detail=True)``; on another view, a route with a URL kwarg (but
-   DRF's ``format``). So a requester refused every method gets ``Allow: OPTIONS`` whether the object
-   exists or not, as a GET of either is refused alike. A ``get_object()``
+   ``@action(detail=True)``; on a generic view (``GenericAPIView``) that
+   overrides ``get_object``, a route with a URL kwarg (but DRF's ``format``).
+   A plain ``APIView`` is loaded only on its lookup kwarg: declare it with
+   ``lookup_url_kwarg``. A ``get_object`` called so must handle every route
+   it is called on (or raise ``Http404``): what else it raises is the
+   OPTIONS's answer. So a requester refused every method gets ``Allow:
+   OPTIONS`` whether the object exists or not, as a GET of either is refused alike. A ``get_object()``
    that raises (the ``Http404`` of a missing object, or of one the requester
    may not read) is the answer, through the view's exception handler, with
    the HSR link.
