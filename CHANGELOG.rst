@@ -41,8 +41,8 @@ Behaviour change (all adapters)
   OPTIONS's answer, with the error Links and the HSR link; ``None`` is no
   object. DRF loads again for each other action (or, off a viewset, method)
   that passed, and ninja runs each other item operation's own ``load``, as
-  checks of those methods (see below). A loader must so be free of side
-  effects (no writes, no audit records): OPTIONS calls it.
+  checks of those methods (see below). OPTIONS calls the loader, so it must
+  be free of side effects (no writes, no audit records).
 * A denial an ``Allow`` hook raises refuses that method, in every adapter:
   DRF's ``PermissionDenied`` or ``NotAuthenticated``, any other 401 or 403
   ``APIException`` (``AuthenticationFailed``, a project's own), or Django's
