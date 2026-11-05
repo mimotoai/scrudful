@@ -9,6 +9,7 @@ from ninja import Router
 from ninja.errors import ConfigError
 from ninja.testing import TestAsyncClient, TestClient
 
+from scrudful._hsr import hsr_link
 from scrudful.ninja import Entity, ScrudfulRouter, scrudful_create
 from scrudful.problem import PROBLEM_JSON, problem_details
 from tests.test_ninja_adapter import TEST_BASE_URL, ItemIn, ItemOut, Store, etag
@@ -163,7 +164,10 @@ def test_the_412_has_the_error_links_and_body(store):
         error_body_func=problem_details,
     )
     assert response.status_code == 412
-    assert response.headers["Link"] == ERROR_LINK
+    # The error entity's Links, then the HTTP Schema Resource link.
+    assert response.headers["Link"] == (
+        f"{ERROR_LINK}, {hsr_link('http://testlocation/_hsr/items')}"
+    )
     assert response.headers["Content-Type"].startswith(PROBLEM_JSON)
     assert response.json()["status"] == 412
 

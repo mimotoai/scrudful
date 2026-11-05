@@ -20,6 +20,7 @@ from ninja.testing import TestClient
 from ninja.utils import contribute_operation_callback
 
 from scrudful._adapter import READ_DESCRIPTIONS, WRITE_DESCRIPTIONS, resolved_signature
+from scrudful._hsr import hsr_link
 from scrudful.ninja import (
     CONDITIONAL_READ_RESPONSES,
     CONDITIONAL_WRITE_RESPONSES,
@@ -1220,7 +1221,13 @@ def test_router_add_decorator_wraps_the_bound_operations(store, mode):
         response = client.get(f"{prefix}/x/1")
         assert response.status_code == 200
         assert response.headers["ETag"] == '"v1"'
-        assert response.headers["Link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+        # The entity's Links, then the HSR link: of either mount's route,
+        # which serve one document (one URL name for both, see _hsr_target).
+        assert response.headers["Link"] in {
+            f"{SCHEMA_LINK}, {CONTEXT_LINK}, "
+            f"{hsr_link(f'http://testlocation{mount}/_hsr/x.pk')}"
+            for mount in ("/one", "/two")
+        }
         response = client.get(f"{prefix}/y/1", headers={"If-None-Match": '"v1"'})
         assert response.status_code == 304
         response = client.get(f"{prefix}/y/1")

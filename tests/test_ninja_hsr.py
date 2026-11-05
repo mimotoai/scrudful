@@ -1088,7 +1088,8 @@ def test_target_under_test_client_needs_ninjas_resolve(monkeypatch, fresh_ninja_
 
 def test_target_under_test_client_needs_ninjas_urls(monkeypatch):
     client = TestClient(mount(target_router("a")))
-    assert client.get("/1").status_code == 200  # the client keeps the patterns
+    # The client keeps the patterns; no response has reversed a route yet.
+    assert client.urls
     monkeypatch.setattr(NinjaAPI, "urls", property(lambda self: {"patterns": []}))
     with pytest.raises(ConfigError, match=r"NinjaAPI\.urls.*upgrade"):
         client.get("/1/target")

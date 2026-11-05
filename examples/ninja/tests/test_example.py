@@ -21,7 +21,7 @@ from referencing.jsonschema import DRAFT202012
 from roles.api import save_role
 from roles.models import Role
 
-from scrudful._hsr import options_operation
+from scrudful._hsr import hsr_link, options_operation
 from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS
 from scrudful_ninja.api import api
 from tests.semantic_http import (
@@ -56,13 +56,15 @@ PRECONDITION_FAILED = {"detail": "Precondition failed."}
 MISSING = 999_999
 
 
-def links(name):
-    """The Link header value of the documents ``name``."""
-    return (
+def links(name, kind=None):
+    """The Link header value of the documents ``name``, followed by the HTTP
+    Schema Resource link of the ``kind`` path (see ``HSR_ROUTES``)."""
+    value = (
         f'<{API}/schemas/{name}>; rel="describedby"; type="application/schema+json", '
         f'<{API}/contexts/{name}>; rel="http://www.w3.org/ns/json-ld#context"; '
         'type="application/ld+json"'
     )
+    return value if kind is None else f"{value}, {hsr_link(BASE + HSR_ROUTES[kind])}"
 
 
 def content(name):
@@ -126,7 +128,7 @@ def test_get(client, role):
     assert response.json() == {"id": role.pk, "name": "admin", "rbac_context": "acme"}
     assert response.headers["ETag"] == f'"{role.etag}"'
     assert response.headers["Last-Modified"] == MODIFIED_HTTP
-    assert response.headers["Link"] == links("role")
+    assert response.headers["Link"] == links("role", "item")
     assert {"ETag", "Link"} <= exposed(response)
 
 
@@ -204,14 +206,14 @@ def test_write_requires_a_precondition(client, role, write):
     response = write(client, role.pk, {"name": "x", "rbac_context": "acme"})
     assert response.status_code == 428
     assert response.json() == PRECONDITION_REQUIRED
-    assert response.headers["Link"] == links("error")
+    assert response.headers["Link"] == links("error", "item")
     assert "Link" in exposed(response)
 
 
 def test_delete_requires_a_precondition(client, role):
     response = client.delete(detail(role.pk), headers=ACME)
     assert response.status_code == 428
-    assert response.headers["Link"] == links("error")
+    assert response.headers["Link"] == links("error", "item")
     assert Role.objects.filter(pk=role.pk).exists()
 
 
@@ -221,7 +223,7 @@ def test_stale_write_is_412(client, role):
     )
     assert response.status_code == 412
     assert response.json() == PRECONDITION_FAILED
-    assert response.headers["Link"] == links("error")
+    assert response.headers["Link"] == links("error", "item")
     role.refresh_from_db()
     assert role.name == "admin"
 
@@ -231,7 +233,7 @@ def test_malformed_if_match_is_400(client, role):
         client, role.pk, {"name": "x", "rbac_context": "acme"}, **{"If-Match": "nope"}
     )
     assert response.status_code == 400
-    assert response.headers["Link"] == links("error")
+    assert response.headers["Link"] == links("error", "item")
 
 
 def test_put(client, role):
@@ -250,7 +252,7 @@ def test_put(client, role):
     assert response.headers["Last-Modified"] == http_date(
         updated.modified_at.timestamp()
     )
-    assert response.headers["Link"] == links("role")
+    assert response.headers["Link"] == links("role", "item")
 
 
 def test_put_with_if_unmodified_since(client, role):
@@ -273,7 +275,7 @@ def test_put_into_another_context_is_403(client, role):
     )
     assert response.status_code == 403
     assert "ETag" not in response.headers
-    assert response.headers["Link"] == links("error")
+    assert response.headers["Link"] == links("error", "item")
     role.refresh_from_db()
     assert role.rbac_context == "acme"
 
@@ -299,7 +301,8 @@ def test_delete(client, role):
     )
     assert response.status_code == 204
     assert "ETag" not in response.headers
-    assert "Link" not in response.headers  # no body, no Links
+    # No body, no entity Links: the HTTP Schema Resource link alone.
+    assert response.headers["Link"] == hsr_link(BASE + HSR_ROUTES["item"])
     assert not Role.objects.filter(pk=role.pk).exists()
 
 
@@ -335,7 +338,7 @@ def test_create(client):
     assert response.headers["Last-Modified"] == http_date(
         created.modified_at.timestamp()
     )
-    assert response.headers["Link"] == links("role")
+    assert response.headers["Link"] == links("role", "collection")
     assert {"ETag", "Link", "Location"} <= exposed(response)
 
     # The 201's validators let the client edit right away, without a GET.
@@ -360,7 +363,7 @@ def test_create_checks_the_preconditions_of_the_collection(client, role):
         headers={**ACME, "If-Match": '"stale"'},
     )
     assert stale.status_code == 412
-    assert stale.headers["Link"] == links("error")
+    assert stale.headers["Link"] == links("error", "collection")
     assert not Role.objects.filter(name="viewer").exists()
     current = client.post(
         "/api/roles",
@@ -411,7 +414,7 @@ def test_search(client, role, hidden):
     )
     assert response.status_code == 200
     assert [found["name"] for found in response.json()] == ["admin", "administrator"]
-    assert response.headers["Link"] == links("role-search-result")
+    assert response.headers["Link"] == links("role-search-result", "search")
     assert "ETag" not in response.headers
     assert "Location" not in response.headers
 
@@ -429,7 +432,7 @@ def test_search_with_the_async_client(role, hidden):
     response = search()
     assert response.status_code == 200
     assert [found["id"] for found in response.json()] == [role.pk]
-    assert response.headers["Link"] == links("role-search-result")
+    assert response.headers["Link"] == links("role-search-result", "search")
 
 
 def test_search_unauthenticated(client):
@@ -446,7 +449,7 @@ def test_list(client, role, hidden):
     other = make_role("viewer")
     response = client.get("/api/roles", headers=ACME)
     assert response.status_code == 200
-    assert response.headers["Link"] == links("roles")
+    assert response.headers["Link"] == links("roles", "collection")
     body = response.json()
     assert list(body) == list(PAGE_FIELDS)
     # Only the authorized roles are counted and listed.
@@ -465,7 +468,10 @@ def test_list(client, role, hidden):
         item = client.get(entry["href"], headers=ACME)
         assert entry["etag"] == item.headers["ETag"]
         assert entry["last_modified"] == item.headers["Last-Modified"]
-        assert entry["link"] == item.headers["Link"]
+        # The item's Links; the GET adds its path's HTTP Schema Resource link.
+        assert item.headers["Link"] == (
+            f"{entry['link']}, {hsr_link(BASE + HSR_ROUTES['item'])}"
+        )
 
 
 def test_list_pagination(client):
@@ -798,7 +804,7 @@ def test_example_links_everywhere(client, role, method, path, arguments, status)
     )
     assert problems == []
     if status in NO_ENTRY - {304}:
-        assert response.headers["Link"] == links("error")
+        assert response.headers["Link"] == links("error", kind)
 
 
 def test_cors_preflight_is_not_broken(client, role):

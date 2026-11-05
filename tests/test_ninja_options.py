@@ -18,7 +18,7 @@ from rest_framework.response import Response
 from rest_framework.test import APIRequestFactory
 
 from scrudful._adapter import SCHEMA_REL
-from scrudful._hsr import hsr_route_name, options_operation
+from scrudful._hsr import hsr_link, hsr_route_name, options_operation
 from scrudful.ninja import (
     CONDITIONAL_READ_RESPONSES,
     CONDITIONAL_WRITE_RESPONSES,
@@ -421,12 +421,14 @@ def test_relative_links_resolved(client, db):
         },
     }
     response = client.get("/api/roles/1")
-    assert [target for target, _ in parse_links(response.headers["Link"])] == [
+    target = hsr_target("/roles/{pk}", prefix="/api", base="http://testserver")
+    # The entity's Links, then the HTTP Schema Resource link.
+    assert [link for link, _ in parse_links(response.headers["Link"])] == [
         "http://testserver/schemas/role",
         "http://testserver/contexts/role",
+        target,
     ]
     assert link_problems("GET", 200, response.headers, True, body) == []
-    target = hsr_target("/roles/{pk}", prefix="/api", base="http://testserver")
     assert hsr_link_problems(dict(client.options("/api/roles/1").items()), target) == []
 
 
@@ -588,10 +590,11 @@ def test_a_context_type_callable_of_non_json_content(context_type):
         return
     body = hsr_get(client, "/rows/{pk}")
     response = client.get("/rows/1")
+    # The context link, then the HTTP Schema Resource link.
     assert response.headers["Link"].endswith(
         "<http://testlocation/contexts/rows>; "
         'rel="https://w3id.org/semantic-http/ns#rdf-context"; '
-        'type="application/csvm+json"'
+        f'type="application/csvm+json", {hsr_link(hsr_target("/rows/{pk}"))}'
     )
     assert link_problems("GET", 200, response.headers, True, body) == []
 
@@ -643,7 +646,8 @@ def test_trace_gets_no_default_entity():
     }
     response = client.request("TRACE", "/items/1")
     assert response.status_code == 200
-    assert "Link" not in response.headers
+    # No entity's Links: the HTTP Schema Resource link alone.
+    assert response.headers["Link"] == hsr_link(hsr_target("/items/{pk}"))
 
     body = hsr_get(client, "/echo/{pk}")
     echo_content = content("/schemas/echo", "/contexts/echo")
@@ -654,7 +658,7 @@ def test_trace_gets_no_default_entity():
         'type="application/schema+json", '
         "<http://testlocation/contexts/echo>; "
         'rel="http://www.w3.org/ns/json-ld#context"; '
-        'type="application/ld+json"'
+        f'type="application/ld+json", {hsr_link(hsr_target("/echo/{pk}"))}'
     )
 
 
@@ -1213,7 +1217,9 @@ def test_user_options_declared_first_is_kept(store):
     assert len([op for op in path_view.operations if "OPTIONS" in op.methods]) == 1
 
 
-def test_no_options_without_a_scrudful_operation():
+def test_options_on_a_path_of_described_operations_only():
+    """Semantic HTTP requirement 3: a path its HTTP Schema Resource describes
+    answers OPTIONS, also without a scrudful operation."""
     router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.get("/plain/{pk}")
@@ -1221,7 +1227,9 @@ def test_no_options_without_a_scrudful_operation():
     def plain(request, pk: int):
         return {}
 
-    assert options(TestClient(router), "/plain/1").status_code == 405
+    options_204(
+        TestClient(router), "/plain/1", "GET, OPTIONS", hsr_target("/plain/{pk}")
+    )
 
 
 def test_options_mixed_operations(store):
