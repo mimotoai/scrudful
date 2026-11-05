@@ -149,7 +149,8 @@ and send the validators on 2xx. PUT, PATCH and DELETE get 428 without a
 precondition, 412 when it is stale, 400 for a malformed ``If-Match`` /
 ``If-None-Match``, and fresh validators on 2xx. With ``error=Entity(...)``
 scrudful's own 400, 412 and 428 bodies carry that entity's Links, and so do
-the errors the operation raises (see :ref:`ninja-errors`). ``load`` is
+the errors the operation raises (see :ref:`ninja-errors`); without it, the
+API-wide :func:`~scrudful.ninja.add_error_links` entity's. ``load`` is
 required when ``etag_func`` or ``last_modified_func`` is set.
 
 The ``schema_*`` / ``context_*`` arguments are the default entity: its Links go
@@ -1063,7 +1064,8 @@ body are the API's, custom handlers included. That response then gets the Links
 of the entity the operation's HTTP Schema Resource describes for its
 status:
 ``responses[status]`` if declared (``error`` first for scrudful's own 400, 412
-and 428 when the operation evaluates the ``If-*`` headers); else, for a 401 or
+and 428 when the operation evaluates the ``If-*`` headers, and the API-wide
+entity when neither is set); else, for a 401 or
 403 when :func:`~scrudful.ninja.add_error_links`'s entity is set and differs
 from ``error``, that entity; else ``error``. The HSR has an entry for each
 status of ``responses=``, so a 404 a client gets agrees with it:
@@ -1124,9 +1126,13 @@ on the event loop: the entity's link callables must be sync (``TypeError``
 otherwise) and must not use the ORM there.
 
 scrudful's own 400, 412 and 428 are returned by the operation, not raised, so
-no exception handler sees them: they carry Links only from the decorator's
-``error``. Give every conditional ``@scrudful`` and ``@scrudful_list`` an
-``error=``, also with :func:`~scrudful.ninja.add_error_links` installed.
+no exception handler sees them: they carry the Links of the decorator's
+``error``, else of the entity ``responses=`` declares for their status, else
+of the serving API's :func:`~scrudful.ninja.add_error_links` entity (whose
+link callables get ``None``), and the HTTP Schema Resource each API serves
+describes them so. Without any of these they carry no error Links: give
+every conditional ``@scrudful`` and ``@scrudful_list`` an ``error=``, or the
+API an ``add_error_links``.
 
 **The error media type.** An error entity describes JSON bodies: its
 ``media_type`` must be ``application/json`` or another ``+json`` type (e.g.

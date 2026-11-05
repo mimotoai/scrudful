@@ -45,7 +45,8 @@ Validators
     calling the view: 400/412/428 as a DRF ``Response`` (a ``JsonResponse`` for
     plain Django views) with a JSON body, 304 without a body or content Links
     (each gets the HTTP Schema Resource link, see "Headers"). With an
-    ``error`` entity the 400/412/428 carry its Links and are served as JSON
+    ``error`` entity (else ``SCRUDFUL["ERROR"]``, the API-wide one) the
+    400/412/428 carry its Links and are served as JSON
     with its media type, whatever renderer DRF's content negotiation picked
     (the browsable API's included): the view's first JSON renderer renders
     them (DRF's ``JSONRenderer`` if it has none).
@@ -578,7 +579,9 @@ class ScrudfulViewFunc:
         browsable API's included): the view's first JSON renderer (one of its
         ``renderer_classes`` with an ``application/json`` or ``+json`` media
         type, else DRF's ``JSONRenderer``) renders them. Without ``error``
-        these responses carry no error Links and are rendered as before.
+        they carry ``SCRUDFUL["ERROR"]``'s Links and media type, the
+        API-wide entity, as the errors :func:`exception_handler` answers
+        do; without either, no error Links, and they are rendered as before.
     error_body_func : callable, optional
         ``error_body_func(request, result)`` returns the body (a ``dict``;
         ``request`` is the DRF ``Request``; a plain function, not ``async``)

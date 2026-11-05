@@ -95,9 +95,12 @@ Validators
     the 400, 412 and 428 bodies carry that entity's Links (its link callables
     get the loaded object) and are served with its media type, which must be
     JSON content (e.g. ``application/problem+json``); the 304 has no body and
-    gets none, and without ``error`` they carry no entity Links and are
-    ``application/json`` (on a :class:`ScrudfulRouter`, each carries the HTTP
-    Schema Resource link). Describe them in OpenAPI with
+    gets none. Without ``error`` they carry the Links and media type of the
+    entity ``responses=`` declares for their status, else of the serving
+    API's :func:`add_error_links` entity (link callables then get ``None``),
+    else no entity Links, and are ``application/json`` (on a
+    :class:`ScrudfulRouter`, each carries the HTTP Schema Resource link).
+    Describe them in OpenAPI with
     ``openapi_extra={"responses": CONDITIONAL_READ_RESPONSES}`` (or
     :data:`CONDITIONAL_WRITE_RESPONSES`). They are built fresh, without the
     headers and cookies of ninja's temporal response: with ninja's stock
@@ -432,10 +435,11 @@ OPTIONS
       evaluates the If-* headers, the early responses are added: 304, 400
       and 412 for GET/HEAD; 400, 412 and 428 for writes, only 400 and 412
       for POST. Each status with a body gets the ``content`` of its entity:
-      scrudful's own 400, 412 and 428 get ``error``'s, if declared, the
-      others ``responses[status]``, else the default entity (2xx, 201 for a
-      create, the collection for a list; never for TRACE, whose content is
-      the echoed request, not the item);
+      scrudful's own 400, 412 and 428 get ``error``'s, if declared, else
+      ``responses[status]``, else the API-wide :func:`add_error_links`
+      entity's; the others ``responses[status]``, else the default entity
+      (2xx, 201 for a create, the collection for a list; never for TRACE,
+      whose content is the echoed request, not the item);
     - each error status ``responses=`` declares, with its entity's
       ``content``: it describes every response with that status, ninja's
       own (a 401 of its authentication, a 422) included;
@@ -1101,7 +1105,8 @@ def scrudful(
         as Links on them, and of the response to an ``HttpError`` or
         ``Http404`` the operation raises, unless ``responses`` declares its
         status (see "Error responses" in the module docstring; link
-        callables then get ``None``). Without it, they carry no Link. Its
+        callables then get ``None``). Without it, they carry the API-wide
+        :func:`add_error_links` entity, if any. Its
         ``media_type`` must be JSON content (``application/json`` or
         ``+json``, e.g. ``application/problem+json``), since scrudful's error
         bodies are JSON objects; they, and the JSON responses to the errors

@@ -399,7 +399,9 @@ browsable API) still gets DRF's 406, raised before OPTIONS is handled. With
 Errors DRF raises
 -----------------
 
-An ``error`` entity gives scrudful's own 400, 412 and 428 its Links. The errors
+An ``error`` entity gives scrudful's own 400, 412 and 428 its Links; without
+one, they carry ``SCRUDFUL["ERROR"]``'s, the API-wide entity, and the HSR's
+400, 412 and 428 entries describe its content. The errors
 DRF itself raises (a serializer's 400, the 404 of ``get_object()``, a 405, a 401
 or 403) need ``exception_handler``, which settings must name::
 
@@ -556,11 +558,13 @@ use a viewset with ``scrudful_viewset``.
    response's schema: the API is then not conformant. Use the default.
 
 Set ``error=`` on every conditional decorator (or ``Meta.error`` /
-``Meta.list_error``) so that scrudful's 400, 412 and 428 carry the error
-entity's Links and are served as JSON with its ``media_type``, which must be
-JSON content (``application/json`` or ``+json``, other than JSON-LD).
-``exception_handler`` does not cover them: scrudful returns them, it does not
-raise them.
+``Meta.list_error``), or ``SCRUDFUL["ERROR"]``, which those without one fall
+back to, so that scrudful's 400, 412 and 428 carry the error entity's Links
+and are served as JSON with its ``media_type``, which must be JSON content
+(``application/json`` or ``+json``, other than JSON-LD). Without either they
+carry no error Links. ``exception_handler`` does not answer them: scrudful
+returns them, it does not raise them, and they fall back to
+``SCRUDFUL["ERROR"]`` with or without it.
 
 CORS
 ----

@@ -846,7 +846,8 @@ application does what the next list says, scrudful guarantees that:
   return absolute ones from ``location_func`` / ``href_func`` if you want
   them;
 * scrudful's own 400, 412 and 428 carry the Links of the ``error`` entity you
-  pass (for FastAPI, else of the ``add_error_links`` entity), and are served
+  pass (else of the API-wide one: ``add_error_links``'s, DRF's
+  ``SCRUDFUL["ERROR"]``), and are served
   with its ``media_type``, which must be JSON content
   (``application/json`` or ``+json``, other than JSON-LD). The same holds for
   every JSON error response that gets an error entity's Links (from the
@@ -891,11 +892,12 @@ The application must still:
   only), just the HTTP Schema Resource link, unless an entity is declared for
   that status (django-ninja's ``responses=`` or ``ScrudfulResponse.entity``);
   one it raises goes through the error-links helper.
-* **Give every conditional decorator** ``error=`` (``Meta.error`` and
-  ``Meta.list_error`` for a DRF viewset): the helpers cover the errors the
-  framework raises, not scrudful's own 400, 412 and 428, which, for DRF and
-  django-ninja, carry Links only from the decorator's ``error`` (FastAPI's
-  fall back to the ``add_error_links`` entity).
+* **Give every conditional decorator an error entity:** ``error=``
+  (``Meta.error`` and ``Meta.list_error`` for a DRF viewset), or the
+  API-wide one (``add_error_links``, DRF's ``SCRUDFUL["ERROR"]``), which
+  scrudful's own 400, 412 and 428 of a decorator without ``error=`` carry.
+  Without either, those responses have no error Links, and nothing in the
+  HSR describes their content.
 * **Give the authorization scrudful can't see to the** ``Allow`` **hook:**
   checks made in a ninja ``add_decorator`` decorator, in a FastAPI dependency
   that uses no security scheme or in a view's own code, and the object-level
@@ -1104,8 +1106,10 @@ this release, also need the 0.9.0 changes in the changelog):
       not the operation's ``error``, unless the operation declares that
       status in ``responses=``: a declared error status has its own HSR entry
       and its entity wins, on every response with that status;
-    * FastAPI: scrudful's 400, 412 and 428 of an endpoint without ``error=``
-      carry the Links and media type of the ``add_error_links`` entity;
+    * all adapters: scrudful's 400, 412 and 428 of an operation without
+      ``error=`` carry the Links and media type of the API-wide error entity
+      (``add_error_links``, DRF's ``SCRUDFUL["ERROR"]``), on the wire and in
+      the HSR (django-ninja: a ``responses=`` entity for the status first);
     * FastAPI: ``add_options(router)`` wraps the router's ``add_api_route``
       and ``include_router`` (and those of the routers included in it), so a
       resource added afterwards gets its OPTIONS and HSR routes as it is

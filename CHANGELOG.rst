@@ -88,6 +88,14 @@ Behaviour change (all adapters)
   API-wide entity's content: ninja's 401, 422 and 429 (without content when
   there is no API-wide entity) and its 403 when there is one; DRF's 401, 403,
   406 and 415 when ``SCRUDFUL["ERROR"]`` is set.
+* scrudful's early 400, 412 and 428 of an operation without ``error=`` carry
+  the Links of the API-wide error entity (ninja and FastAPI
+  ``add_error_links``, DRF ``SCRUDFUL["ERROR"]``), and its media type as
+  their ``Content-Type``, and the HSR's 400, 412 and 428 entries have its
+  content (0.9 sent them as ``application/json`` without schema or context
+  Links). For ninja, an entity ``responses=`` declares for the status comes
+  first, and the API-wide entity's link callables get ``None``; for FastAPI
+  they are called with ``request=``, as in the app's handlers.
 * Every response of a described path carries the **HSR link**: the 2xx, 304
   and HEAD responses, scrudful's early 400, 412 and 428, a 204 or an error the
   view returns, and the errors the framework answers through scrudful's error
@@ -379,12 +387,6 @@ Behaviour change (FastAPI)
 * scrudful's early 400, 412 and 428 keep the Links a dependency set on the
   injected ``Response``, merged by relation, except those with the
   ``describedby`` or an RDF context relation (0.9 dropped them all).
-* scrudful's early 400, 412 and 428 of an endpoint without ``error=`` carry
-  the Links of the app's ``add_error_links`` entity, and its media type as
-  their ``Content-Type``, and the HSR's 400, 412 and 428 entries have its
-  content (0.9 sent them as ``application/json`` without schema or context
-  Links). Its link callables are called with ``request=`` there, as in the
-  app's handlers.
 * The callables ``add_options`` calls outside the endpoint are called as
   ``func()`` (were given the URL's path parameters and the request);
   ``add_error_links``' calls are unchanged.
