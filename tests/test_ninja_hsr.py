@@ -1,5 +1,6 @@
 """The HTTP Schema Resource of a ``ScrudfulRouter`` path, built without a request."""
 
+import dataclasses
 import functools
 import json
 import re
@@ -491,6 +492,46 @@ def test_same_entity_needs_no_explicit_error_entries():
     responses = http_schema_resource(router, "/{pk}")["put"]["responses"]
     assert responses["default"]["content"] == entity_content(API_ERROR)
     assert not {"401", "422", "429"} & responses.keys()
+
+
+@dataclasses.dataclass
+class LinkBuilder:
+    """A link callable object: a dataclass with ``eq`` is unhashable, and so
+    is an ``Entity`` holding it."""
+
+    path: str
+
+    def __call__(self, request: Any, obj: Any) -> str:
+        return "https://api.example" + self.path
+
+
+def test_an_unhashable_api_wide_entity_is_described_and_served():
+    """The HSRs are kept by the entity they describe, by identity: an
+    unhashable one works end to end (GET, ``http_schema_resource`` and
+    OPTIONS, whose HSR link is served), and agrees with the wire error."""
+    error = Entity(
+        schema_link_or_func=LinkBuilder("/schemas/api-error"),
+        context_link_or_func="https://api.example/contexts/api-error",
+    )
+    with pytest.raises(TypeError):
+        hash(error)
+    api, router = make_api()
+    add_error_links(api, error)
+    client = TestClient(api)
+    assert client.get("/1").status_code == 200
+    response = options(client, "/1")
+    assert response.status_code == 204
+    assert hsr_link_problems(dict(response.headers), f"{BASE_URL}_hsr/pk") == []
+    served = client.get("/_hsr/pk")
+    assert served.status_code == 200
+    hsr = json.loads(served.content)
+    assert hsr == http_schema_resource(router, "/{pk}")
+    assert hsr["get"]["responses"]["default"]["content"] == entity_content(API_ERROR)
+    response = client.get("/1", headers={"If-Match": "garbage"})
+    assert response.status_code == 400
+    assert link_problems("GET", 400, dict(response.headers), True, hsr) == []
+    # Kept: the same document is built once.
+    assert router._hsr("/{pk}") is router._hsr("/{pk}")
 
 
 def test_operation_error_without_api_wide_entity():

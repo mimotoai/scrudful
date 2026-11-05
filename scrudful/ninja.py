@@ -1963,7 +1963,13 @@ class ScrudfulRouter(Router):
         #: The ``PathView`` of each path, as given to the operation decorator.
         self._scrudful_paths: dict[str, Any] = {}
         #: The HTTP Schema Resource of each path, once built.
-        self._scrudful_hsrs: dict[Any, dict[str, Any]] = {}
+        #: The built HTTP Schema Resource of each path and API-wide entity
+        #: (see :meth:`_hsr`), keyed by the entity's identity (an entity may
+        #: be unhashable, e.g. with a dataclass link callable): the value
+        #: holds the entity, which keeps it alive, so its id is not reused.
+        self._scrudful_hsrs: dict[
+            tuple[str, int], tuple[Entity | None, dict[str, Any]]
+        ] = {}
         #: The URL name of the HSR route of each path that has one, as the
         #: router's operation has it (see :func:`_hsr_url_name`).
         self._scrudful_hsr_url_names: dict[str, str] = {}
@@ -2258,23 +2264,24 @@ class ScrudfulRouter(Router):
         else (no ``api``) the one of the APIs mounting the router
         (:func:`_api_error`).
 
-        Kept per path and API-wide entity, which is looked up first: an API
-        mounting the router later (ninja's ``add_router``, which clears
-        nothing) gets the document of its own entity.
+        Kept per path and API-wide entity (by identity), which is looked up
+        first: an API mounting the router later (ninja's ``add_router``,
+        which clears nothing) gets the document of its own entity.
         """
         api_error = _api_error(self) if api is None else _API_ERRORS.get(api)
-        key = (path, api_error)
-        hsr = self._scrudful_hsrs.get(key)
-        if hsr is None:
-            path_view = self._scrudful_paths.get(path)
-            if path_view is None:
-                raise ConfigError(
-                    f"{path!r} is not a path of this ScrudfulRouter (its paths "
-                    f"are {sorted(self._scrudful_paths)}): give the path as "
-                    "given to the operation decorator"
-                )
-            hsr = _describe_path(self, path_view, api_error)
-            self._scrudful_hsrs[key] = hsr
+        key = (path, id(api_error))
+        kept = self._scrudful_hsrs.get(key)
+        if kept is not None and kept[0] is api_error:
+            return kept[1]
+        path_view = self._scrudful_paths.get(path)
+        if path_view is None:
+            raise ConfigError(
+                f"{path!r} is not a path of this ScrudfulRouter (its paths "
+                f"are {sorted(self._scrudful_paths)}): give the path as "
+                "given to the operation decorator"
+            )
+        hsr = _describe_path(self, path_view, api_error)
+        self._scrudful_hsrs[key] = (api_error, hsr)
         return hsr
 
     def _base_url(self) -> str | None:
