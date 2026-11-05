@@ -1114,11 +1114,12 @@ does not validate, the 401 of missing credentials, the 403 of an
 handlers. A scrudful operation declaring the status in ``responses=`` gives
 them that entity's Links (with or without an API-wide entity);
 :func:`~scrudful.ninja.add_error_links` gives the others an API-wide error
-entity. Without one, the 401 and 403 of a scrudful operation with an
-``error`` (missing credentials, an ``AuthorizationError``, a CSRF failure)
-carry ``error``'s Links, as the 401s and 403s the operation raises do, so
-every 401 and 403 agrees with the HSR's ``default`` entry; its 422 and 429
-carry none, and the HSR lists them without content:
+entity. Without one, the 401, 403, 422 and 429 of a scrudful operation with
+an ``error`` (missing credentials, an ``AuthorizationError``, a CSRF failure,
+a parameter that does not validate, a throttle) carry ``error``'s Links and
+media type, as those the operation raises do (a problem-details ``error``
+reshapes the validation 422 as problem details), so each agrees with the
+HSR's ``default`` entry:
 
 .. code-block:: python
 

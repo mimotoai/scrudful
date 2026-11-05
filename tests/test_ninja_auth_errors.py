@@ -6,7 +6,7 @@ answers it before the operation runs (a CSRF failure, an
 ``AuthorizationError``, an ``HttpError`` of an auth callback) or ``before=``,
 ``after_throttles=``, ``load`` or the operation raises it, carries the
 API-wide entity, which the HSR's explicit entries describe. Without an
-API-wide entity, every 401 and 403 carries the operation's ``error``, which
+API-wide entity, every one of them carries the operation's ``error``, which
 the HSR's ``default`` describes. The module is its own URLconf.
 """
 
@@ -19,6 +19,7 @@ from django.urls import path
 from ninja import NinjaAPI, Schema
 from ninja.errors import AuthorizationError, HttpError
 from ninja.security import APIKeyCookie, APIKeyHeader
+from ninja.throttling import BaseThrottle
 
 from scrudful.ninja import Entity, ScrudfulRouter, add_error_links, scrudful
 from scrudful.problem import PROBLEM_JSON
@@ -130,8 +131,20 @@ api = NinjaAPI(urls_namespace="auth-errors")
 api.add_router("/things", router)
 add_error_links(api, API_WIDE)
 
-#: The same operations without an API-wide entity: every 401 and 403 of an
-#: operation carries its ``error``, which the HSR's ``default`` describes.
+
+class Throttle(BaseThrottle):
+    """Refuses a request sending ``X-Throttle: yes``."""
+
+    def allow_request(self, request: Any) -> bool:
+        return request.headers.get("X-Throttle") != "yes"
+
+    def wait(self) -> None:
+        return None
+
+
+#: The same operations without an API-wide entity: every 401, 403, 422 and
+#: 429 of an operation carries its ``error``, which the HSR's ``default``
+#: describes.
 plain_router = ScrudfulRouter(base_url=BASE_URL)
 plain_router.add_api_operation(
     "/{pk}",
@@ -139,6 +152,7 @@ plain_router.add_api_operation(
     scrudful(load=load, error=OWN, before=before, **LINKS)(get_thing),
     response=Thing,
     auth=Key(),
+    throttle=[Throttle()],
 )
 plain_router.add_api_operation(
     "/{pk}",
@@ -152,7 +166,28 @@ plain_router.add_api_operation(
 plain_api = NinjaAPI(urls_namespace="auth-errors-plain")
 plain_api.add_router("/things", plain_router)
 
-urlpatterns = [path("p/", api.urls), path("q/", plain_api.urls)]
+#: A problem-details ``error`` without an API-wide entity: ninja's validation
+#: 422 is reshaped as problem details, as the entity describes it.
+PROBLEM = Entity(
+    "https://api.example/schemas/problem.json",
+    context_link_or_func="https://api.example/contexts/problem.jsonld",
+    media_type=PROBLEM_JSON,
+)
+problem_router = ScrudfulRouter(base_url=BASE_URL)
+problem_router.add_api_operation(
+    "/{pk}",
+    ["GET"],
+    scrudful(load=load, error=PROBLEM, **LINKS)(get_thing),
+    response=Thing,
+)
+problem_api = NinjaAPI(urls_namespace="auth-errors-problem")
+problem_api.add_router("/things", problem_router)
+
+urlpatterns = [
+    path("p/", api.urls),
+    path("q/", plain_api.urls),
+    path("r/", problem_api.urls),
+]
 
 
 def hsr_of(client: Client, url: str) -> dict:
@@ -235,13 +270,11 @@ def test_other_errors_keep_the_operations_entity():
     assert schema_links(response) == [OWN.schema_link_or_func]
 
 
-def test_without_an_api_wide_entity_401_and_403_are_under_default():
+def test_without_an_api_wide_entity_the_framework_errors_are_under_default():
     responses = hsr_of(Client(), "/q/things/_hsr/pk")["get"]["responses"]
-    # ninja's own 422 and 429 carry no entity: explicit entries without
-    # content. Every 401 and 403 carries the operation's: default.
-    assert {"422", "429"} <= responses.keys()
-    assert "content" not in responses["422"]
-    assert not {"401", "403"} & responses.keys()
+    # Every 401, 403, 422 and 429 carries the operation's ``error``, which
+    # ``default`` describes: no explicit entry.
+    assert not {"401", "403", "422", "429"} & responses.keys()
     [schema] = [
         entry["schema"]["$ref"] for entry in responses["default"]["content"].values()
     ]
@@ -332,3 +365,54 @@ def test_a_raised_403_of_load_carries_the_api_wide_entity():
     assert response.status_code == 403
     assert link_problems("GET", 403, dict(response.items()), True, hsr) == []
     assert schema_links(response) == [API_WIDE.schema_link_or_func]
+
+
+@pytest.mark.parametrize(
+    "url, headers, status",
+    [
+        # ninja answers them before the operation runs.
+        ("/q/things/abc", {"X-Key": "ok"}, 422),
+        ("/q/things/1", {"X-Key": "ok", "X-Throttle": "yes"}, 429),
+        # before= raises them.
+        ("/q/things/1", {"X-Key": "ok", "X-Before": "422"}, 422),
+        ("/q/things/1", {"X-Key": "ok", "X-Before": "429"}, 429),
+        # load raises them.
+        ("/q/things/1422", {"X-Key": "ok"}, 422),
+        # The operation raises them.
+        ("/q/things/422", {"X-Key": "ok"}, 422),
+        ("/q/things/429", {"X-Key": "ok"}, 429),
+    ],
+    ids=[
+        "validation",
+        "throttle",
+        "before-422",
+        "before-429",
+        "load-422",
+        "op-422",
+        "op-429",
+    ],
+)
+def test_without_an_api_wide_entity_422_and_429_carry_the_operations_entity(
+    url, headers, status
+):
+    """ninja's own 422 and 429 carry the operation's ``error``, as those it
+    raises do, so each agrees with the entry Agreement picks."""
+    client = Client()
+    hsr = hsr_of(client, "/q/things/_hsr/pk")
+    response = client.get(url, headers=headers)
+    assert response.status_code == status
+    assert status_entry_problems("GET", status, hsr) == []
+    assert link_problems("GET", status, dict(response.items()), True, hsr) == []
+    assert schema_links(response) == [OWN.schema_link_or_func]
+
+
+def test_without_an_api_wide_entity_a_problem_error_reshapes_the_validation_422():
+    client = Client()
+    hsr = hsr_of(client, "/r/things/_hsr/pk")
+    response = client.get("/r/things/abc")
+    assert response.status_code == 422
+    assert response["Content-Type"].startswith(PROBLEM_JSON)
+    body = json.loads(response.content)
+    assert body["status"] == 422 and isinstance(body["errors"], list)
+    assert link_problems("GET", 422, dict(response.items()), True, hsr) == []
+    assert schema_links(response) == [PROBLEM.schema_link_or_func]

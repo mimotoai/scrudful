@@ -215,13 +215,15 @@ Behaviour change (ninja)
   did, so each agrees with the HSR, which lists a 401, 403, 422 and 429
   entry with that entity. This applies only to the statuses the operation
   doesn't declare in ``responses=``.
-* Without ``add_error_links``, ninja's own 401 and 403 for a scrudful
-  operation with an ``error`` (its authentication, an ``AuthorizationError``,
-  a failed CSRF check) carry that ``error``'s **Links** and media type (they
-  carried none), as the 401s and 403s the operation raises do, and the HSR
-  lists neither status explicitly (it listed a 401 without content), so
-  every 401 and 403 agrees with its ``default`` entry. Its 422 and 429 still
-  carry none, under entries without content.
+* Without ``add_error_links``, ninja's own 401, 403, 422 and 429 for a
+  scrudful operation with an ``error`` (its authentication, an
+  ``AuthorizationError``, a failed CSRF check, its request validation, its
+  throttles) carry that ``error``'s **Links** and media type (they carried
+  none), as those the operation raises do; a problem-details ``error``
+  reshapes the validation 422 as problem details. The HSR lists none of
+  these statuses explicitly (it listed a 401, 422 and 429 without content),
+  so each agrees with its ``default`` entry. A status declared in
+  ``responses=`` keeps its own entity.
 * An error status declared in ``responses=`` has an HSR entry of its own,
   with that entity's content, and that entity wins on the wire too: the
   errors ninja answers before the operation (its authentication's 401 and

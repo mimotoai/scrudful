@@ -538,11 +538,9 @@ def test_operation_error_without_api_wide_entity():
     _, router = make_api(error=OP_ERROR)
     responses = http_schema_resource(router, "/{pk}")["get"]["responses"]
     assert responses["default"]["content"] == entity_content(OP_ERROR)
-    # ninja's own 422 and 429 carry no error entity: no content.
-    for key in ("422", "429"):
-        assert "content" not in responses[key] and responses[key]["description"]
-    # Its 401 and 403 carry the operation's, as the operation's own do.
-    assert not {"401", "403"} & responses.keys()
+    # ninja's own 401, 403, 422 and 429 carry the operation's, as the
+    # operation's own do: under default.
+    assert not {"401", "403", "422", "429"} & responses.keys()
 
 
 def test_no_error_entity_gives_a_default_entry_without_content():
