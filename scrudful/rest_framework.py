@@ -2967,7 +2967,10 @@ def _check_hsr_options(hsr_route: Any, hsr_url: Any, hsr_cache_control: Any) -> 
             f"{type(hsr_cache_control).__name__}"
         )
     if hsr_cache_control is not None:
-        check_hsr_cache_control(hsr_cache_control, "Meta.hsr_cache_control")
+        try:
+            check_hsr_cache_control(hsr_cache_control, "Meta.hsr_cache_control")
+        except HsrConfigError as exc:
+            raise ImproperlyConfigured(str(exc)) from exc
 
 
 def _describe_mode_view(view_func: Callable[..., Any]) -> APIView:
