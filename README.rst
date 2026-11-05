@@ -263,7 +263,10 @@ order:
    ============  ===========================================  ==========================================
 
    No throttle and no handler runs per method: computing ``Allow`` uses no
-   throttle quota and writes nothing.
+   throttle quota and writes nothing. For FastAPI, though, a security
+   dependency runs whole, with the plain dependencies nested inside it (a
+   database session, a throttle a ``get_current_user`` depends on): those run
+   for each method checked.
 5. ``Allow`` lists the allowed methods and ``OPTIONS``; ``HEAD`` only when the
    path serves it. A 405 keeps RFC 9110's ``Allow`` for django-ninja and DRF:
    every method the path serves, whoever asks (FastAPI's 405 is
@@ -966,15 +969,21 @@ between spec commits ``bcc338e`` and ``37ec1ce``. For a project on 0.9
    ``Meta.allowed_func`` (or ``allowed_func=`` on a decorator),
    ``allowed_func(view, request, method, obj) -> bool``; for django-ninja,
    ``ScrudfulRouter(allowed=...)`` (or ``allowed=`` on a decorator),
-   ``allowed(request, method, obj) -> bool``. Check the requester's permission
-   for ``method`` (``http.<METHOD>``) against the policy, and its conditions
-   against ``obj`` when there is one. ``obj`` is ``None`` for a collection,
-   and, under django-ninja, also on an item URL when the GET operation's
-   ``auth=`` or ``before=`` refused the requester (the object is then not
-   loaded). Under DRF, a hook makes OPTIONS load the object for every
-   requester, so ``get_object()`` must hide, with a 404, the objects a
-   requester may not see. Without a hook, the permission classes (DRF) or
-   ``auth=`` and ``before=`` (ninja) decide.
+   ``allowed(request, method, obj) -> bool``; for FastAPI,
+   ``add_options(app, allowed=..., load=...)``, with
+   ``allowed(request, method, obj) -> bool`` and
+   ``load(request, **path_params)`` returning the object (``None`` for none).
+   Check the requester's permission for ``method`` (``http.<METHOD>``)
+   against the policy, and its conditions against ``obj`` when there is one.
+   ``obj`` is ``None`` for a collection, and, under django-ninja, also on an
+   item URL when the GET operation's ``auth=`` or ``before=`` refused the
+   requester (the object is then not loaded). Under DRF and FastAPI, a hook
+   makes OPTIONS load the object for every requester, so ``get_object()``
+   (DRF) or ``load`` (FastAPI) must hide, with a 404 or ``None``, the objects
+   a requester may not see. A denial the hook raises (a 401 or 403) refuses
+   the method; a 404 it raises answers the OPTIONS. Without a hook, the
+   permission classes (DRF), ``auth=`` and ``before=`` (ninja) or the security
+   dependencies (FastAPI) decide.
 6. **Update the tests that assert the 200 OPTIONS body.** OPTIONS is now a 204
    without content, ``Allow`` depends on the requester, and the document is
    at the target of the response's HTTP Schema Resource link: GET it there. It
