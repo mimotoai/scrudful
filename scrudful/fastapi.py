@@ -275,15 +275,18 @@ def scrudful(
         route's OpenAPI ``responses=`` with :data:`CONDITIONAL_READ_RESPONSES`
         and :data:`CONDITIONAL_WRITE_RESPONSES`. With ``error``, the 400, 412
         and 428 carry its Links (not the endpoint's) and are served with its
-        ``media_type`` as their Content-Type; without it they carry no Link
-        and are ``application/json``. Headers dependencies set on the
+        ``media_type`` as their Content-Type; without it, those of the app's
+        :func:`add_error_links` entity (its callables called with
+        ``request=`` only, as in the app's handlers), as the errors raised
+        for the endpoint get; without either they carry no Link and are
+        ``application/json``. Headers dependencies set on the
         injected ``Response`` are kept: all of them on a 304 (except
         ``Content-*`` metadata), only ``Set-Cookie`` and ``Link`` on the
         others. Of the Links a dependency set, those with the
         ``describedby`` relation or an RDF context one (JSON-LD's or
         ``rdf-context``) are dropped from the 400, 412 and 428: they
         describe the success representation, and the body is the error's,
-        which only ``error``'s Links describe. The others (an ``author``
+        which only the error entity's Links describe. The others (an ``author``
         link, say) are kept, before the error's Links and the HSR link; one
         with the HSR relation replaces scrudful's.
 
@@ -383,8 +386,9 @@ def scrudful(
         return ``Response(..., media_type="text/csv")``). Without it, the
         content is ``application/json`` with the link options' links.
     error : Entity, optional
-        The schema and context of scrudful's own 400, 412 and 428 bodies.
-        Its link callables get the endpoint's keyword arguments, like the
+        The schema and context of scrudful's own 400, 412 and 428 bodies
+        (without it, :func:`add_error_links`'s entity of the app describes
+        them). Its link callables get the endpoint's keyword arguments, like the
         other callbacks. Its ``media_type`` must be JSON content
         (``application/json`` or ``+json``, e.g.
         ``application/problem+json``), since those bodies are JSON objects.
@@ -469,10 +473,14 @@ def scrudful(
         hsr: str | None,
     ) -> Response:
         result = with_error_body(error_body_func, request, result)
-        if result.body is None or error is None:
+        entity, entity_kwargs = error, kwargs
+        if entity is None:
+            # The entity the app's handlers give the errors raised for it.
+            entity, entity_kwargs = _app_error(request), {"request": request}
+        if result.body is None or entity is None:
             return _conditional_response(result, injected, hsr=hsr)
-        links = await _entity_links(error, kwargs, base)
-        return _conditional_response(result, injected, links, error.media_type, hsr)
+        links = await _entity_links(entity, entity_kwargs, base)
+        return _conditional_response(result, injected, links, entity.media_type, hsr)
 
     def decorator(endpoint: Endpoint) -> Endpoint:
         if inspect.isgeneratorfunction(endpoint) or inspect.isasyncgenfunction(
@@ -634,7 +642,9 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
     the first request).
 
     scrudful's own 400, 412 and 428 are returned by the endpoint, not raised:
-    they get the ``error`` of :func:`scrudful`, not this one.
+    they get the ``error`` of :func:`scrudful` when it has one, else this one
+    (its callables called with ``request=`` only, as here), on the wire and
+    in the HTTP Schema Resource.
 
     Parameters
     ----------
@@ -810,6 +820,16 @@ def _live_base(request: Request, endpoint: Any = None) -> str:
     if isinstance(options, _HsrOptions) and options.explicit and options.base_url:
         return options.base_url
     return str(request.url)
+
+
+def _app_error(request: Request) -> Entity | None:
+    """The :func:`add_error_links` entity of the app serving ``request``
+    (whose exception handlers answer the errors raised for it), if any."""
+    app = request.scope.get("app")
+    try:
+        return _APP_ERRORS.get(app)
+    except TypeError:  # not weakly referenceable
+        return None
 
 
 def _raised_entity(request: Request, error: Entity) -> tuple[Entity, dict[str, Any]]:
@@ -1177,7 +1197,8 @@ def add_options(
       endpoint's ``entity`` (by default ``application/json``, from the link
       options: a ``schema`` ``$ref`` and an ``x-rdf-context``), and, when it
       has validator callbacks, scrudful's 304, 400 and 412, the 400 and 412
-      with the content of its ``error``;
+      with the content of its ``error``, else of :func:`add_error_links`'s
+      entity (none without either);
     - a scrudful HEAD: the same responses, without content;
     - a scrudful TRACE: its success status, without content: a TRACE's
       content is the echoed request, which the endpoint's links don't
@@ -1186,7 +1207,8 @@ def add_options(
       endpoint's content, when the endpoint takes a body; DELETE has none),
       the success status with that content (but a 204), and, when
       conditional, scrudful's 400, 412 and (but for POST) 428 with the
-      ``error`` content and the precondition header parameters;
+      content of the ``error`` (else of :func:`add_error_links`'s entity)
+      and the precondition header parameters;
     - ``options``: ``{"responses": {"204": {"description": "No Content"}}}``;
     - a method served by a route that isn't scrudful: its success status,
       without content or a request body.
@@ -1834,9 +1856,11 @@ def _describe_route(
     content = error_content = None
     if config is not None and with_content and method != "trace":
         content = yield from media(config, config.media_type, str(status))
-    if conditional and with_content and config.error is not None:
-        # scrudful's own 400, 412 and 428
-        error_content = yield from media(config.error, config.error.media_type, "400")
+    # The entity of scrudful's own 400, 412 and 428: the endpoint's error,
+    # else the app's (see early_response in scrudful).
+    own_error = api_error if config is None or config.error is None else config.error
+    if conditional and with_content and own_error is not None:
+        error_content = yield from media(own_error, own_error.media_type, "400")
     if method in ("get", "head", "trace"):
         description = describe_read(None, conditional, [status], error_content)
         if content and has_default_entity(method, status):
@@ -2371,7 +2395,7 @@ async def _hooked(
     """``allowed(clone, method, obj)``, with ``clone`` a copy of ``request``
     whose method is ``method`` (sync hooks run in the threadpool, an
     awaitable result is awaited). An ``HTTPException`` 401 or 403 it raises
-    means not allowed (R30, as DRF's and ninja's hooks); anything else it
+    means not allowed (as with DRF's and ninja's hooks); anything else it
     raises propagates (an ``HTTPException``, a 404 included, is then the
     OPTIONS's answer).
 
@@ -3675,10 +3699,11 @@ def _conditional_response(
     :func:`scrudful._adapter.merge_links`). On the 400, 412 and 428 an
     injected link with the ``describedby`` relation or an RDF context one
     (JSON-LD's or ``rdf-context``; relations compared case-insensitively)
-    is dropped (ruling R27): a dependency's schema and context links
-    describe the success representation, not the error body, which only the
-    ``error`` entity's describe (and without one nothing does). A 304 keeps
-    them: it stands for the success representation.
+    is dropped: a dependency's schema and context links describe the
+    success representation, not the error body, which only the error
+    entity's describe (the endpoint's ``error``, else the app's; without one
+    nothing does). A 304 keeps them: it stands for the success
+    representation.
     """
     if result.body is None:
         response = Response(status_code=result.status, headers=result.headers)

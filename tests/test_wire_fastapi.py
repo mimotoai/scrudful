@@ -304,6 +304,13 @@ def wire_app() -> FastAPI:
     async def described(nid: int):
         return {"id": nid, "name": find(nid)["name"]}
 
+    @app.get("/bare/{nid}")
+    @app.put("/bare/{nid}")
+    @scrudful(etag_func=note_etag, entity=NOTE)
+    async def bare(nid: int):
+        # No error=: scrudful's own 400, 412 and 428 get the app's entity.
+        return {"id": nid, "name": find(nid)["name"]}
+
     @app.get("/boom/{nid}")
     @scrudful(entity=NOTE, error=PROBLEM)
     async def boom(nid: int):
@@ -416,6 +423,7 @@ KINDS = {
     "described": Kind(
         "wire", "/described/{nid}", "/described/1", "/_hsr/described.nid"
     ),
+    "bare": Kind("wire", "/bare/{nid}", "/bare/1", "/_hsr/bare.nid"),
     "boom": Kind("wire", "/boom/{nid}", "/boom/1", "/_hsr/boom.nid"),
     "returned": Kind("wire", "/returned/{nid}", "/returned/1", "/_hsr/returned.nid"),
     "hooked": Kind("hooked", "/items/{iid}", "/h/items/1", "/h/_hsr/items.iid"),
@@ -576,6 +584,12 @@ def wire_exchanges() -> list[Exchange]:
         on("described")("GET 400", "GET", 400, MALFORMED),
         on("described")("GET 412", "GET", 412, STALE),
         on("described")("PUT 428", "PUT", 428),
+        on("bare")("GET 200", "GET", 200),
+        on("bare")("GET 304", "GET", 304, FRESH),
+        on("bare")("GET 400", "GET", 400, MALFORMED),
+        on("bare")("GET 412", "GET", 412, STALE),
+        on("bare")("PUT 428", "PUT", 428),
+        on("bare")("PUT 412", "PUT", 412, STALE),
         on("boom")("GET 500", "GET", 500),
         on("boom")("GET 500 JSON", "GET", 500, JSON),
         unknown("wire", "unknown URL 404", "/nope"),

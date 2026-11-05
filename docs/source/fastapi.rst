@@ -125,7 +125,8 @@ requester. For each method of the path, in the order ``get``, ``put``,
   status with the error entity's content. A status set at run time
   (``response.status_code = 201``) can't be known: declare it;
 * scrudful's 304, 400, 412 and 428 when the endpoint is conditional, with the
-  ``error`` content and the precondition headers;
+  content of its ``error`` (else of ``add_error_links``'s entity) and the
+  precondition headers;
 * a ``default`` entry, with the content of the entity the errors raised for
   the endpoint get: its ``error``, else ``add_error_links``'s (no content
   without ``add_error_links``);
@@ -338,9 +339,11 @@ The HSR agrees: a route whose ``status_code`` is not such a 2xx is described
 without content.
 
 scrudful's own 400, 412 and 428 are returned by the endpoint, not raised, so
-no exception handler sees them: they carry Links only from the decorator's
-``error``. Give every conditional ``@scrudful(...)`` an ``error=``, also with
-:func:`~scrudful.fastapi.add_error_links` installed. A Link a dependency set on
+no exception handler sees them: they carry the Links of the decorator's
+``error``, else of the app's :func:`~scrudful.fastapi.add_error_links` entity
+(its callables called with ``request=`` only, as in the app's handlers), and
+the HSR describes them with that entity's content. Without either they carry
+no schema or context Link. A Link a dependency set on
 the injected ``Response`` stays on them, merged by relation, except one with
 the ``describedby`` relation or an RDF context one: that describes the success
 content, and the body is the error's.
@@ -388,8 +391,8 @@ An error entity describes JSON bodies: its ``media_type`` must be
 ``application/json`` or another ``+json`` type (e.g.
 ``application/problem+json``), other than JSON-LD; anything else raises
 ``ValueError``. scrudful's own 400, 412 and 428 are served with the endpoint's
-``error.media_type`` as their ``Content-Type`` (``application/json`` without
-an ``error``). The responses :func:`~scrudful.fastapi.add_error_links` touches
+``error.media_type`` as their ``Content-Type``, else with that of
+``add_error_links``'s entity (``application/json`` without either). The responses :func:`~scrudful.fastapi.add_error_links` touches
 are those with JSON content only, and each is served with the entity's
 ``media_type``, whatever the handler chose: a custom handler's
 ``application/json`` response is relabelled, say, ``application/problem+json``,

@@ -1640,6 +1640,60 @@ def test_early_responses_without_error_are_unchanged(make_client, store):
     assert response.headers["content-type"] == "application/json"
 
 
+@pytest.mark.parametrize(
+    "method, headers, status",
+    [
+        ("PUT", {"If-Match": '"other"'}, 412),
+        ("PUT", {}, 428),
+        ("GET", {"If-None-Match": "v1"}, 400),
+    ],
+)
+def test_early_responses_without_error_get_the_app_s_error_entity(
+    make_client, store, method, headers, status
+):
+    """Without the endpoint's ``error``, scrudful's own 400, 412 and 428 are
+    described by the app's ``add_error_links`` entity, on the wire and in the
+    HSR, as the errors the app's handlers answer for it are. Its callables get
+    ``request=`` only, as in those handlers."""
+    seen = []
+
+    def schema(request=None):  # None in describe mode
+        seen.append(type(request).__name__)
+        return "/schemas/error"
+
+    app = _error_app(store, error=None)
+    add_error_links(
+        app,
+        Entity(
+            schema_link_or_func=schema,
+            context_link_or_func="http://example.com/error.jsonld",
+            media_type="application/problem+json",
+        ),
+    )
+    add_options(app, base_url="http://testserver/")
+    response = make_client(app).request(method, "/items/3", headers=headers)
+    assert response.status_code == status
+    assert response.headers["content-type"] == "application/problem+json"
+    hsr_link = (
+        '<http://testserver/_hsr/items.item_id>; rel="https://w3id.org/'
+        'semantic-http/ns#http-schema-resource-document"; type="application/json"'
+    )
+    assert response.headers["link"] == f"{ERROR_LINKS}, {hsr_link}"
+    assert "Request" in seen
+    hsr = http_schema_resource(app, "/items/{item_id}")
+    entry = hsr[method.lower()]["responses"][str(status)]
+    assert entry["content"] == {
+        "application/problem+json": {
+            "schema": {"$ref": "http://testserver/schemas/error"},
+            "x-rdf-context": {
+                "href": "http://example.com/error.jsonld",
+                "type": "application/ld+json",
+            },
+        }
+    }
+    assert link_problems(method, status, response.headers, True, hsr) == []
+
+
 def test_error_link_callables_get_the_endpoint_kwargs(make_client, store):
     app = FastAPI()
     received = []

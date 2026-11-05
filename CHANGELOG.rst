@@ -365,6 +365,12 @@ Behaviour change (FastAPI)
 * scrudful's early 400, 412 and 428 keep the Links a dependency set on the
   injected ``Response``, merged by relation, except those with the
   ``describedby`` or an RDF context relation (0.9 dropped them all).
+* scrudful's early 400, 412 and 428 of an endpoint without ``error=`` carry
+  the Links of the app's ``add_error_links`` entity, and its media type as
+  their ``Content-Type``, and the HSR's 400, 412 and 428 entries have its
+  content (they had no schema or context Link, nor content, while the
+  ``application/json`` they were served as was described). Its link callables
+  are called with ``request=`` there, as in the app's handlers.
 * The callables ``add_options`` calls outside the endpoint are called as
   ``func()`` (were given the URL's path parameters and the request);
   ``add_error_links``' calls are unchanged.
