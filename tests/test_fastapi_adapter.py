@@ -516,6 +516,7 @@ def test_returned_response_gets_the_headers(make_client, store):
         etag_func=store.etag,
         last_modified_func=store.last_modified,
         schema_link_or_func=SCHEMA,
+        context_link_or_func=CONTEXT,
     )
     async def get_items():
         return JSONResponse({"a": 1}, headers={"X-Own": "1"})
@@ -525,7 +526,7 @@ def test_returned_response_gets_the_headers(make_client, store):
     assert response.headers["x-own"] == "1"
     assert response.headers["etag"] == '"v1"'
     assert response.headers["last-modified"] == MODIFIED_HTTP
-    assert response.headers["link"] == SCHEMA_LINK
+    assert response.headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
     assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
 
 
@@ -573,7 +574,9 @@ def test_http_exception_propagates_unchanged(make_client, store):
     app = FastAPI()
 
     @app.get("/items")
-    @scrudful(etag_func=store.etag, schema_link_or_func=SCHEMA)
+    @scrudful(
+        etag_func=store.etag, schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT
+    )
     async def get_items():
         raise HTTPException(status_code=409, detail="nope", headers={"X-A": "b"})
 
@@ -762,6 +765,7 @@ def test_link_defaults_and_custom_values(make_client):
         schema_link_or_func=SCHEMA,
         schema_rel_or_func=lambda **kwargs: None,
         schema_type_or_func=lambda **kwargs: "",
+        context_link_or_func=CONTEXT,
     )
     async def callable_defaults():
         return {}
@@ -776,7 +780,9 @@ def test_link_defaults_and_custom_values(make_client):
     response = client.get("/none")
     assert "link" not in response.headers
     assert response.headers["access-control-expose-headers"] == "Link, Allow"
-    assert client.get("/callable-defaults").headers["link"] == SCHEMA_LINK
+    assert client.get("/callable-defaults").headers["link"] == (
+        f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+    )
 
 
 def test_link_values_are_escaped(make_client):
@@ -1092,7 +1098,7 @@ def test_no_preconditions_without_validator_callbacks(make_client):
     app = FastAPI()
 
     @app.api_route("/item", methods=["GET", "PUT", "DELETE"])
-    @scrudful(schema_link_or_func=SCHEMA)
+    @scrudful(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
     async def item():
         return {}
 
@@ -1101,7 +1107,7 @@ def test_no_preconditions_without_validator_callbacks(make_client):
         for headers in ({}, {"If-Match": "*"}, {"If-Match": "x"}):
             response = client.request(method, "/item", headers=headers)
             assert response.status_code == 200
-            assert response.headers["link"] == SCHEMA_LINK
+            assert response.headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
             assert "etag" not in response.headers
 
 
@@ -1586,7 +1592,7 @@ def _error_app(store, error=ERROR):
     app = FastAPI()
 
     @app.api_route("/items/{item_id}", methods=["GET", "PUT"])
-    @scrudful(etag_func=store.etag, schema_link_or_func=SCHEMA, error=error)
+    @scrudful(etag_func=store.etag, **ITEM_LINKS, error=error)
     async def item(item_id: int):
         return {}
 
@@ -1778,7 +1784,9 @@ def test_relative_link_resolved(make_client):
         return {}
 
     @app.get("/network-path")
-    @scrudful(schema_link_or_func="//cdn.example/schema.json")
+    @scrudful(
+        schema_link_or_func="//cdn.example/schema.json", context_link_or_func=CONTEXT
+    )
     async def network_path():
         return JSONResponse({})
 
@@ -1835,7 +1843,7 @@ def test_endpoint_config_is_attached():
     def etag(**kwargs):
         return "x"
 
-    @scrudful(etag_func=etag, schema_link_or_func=SCHEMA, error=ERROR)
+    @scrudful(etag_func=etag, **ITEM_LINKS, error=ERROR)
     async def get_item(item_id: int, req: Request):
         return {}
 
@@ -1849,7 +1857,7 @@ def test_endpoint_config_is_attached():
         schema_link_or_func=SCHEMA,
         schema_rel_or_func=None,
         schema_type_or_func=None,
-        context_link_or_func=None,
+        context_link_or_func=CONTEXT,
         context_rel_or_func=None,
         context_type_or_func=None,
         error=ERROR,
@@ -3443,7 +3451,7 @@ def test_a_view_s_own_hsr_link_wins(make_client, store):
     app = FastAPI()
 
     @app.get("/items/{item_id}")
-    @scrudful(etag_func=store.etag, schema_link_or_func=SCHEMA, error=ERROR)
+    @scrudful(etag_func=store.etag, **ITEM_LINKS, error=ERROR)
     async def get_item(item_id: int, response: Response):
         if item_id == 404:
             raise HTTPException(404, headers={"Link": hsr_link(own)})
@@ -3589,7 +3597,7 @@ def _boom_app(*, endpoint_error=None, **app_options) -> FastAPI:
     app = FastAPI(**app_options)
 
     @app.get("/items/{item_id}")
-    @scrudful(schema_link_or_func=SCHEMA, error=endpoint_error)
+    @scrudful(**ITEM_LINKS, error=endpoint_error)
     async def item(item_id: int):
         raise RuntimeError("boom")
 
@@ -3716,7 +3724,7 @@ def _validated_app() -> FastAPI:
     app = FastAPI()
 
     @app.post("/items/{item_id}")
-    @scrudful(schema_link_or_func=SCHEMA)
+    @scrudful(**ITEM_LINKS)
     async def create(item_id: int, body: _Positive):
         return {}
 

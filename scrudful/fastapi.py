@@ -411,6 +411,10 @@ def scrudful(
         an :class:`Entity`, or ``entity`` is given with a link option.
     ValueError
         If ``error``'s media type is not JSON content.
+    scrudful.entity.HsrConfigError
+        A ``ValueError``: if ``schema_link_or_func`` is a value (not a
+        callable) and there is no ``context_link_or_func``, as
+        :class:`Entity` refuses it.
     """
     check_validators(etag_func, last_modified_func)
     links_given = dict(
@@ -422,6 +426,11 @@ def scrudful(
         context_type_or_func=context_type_or_func,
     )
     _check_entity(entity, links_given)
+    if entity is None:
+        # The link options are an application/json entity: Entity holds the
+        # rules (a schema link with no context link is refused now, not when
+        # the HTTP Schema Resource is first built).
+        Entity(**links_given)
     _check_error(error)
     check_error_body_func(error_body_func)
     has_validators = etag_func is not None or last_modified_func is not None
@@ -1514,8 +1523,6 @@ def _run_describing(flow: _Flow[T]) -> T:
             func, where = flow.send(result)
         except StopIteration as stop:
             return stop.value
-        except HsrConfigError as exc:
-            raise ValueError(str(exc)) from exc
         try:
             result = func()
             if inspect.isawaitable(result):
@@ -1533,8 +1540,6 @@ async def _run_describing_async(flow: _Flow[T]) -> T:
             func, where = flow.send(result)
         except StopIteration as stop:
             return stop.value
-        except HsrConfigError as exc:
-            raise ValueError(str(exc)) from exc
         try:
             result = await _call(func, {})
         except Exception as exc:

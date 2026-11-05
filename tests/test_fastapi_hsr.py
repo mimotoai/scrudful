@@ -632,9 +632,8 @@ def test_relative_link_without_base_url_raises(make_client):
     app = make_app(base_url=None)
     with pytest.raises(ValueError, match="relative URL '/schemas/user.json'") as raised:
         http_schema_resource(app, "/users/{id}")
-    assert type(raised.value) is ValueError
-    assert isinstance(raised.value.__cause__, HsrConfigError)
-    assert str(raised.value) == str(raised.value.__cause__)
+    # The shared HSR configuration error, a ValueError, not re-wrapped.
+    assert type(raised.value) is HsrConfigError
     assert "get_user()'s 200 response schema link" in str(raised.value)
     # Its route builds it on a request: the same error (OPTIONS builds none).
     with pytest.raises(ValueError, match="set a base URL"):
@@ -682,6 +681,39 @@ def test_without_base_url_live_links_resolve_against_the_request(make_client):
 def test_base_url_must_be_absolute():
     with pytest.raises(ValueError, match="base_url must be an absolute URL"):
         add_options(FastAPI(), base_url="/api/")
+
+
+@pytest.mark.parametrize("base_url", [b"https://api.example/", 42])
+def test_a_base_url_that_isnt_a_str_is_the_config_error(base_url):
+    with pytest.raises(HsrConfigError, match="base_url must be an absolute URL"):
+        add_options(FastAPI(), base_url=base_url)
+
+
+def test_a_schema_link_without_a_context_is_refused_at_decoration():
+    """The link options make an ``application/json`` entity, which needs an
+    RDF context: refused by the decorator, as ``Entity`` refuses it (the HSR
+    route would 500 while OPTIONS and every GET link to it)."""
+    with pytest.raises(HsrConfigError, match="context"):
+        scrudful(schema_link_or_func="https://e.example/s.json")
+    # A callable can't be checked before it is called: its HSR build is.
+    scrudful(schema_link_or_func=lambda **kwargs: "https://e.example/s.json")
+    scrudful(
+        schema_link_or_func="https://e.example/s.json",
+        context_link_or_func="https://e.example/c.jsonld",
+    )
+
+
+def test_a_callable_schema_link_without_a_context_is_the_config_error():
+    app = FastAPI()
+
+    @app.get("/items/{id}")
+    @scrudful(schema_link_or_func=lambda **kwargs: "https://e.example/s.json")
+    async def get_item(id: int):
+        return {}
+
+    add_options(app, base_url=BASE)
+    with pytest.raises(HsrConfigError, match="get_item\\(\\)'s 200 response"):
+        http_schema_resource(app, "/items/{id}")
 
 
 def test_add_options_stores_its_options():

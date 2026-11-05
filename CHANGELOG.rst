@@ -107,7 +107,8 @@ Behaviour change (all adapters)
   a ``ValueError``, when created, and so do the DRF decorators given one
   (``scrudful``, ``scrudful_api_view``, ``ScrudfulViewFunc``, and
   ``scrudful_viewset`` for ``Meta``'s item and ``list_`` links, whatever
-  methods the class has); the ninja decorators (``scrudful``,
+  methods the class has) and FastAPI's ``scrudful`` for its link options
+  (it accepted one, whose HSR route then answered 500); the ninja decorators (``scrudful``,
   ``scrudful_create``, ``scrudful_list``, for the item's and the collection's
   links) raise ``ConfigError`` chained to it (``scrudful`` and the item links
   of ``scrudful_list`` accepted one); a callable one raises the
@@ -124,7 +125,9 @@ Behaviour change (all adapters)
   callable raising in describe mode, a schema without a context, a non-JSON
   context whose type callable returns nothing) carry one message, naming the
   entry, raised as ``ninja.errors.ConfigError``, Django's
-  ``ImproperlyConfigured`` (DRF) and ``ValueError`` (FastAPI).
+  ``ImproperlyConfigured`` (DRF) and, for FastAPI, ``ValueError``: the
+  shared ``scrudful.entity.HsrConfigError`` for a relative URL or a schema
+  without a context (FastAPI re-raised it as a plain ``ValueError``).
 * ``SCRUDFUL`` (Django) must be a dict of the keys ``BASE_URL``,
   ``HSR_ROUTE``, ``HSR_URL``, ``HSR_CACHE_CONTROL`` and ``ERROR``: another
   value, or an unknown key, raises ``ImproperlyConfigured``. A base URL that
