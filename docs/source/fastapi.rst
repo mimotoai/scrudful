@@ -112,7 +112,11 @@ The document
 The HSR (see :func:`~scrudful.fastapi.http_schema_resource`) is built the first
 time it is needed, without a request, and kept until the routes of its path or
 the app's ``add_error_links`` entity change: the same document for every
-requester. For each method of the path, in the order ``get``, ``put``,
+requester. A router given ``add_options`` and included in several apps has a
+document per app's ``add_error_links`` entity (an app without one included):
+each app's HSR route serves the one its responses agree with, and
+``http_schema_resource(router, path, for_app=app)`` returns it. For each method
+of the path, in the order ``get``, ``put``,
 ``post``, ``delete``, ``options``, ``head``, ``patch``, ``trace``:
 
 * a scrudful endpoint's success status, its route's ``status_code=`` (else the

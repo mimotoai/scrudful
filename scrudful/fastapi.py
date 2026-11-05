@@ -1005,12 +1005,11 @@ _iter_route_contexts = getattr(fastapi_routing, "iter_route_contexts", None)
 
 class _Built(NamedTuple):
     """A built HTTP Schema Resource, with what it was built from: valid while
-    its path's routes are the same objects in the same order, and the
-    :func:`add_error_links` entity is equal."""
+    its path's routes are the same objects in the same order (it is kept by
+    resource key and :func:`add_error_links` entity)."""
 
     #: The path's routes (their ``original_route``), compared by identity.
     routes: tuple[Any, ...]
-    api_error: Entity | None
     document: dict[str, Any]
 
 
@@ -1039,10 +1038,14 @@ class _HsrOptions:
     #: Whether :func:`add_options` gave them (else they are the defaults, for
     #: :func:`http_schema_resource` on an app without it).
     explicit: bool = False
-    #: Each built document, by resource key.
-    built: dict[str, _Built] = field(default_factory=dict)
-    #: Each served document's bytes and ETag, by resource key.
-    serialized: dict[str, _Serialized] = field(default_factory=dict)
+    #: Each built document, by resource key and :func:`add_error_links`
+    #: entity (a router included in several apps has one per app's entity,
+    #: ``None`` for an app without one).
+    built: dict[tuple[str, Entity | None], _Built] = field(default_factory=dict)
+    #: Each served document's bytes and ETag, by the same keys.
+    serialized: dict[tuple[str, Entity | None], _Serialized] = field(
+        default_factory=dict
+    )
     #: The owner's resources, indexed (see :func:`_scrudful_paths`).
     index: _PathsIndex | None = field(default=None, compare=False, repr=False)
     #: The resource keys of a router announced as having no OPTIONS or HSR
@@ -1310,7 +1313,10 @@ def add_options(
     The document is built without a request, the first time it is needed
     (an OPTIONS request, or :func:`http_schema_resource`), and kept: it is
     built again only when the routes of its path or the app's
-    :func:`add_error_links` entity change. Link callables are called in
+    :func:`add_error_links` entity change. A router included in several
+    apps has a document per app's entity (``None`` for an app without
+    :func:`add_error_links`): each app's HSR route serves the one that
+    agrees with that app's responses. Link callables are called in
     *describe* mode, ``func()``, with no arguments, even those that take the
     endpoint's keyword arguments inside it: give such parameters defaults
     (or accept ``**kwargs``). A callable must return the same target in both
@@ -1509,7 +1515,9 @@ def _hsr_options(owner: FastAPI | APIRouter) -> _HsrOptions:
     return options
 
 
-def http_schema_resource(app: FastAPI | APIRouter, path: str) -> dict[str, Any]:
+def http_schema_resource(
+    app: FastAPI | APIRouter, path: str, *, for_app: FastAPI | None = None
+) -> dict[str, Any]:
     """The HTTP Schema Resource (an OpenAPI 3.1 Path Item) of ``path``.
 
     ``path`` is the full path template of the routes, as :func:`add_options`
@@ -1520,6 +1528,12 @@ def http_schema_resource(app: FastAPI | APIRouter, path: str) -> dict[str, Any]:
     request, once (see :func:`add_options`, which describes its content and
     whose ``base_url`` it uses), and a copy is returned.
 
+    For an ``APIRouter`` included in several apps, each app's document
+    describes that app's :func:`add_error_links` entity (none for an app
+    without one), as its HSR route serves it: ``for_app`` names the app.
+    Without it, the entity of the apps including the router, which must
+    then agree.
+
     Link callables are called in *describe* mode, ``func()``: with no
     arguments. They must return the same target as on the responses they
     describe, or the description disagrees with the responses. An async
@@ -1529,15 +1543,20 @@ def http_schema_resource(app: FastAPI | APIRouter, path: str) -> dict[str, Any]:
     Raises
     ------
     TypeError
-        If ``app`` is neither a ``FastAPI`` application nor an ``APIRouter``.
+        If ``app`` is neither a ``FastAPI`` application nor an ``APIRouter``,
+        or ``for_app`` (if given) isn't a ``FastAPI`` application.
     ValueError
         If no scrudful endpoint serves ``path``; a link URL is relative and
         there is no base URL; a link callable raises when called as
-        ``func()``; or a router is included in apps that
-        :func:`add_error_links` gave different entities.
+        ``func()``; or, without ``for_app``, a router is included in apps
+        that :func:`add_error_links` gave different entities.
     """
     _check_owner(app)
-    return copy.deepcopy(_run_describing(_hsr_flow(app, path)))
+    if for_app is not None and not isinstance(for_app, FastAPI):
+        raise TypeError(
+            f"for_app must be a FastAPI application, not {type(for_app).__name__}"
+        )
+    return copy.deepcopy(_run_describing(_hsr_flow(app, path, for_app=for_app)))
 
 
 def http_schema_resource_endpoint(
@@ -1597,29 +1616,30 @@ def _hsr_flow(
     owner: FastAPI | APIRouter,
     path: str,
     paths: Mapping[str, _Resource] | None = None,
+    *,
+    for_app: Any = None,
 ) -> _Flow[dict[str, Any]]:
-    """The HTTP Schema Resource of ``path`` on ``owner`` (not a copy): the
-    one built, unless the routes of ``path`` or the error entity changed.
-    ``paths`` is ``owner``'s :func:`_scrudful_paths`, when the caller has
-    them."""
+    """The HTTP Schema Resource of ``path`` on ``owner`` (not a copy) for the
+    app ``for_app`` (see :func:`_owner_error`): the one built for that app's
+    error entity, unless the routes of ``path`` changed. ``paths`` is
+    ``owner``'s :func:`_scrudful_paths`, when the caller has them."""
     options = _hsr_options(owner)
     if paths is None:
         paths = _scrudful_paths(owner)
-    key = _template_key(path)
     resource = _resource(owner, paths, path)
     routes = resource.routes
-    api_error = _api_error(owner)
+    api_error = _owner_error(owner, for_app)
+    cache_key = (_template_key(path), api_error)
     originals = tuple(getattr(route, "original_route", route) for route in routes)
-    built = options.built.get(key)
+    built = options.built.get(cache_key)
     if (
         built is not None
         and len(built.routes) == len(originals)
         and all(old is new for old, new in zip(built.routes, originals))
-        and built.api_error == api_error
     ):
         return built.document
     document = yield from _describe_path(routes, options.base_url, api_error)
-    options.built[key] = _Built(originals, api_error, document)
+    options.built[cache_key] = _Built(originals, document)
     return document
 
 
@@ -1912,6 +1932,16 @@ def _mount_path(route: Any) -> str:
     return str(original.path) if isinstance(original, Mount) else ""
 
 
+def _owner_error(owner: FastAPI | APIRouter, for_app: Any) -> Entity | None:
+    """The :func:`add_error_links` entity the HTTP Schema Resources of
+    ``owner``'s paths describe: an app's own; for a router, that of the app
+    ``for_app`` (the app serving the request, or the one named), whose
+    handlers answer its errors there; else :func:`_api_error`'s."""
+    if isinstance(owner, APIRouter) and isinstance(for_app, FastAPI):
+        return _APP_ERRORS.get(for_app)
+    return _api_error(owner)
+
+
 def _api_error(owner: FastAPI | APIRouter) -> Entity | None:
     """The entity :func:`add_error_links` gave the app serving ``owner``'s
     routes: the app's own, or for a router, that of the apps including it.
@@ -1937,9 +1967,9 @@ def _api_error(owner: FastAPI | APIRouter) -> Entity | None:
     if len(errors) > 1:
         raise ValueError(
             "an APIRouter is included in apps that add_error_links gave "
-            "different error entities, so its HTTP Schema Resources would "
-            "differ between them: give them the same entity, or call "
-            "add_options on each app"
+            "different error entities, so its HTTP Schema Resources differ "
+            "between them: name the app, http_schema_resource(router, path, "
+            "for_app=app)"
         )
     return errors[0] if errors else None
 
@@ -3603,10 +3633,12 @@ async def _hsr_get(
     paths: Mapping[str, _Resource] | None = None,
 ) -> Response:
     """The answer to a GET or HEAD of ``path``'s HTTP Schema Resource on
-    ``owner``, with ``owner``'s ``Cache-Control`` (see :func:`_hsr_response`)."""
-    document = await _run_describing_async(_hsr_flow(owner, path, paths))
+    ``owner``, with ``owner``'s ``Cache-Control`` (see :func:`_hsr_response`).
+    A router's describes the error entity of the app serving ``request``."""
+    app = request.scope.get("app")
+    document = await _run_describing_async(_hsr_flow(owner, path, paths, for_app=app))
     options = _hsr_options(owner)
-    key = _template_key(path)
+    key = (_template_key(path), _owner_error(owner, app))
     serialized = options.serialized.get(key)
     if serialized is None or serialized.document is not document:
         body = serialize_hsr(document)

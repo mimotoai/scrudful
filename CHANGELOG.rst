@@ -347,6 +347,12 @@ Behaviour change (FastAPI)
   ``str`` joined by ``-`` (``users.id``, ``users.id-int``).
 * ``add_options(router)`` adds an OPTIONS route to the resources of the
   routers included in the router too, at any depth.
+* A router given ``add_options`` and included in several apps serves, from
+  each app, the HSR of that app's ``add_error_links`` entity (or of none),
+  which agrees with that app's responses (0.9 described one entity for every
+  app, and failed for apps given different entities).
+  ``http_schema_resource`` takes ``for_app=`` to name the app; without it, a
+  router in apps with different entities still raises ``ValueError``.
 * ``add_options`` raises **ValueError** (was ``TypeError``) for a link callable
   of a scrudful endpoint, or of its ``error``, that can't be called as
   ``func()``, checked up front for all of them; and for a base URL that isn't

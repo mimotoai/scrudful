@@ -698,6 +698,103 @@ def test_router_included_in_apps_with_different_error_entities_raises():
         http_schema_resource(router, "/items/{id}")
 
 
+def error_entity(name: str) -> Entity:
+    return Entity(
+        f"https://api.example/schemas/{name}.json",
+        context_link_or_func=f"https://api.example/contexts/{name}.jsonld",
+    )
+
+
+def router_in_three_apps() -> tuple[APIRouter, dict[str, FastAPI]]:
+    """A conditional router (no ``error=``) included in apps ``a`` and ``b``,
+    given different ``add_error_links`` entities, and ``c``, given none."""
+    router = APIRouter()
+
+    @router.get("/items/{iid}")
+    @router.put("/items/{iid}")
+    @scrudful(
+        etag_func=lambda iid: '"1"',
+        schema_link_or_func="https://api.example/s.json",
+        context_link_or_func="https://api.example/c.jsonld",
+    )
+    def item(iid: int):
+        if iid == 99:
+            raise HTTPException(404)
+        return {"id": iid}
+
+    add_options(router, base_url=BASE)
+    apps = {name: FastAPI() for name in "abc"}
+    for name, app in apps.items():
+        app.include_router(router, prefix=f"/{name}")
+    add_error_links(apps["a"], error_entity("err-a"))
+    add_error_links(apps["b"], error_entity("err-b"))
+    return router, apps
+
+
+#: ``(method, path, headers, status)``: scrudful's early 400 and 412, and a
+#: raised 404, of :func:`router_in_three_apps`'s item.
+ERRORS = [
+    ("GET", "/items/1", {"If-None-Match": "garbage"}, 400),
+    ("PUT", "/items/1", {"If-Match": '"9"'}, 412),
+    ("PUT", "/items/1", {}, 428),
+    ("GET", "/items/99", {}, 404),
+]
+
+
+@pytest.mark.parametrize("order", ["abc", "cba", "bac"])
+def test_router_in_several_apps_serves_each_apps_hsr(make_client, order):
+    """Each app's HSR describes its own ``add_error_links`` entity (none for
+    ``c``), whichever app builds first, and agrees with its responses."""
+    router, apps = router_in_three_apps()
+    documents = {}
+    for name in order:
+        client = make_client(apps[name], raise_server_exceptions=False)
+        hsr = options_hsr(client, f"/{name}/items/1")
+        documents[name] = hsr
+        for method, path, headers, status in ERRORS:
+            response = client.request(method, f"/{name}{path}", headers=headers)
+            assert response.status_code == status
+            schemas = [
+                target
+                for target, params in parse_links(response.headers.get("link"))
+                if params.get("rel") == "describedby"
+            ]
+            if name == "c":
+                entries = hsr[method.lower()]["responses"]
+                assert schemas == []
+                assert "content" not in entries.get(str(status), entries["default"])
+                continue
+            assert schemas == [f"https://api.example/schemas/err-{name}.json"]
+            problems = link_problems(method, status, response.headers, True, hsr)
+            assert problems == [], (name, method, status)
+    assert len({repr(document) for document in documents.values()}) == 3
+    # Without a request, the app to describe is named.
+    for name, app in apps.items():
+        document = http_schema_resource(router, "/items/{iid}", for_app=app)
+        assert document == documents[name]
+    with pytest.raises(ValueError, match="different error entities"):
+        http_schema_resource(router, "/items/{iid}")
+
+
+def test_router_hsr_per_app_has_its_own_etag(make_client):
+    """The served bytes, and so the ``ETag``, are each app's."""
+    _, apps = router_in_three_apps()
+    etags = set()
+    for name, app in apps.items():
+        client = make_client(app)
+        first = client.get(f"/{name}/_hsr/items.iid")
+        assert (
+            hsr_get_problems(first.status_code, dict(first.headers), first.content)
+            == []
+        )
+        again = client.get(
+            f"/{name}/_hsr/items.iid", headers={"If-None-Match": first.headers["etag"]}
+        )
+        assert again.status_code == 304
+        etags.add(first.headers["etag"])
+    assert len(etags) == 3
+
+
 # --- base URL ----------------------------------------------------------------------
 
 
