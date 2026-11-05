@@ -308,6 +308,21 @@ def test_callable_error_message():
     assert isinstance(info.value.__cause__, LookupError)
 
 
+def test_a_context_type_callable_returning_nothing_is_config_error():
+    """A non-JSON context needs a type, which a callable can't be checked for
+    when decorating: building the HSR raises ``ConfigError`` naming the
+    operation and the entry, not a bare ``ValueError``."""
+    csv = Entity(
+        "https://api.example/schemas/item.csv",
+        context_link_or_func="https://api.example/contexts/item",
+        context_type_or_func=lambda request, obj: None,
+        media_type="text/csv",
+    )
+    _, router = make_api(responses={200: csv})
+    with pytest.raises(ConfigError, match=r"get_item\(\)'s 200 response.*needs a type"):
+        http_schema_resource(router, "/{pk}")
+
+
 def test_relative_url_from_a_callable_is_config_error():
     _, router = make_api(base_url=None, schema_link_or_func=lambda request, obj: "/s")
     with pytest.raises(ConfigError, match="relative URL '/s'"):

@@ -5939,8 +5939,9 @@ def _media(entity: Entity | None, base_url: str | None, where: str) -> _Flow[Any
     Raises
     ------
     HsrConfigError
-        If a URL is relative and there is no ``base_url``, or a schema has
-        no RDF context.
+        If a URL is relative and there is no ``base_url``, a schema has no
+        RDF context, or a context of a media type that isn't JSON has no
+        type (its callable returned none).
     """
     if entity is None:
         return None
@@ -5970,5 +5971,7 @@ def _media(entity: Entity | None, base_url: str | None, where: str) -> _Flow[Any
             context_url,
             None if context_type is None else str(context_type),
         )
-    except HsrConfigError as exc:
+    except ValueError as exc:
+        # Also the ValueError of a context without a type, whose callable
+        # couldn't be checked when decorating.
         raise HsrConfigError(f"{where}: {exc}") from exc
