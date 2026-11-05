@@ -90,19 +90,20 @@ Behaviour change (all adapters)
   operation's error entity differs from the API-wide one, the errors the
   framework answers before the operation have explicit entries with the
   API-wide entity's content: ninja's 401, 403, 422 and 429 (and every
-  response of the operation with one of these statuses carries that entity),
-  DRF's 401, 403, 406 and 415 when ``SCRUDFUL["ERROR"]`` is set. Without an
-  API-wide entity, ninja lists none of them: its own 401, 403, 422 and 429
-  for an operation with an ``error`` carry that ``error``, as its
-  ``default`` entry describes.
+  response of the operation with one of these statuses carries that entity,
+  unless ``responses=`` declares the status), DRF's 401, 403, 406 and 415
+  when ``SCRUDFUL["ERROR"]`` is set. Without an API-wide entity, ninja lists
+  none of them: its own 401, 403, 422 and 429 for an operation with an
+  ``error`` carry that ``error``, as its ``default`` entry describes, unless
+  ``responses=`` declares the status, which then has an entry of its own.
 * scrudful's early 400, 412 and 428 of an operation without ``error=`` carry
   the Links of the API-wide error entity (ninja and FastAPI
   ``add_error_links``, DRF ``SCRUDFUL["ERROR"]``), and its media type as
   their ``Content-Type``, and the HSR's 400, 412 and 428 entries have its
   content (0.9 sent them as ``application/json`` without schema or context
   Links). For ninja, an entity ``responses=`` declares for the status comes
-  first, and the API-wide entity's link callables get ``None``; for FastAPI
-  they are called with ``request=``, as in the app's handlers.
+  first, and the API-wide entity's link callables get ``obj=None``; for
+  FastAPI they are called with ``request=``, as in the app's handlers.
 * Every response of a described path carries the **HSR link**: the 2xx, 304
   and HEAD responses, scrudful's early 400, 412 and 428, a 204 or an error the
   view returns, and the errors the framework answers through scrudful's error
@@ -120,13 +121,6 @@ Behaviour change (all adapters)
   evaluated when an ``Entity`` is made, and ``handler404`` / ``handler500``
   don't evaluate one when made either, so both may be made in ``urls.py``
   above the ``urlpatterns`` they name.
-* ``handler404`` / ``handler500`` refuse a plain link URL that can't be parsed
-  when made (``ImproperlyConfigured``). They never raise for their Links: any
-  error building them (a lazy URL that doesn't reverse, can't be parsed, or
-  raises anything else) is logged on the ``scrudful._django`` logger, with
-  its traceback and the request's path, and the error served without the
-  entity's Links. A ``handler500`` that fails anyway, past its Links, first
-  logs the error it was answering, which Django then doesn't log.
 * A base URL that can't be parsed at all (``"http://[::1"``) is refused as a
   relative one is (``HsrConfigError``, so ``scrudful.E006`` /
   ``ImproperlyConfigured`` for ``SCRUDFUL["BASE_URL"]``), not with a bare
@@ -173,8 +167,8 @@ Behaviour change (all adapters)
   characters (CR, LF ...; a tab is allowed) or characters outside Latin-1,
   which no field can carry: such a value is refused when given, with the
   same error types (``ImproperlyConfigured`` for DRF's
-  ``Meta.hsr_cache_control``), rather than fail every HSR response. A base URL that doesn't make a relative link
-  absolute is refused too.
+  ``Meta.hsr_cache_control``), rather than fail every HSR response. A base
+  URL that doesn't make a relative link absolute is refused too.
 * ``scrudful.entity.HsrConfigError`` is the public name of the error the
   shared HSR code raises.
 
@@ -186,39 +180,42 @@ Behaviour change (ninja)
   checks the ninja internals it relies on against, 1.7.2 and 1.7.3 now
   included. A later ninja installed without the extra may be refused with
   ``ConfigError`` at startup until scrudful has verified it.
-* ``ScrudfulRouter``'s OPTIONS runs the operations' checks: the loading
-  operation's ``auth=`` and ``before`` (then ``load``), and each method's
-  ``auth=`` and ``before`` (or ``allowed``), then, for a ``@scrudful`` item
-  operation with a ``load``, that ``load``, on a copy of the request with that
-  method, unless it is the very call the loading operation made (the same
-  function, method, a HEAD counting as a GET, path parameters and
-  ``request.auth``; so a ``load`` shared with the loading operation runs again
-  for each other method, and one authorizing by ``request.method`` is checked
-  per method, as DRF loads per action): any ``HttpError``, ``Http404`` or
-  ``PermissionDenied`` it raises leaves only that method out of ``Allow``
-  (only the loading operation's error answers the OPTIONS; another exception
-  still propagates; an ``HttpError`` other than a 401, 403 or 404 is logged,
-  with its traceback, on the ``scrudful.ninja`` logger, as an error for a 5xx
-  and as a warning otherwise), so authorization in a method's ``load`` shapes
-  ``Allow``; it runs only once the method's ``auth=`` and ``before`` passed. A
-  method whose path parameters don't validate (its request would be a 422), or
-  whose path validation raises anything, is left out of ``Allow``, and its
-  ``load`` doesn't run: an ``HttpError``, ``Http404`` or ``PermissionDenied``
+* ``ScrudfulRouter``'s OPTIONS runs the operations' checks. The loading
+  operation's ``auth=`` and ``before`` run first, then its ``load``. Then
+  each method is checked on a copy of the request with that method. With an
+  ``allowed`` hook, the hook alone decides: the method's ``auth=`` only
+  authenticates the copy, and neither its ``before``, its path check nor its
+  ``load`` runs. Without one, the method's ``auth=`` and ``before`` run, then
+  its path check, then, for a ``@scrudful`` item operation with a ``load``,
+  that ``load``, unless it is the very call the loading operation made (the
+  same function, method, a HEAD counting as a GET, path parameters and
+  ``request.auth``; so a ``load`` shared with the loading operation runs
+  again for each other method, and one authorizing by ``request.method`` is
+  checked per method, as DRF loads per action). Any ``HttpError``,
+  ``Http404`` or ``PermissionDenied`` that ``load`` raises leaves only that
+  method out of ``Allow``, so authorization in a method's ``load`` shapes
+  ``Allow``: only the loading operation's error answers the OPTIONS, and
+  another exception still propagates. An ``HttpError`` other than a 401, 403
+  or 404 is also logged, with its traceback, on the ``scrudful.ninja``
+  logger, as an error for a 5xx and as a warning otherwise. A method whose
+  path parameters don't validate (its request would be a 422), or whose path
+  validation raises anything, is left out of ``Allow``, and its ``load``
+  doesn't run: an ``HttpError``, ``Http404`` or ``PermissionDenied``
   silently, anything else (an app's own error, a lookup's
   ``ObjectDoesNotExist``) logged once per route, with its traceback, on the
   ``scrudful.ninja`` logger. A path scrudful can't validate as ninja does (a
   custom path model) isn't checked, with a ``RuntimeWarning`` once per route
   naming it: its method is listed, unless it has its own ``load`` to run,
-  which can't be called without the path parameters, and is then left out. The
-  loading operation's path follows the same rules: when it can't be validated,
-  OPTIONS loads no object and still answers. OPTIONS never answers a 500 or
-  raises ``ConfigError`` for such a path. Bad credentials make the requester
-  anonymous (ninja's auth callbacks return ``None``), so they get the
-  anonymous ``Allow``. A raised ``HttpError`` 401, 403 or 404, ``Http404`` or
-  ``PermissionDenied`` from ``auth=`` or ``before`` refuses a method; from
-  ``allowed``, a 401, 403 or ``PermissionDenied`` refuses it and a 404 is the
-  OPTIONS's answer; anything else raised is answered by the API's exception
-  handler.
+  which can't be called without the path parameters, and is then left out.
+  The loading operation's path follows the same rules: when it fails or
+  can't be validated, OPTIONS loads no object and still answers. OPTIONS
+  never answers a 500 or raises ``ConfigError`` for such a path. Bad
+  credentials make the requester anonymous (ninja's auth callbacks return
+  ``None``), so they get the anonymous ``Allow``. Without a hook, a raised
+  ``HttpError`` 401, 403 or 404, ``Http404`` or ``PermissionDenied`` from
+  ``auth=`` or ``before`` refuses a method; from ``allowed``, a 401, 403 or
+  ``PermissionDenied`` refuses it and a 404 is the OPTIONS's answer;
+  anything else raised is answered by the API's exception handler.
 * The per-method checks of OPTIONS get a copy of the request with that
   method in ``request.method``, while ``request.META["REQUEST_METHOD"]``
   stays ``"OPTIONS"``: a ``load`` that locks its row should lock only when
@@ -231,8 +228,8 @@ Behaviour change (ninja)
   ended (from a task or thread it left running) raises ``RuntimeError``
   (naming the handler, and the calling operation): its hooks didn't run for
   that call. Move the shared code into a plain function instead. (Since
-  0.7.1, such a call from an operation with hooks of its own ran the
-  handler with its hooks skipped.)
+  0.7.1, such a call ran, without its hooks running for it, whenever the
+  hooks of the operation running had allowed the request.)
 * OPTIONS is answered by an ``Operation.run`` decorator, so the API's and
   routers' ``add_decorator(mode="operation")`` decorators no longer gate it
   (they did in 0.9); ``mode="view"`` ones still run first. A non-preflight
@@ -320,7 +317,10 @@ Behaviour change (ninja)
 * The ninja internals OPTIONS relies on are checked when a path gets its
   OPTIONS operation, at startup (``ConfigError`` for a ninja whose internals
   differ). Where ninja's source isn't installed, the weaker check by names is
-  announced by a ``RuntimeWarning``, once.
+  announced by a ``RuntimeWarning``, once. That warning, and ninja's other
+  once-only ones (OPTIONS' unchecked paths, the HSR routes' shadow check),
+  count as given only once they were: one raised as an error (``-W error``)
+  is raised again by the next check.
 * A change of ``SCRUDFUL`` (``override_settings``) discards the built HSRs,
   and so does setting ``router.base_url``.
 * ``ScrudfulRouter``'s ``base_url``, ``hsr_route``, ``hsr_url``,
@@ -376,10 +376,11 @@ Behaviour change (DRF)
 * OPTIONS is no longer gated by the view's permissions (DRF's ``initial()``
   checked them for OPTIONS too); authentication and throttles still run. Its
   ``Allow`` runs each method's ``check_permissions`` and, with the object,
-  ``check_object_permissions``; an ``Http404`` the first loaded method's
-  object check raises (``DjangoObjectPermissions`` for an object the
-  requester may not read) is the OPTIONS's 404, another method's leaves out
-  only that method. A method with an ``allowed_func`` passes the first pass
+  ``check_object_permissions``; an ``Http404`` a view-level check
+  (``has_permission``) raises, or the first loaded method's object check
+  (``DjangoObjectPermissions`` for an object the requester may not read), is
+  the OPTIONS's 404, another method's object check's leaves out only that
+  method. A method with an ``allowed_func`` passes the first pass
   for every requester, so on such a view the object is loaded for anyone.
 * An action of a ``scrudful_viewset`` class without ``@scrudful`` (an
   ``@action``, or a method its ``mapping`` adds) gets no HSR link on its
@@ -485,6 +486,9 @@ Behaviour change (FastAPI)
 * ``Allow`` runs only the routes' security dependencies (``Security(...)``,
   and a ``Depends`` with a security scheme below it), resolved without the
   body; a plain dependency, a throttle in ``dependencies=`` say, is not run.
+  A security dependency's ``HTTPException`` 401, 403 or 404, or a failed
+  validation of its parameters, refuses its method only; another
+  ``HTTPException`` (a 429) answers the OPTIONS.
   ``load(request, **path_params)`` is called only for a URL with path
   parameters, with all of them.
 * A security dependency that needs the request's body (a body, form or file
@@ -562,13 +566,15 @@ New
   entity's Links unless ``Accept`` prefers ``text/html``, with ``Vary:
   Accept``. ``error`` is checked when the handler is made: an ``Entity``
   (``TypeError``) of a JSON media type (``ValueError``), with plain link
-  values whose rels and types a Link can carry. A Link that depends on the
-  settings or the request and can't be built (an invalid
-  ``SCRUDFUL["BASE_URL"]``, a refused host for a relative link) is logged on
-  the ``scrudful._django`` logger, with the request's path, and the error
-  served without it; anything else raised building the Links propagates to
-  Django. The request's host is read only for a relative link without a
-  base URL.
+  values whose rels and types a Link can carry, and URLs that can be parsed
+  (``ImproperlyConfigured``). They never raise for their Links: any error
+  building them (an invalid ``SCRUDFUL["BASE_URL"]``, a refused host for a
+  relative link, a lazy URL that doesn't reverse, can't be parsed, or raises
+  anything else) is logged on the ``scrudful._django`` logger, with its
+  traceback and the request's path, and the error served without the
+  entity's Links. A ``handler500`` that fails anyway, past its Links, first
+  logs the error it was answering, which Django then doesn't log. The
+  request's host is read only for a relative link without a base URL.
 * ninja: ``ScrudfulRouter(base_url=, hsr_route=, hsr_url=, hsr_cache_control=,
   allowed=)``; ``allowed=`` on ``scrudful``, ``scrudful_create`` and
   ``scrudful_list``; ``described(entity)`` and ``add_api_operation(...,
@@ -615,8 +621,8 @@ Examples and tests
   ``scrudful_rest_framework.settings``.
 * CI runs the FastAPI modules on the lowest FastAPI the extra allows
   (``floor-fastapi``: 0.100, with pydantic 2.3), and the ninja modules, with
-  the shared ones that have ninja cases, on the oldest and the newest
-  django-ninja it allows (``floor-ninja``: 1.7.0; ``latest-ninja``).
+  some of the shared ones that have ninja cases, on the oldest and the
+  newest django-ninja it allows (``floor-ninja``: 1.7.0; ``latest-ninja``).
 * ``scripts/ninja_digests.py`` prints the digests of the django-ninja
   internals ``scrudful.ninja`` checks, for a ninja release, without importing
   it: compare them with ``scrudful.ninja``'s before admitting the release in
