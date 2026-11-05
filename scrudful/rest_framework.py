@@ -227,7 +227,12 @@ System checks
     - ``scrudful.E005``: a view whose HTTP Schema Resource can't be built
       (a relative link URL without a base URL, a schema without an RDF
       context, content that isn't JSON without a context type, or anything
-      else building it raises but what ``scrudful.W001`` reports);
+      else building it raises but what ``scrudful.W001`` reports). For an
+      exception that isn't scrudful's configuration error (a link
+      callable's, the view's, or scrudful's own), the hint names the frame
+      that raised it, labelling one inside scrudful as what may be its
+      internal error, and the ``scrudful.rest_framework`` logger logs the
+      traceback;
     - ``scrudful.E006``: an invalid ``SCRUDFUL`` setting: not a dict of its
       keys, or a key whose value is invalid (one error for each). While the
       setting is invalid, what depends on it is not checked (no document
@@ -268,6 +273,8 @@ import contextlib
 import copy
 import functools
 import inspect
+import logging
+import pathlib
 import types
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -395,6 +402,8 @@ from scrudful.collection import (
 from scrudful.entity import Entity
 from scrudful.problem import PROBLEM_JSON, problem_from_errors
 from scrudful.utils import join_links, link_content, resolve_uri
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "Entity",
@@ -2762,21 +2771,23 @@ def _hsr_build_messages(
     else a callable raises, such as a ``NoReverseMatch`` or a ``TypeError``
     of its signature; scrudful's configuration errors; whatever else the
     build raises) stops the build, and is the error ``scrudful.E005``, so
-    that one view never stops the check of the others.
+    that one view never stops the check of the others; one that isn't
+    scrudful's configuration error gets :func:`_unexpected_error`'s hint
+    and log.
     """
     where = f"the HTTP Schema Resource of the route {view_name!r} can't be built"
     failures: list[_DataDependentError] = []
     messages: list[checks.CheckMessage] = []
     try:
         _describe_view(_describe_mode_view(view_func), failures)
+    except _CallableError as exc:
+        messages.append(_unexpected_error(view_func, f"{where}: {exc}", exc.__cause__))
     except ImproperlyConfigured as exc:
         messages.append(
             checks.Error(f"{where}: {exc}", obj=view_func.cls, id="scrudful.E005")
         )
     except Exception as exc:
-        messages.append(
-            checks.Error(f"{where}: {exc!r}", obj=view_func.cls, id="scrudful.E005")
-        )
+        messages.append(_unexpected_error(view_func, f"{where}: {exc!r}", exc))
     warnings = [
         checks.Warning(
             f"{where} now: {failure}",
@@ -2790,6 +2801,43 @@ def _hsr_build_messages(
         for failure in failures
     ]
     return warnings + messages
+
+
+#: The directory of scrudful's own modules.
+_PACKAGE_DIR = pathlib.Path(__file__).resolve().parent
+
+
+def _unexpected_error(
+    view_func: Callable[..., Any], message: str, exc: BaseException | None
+) -> checks.CheckMessage:
+    """The ``scrudful.E005`` ``message`` for ``exc``, an exception a link
+    callable or the build raised that isn't one of scrudful's configuration
+    errors: its hint names the innermost frame of its traceback, and it is
+    logged with its traceback to the ``scrudful.rest_framework`` logger
+    (Django's check framework shows neither). One raised in scrudful's own
+    code, rather than by a link callable or the view's code, is labelled as
+    what may be scrudful's internal error."""
+    tb = None if exc is None else exc.__traceback__
+    while tb is not None and tb.tb_next is not None:
+        tb = tb.tb_next
+    if tb is None:
+        hint = "The scrudful.rest_framework logger logged it."
+    else:
+        code = tb.tb_frame.f_code
+        frame = f"{code.co_filename}:{tb.tb_lineno}, in {code.co_name}"
+        hint = (
+            f"Raised at {frame}; the scrudful.rest_framework logger logged its "
+            "traceback."
+        )
+        if pathlib.Path(code.co_filename).resolve().is_relative_to(_PACKAGE_DIR):
+            hint = (
+                f"Raised inside scrudful, at {frame}, not by a link callable or "
+                "the view: unless the message names your configuration, this "
+                "is a scrudful internal error, please report it with the "
+                "traceback the scrudful.rest_framework logger logged."
+            )
+    logger.error("%s", message, exc_info=exc)
+    return checks.Error(message, hint=hint, obj=view_func.cls, id="scrudful.E005")
 
 
 def _join_route(prefix: str, route: str) -> str:
@@ -3152,6 +3200,11 @@ class _DataDependentError(ImproperlyConfigured):
         self.func = func
 
 
+class _CallableError(ImproperlyConfigured):
+    """A link callable called in describe mode raised an exception (its
+    ``__cause__``) that isn't a :class:`_DataDependentError`'s."""
+
+
 class _Describing:
     """Evaluates link values in describe mode, for one method of a view."""
 
@@ -3198,7 +3251,7 @@ class _Describing:
             )
             if isinstance(exc, _DATA_DEPENDENT):
                 raise _DataDependentError(message, value_or_func) from exc
-            raise ImproperlyConfigured(message) from exc
+            raise _CallableError(message) from exc
 
     def content(
         self, source: ScrudfulViewFunc | Entity | None, media_type: str, where: str

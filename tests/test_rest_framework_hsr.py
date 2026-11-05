@@ -1941,6 +1941,113 @@ def test_the_check_reports_each_view_whatever_its_build_raises(settings):
     assert any("RuntimeError('broken view')" in m.msg for m in messages)
 
 
+def lookup_helper():
+    raise LookupError("no such schema")
+
+
+def schema_through_a_helper(view, request, **kwargs):
+    return lookup_helper()
+
+
+@scrudful_viewset
+class OddMethodsViewSet(ItemViewSetBase):
+    """``allowed_methods`` that scrudful's own describe code can't read."""
+
+    class Meta:
+        entity = Entity("https://x/s", context_link_or_func="https://x/c")
+
+    @property
+    def allowed_methods(self):
+        return [None]
+
+
+def build_error_of(view, name, caplog, scrudful_setting={"BASE_URL": BASE_URL}):
+    """The E005 of the route ``name`` of ``view`` and what was logged."""
+
+    class URLconf:
+        urlpatterns = [
+            path("odd/<str:pk>/", view.as_view({"get": "retrieve"}), name=name),
+            path("", include(hsr_urls())),
+        ]
+
+    with override_settings(ROOT_URLCONF=URLconf, SCRUDFUL=scrudful_setting):
+        with caplog.at_level("ERROR", logger="scrudful.rest_framework"):
+            [error] = scrudful_check_errors()
+    assert error.id == "scrudful.E005"
+    return error, [r for r in caplog.records if r.name == "scrudful.rest_framework"]
+
+
+def test_an_e005_names_the_innermost_frame_and_logs_the_traceback(caplog):
+    """An exception outside scrudful (the view's own ``__init__``) is the E005
+    of the same message, with a hint naming where it was raised, and its
+    traceback logged."""
+
+    def raising_init(self, **kwargs):
+        raise RuntimeError("broken view")
+
+    view = type("BrokenInit", (DatabaseLinkViewSet,), {"__init__": raising_init})
+    error, records = build_error_of(view, "broken", caplog)
+    assert error.msg == (
+        "the HTTP Schema Resource of the route 'broken' can't be built: "
+        "RuntimeError('broken view')"
+    )
+    assert "test_rest_framework_hsr.py" in error.hint
+    assert "raising_init" in error.hint
+    assert "scrudful internal error" not in error.hint
+    [record] = records
+    assert "'broken'" in record.getMessage()
+    assert record.exc_info[1] is not None
+    assert str(record.exc_info[1]) == "broken view"
+
+
+def test_an_e005_of_a_link_callable_names_its_innermost_frame(caplog):
+    """A link callable's error is named by the frame that raised it, deep in
+    a helper of the callable."""
+    view = scrudful_viewset(
+        type(
+            "Helped",
+            (ItemViewSetBase,),
+            {
+                "Meta": type(
+                    "Meta",
+                    (),
+                    {
+                        "schema_link_or_func": schema_through_a_helper,
+                        "context_link_or_func": "https://x/c",
+                    },
+                )
+            },
+        )
+    )
+    error, records = build_error_of(view, "helped", caplog)
+    assert "schema_through_a_helper" in error.msg
+    assert "LookupError('no such schema')" in error.msg
+    assert "lookup_helper" in error.hint
+    assert "scrudful internal error" not in error.hint
+    [record] = records
+    assert isinstance(record.exc_info[1], LookupError)
+
+
+def test_an_e005_raised_inside_scrudful_says_so(caplog):
+    """An exception raised by scrudful's own code, not by a link callable or
+    the view's, is labelled as possibly scrudful's internal error."""
+    error, records = build_error_of(OddMethodsViewSet, "odd", caplog)
+    assert error.msg.startswith(
+        "the HTTP Schema Resource of the route 'odd' can't be built: AttributeError("
+    )
+    assert "scrudful internal error" in error.hint
+    assert "rest_framework.py" in error.hint
+    [record] = records
+    assert isinstance(record.exc_info[1], AttributeError)
+
+
+def test_a_configuration_e005_logs_nothing(caplog):
+    """scrudful's own configuration error is its message alone."""
+    error, records = build_error_of(RelativeLinkViewSet, "relative", caplog, None)
+    assert error.hint is None
+    assert records == []
+
+
 def test_hsr_target_is_the_route_resolved_against_the_base_url(urls):
     assert target("/items/1/") == "https://api.example/_hsr/item-detail"
     assert target("/notes/1") == "https://api.example/_hsr/notes"

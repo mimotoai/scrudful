@@ -66,7 +66,11 @@ request, as errors of Django's URL system check:
   a base URL, a schema link without an RDF context, content that isn't JSON
   without a context type, or anything else building it raises but what
   ``scrudful.W001`` reports; a link callable raising a ``NoReverseMatch`` or a
-  ``TypeError`` of its signature included);
+  ``TypeError`` of its signature included). For an exception that isn't
+  scrudful's configuration error (a link callable's, the view's, or scrudful's
+  own), the hint names the frame that raised it, labelling one inside scrudful
+  as what may be its internal error (please report it), and the
+  ``scrudful.rest_framework`` logger logs the traceback at ``ERROR``;
 * ``scrudful.E006``: the ``SCRUDFUL`` setting is invalid: it isn't a dict of
   its keys, or a key's value is invalid (one error for each key). While it is,
   the checks that depend on it are skipped (no HSR is built);

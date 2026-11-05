@@ -273,7 +273,10 @@ Behaviour change (DRF)
   ``W001`` for each callable that fails so, and the check goes on past it,
   so a ``W001`` hides no ``E005`` of the same view. Any other
   exception a callable raises (``NoReverseMatch``, a signature's
-  ``TypeError``) is ``E005``. The errors fail ``manage.py check`` and the
+  ``TypeError``) is ``E005``; for such an exception, or one the view or
+  scrudful itself raises, the ``E005`` hint names the frame that raised it
+  (one inside scrudful labelled as what may be its internal error), and the
+  ``scrudful.rest_framework`` logger logs its traceback at ``ERROR``. The errors fail ``manage.py check`` and the
   commands that run it (``runserver``, ``migrate``, Django's test runner).
   The ``hsr_urls()`` pattern runs the check in Django's URL check; ``E003``
   needs ``scrudful.rest_framework`` imported before the checks start, which
