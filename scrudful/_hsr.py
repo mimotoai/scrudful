@@ -139,7 +139,9 @@ def hsr_route_name(path_template: str) -> str:
     """A route name for ``path_template``: its segments joined with ``.``.
 
     ``{name}`` and ``{converter:name}`` become ``name``; the empty path is
-    ``"_root"``.
+    ``"_root"``. It reads Django's and ninja's ``{converter:name}`` order
+    only: Starlette's ``{name:converter}`` would give ``converter`` (the
+    FastAPI adapter rewrites its templates first).
     """
     segments = [
         _PARAMETER.sub(r"\1", segment)
