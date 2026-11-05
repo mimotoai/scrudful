@@ -574,8 +574,12 @@ def test_decorator_base_url_overrides_the_setting(client):
 
 @pytest.mark.parametrize("value", ["/relative/", "api.example", 3])
 def test_base_url_must_be_absolute(settings, value):
+    """A non-str one too: DRF's configuration error, as for ninja and FastAPI."""
     with pytest.raises(ImproperlyConfigured, match="absolute URL"):
         scrudful(base_url=value)
+    meta = type("Meta", (), {"base_url": value})
+    with pytest.raises(ImproperlyConfigured, match="base_url.*absolute URL"):
+        scrudful_viewset(type("V", (ItemViewSetBase,), {"Meta": meta}))
     settings.SCRUDFUL = {"BASE_URL": value}
     with pytest.raises(ImproperlyConfigured, match=r"SCRUDFUL\[.BASE_URL.\]"):
         http_schema_resource(NoErrorViewSet.as_view({"get": "retrieve"}))
@@ -968,7 +972,7 @@ def test_a_subclass_without_removed_hooks_still_works(settings, client):
 
 NO_INCLUDE = (
     "add path('', include(scrudful.rest_framework.hsr_urls())) to your root "
-    "URLconf, or set SCRUDFUL['HSR_URL']"
+    "URLconf, or set SCRUDFUL['HSR_URL'] (or the view's Meta.hsr_url)"
 )
 
 

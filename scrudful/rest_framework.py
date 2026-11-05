@@ -2147,7 +2147,9 @@ def http_schema_resource(view_func: Callable[..., Any]) -> dict[str, Any]:
     its action map) or :func:`scrudful_api_view` does: the view function a
     URL pattern routes to. The document is the same for every requester: it
     is built without a request, once per ``view_func`` (a change of the
-    ``SCRUDFUL`` or ``REST_FRAMEWORK`` setting discards it), and a copy is
+    ``SCRUDFUL``, ``REST_FRAMEWORK`` or ``ROOT_URLCONF`` setting discards
+    it, as link callables may ``reverse()`` in the root URLconf), and a copy
+    is
     returned.
 
     It is built from a *describe-mode* view instance,
@@ -2198,10 +2200,10 @@ def http_schema_resource(view_func: Callable[..., Any]) -> dict[str, Any]:
         If ``view_func`` is not a DRF view function.
     ImproperlyConfigured
         If a link URL is relative and there is no base URL, a schema link
-        has no RDF context link (the message of
-        :class:`~scrudful._hsr.HsrConfigError`); a link callable raises when
-        called as ``func(view, None)``; or the ``SCRUDFUL`` setting is
-        invalid.
+        has no RDF context link, or content that isn't JSON has no context
+        type (the message of :class:`~scrudful.entity.HsrConfigError`); a
+        link callable raises when called as ``func(view, None)``; or the
+        ``SCRUDFUL`` setting is invalid.
     """
     cls = getattr(view_func, "cls", None)
     if not (isinstance(cls, type) and issubclass(cls, APIView)):
@@ -2245,7 +2247,7 @@ setting_changed.connect(_forget_hsrs)
 #: The message of a missing :func:`hsr_urls` include (see :func:`_hsr_target`).
 _NO_HSR_URLS = (
     "add path('', include(scrudful.rest_framework.hsr_urls())) to your root "
-    "URLconf, or set SCRUDFUL['HSR_URL']"
+    "URLconf, or set SCRUDFUL['HSR_URL'] (or the view's Meta.hsr_url)"
 )
 
 
@@ -3350,8 +3352,9 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
     :class:`ScrudfulViewFunc`), so that it agrees with the HTTP Schema
     Resource.
     Without an ``error`` entity, or when the view has no such handler,
-    the response is DRF's, unchanged; so is ``None`` for an exception DRF does
-    not handle.
+    the response is DRF's, unchanged but for ``Access-Control-Expose-Headers``
+    on a scrudful view (below); so is ``None`` for an exception DRF does not
+    handle.
 
     The handler is looked up as :meth:`ScrudfulMetadata.get_method` does:
     ``view.action`` (a viewset's), then the request method. When that is no
@@ -3390,9 +3393,10 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
         }
 
     It carries the attribute ``scrudful_error_links = True``, by which
-    :class:`ScrudfulMetadata` knows that the serializer's 400 gets the error
-    Links, and so describes it. A project handler that delegates to it (logs,
-    then returns ``exception_handler(exc, context)``) must carry it too: set
+    :func:`http_schema_resource` knows that the serializer's 400 (and the
+    other raised errors) get the error Links, and so describes them. A
+    project handler that delegates to it (logs, then returns
+    ``exception_handler(exc, context)``) must carry it too: set
     ``handler.scrudful_error_links = True``, or decorate the handler with
     ``functools.wraps(exception_handler)``, which copies it.
 
@@ -3501,9 +3505,11 @@ def _error_entity(view: APIView, method: str | None) -> Entity | None:
     view-wide one, from the scrudful handlers of the view's methods (a
     viewset's route's action map): the one ``error`` they share; else, when
     they have several, the GET handler's; else the first in the order of
-    :data:`~scrudful._adapter.METHOD_KEYS`. The OPTIONS body lists none of
-    these errors, so any error entity of the view describes them; a body
-    with content then always has Links.
+    :data:`~scrudful._adapter.METHOD_KEYS`. The HTTP Schema Resource has no
+    entry for these errors of their own (its ``options`` entry is exactly
+    the 204, and a 405 for a method the view doesn't serve falls under the
+    ``default`` entries of the methods it does), so any error entity of the
+    view may describe them; a body with content then always has Links.
     """
     handler = _request_handler(view, method)
     if handler is not None:
