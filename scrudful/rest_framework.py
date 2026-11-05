@@ -222,7 +222,7 @@ System checks
     - ``scrudful.E005``: a view whose HTTP Schema Resource can't be built
       (a relative link URL without a base URL, a schema without an RDF
       context, content that isn't JSON without a context type, or anything
-      else building it raises but a link callable);
+      else building it raises but what ``scrudful.W001`` reports);
     - ``scrudful.E006``: an invalid ``SCRUDFUL`` setting: not a dict of its
       keys, or a key whose value is invalid (one error for each). While the
       setting is invalid, what depends on it is not checked (no document
@@ -235,13 +235,17 @@ System checks
 
     and as a warning:
 
-    - ``scrudful.W001``: a link callable raising when called as
-      ``func(view, None)``, naming the route, the callable and the
-      exception. A warning, not an error, as ``migrate`` runs the checks
-      first: a callable that reads the database fails on a database not
-      migrated yet, and must not stop ``migrate``. The document is built
-      again, the callable called again, when it is first served; one that
-      can't work then (it needs the request, say) fails that request.
+    - ``scrudful.W001``: what may depend on the data: a link callable
+      raising a ``django.db.DatabaseError`` when called as ``func(view,
+      None)`` (naming the route, the callable and the exception), or
+      returning nothing for a context link (beside a schema link) or for
+      its type. A warning, not
+      an error, as ``migrate`` runs the checks first: a callable that reads
+      the database fails on a database not migrated yet, and must not stop
+      ``migrate``. The document is built again, the callables called again,
+      when it is first served; if it fails then, that request fails. Any
+      other exception a callable raises (a ``NoReverseMatch``, a
+      ``TypeError`` of its signature) is ``scrudful.E005``.
 
     Each would otherwise fail on a request. The check builds each document
     as :func:`http_schema_resource` does (no request, no database access by
@@ -263,6 +267,7 @@ from django.conf import settings
 from django.core import checks
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.core.signals import setting_changed
+from django.db import DatabaseError
 from django.http import (
     Http404,
     HttpRequest,
@@ -2656,25 +2661,29 @@ def _hsr_build_messages(
     builds it, without keeping it (the settings may change before a
     request), and report why it can't be.
 
-    A link callable that raises is the warning ``scrudful.W001``: what it
-    does may work only later (a callable reading the database fails before
+    A failure that may depend on the data (:class:`_DataDependentError`:
+    a link callable raising a ``django.db.DatabaseError``, or returning
+    nothing for a context link or its type) is the warning ``scrudful.W001``: it may
+    not happen later (a callable reading the database fails before
     ``migrate`` has created its tables, and ``migrate`` runs this check
-    first), and the document is built again when it is first served. Any
-    other failure, scrudful's configuration errors and whatever else the
-    build raises, is the error ``scrudful.E005``, so that one view never
-    stops the check of the others.
+    first; one returning a row's URL returns nothing while the table is
+    empty), and the document is built again when it is first served. Any
+    other failure (whatever else a callable raises, such as a
+    ``NoReverseMatch`` or a ``TypeError`` of its signature; scrudful's
+    configuration errors; whatever else the build raises) is the error
+    ``scrudful.E005``, so that one view never stops the check of the others.
     """
     where = f"the HTTP Schema Resource of the route {view_name!r} can't be built"
     try:
         _describe_view(_describe_mode_view(view_func))
-    except _LinkCallableError as exc:
+    except _DataDependentError as exc:
         return [
             checks.Warning(
                 f"{where} now: {exc}",
                 hint=(
-                    "It is built when it is first served, calling the "
-                    "callable again: if it can't work by then (it needs the "
-                    "request or a URL kwarg, say), that request fails."
+                    "It is built when it is first served, calling the link "
+                    "callables again: if it fails then too, that request "
+                    "fails."
                 ),
                 obj=view_func.cls,
                 id="scrudful.W001",
@@ -3016,11 +3025,14 @@ def _describe_view(view: APIView) -> dict[str, Any]:
     return body
 
 
-class _LinkCallableError(ImproperlyConfigured):
-    """A link callable raised when called in describe mode, as
-    ``func(view, None)`` (see :meth:`_Describing.value`); its ``__cause__``
-    is what it raised. The system check tells it from scrudful's own
-    configuration errors (see :func:`_hsr_build_messages`)."""
+class _DataDependentError(ImproperlyConfigured):
+    """A describe-mode failure that may depend on the data, so may not
+    happen later: a link callable called as ``func(view, None)`` raised a
+    database error (``django.db.DatabaseError``, its ``__cause__``), or
+    returned nothing for a context link (beside a schema link) or for its
+    type, as one reading a row may while the table is empty. The system check reports
+    it as a warning (see :func:`_hsr_build_messages`); any other error of a
+    callable is a plain ``ImproperlyConfigured``."""
 
 
 class _Describing:
@@ -3042,8 +3054,9 @@ class _Describing:
         Raises
         ------
         ImproperlyConfigured
-            If the callable raises (a :class:`_LinkCallableError`, naming
-            the callable, this method and the exception, chained to it).
+            If the callable raises, naming the callable, this method and the
+            exception, chained to it: a :class:`_DataDependentError` for a
+            ``django.db.DatabaseError``.
         """
         if not callable(value_or_func):
             return value_or_func
@@ -3051,7 +3064,12 @@ class _Describing:
             return value_or_func(self.view, None)
         except Exception as exc:
             func = getattr(value_or_func, "__qualname__", repr(value_or_func))
-            raise _LinkCallableError(
+            error = (
+                _DataDependentError
+                if isinstance(exc, DatabaseError)
+                else ImproperlyConfigured
+            )
+            raise error(
                 f"{func}, a link callable of {self.name}, must work without a "
                 "request when the HTTP Schema Resource is built (called as "
                 f"func(view, None)): {exc!r}"
@@ -3093,13 +3111,22 @@ class _Describing:
         if not schema:
             return None
         schema_type = self.value(source.schema_type_or_func)
-        context = context_type = None
+        context = context_type = given_type = None
         rel, default_type = context_defaults(media_type)
         if rel is not None:  # not in-band RDF
             context = self.value(source.context_link_or_func)
         if context:
-            context_type = self.value(source.context_type_or_func) or default_type
+            given_type = self.value(source.context_type_or_func)
+            context_type = given_type or default_type
         where = f"{self.name}'s {where}"
+        # A callable that returned nothing for the context link, or for its
+        # type: describe_content's refusal of that may depend on the data,
+        # and not happen later (see _DataDependentError). A relative URL
+        # needs a base URL, which is configuration.
+        returned_nothing = (not context and callable(source.context_link_or_func)) or (
+            bool(context) and not given_type and callable(source.context_type_or_func)
+        )
+        describing = False
         try:
             schema_url = absolute_for_hsr(
                 str(schema), self.base_url, f"{where} schema link"
@@ -3109,6 +3136,7 @@ class _Describing:
                 if context
                 else None
             )
+            describing = True
             try:
                 return describe_content(
                     media_type,
@@ -3123,7 +3151,9 @@ class _Describing:
                 # content): either is this entry's configuration error.
                 raise HsrConfigError(f"{where}: {exc}") from exc
         except HsrConfigError as exc:
-            raise ImproperlyConfigured(str(exc)) from exc
+            data = describing and returned_nothing
+            error = _DataDependentError if data else ImproperlyConfigured
+            raise error(str(exc)) from exc
 
 
 def _describe_method(

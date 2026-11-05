@@ -204,9 +204,12 @@ Behaviour change (DRF)
   error for each invalid key, ``HSR_CACHE_CONTROL`` and ``ERROR`` included,
   reported beside the routes' errors), ``E007`` (an action of a
   ``scrudful_viewset`` class without ``@scrudful``); and, as the warning
-  ``scrudful.W001``,
-  a link callable raising when called as ``func(view, None)``, so that
-  ``migrate`` runs on a fresh database whose tables a callable reads. The
+  ``scrudful.W001``, what may depend on the data: a link callable raising a
+  ``django.db.DatabaseError`` when called as ``func(view, None)``, or
+  returning nothing for a context link or its type, so that ``migrate`` runs on a
+  fresh database whose tables a callable reads. Any other exception a
+  callable raises (``NoReverseMatch``, a signature's ``TypeError``) is
+  ``E005``. The
   ``hsr_urls()`` pattern runs the check in Django's URL check; ``E003`` needs
   ``scrudful.rest_framework`` imported before the checks start, which
   registers the check (an ``AppConfig.ready()``).

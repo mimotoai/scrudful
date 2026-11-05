@@ -20,7 +20,8 @@ from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.core.management import call_command
-from django.db import OperationalError
+from django.db import DatabaseError, OperationalError, ProgrammingError
+from django.urls import NoReverseMatch
 from django.http import Http404
 from django.test import Client, RequestFactory
 from django.urls import ResolverMatch, include, path, resolve, reverse
@@ -1510,11 +1511,11 @@ class DatabaseLinkURLconf:
     ]
 
 
-def test_a_link_callable_raising_is_a_warning(settings):
-    """A link callable that fails when the check calls it (one reading a
-    database not migrated yet) is the warning W001, naming the route, the
-    callable and the exception; an HSR that can't be built for a reason of
-    its own is still E005."""
+def test_a_link_callable_raising_a_database_error_is_a_warning(settings):
+    """A link callable that raises a database error when the check calls it
+    (one reading a database not migrated yet) is the warning W001, naming
+    the route, the callable and the exception; an HSR that can't be built
+    for a reason of its own is still E005."""
     settings.ROOT_URLCONF = DatabaseLinkURLconf
     settings.SCRUDFUL = None
     messages = scrudful_check_errors()
@@ -1531,6 +1532,81 @@ def test_a_link_callable_raising_is_a_warning(settings):
     [error] = [message for message in messages if message.id == "scrudful.E005"]
     assert type(error) is checks.Error
     assert "'relative-item'" in error.msg and "relative" in error.msg
+
+
+def raising(exc):
+    def schema(view, request, **kwargs):
+        raise exc
+
+    return schema
+
+
+def returning(value):
+    def link(view, request, **kwargs):
+        return value
+
+    return link
+
+
+def needs_the_request(view, request, pk, **kwargs):
+    return f"https://api.example/schemas/{pk}"
+
+
+@pytest.mark.parametrize(
+    "links, media_type, expected",
+    [
+        # Raised: a database error may be the data's (W001), anything else
+        # is a misconfiguration (E005).
+        ({"schema_link_or_func": raising(OperationalError("x"))}, None, "W001"),
+        ({"schema_link_or_func": raising(ProgrammingError("x"))}, None, "W001"),
+        ({"schema_link_or_func": raising(DatabaseError("x"))}, None, "W001"),
+        ({"schema_link_or_func": raising(NoReverseMatch("x"))}, None, "E005"),
+        ({"schema_link_or_func": needs_the_request}, None, "E005"),
+        ({"schema_link_or_func": raising(LookupError("x"))}, None, "E005"),
+        # Returned nothing for the context or its type: may be the data's.
+        ({"context_link_or_func": returning(None)}, None, "W001"),
+        ({"context_link_or_func": returning("")}, None, "W001"),
+        ({"context_type_or_func": returning(None)}, "text/csv", "W001"),
+        # A relative URL needs a base URL, returned or not: configuration.
+        ({"schema_link_or_func": returning("/relative")}, None, "E005"),
+        ({"context_link_or_func": returning("/relative")}, None, "E005"),
+        ({"schema_link_or_func": "/relative"}, None, "E005"),
+        (
+            {
+                "schema_link_or_func": returning("https://x/s"),
+                "context_link_or_func": None,
+            },
+            None,
+            "E005",
+        ),
+    ],
+)
+def test_what_a_link_callable_does_decides_warning_or_error(
+    settings, links, media_type, expected
+):
+    entity = {
+        "schema_link_or_func": "https://x/s",
+        "context_link_or_func": "https://x/c",
+        "context_type_or_func": "application/csvm+json" if media_type else None,
+        **links,
+    }
+    meta = type("Meta", (), entity)
+    if media_type is not None:
+        meta = type("Meta", (), {"entity": Entity(**entity, media_type=media_type)})
+    view = scrudful_viewset(type("Linked", (ItemViewSetBase,), {"Meta": meta}))
+
+    class LinkedURLconf:
+        urlpatterns = [
+            path("linked/<str:pk>/", view.as_view({"get": "retrieve"}), name="l"),
+            path("", include(hsr_urls())),
+        ]
+
+    settings.ROOT_URLCONF = LinkedURLconf
+    settings.SCRUDFUL = None
+    [message] = scrudful_check_errors()
+    assert message.id == f"scrudful.{expected}"
+    assert type(message) is (checks.Warning if expected == "W001" else checks.Error)
+    assert "'l'" in message.msg
 
 
 def test_manage_py_check_passes_a_link_callable_raising(settings):
@@ -1673,7 +1749,7 @@ def test_the_check_reports_each_view_whatever_its_build_raises(settings):
         for name in ("no-type", "broken", "db-item", "relative-item")
     }
     assert by_route == {
-        "no-type": ["scrudful.E005"],
+        "no-type": ["scrudful.W001"],
         "broken": ["scrudful.E005"],
         "db-item": ["scrudful.W001"],
         "relative-item": [],
