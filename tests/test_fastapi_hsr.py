@@ -818,6 +818,46 @@ def test_router_in_several_apps_serves_each_apps_hsr(make_client, order):
         http_schema_resource(router, "/items/{iid}")
 
 
+def test_a_router_hsr_served_from_an_unrelated_app_describes_the_including_app(
+    make_client,
+):
+    """A router's HSR served by :func:`http_schema_resource_endpoint` from a
+    separate docs app (``hsr_route=False``) describes the entity of the app
+    that includes the router, whose handlers answer its errors: the docs app
+    includes none of its endpoints, so its own entity (here none) is not the
+    one. The wire 422 agrees with the served ``default``."""
+    router = APIRouter()
+
+    @router.get("/items/{iid}")
+    @scrudful(
+        schema_link_or_func="https://api.example/s.json",
+        context_link_or_func="https://api.example/c.jsonld",
+    )
+    def item(iid: int):
+        return {"id": iid}
+
+    add_options(
+        router,
+        base_url=BASE,
+        hsr_route=False,
+        hsr_url=lambda template: "https://api.example/docs/hsr/items",
+    )
+    api = FastAPI()
+    api.include_router(router)
+    docs = FastAPI()
+    docs.add_route("/hsr/items", http_schema_resource_endpoint(router, "/items/{iid}"))
+    api.mount("/docs", docs)
+    add_error_links(api, error_entity("problem"))
+    client = make_client(api)
+    hsr = options_hsr(client, "/items/1")
+    assert hsr == http_schema_resource(router, "/items/{iid}", for_app=api)
+    assert hsr == http_schema_resource(router, "/items/{iid}", for_app=docs)
+    assert "content" in hsr["get"]["responses"]["default"]
+    response = client.get("/items/abc")
+    assert response.status_code == 422
+    assert link_problems("GET", 422, response.headers, True, hsr) == []
+
+
 def test_router_hsr_per_app_has_its_own_etag(make_client):
     """The served bytes, and so the ``ETag``, are each app's."""
     _, apps = router_in_three_apps()

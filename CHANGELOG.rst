@@ -352,7 +352,10 @@ Behaviour change (FastAPI)
   which agrees with that app's responses (0.9 described one entity for every
   app, and failed for apps given different entities).
   ``http_schema_resource`` takes ``for_app=`` to name the app; without it, a
-  router in apps with different entities still raises ``ValueError``.
+  router in apps with different entities still raises ``ValueError``. An app
+  that includes none of the router's endpoints, such as a docs app serving its
+  HSR with ``http_schema_resource_endpoint``, is not the one described: the
+  HSR describes the entity of the apps that include the router.
 * ``add_options`` raises **ValueError** (was ``TypeError``) for a link callable
   of a scrudful endpoint, or of its ``error``, that can't be called as
   ``func()``, checked up front for all of them; and for a base URL that isn't

@@ -115,7 +115,10 @@ the app's ``add_error_links`` entity change: the same document for every
 requester. A router given ``add_options`` and included in several apps has a
 document per app's ``add_error_links`` entity (an app without one included):
 each app's HSR route serves the one its responses agree with, and
-``http_schema_resource(router, path, for_app=app)`` returns it. For each method
+``http_schema_resource(router, path, for_app=app)`` returns it. An app that
+includes none of the router's endpoints (a docs app serving the HSR with
+``http_schema_resource_endpoint``) answers none of its errors, so the document
+it serves is that of the apps including the router. For each method
 of the path, in the order ``get``, ``put``,
 ``post``, ``delete``, ``options``, ``head``, ``patch``, ``trace``:
 

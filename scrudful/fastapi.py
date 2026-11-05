@@ -1539,8 +1539,9 @@ def http_schema_resource(
     For an ``APIRouter`` included in several apps, each app's document
     describes that app's :func:`add_error_links` entity (none for an app
     without one), as its HSR route serves it: ``for_app`` names the app.
-    Without it, the entity of the apps including the router, which must
-    then agree.
+    Without it, or when ``for_app`` includes none of the router's endpoints
+    (a docs app serving it with :func:`http_schema_resource_endpoint`), the
+    entity of the apps including the router, which must then agree.
 
     Link callables are called in *describe* mode, ``func()``: with no
     arguments. They must return the same target as on the responses they
@@ -1947,10 +1948,31 @@ def _owner_error(owner: FastAPI | APIRouter, for_app: Any) -> Entity | None:
     """The :func:`add_error_links` entity the HTTP Schema Resources of
     ``owner``'s paths describe: an app's own; for a router, that of the app
     ``for_app`` (the app serving the request, or the one named), whose
-    handlers answer its errors there; else :func:`_api_error`'s."""
-    if isinstance(owner, APIRouter) and isinstance(for_app, FastAPI):
+    handlers answer its errors there, when it includes the router's
+    endpoints; else :func:`_api_error`'s (an app serving the HTTP Schema
+    Resource with :func:`http_schema_resource_endpoint` alone, such as a
+    separate docs app, answers none of the router's errors)."""
+    if (
+        isinstance(owner, APIRouter)
+        and isinstance(for_app, FastAPI)
+        and _includes(for_app, _router_endpoints(owner))
+    ):
         return _APP_ERRORS.get(for_app)
     return _api_error(owner)
+
+
+def _router_endpoints(router: APIRouter) -> list[Any]:
+    """The scrudful endpoints of ``router``'s resources."""
+    return [endpoint for endpoint, _, _ in _endpoints(router.routes, for_options=True)]
+
+
+def _includes(app: FastAPI, endpoints: Sequence[Any]) -> bool:
+    """Whether ``app``'s handlers answer the errors of one of ``endpoints``:
+    it routes to it (but under a mounted app, which has its own)."""
+    return any(
+        any(endpoint is ours for ours in endpoints)
+        for endpoint, _, _ in _endpoints(app.router.routes, for_options=False)
+    )
 
 
 def _api_error(owner: FastAPI | APIRouter) -> Entity | None:
@@ -1965,15 +1987,10 @@ def _api_error(owner: FastAPI | APIRouter) -> Entity | None:
     """
     if isinstance(owner, FastAPI):
         return _APP_ERRORS.get(owner)
-    endpoints = [
-        endpoint for endpoint, _, _ in _endpoints(owner.routes, for_options=True)
-    ]
+    endpoints = _router_endpoints(owner)
     errors: list[Entity] = []
     for app, error in list(_APP_ERRORS.items()):
-        if error not in errors and any(
-            any(endpoint is ours for ours in endpoints)
-            for endpoint, _, _ in _endpoints(app.router.routes, for_options=False)
-        ):
+        if error not in errors and _includes(app, endpoints):
             errors.append(error)
     if len(errors) > 1:
         raise ValueError(
