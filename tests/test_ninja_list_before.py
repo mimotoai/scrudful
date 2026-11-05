@@ -522,7 +522,7 @@ def test_changed_ninja_checks_are_a_config_error(monkeypatch, cls):
         list_router(cls is ninja_operation.AsyncOperation, before=Recorder())
     message = str(caught.value)
     assert "needs ninja's own Operation._run_checks" in message
-    assert "ninja 1.7.0 and 1.7.1" in message
+    assert "ninja 1.7.0 to 1.7.3" in message
     assert "upgrade scrudful" in message
     assert "pin" not in message
     assert "1.6" not in message

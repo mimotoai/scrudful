@@ -1,0 +1,64 @@
+    def _get_bound_routers(self) -> List[BoundRouter]:
+        """Get or create bound router instances."""
+        if self._bound_routers_cache is None:
+            # Build mounts from registrations (delayed to capture all child routers)
+            all_mounts: List[RouterMount] = []
+
+            for (
+                prefix,
+                router,
+                auth,
+                throttle,
+                tags,
+                url_name_prefix,
+            ) in self._router_registrations:
+                # Get API-level decorators from default router
+                api_decorators = (
+                    self.default_router._decorators
+                    if router is not self.default_router
+                    else []
+                )
+
+                # Build mount configurations (non-mutating)
+                # Pass auth/throttle/tags so they can be inherited by children
+                mounts = router.build_routers(
+                    prefix,
+                    api_decorators,
+                    inherited_auth=auth,
+                    inherited_throttle=throttle,
+                    inherited_tags=tags,
+                    mount_auth=auth,
+                    mount_throttle=throttle,
+                )
+
+                # Apply mount-level overrides to the first (parent) mount
+                # build_routers() always returns at least one mount (the router itself)
+                first_mount = mounts[0]
+                if auth is not NOT_SET:
+                    first_mount.auth = auth
+                if throttle is not NOT_SET:
+                    first_mount.throttle = throttle
+                if tags is not None:
+                    first_mount.tags = tags
+
+                # Apply url_name_prefix to all mounts
+                if url_name_prefix is not None:
+                    for mount in mounts:
+                        mount.url_name_prefix = url_name_prefix
+
+                all_mounts.extend(mounts)
+
+            # Create bound routers from mounts
+            self._bound_routers_cache = [
+                BoundRouter(mount, self) for mount in all_mounts
+            ]
+
+            # Freeze all templates after binding
+            for mount in all_mounts:
+                mount.template._freeze()
+
+            # Update _routers for backward compat (include all nested routers)
+            self._routers = [(m.prefix, m.template) for m in all_mounts]
+
+        return self._bound_routers_cache
+

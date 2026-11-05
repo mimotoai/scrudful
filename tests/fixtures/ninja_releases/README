@@ -1,0 +1,8 @@
+Methods of django-ninja releases scrudful is verified against, whose source
+differs from that of the release the test suite installs. Each file
+``<release>__<Class>.<method>.txt`` is that method as the release ships it,
+copied verbatim (indented as in its class) from its ``ninja`` package, so
+that tests/test_ninja_releases.py can check scrudful accepts it.
+
+django-ninja is Copyright (c) 2025 Vitaliy Kucheryaviy, under the MIT License
+(https://github.com/vitalik/django-ninja/blob/master/LICENSE).

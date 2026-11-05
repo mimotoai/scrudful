@@ -1695,9 +1695,9 @@ def scrudful_list(
         awaitable raises ``TypeError``, and the request does not go on (a
         coroutine is closed and a future cancelled: never awaited). scrudful
         runs ``before`` in its own copy of ninja's per-operation checks,
-        verified against ninja 1.7.0 and 1.7.1, though the ``ninja`` extra
-        allows any ninja from 1.7 below 2: on a ninja whose checks, or
-        whose ``Operation.run`` calling them, differ (compared by a digest
+        verified against ninja 1.7.0 to 1.7.3, the releases the ``ninja``
+        extra allows: on a ninja whose checks, or whose ``Operation.run``
+        calling them, differ (compared by a digest
         of their source,
         comments, docstrings and blank lines aside, or, without installed
         source, only by the names, locals and arguments they use),
@@ -1752,7 +1752,7 @@ def scrudful_list(
         ``Operation.run`` without ``functools.wraps`` (scrudful then can't
         install them), if the
         installed ninja's per-operation checks, or the ``Operation.run``
-        calling them, differ from ninja 1.7.0's and 1.7.1's, or if an
+        calling them, differ from ninja 1.7.0's to 1.7.3's, or if an
         ``Operation`` subclass overrides either. Also when decorating, if a
         schema link (the item's or the collection's) has no RDF context
         link, chained to the :class:`~scrudful.entity.HsrConfigError` of
@@ -2215,7 +2215,7 @@ class ScrudfulRouter(Router):
         otherwise match ``/_hsr/<name>``. That order is kept by ninja's
         ``BoundRouter._bind_operations`` (which clones the paths for each
         mount) and ``BoundRouter.urls_paths`` (which yields their URL
-        patterns), checked to be ninja 1.7.0's and 1.7.1's. A path of an
+        patterns), checked to be ninja 1.7.0's to 1.7.3's. A path of an
         earlier router of the API, or of the API itself, that matches a
         route first is refused when the API's URL patterns are built
         (:func:`_check_hsr_route_reachable`).
@@ -2881,8 +2881,8 @@ def _operation_api(operation: Any) -> NinjaAPI:
         raise ConfigError(
             "scrudful reads the API serving the request from ninja's "
             "Operation.api, which the installed ninja's "
-            f"{type(operation).__qualname__} doesn't have as ninja 1.7.0 and "
-            "1.7.1 do: upgrade scrudful, or keep ninja at one of those releases"
+            f"{type(operation).__qualname__} doesn't have as ninja 1.7.0 to "
+            "1.7.3 do: upgrade scrudful, or keep ninja at one of those releases"
         )
     return api
 
@@ -2901,7 +2901,7 @@ def _api_patterns(api: NinjaAPI) -> list[Any]:
         raise ConfigError(
             "scrudful reverses the HTTP Schema Resource routes of an API among "
             "its patterns, the first item of ninja's NinjaAPI.urls, which the "
-            "installed ninja doesn't give as ninja 1.7.0 and 1.7.1 do, a "
+            "installed ninja doesn't give as ninja 1.7.0 to 1.7.3 do, a "
             "(patterns, app_name, namespace) tuple: upgrade scrudful, or keep "
             "ninja at one of those releases"
         )
@@ -3863,7 +3863,7 @@ def _raised_links_run(
 #: ``Operation`` and ``AsyncOperation`` that scrudful's copy of the checks
 #: (:func:`_install_hooks`) was written from: ``_run_checks``, which it
 #: copies, and ``run``, which answers the response it returns before reading
-#: any parameter. ninja 1.7.0 and 1.7.1 on Python 3.10 to 3.14 (``run``'s
+#: any parameter. ninja 1.7.0 to 1.7.3 on Python 3.10 to 3.14 (``run``'s
 #: f-string is tokenized differently from Python 3.12 on). Also those the HTTP
 #: Schema Resource routes and links rely on (:meth:`ScrudfulRouter._add_hsr_route`,
 #: :func:`_hsr_route_path`): ``BoundRouter._bind_operations`` and
@@ -3891,7 +3891,13 @@ _NINJA_SOURCES = {
         {"12d6d65ac18a38775f1dbf350efd8b2716cd46fbc7e3f9e96ff49ac722000b39"}
     ),
     "NinjaAPI._get_bound_routers": frozenset(
-        {"41498c0b58d36097dc76dc36d81d0b0bfcb177d303339a2bd53260f5962012de"}
+        {
+            # 1.7.0 and 1.7.1, then 1.7.2 and 1.7.3 (which pass a mount's
+            # auth and throttle to Router.build_routers, instead of writing
+            # them on a nested router).
+            "41498c0b58d36097dc76dc36d81d0b0bfcb177d303339a2bd53260f5962012de",
+            "060bdd987299b0a08cd70f59f363bb0a593f0712ae51ad5c9fbfe99f8a71277f",
+        }
     ),
     "NinjaAPI._get_urls": frozenset(
         {"5326f1f8197ffeae637c278614d4096275d1aedfe5e26b6f0362e87f0e218f96"}
@@ -3946,7 +3952,7 @@ _NINJA_SOURCES = {
         {"5189477ffad3b05335304fa19f3900e208d8d234ca99626b9117cf7067921fc7"}
     ),
     # The JSON 405 (_ScrudfulPathView); each tokenizes alike on Python 3.10
-    # to 3.14, in ninja 1.7.0 and 1.7.1.
+    # to 3.14, in ninja 1.7.0 to 1.7.3.
     "PathView.clone": frozenset(
         {"7635be8d39a8461cbdffc9c5d1352cc54f5196c1e34cccf401b8f2ee7bbc7315"}
     ),
@@ -4007,7 +4013,7 @@ _BOUND_ROUTERS_LOCALS = (
     "mount",
 )
 #: Where the source isn't available: the names, local variables and argument
-#: count of each (the same in ninja 1.7.0 and 1.7.1 on Python 3.10 to 3.14,
+#: count of each (the same in ninja 1.7.0 to 1.7.3 on Python 3.10 to 3.14,
 #: but where noted), or a set of them. Weaker: a body using the same names in
 #: another order passes.
 _NINJA_CODE: dict[str, Any] = {
@@ -4438,14 +4444,14 @@ def _is_ninja_code(func: Any, name: str) -> bool:
 
 def _check_ninja_internal(owner: Any, owner_name: str, method: str, use: str) -> None:
     """Raise ``ConfigError`` unless ``owner`` (ninja's class ``owner_name``,
-    ``None`` when the installed ninja has none) has ninja 1.7.0's and
-    1.7.1's ``method``, which ``use`` relies on."""
+    ``None`` when the installed ninja has none) has ninja 1.7.0's to
+    1.7.3's ``method``, which ``use`` relies on."""
     name = f"{owner_name}.{method}"
     func = getattr(owner, method, None) if owner is not None else None
     if func is None or not _is_ninja_code(func, name):
         raise ConfigError(
             f"{use}: scrudful relies on ninja's {name} here, and the installed "
-            "ninja's differs from ninja 1.7.0's and 1.7.1's, which scrudful is "
+            "ninja's differs from ninja 1.7.0's to 1.7.3's, which scrudful is "
             "verified against: upgrade scrudful, or keep ninja at one of those "
             "releases"
         )
@@ -4490,7 +4496,7 @@ def _check_ninja_checks(
                 label,
                 config,
                 f"the installed ninja's {ninja_class.__name__}.{method} differs "
-                f"from ninja 1.7.0's and 1.7.1's, which scrudful's {hooks} "
+                f"from ninja 1.7.0's to 1.7.3's, which scrudful's {hooks} "
                 f"{_verb(config, 'is', 'are')} verified against: upgrade "
                 "scrudful, or keep ninja at one of those releases",
             )
@@ -4507,7 +4513,7 @@ def _checks_error(label: str, config: _Config, reason: str) -> ConfigError:
     return ConfigError(
         f"{label}: {config.hooks_label} {_verb(config, 'needs', 'need')} ninja's "
         "own Operation._run_checks and the Operation.run calling it (as in "
-        f"ninja 1.7.0 and 1.7.1), as scrudful runs {where}; {reason}."
+        f"ninja 1.7.0 to 1.7.3), as scrudful runs {where}; {reason}."
     )
 
 
@@ -4520,7 +4526,7 @@ def _install_hooks(
     throttling).
 
     ``Operation.run`` answers a response its ``_run_checks`` returns before it
-    reads any parameter. These checks are ninja 1.7.0's and 1.7.1's (CSRF
+    reads any parameter. These checks are ninja 1.7.0's to 1.7.3's (CSRF
     exemption flag, authentication, throttles) with ``before`` called between
     authentication and throttling, so a request it refuses uses none of a
     throttle's quota, and ``after_throttles`` after throttling, so a
@@ -5493,7 +5499,7 @@ _PATH_VIEW_METHODS = ("clone", "get_view", "_sync_view", "_async_view")
 
 def _check_path_view() -> None:
     """Raise ``ConfigError`` unless ninja's ``PathView`` has ninja 1.7.0's
-    and 1.7.1's :data:`_PATH_VIEW_METHODS` (memoized, see
+    to 1.7.3's :data:`_PATH_VIEW_METHODS` (memoized, see
     :func:`_is_ninja_code`)."""
     for method in _PATH_VIEW_METHODS:
         _check_ninja_internal(
@@ -5551,7 +5557,7 @@ class _ScrudfulPathView(PathView):
             raise ConfigError(
                 "scrudful's JSON 405 replaces ninja's PathView of each path of a "
                 "ScrudfulRouter, but the installed ninja made a "
-                f"{type(path_view).__qualname__}, where ninja 1.7.0 and 1.7.1 "
+                f"{type(path_view).__qualname__}, where ninja 1.7.0 to 1.7.3 "
                 "make a PathView: upgrade scrudful, or keep ninja at one of "
                 "those releases"
             )
@@ -5704,8 +5710,8 @@ def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
     ninja.errors.ConfigError
         If an earlier path of the API matches the route; or if the installed
         ninja's ``NinjaAPI._get_urls`` (the order of the patterns) or
-        ``NinjaAPI._get_bound_routers`` differs from ninja 1.7.0's and
-        1.7.1's, or its bound routers don't hold the route.
+        ``NinjaAPI._get_bound_routers`` differs from ninja 1.7.0's to
+        1.7.3's, or its bound routers don't hold the route.
     """
     api = getattr(next(iter(path_view.operations), None), "api", None)
     if not isinstance(api, NinjaAPI):
@@ -5986,7 +5992,7 @@ def _options_throttled(
     ------
     ConfigError
         If the installed ninja's ``Operation._check_throttles`` differs from
-        ninja 1.7.0's and 1.7.1's, or its ``BoundRouter`` has no ``throttle``.
+        ninja 1.7.0's to 1.7.3's, or its ``BoundRouter`` has no ``throttle``.
     """
     _check_ninja_internal(
         type(operation),
@@ -5999,7 +6005,7 @@ def _options_throttled(
             raise ConfigError(
                 "scrudful throttles OPTIONS with ninja's BoundRouter.throttle, "
                 "which the installed ninja's BoundRouter doesn't have as ninja "
-                "1.7.0 and 1.7.1 do: upgrade scrudful, or keep ninja at one of "
+                "1.7.0 to 1.7.3 do: upgrade scrudful, or keep ninja at one of "
                 "those releases"
             )
         throttle: Any = NOT_SET
@@ -6100,8 +6106,8 @@ def _bound_mount(api: NinjaAPI, running: Any) -> tuple[Any, Any]:
     ------
     ConfigError
         If the installed ninja's ``NinjaAPI._get_bound_routers`` or
-        ``BoundRouter._bind_operations`` differ from ninja 1.7.0's and
-        1.7.1's, or ``BoundRouter.path_operations`` doesn't hold ``running``.
+        ``BoundRouter._bind_operations`` differ from ninja 1.7.0's to
+        1.7.3's, or ``BoundRouter.path_operations`` doesn't hold ``running``.
     """
     _check_ninja_internal(
         type(api),
@@ -6140,7 +6146,7 @@ def _check_options_internals() -> None:
     Raises
     ------
     ConfigError
-        If the installed ninja's differ from ninja 1.7.0's and 1.7.1's.
+        If the installed ninja's differ from ninja 1.7.0's to 1.7.3's.
     """
     try:
         from ninja.params import models as ninja_params
@@ -6164,7 +6170,7 @@ def _bound_path_error() -> ConfigError:
         "scrudful's per-requester Allow of OPTIONS finds the operations of the "
         "mount serving the request through ninja's BoundRouter.path_operations "
         "(PathView clones of the router's, in its order), which the installed "
-        "ninja doesn't have as ninja 1.7.0 and 1.7.1 do: upgrade scrudful, or "
+        "ninja doesn't have as ninja 1.7.0 to 1.7.3 do: upgrade scrudful, or "
         "keep ninja at one of those releases"
     )
 
@@ -6253,7 +6259,7 @@ def _path_values(
     ):
         raise ConfigError(
             f"{use} validates the path parameters with ninja's Operation.models, "
-            "which the installed ninja doesn't have as ninja 1.7.0 and 1.7.1 do "
+            "which the installed ninja doesn't have as ninja 1.7.0 to 1.7.3 do "
             "(a list of ParamModel classes): upgrade scrudful, or keep ninja at "
             "one of those releases"
         )
@@ -6301,7 +6307,7 @@ def _authenticated(
     ConfigError
         If the installed ninja's ``_run_authentication`` (of the operation's
         class, ``Operation`` or ``AsyncOperation``) differs from ninja
-        1.7.0's and 1.7.1's, or its ``Operation.auth_callbacks`` isn't a
+        1.7.0's to 1.7.3's, or its ``Operation.auth_callbacks`` isn't a
         sequence of callables.
     """
     ninja_class = AsyncOperation if getattr(operation, "is_async", False) else Operation
@@ -6316,7 +6322,7 @@ def _authenticated(
         raise ConfigError(
             "scrudful's per-requester Allow of OPTIONS runs the auth callbacks "
             "of ninja's Operation.auth_callbacks, which the installed ninja "
-            "doesn't have as ninja 1.7.0 and 1.7.1 do (a sequence of "
+            "doesn't have as ninja 1.7.0 to 1.7.3 do (a sequence of "
             "callables): upgrade scrudful, or keep ninja at one of those releases"
         )
     # A copy of the OPTIONS request, which _options_answer marked CSRF-exempt.
