@@ -6114,14 +6114,11 @@ def _options_answer(
     # As ninja's _run_checks marks the request of a CSRF-exempt operation.
     request._ninja_csrf_exempt = True  # type: ignore[attr-defined]
     meta = getattr(request, "META", None)
-    if (
-        request.method == "OPTIONS"
-        and isinstance(meta, dict)
-        and "REQUEST_METHOD" not in meta
-    ):
+    if isinstance(meta, dict) and "REQUEST_METHOD" not in meta:
         # ninja's test clients build a request without the request line's
         # method: the per-method checks get copies whose ``method`` is
-        # theirs, so this is how they tell an OPTIONS (as documented).
+        # theirs, so this is how they tell an OPTIONS (as documented). Only
+        # the automatic OPTIONS operation gets here: it is an OPTIONS.
         meta["REQUEST_METHOD"] = "OPTIONS"
     try:
         bound_router, bound_view = _bound_mount(api, operation)

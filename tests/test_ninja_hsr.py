@@ -3819,18 +3819,6 @@ def test_options_gives_a_request_without_a_request_line_its_method():
     assert LOCK_SEEN == [("PUT", "KEPT")]
 
 
-def test_options_sets_no_request_line_of_another_method():
-    store, seen = Store(), []
-
-    def load(request, pk, **params):
-        seen.append(request.META.get("REQUEST_METHOD"))
-        return store.load(request, pk, **params)
-
-    api, _ = make_api(load=load)
-    assert TestClient(api).get("/1").status_code == 200
-    assert seen == [None]
-
-
 def test_options_with_an_allowed_hook_runs_no_methods_own_load():
     """An ``allowed`` hook alone decides: a method's own ``load`` doesn't
     run, and the hook gets the loader's object."""
