@@ -1006,11 +1006,14 @@ _iter_route_contexts = getattr(fastapi_routing, "iter_route_contexts", None)
 
 class _Built(NamedTuple):
     """A built HTTP Schema Resource, with what it was built from: valid while
-    its path's routes are the same objects in the same order (it is kept by
-    resource key and :func:`add_error_links` entity)."""
+    its path's routes are the same objects in the same order, and its entity
+    the same object (it is kept by resource key and ``id`` of the entity)."""
 
     #: The path's routes (their ``original_route``), compared by identity.
     routes: tuple[Any, ...]
+    #: The :func:`add_error_links` entity described (``None``: none), compared
+    #: by identity; held here, so its ``id`` in the key isn't reused.
+    error: Entity | None
     document: dict[str, Any]
 
 
@@ -1039,14 +1042,15 @@ class _HsrOptions:
     #: Whether :func:`add_options` gave them (else they are the defaults, for
     #: :func:`http_schema_resource` on an app without it).
     explicit: bool = False
-    #: Each built document, by resource key and :func:`add_error_links`
-    #: entity (a router included in several apps has one per app's entity,
-    #: ``None`` for an app without one).
-    built: dict[tuple[str, Entity | None], _Built] = field(default_factory=dict)
+    #: Each built document, by resource key and ``id`` of the
+    #: :func:`add_error_links` entity it describes (a router included in
+    #: several apps has one per app's entity, ``None``'s for an app without
+    #: one). By identity, not equality: an entity may be unhashable (a link
+    #: callable object defining ``__eq__``), and the cache is of the entity
+    #: given, which the :class:`_Built` holds.
+    built: dict[tuple[str, int], _Built] = field(default_factory=dict)
     #: Each served document's bytes and ETag, by the same keys.
-    serialized: dict[tuple[str, Entity | None], _Serialized] = field(
-        default_factory=dict
-    )
+    serialized: dict[tuple[str, int], _Serialized] = field(default_factory=dict)
     #: The owner's resources, indexed (see :func:`_scrudful_paths`).
     index: _PathsIndex | None = field(default=None, compare=False, repr=False)
     #: The resource keys of a router announced as having no OPTIONS or HSR
@@ -1565,7 +1569,8 @@ def http_schema_resource(
         raise TypeError(
             f"for_app must be a FastAPI application, not {type(for_app).__name__}"
         )
-    return copy.deepcopy(_run_describing(_hsr_flow(app, path, for_app=for_app)))
+    built = _run_describing(_hsr_flow(app, path, for_app=for_app))
+    return copy.deepcopy(built.document)
 
 
 def http_schema_resource_endpoint(
@@ -1627,29 +1632,32 @@ def _hsr_flow(
     paths: Mapping[str, _Resource] | None = None,
     *,
     for_app: Any = None,
-) -> _Flow[dict[str, Any]]:
-    """The HTTP Schema Resource of ``path`` on ``owner`` (not a copy) for the
-    app ``for_app`` (see :func:`_owner_error`): the one built for that app's
-    error entity, unless the routes of ``path`` changed. ``paths`` is
-    ``owner``'s :func:`_scrudful_paths`, when the caller has them."""
+) -> _Flow[_Built]:
+    """The HTTP Schema Resource of ``path`` on ``owner`` (its document not a
+    copy) for the app ``for_app`` (see :func:`_owner_error`): the one built
+    for that app's error entity, unless the routes of ``path`` changed.
+    ``paths`` is ``owner``'s :func:`_scrudful_paths`, when the caller has
+    them."""
     options = _hsr_options(owner)
     if paths is None:
         paths = _scrudful_paths(owner)
     resource = _resource(owner, paths, path)
     routes = resource.routes
     api_error = _owner_error(owner, for_app)
-    cache_key = (_template_key(path), api_error)
+    cache_key = (_template_key(path), id(api_error))
     originals = tuple(getattr(route, "original_route", route) for route in routes)
     built = options.built.get(cache_key)
     if (
         built is not None
+        and built.error is api_error
         and len(built.routes) == len(originals)
         and all(old is new for old, new in zip(built.routes, originals))
     ):
-        return built.document
+        return built
     document = yield from _describe_path(routes, options.base_url, api_error)
-    options.built[cache_key] = _Built(originals, document)
-    return document
+    built = _Built(originals, api_error, document)
+    options.built[cache_key] = built
+    return built
 
 
 def _resource(
@@ -3780,9 +3788,10 @@ async def _hsr_get(
     ``owner``, with ``owner``'s ``Cache-Control`` (see :func:`_hsr_response`).
     A router's describes the error entity of the app serving ``request``."""
     app = request.scope.get("app")
-    document = await _run_describing_async(_hsr_flow(owner, path, paths, for_app=app))
+    built = await _run_describing_async(_hsr_flow(owner, path, paths, for_app=app))
+    document = built.document
     options = _hsr_options(owner)
-    key = (_template_key(path), _owner_error(owner, app))
+    key = (_template_key(path), id(built.error))
     serialized = options.serialized.get(key)
     if serialized is None or serialized.document is not document:
         body = serialize_hsr(document)

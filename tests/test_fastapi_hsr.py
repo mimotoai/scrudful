@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import re
 import warnings
@@ -856,6 +857,55 @@ def test_a_router_hsr_served_from_an_unrelated_app_describes_the_including_app(
     response = client.get("/items/abc")
     assert response.status_code == 422
     assert link_problems("GET", 422, response.headers, True, hsr) == []
+
+
+@dataclasses.dataclass
+class LinkBuilder:
+    """A link callable object: a dataclass with ``eq`` is unhashable, and so
+    is an ``Entity`` holding it."""
+
+    path: str
+
+    def __call__(self, **kwargs: Any) -> str:
+        return "https://api.example" + self.path
+
+
+@pytest.mark.parametrize("mode", ["app", "router"])
+def test_an_unhashable_error_entity_is_described_and_served(make_client, mode):
+    """The HSRs are kept by the entity they describe, by identity: an
+    unhashable one works end to end (GET, ``http_schema_resource`` and
+    OPTIONS, whose HSR link is served), and agrees with the wire error."""
+    error = Entity(
+        media_type="application/problem+json",
+        schema_link_or_func=LinkBuilder("/schemas/problem.json"),
+        context_link_or_func="https://api.example/contexts/problem.jsonld",
+    )
+    with pytest.raises(TypeError):
+        hash(error)
+    owner: FastAPI | APIRouter = FastAPI() if mode == "app" else APIRouter()
+
+    @owner.get("/items/{iid}")
+    @scrudful(etag_func=lambda **kwargs: '"1"', **USER_LINKS)
+    def item(iid: int):
+        return {"id": iid}
+
+    add_options(owner, base_url=BASE)
+    if isinstance(owner, FastAPI):
+        app = owner
+    else:
+        app = FastAPI()
+        app.include_router(owner)
+    add_error_links(app, error)
+    client = make_client(app)
+    assert client.get("/items/1").status_code == 200
+    hsr = options_hsr(client, "/items/1")
+    assert hsr == http_schema_resource(owner, "/items/{iid}")
+    assert hsr["get"]["responses"]["default"]["content"] == APP_ERROR_CONTENT
+    response = client.get("/items/1", headers={"If-None-Match": "garbage"})
+    assert response.status_code == 400
+    assert link_problems("GET", 400, response.headers, True, hsr) == []
+    # Kept: the same document again.
+    assert client.get("/_hsr/items.iid").json() == hsr
 
 
 def test_router_hsr_per_app_has_its_own_etag(make_client):
