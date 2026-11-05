@@ -121,8 +121,9 @@ Behaviour change (all adapters)
   as ``application/problem+json`` with their ``{"detail": [...]}`` body; DRF's
   serializer 400 kept its body).
 * The HSR's configuration errors (a relative URL without a base URL, a link
-  callable raising in describe mode, a schema without a context) carry one
-  message, raised as ``ninja.errors.ConfigError``, Django's
+  callable raising in describe mode, a schema without a context, a non-JSON
+  context whose type callable returns nothing) carry one message, naming the
+  entry, raised as ``ninja.errors.ConfigError``, Django's
   ``ImproperlyConfigured`` (DRF) and ``ValueError`` (FastAPI).
 * ``SCRUDFUL`` (Django) must be a dict of the keys ``BASE_URL``,
   ``HSR_ROUTE``, ``HSR_URL``, ``HSR_CACHE_CONTROL`` and ``ERROR``: another
