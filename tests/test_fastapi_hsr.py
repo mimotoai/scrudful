@@ -46,6 +46,7 @@ from scrudful.fastapi import (
     http_schema_resource_endpoint,
     scrudful,
 )
+from tests import annotation_globals_base, annotation_globals_uses
 from tests import fastapi_security_annotations as security_annotations
 from tests.semantic_http import (
     HSR_DOCUMENT_REL,
@@ -3691,6 +3692,51 @@ def test_resolved_signature_reads_a_non_function_in_its_globals(call):
     parameters = resolved_signature(call).parameters
     assert typing.get_origin(parameters["user"].annotation) is typing.Annotated
     assert parameters["db"].annotation == "Session"
+
+
+@pytest.mark.parametrize(
+    "name, module, security",
+    [
+        ("CHECK", annotation_globals_base, "writer"),
+        ("User", annotation_globals_base, "writer"),
+        ("CHECKER", annotation_globals_base, "writer"),
+        ("logged_user", annotation_globals_uses, "editor"),
+        ("SIGNED", annotation_globals_uses, "editor"),
+    ],
+    ids=["bound-method", "class", "callable-instance", "wrapped", "module"],
+)
+def test_annotation_globals_are_those_of_the_signatures_function(
+    name, module, security
+):
+    """Each annotation is evaluated in the globals of the function the
+    signature comes from, in another module than the callable's: a bound
+    method's function, a class's inherited ``__init__``, a callable
+    instance's inherited ``__call__``, a wrapper's ``__wrapped__``; else
+    (``__signature__``, and no Python ``__call__``) the callable's module.
+    The module the callable is in (or its ``__module__`` names) can't
+    evaluate them."""
+    from scrudful._adapter import annotation_globals, resolved_signature
+
+    call = getattr(annotation_globals_uses, name)
+    assert annotation_globals(call) is vars(module)
+    parameters = resolved_signature(call).parameters
+    user = parameters["user"].annotation
+    assert typing.get_origin(user) is typing.Annotated
+    assert typing.get_args(user)[1].dependency is getattr(module, security)
+    assert parameters["db"].annotation == "Session"
+
+
+def test_a_bound_method_dependency_is_read_in_its_functions_globals(make_client):
+    """A bound method whose function is another module's (its
+    ``__module__`` naming the endpoint's) is read in that function's globals,
+    as FastAPI reads it: its ``Security(...)`` refuses whom it refuses, and
+    nothing is announced (the suite runs with warnings as errors)."""
+    client = make_client(annotation_globals_uses.bound_method_app())
+    assert client.put("/notes/1").status_code == 403
+    writer = security_annotations.WRITER
+    assert client.put("/notes/1", headers=writer).status_code == 200
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
+    options_204(client, "/notes/1", "GET, PUT, OPTIONS", NOTE_TARGET, headers=writer)
 
 
 def test_resolved_signature_leaves_an_attribute_error_annotation_a_string():
