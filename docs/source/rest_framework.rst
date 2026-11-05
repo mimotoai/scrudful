@@ -300,10 +300,18 @@ With ``ScrudfulMetadata`` installed, OPTIONS is answered in this order:
    view's ``request``, with the method's action as a viewset's ``action``,
    meanwhile). A method with an ``allowed_func`` skips this pass: the hook
    alone decides, with the object.
-4. **Only if a method passed is the object loaded**, on a detail route (one
-   whose ``lookup_url_kwarg``, else ``lookup_field``, is in the URL kwargs),
-   with ``get_object()``, its ``check_object_permissions`` suppressed. So a
-   requester refused every method gets ``Allow: OPTIONS`` whether the object
+4. **Only if a method passed is the object loaded**, on an item's route, with
+   ``get_object()``, its ``check_object_permissions`` suppressed, as the first
+   method that passed (GET, when it did) loads it: a request of that method is
+   the view's ``request`` meanwhile and, on a viewset, that method's action
+   (``retrieve`` for GET) its ``action``, so a ``get_queryset`` that scopes by
+   ``self.action`` gives the queryset that method gets (not OPTIONS's
+   ``metadata`` action's). An item's route is one whose ``lookup_url_kwarg``,
+   else ``lookup_field``, is in the URL kwargs; with a ``get_object`` of the
+   view's own, whatever the URL kwarg is named: on a viewset, a route whose
+   action is ``retrieve``, ``update``, ``partial_update``, ``destroy`` or an
+   ``@action(detail=True)``; on another view, a route with a URL kwarg (but
+   DRF's ``format``). So a requester refused every method gets ``Allow: OPTIONS`` whether the object
    exists or not, as a GET of either is refused alike. A ``get_object()``
    that raises (the ``Http404`` of a missing object, or of one the requester
    may not read) is the answer, through the view's exception handler, with

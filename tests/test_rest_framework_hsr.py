@@ -33,6 +33,7 @@ from rest_framework.metadata import BaseMetadata
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient, APIRequestFactory
 from rest_framework.views import APIView
 
@@ -2177,3 +2178,204 @@ def test_another_exception_an_allowed_func_raises_propagates(settings, client):
     settings.ROOT_URLCONF = RaisingHookURLconf
     with pytest.raises(LookupError, match="broken"):
         client.options("/raising/broken/")
+
+
+# --- OPTIONS: the object loaded as the checked method loads it ------------------
+
+#: The action (or method) each loader below was called under.
+SEEN_ACTIONS = []
+GROUP = Entity(
+    "https://api.example/schemas/group",
+    context_link_or_func="https://api.example/contexts/group",
+)
+
+
+class WritesForNobody(BasePermission):
+    """Every requester may read an object; nobody may write it."""
+
+    def has_object_permission(self, request, view, obj):
+        return request.method in ("GET", "HEAD")
+
+
+class GetForNobody(BasePermission):
+    """No requester may GET (or HEAD); the writes are left to the object."""
+
+    def has_permission(self, request, view):
+        return request.method not in ("GET", "HEAD")
+
+
+@scrudful_viewset
+class ByActionViewSet(viewsets.ModelViewSet):
+    """DRF's own ``get_object``, over a queryset scoped by action, as many
+    projects scope it: the item actions see the groups, the others none."""
+
+    queryset = Group.objects.all()
+    permission_classes = [WritesForNobody]
+
+    class Meta:
+        entity = GROUP
+
+    def get_queryset(self):
+        SEEN_ACTIONS.append(self.action)
+        if self.action in ("retrieve", "update", "partial_update", "destroy"):
+            return Group.objects.all()
+        return Group.objects.none()
+
+    def retrieve(self, request, pk):
+        return Response({"pk": self.get_object().pk})
+
+
+@scrudful_viewset
+class WriteOnlyViewSet(ByActionViewSet):
+    """The requester may not GET: the object is loaded as a PUT loads it."""
+
+    permission_classes = [GetForNobody]
+
+    def get_queryset(self):
+        SEEN_ACTIONS.append(self.action)
+        if self.action == "update":
+            return Group.objects.all()
+        return Group.objects.none()
+
+
+class SlugThing:
+    pk = "thing"
+
+
+@scrudful_viewset
+class SlugViewSet(viewsets.GenericViewSet):
+    """A ``get_object`` of its own, looking the object up by the URL's
+    ``slug`` (``lookup_field`` stays ``pk``)."""
+
+    permission_classes = [WritesForNobody]
+
+    class Meta:
+        entity = GROUP
+
+    def get_object(self):
+        SEEN_ACTIONS.append(self.action)
+        if self.kwargs["slug"] != "thing":
+            raise Http404
+        obj = SlugThing()
+        self.check_object_permissions(self.request, obj)
+        return obj
+
+    def retrieve(self, request, slug):
+        return Response({"pk": self.get_object().pk})
+
+    def update(self, request, slug):
+        return Response({"pk": self.get_object().pk})
+
+    @action(detail=True, methods=["get", "put"])
+    @scrudful(entity=GROUP)
+    def extra(self, request, slug):
+        return Response({"pk": self.get_object().pk})
+
+
+class SlugView(APIView):
+    """An ``APIView`` (no ``lookup_field``) with a ``get_object`` of its own."""
+
+    permission_classes = [WritesForNobody]
+
+    def get_object(self):
+        SEEN_ACTIONS.append(self.request.method)
+        if self.kwargs["slug"] != "thing":
+            raise Http404
+        obj = SlugThing()
+        self.check_object_permissions(self.request, obj)
+        return obj
+
+    @scrudful(entity=GROUP)
+    def get(self, request, slug):
+        return Response({"pk": self.get_object().pk})
+
+    @scrudful(entity=GROUP)
+    def put(self, request, slug):
+        return Response({"pk": self.get_object().pk})
+
+
+slug_detail = SlugViewSet.as_view({"get": "retrieve", "put": "update"})
+slug_extra = SlugViewSet.as_view({"get": "extra", "put": "extra"})
+
+
+class LoadingURLconf:
+    router = SimpleRouter()
+    router.register("by-action", ByActionViewSet, basename="by-action")
+    router.register("write-only", WriteOnlyViewSet, basename="write-only")
+    urlpatterns = [
+        path("", include(router.urls)),
+        path("slugs/<slug:slug>/", slug_detail, name="slug-detail"),
+        path("slugs/<slug:slug>/extra/", slug_extra, name="slug-extra"),
+        path("slug-view/<slug:slug>", SlugView.as_view(), name="slug-view"),
+        path("", include(hsr_urls())),
+    ]
+
+
+@pytest.fixture
+def loading(settings):
+    settings.ROOT_URLCONF = LoadingURLconf
+    SEEN_ACTIONS.clear()
+    yield
+    SEEN_ACTIONS.clear()
+
+
+def test_options_loads_the_object_under_the_get_action(loading, client):
+    """The object is loaded as a GET loads it (``action`` ``retrieve``, a GET
+    request), not under DRF's OPTIONS action, ``metadata``."""
+    group = Group.objects.create(name="g")
+    assert client.get(f"/by-action/{group.pk}/").status_code == 200
+    SEEN_ACTIONS.clear()
+    r = client.options(f"/by-action/{group.pk}/")
+    assert r.status_code == 204
+    assert r["Allow"] == "GET, OPTIONS, HEAD"
+    assert SEEN_ACTIONS == ["retrieve"]
+    # The view and its request are as DRF left them for OPTIONS.
+    request, view = r.renderer_context["request"], r.renderer_context["view"]
+    assert view.action == "metadata"
+    assert view.request is request and request.method == "OPTIONS"
+    assert "check_object_permissions" not in vars(view)
+    # A missing object is the 404 a GET gives, for the same reason.
+    assert client.options("/by-action/999999/").status_code == 404
+    assert client.get("/by-action/999999/").status_code == 404
+
+
+def test_options_loads_the_object_under_the_first_allowed_methods_action(
+    loading, client
+):
+    """Without GET, the object is loaded as the first method that passed its
+    view-level checks loads it: PUT, ``update``."""
+    group = Group.objects.create(name="g")
+    r = client.options(f"/write-only/{group.pk}/")
+    assert r.status_code == 204
+    assert r["Allow"] == "PUT, DELETE, OPTIONS, PATCH"
+    assert SEEN_ACTIONS == ["update"]
+
+
+def test_options_of_a_collection_loads_nothing(loading, client):
+    r = client.options("/by-action/")
+    assert r.status_code == 204
+    assert SEEN_ACTIONS == []
+
+
+@pytest.mark.parametrize(
+    "url, loaded",
+    [
+        ("/slugs/thing/", ["retrieve"]),
+        ("/slugs/thing/extra/", ["extra"]),
+        ("/slug-view/thing", ["GET"]),
+    ],
+)
+def test_options_loads_with_the_views_own_get_object_whatever_the_kwarg(
+    loading, client, url, loaded
+):
+    """A ``get_object`` of the view's own is called whatever its URL kwarg
+    is named, so the object-level checks run: PUT is refused on the object."""
+    assert client.put(url).status_code == 403
+    SEEN_ACTIONS.clear()
+    r = client.options(url)
+    assert r.status_code == 204
+    assert r["Allow"] == "GET, OPTIONS, HEAD"
+    assert SEEN_ACTIONS == loaded
+    missing = url.replace("thing", "nothing")
+    assert client.options(missing).status_code == 404
+    assert client.get(missing).status_code == 404

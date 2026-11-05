@@ -142,13 +142,22 @@ OPTIONS
        meanwhile). A method with an ``allowed_func`` (its handler's, else
        ``Meta.allowed_func``) skips this check: the hook alone decides, with
        the object.
-    4. Only if one method passed step 3 is the object loaded, on a detail
-       route (one whose ``lookup_url_kwarg``, else ``lookup_field``, is in
-       the URL kwargs), with ``get_object()``, its
-       ``check_object_permissions`` suppressed. So on a view whose methods
-       are all gated by permissions, a requester refused every method gets
-       ``Allow: OPTIONS`` whether the object exists or not, as a GET of either
-       is refused alike: OPTIONS is no existence oracle for it. A method with
+    4. Only if one method passed step 3 is the object loaded, on an item's
+       route, with ``get_object()``, its ``check_object_permissions``
+       suppressed, as the first method that passed (GET, when it did) loads
+       it: with a request of that method as the view's ``request`` and,
+       on a viewset, that method's action as ``action`` (so a
+       ``get_queryset`` scoped by action gives the queryset that method
+       gets, not OPTIONS's ``metadata``'s). An item's route is one whose
+       ``lookup_url_kwarg``, else ``lookup_field``, is in the URL kwargs;
+       with a ``get_object`` of the view's own, whatever its URL kwarg is
+       named, a viewset route whose action is ``retrieve``, ``update``,
+       ``partial_update``, ``destroy`` or an ``@action(detail=True)``, or
+       another view's route with a URL kwarg (but ``format``). So on a view
+       whose methods are all gated by permissions, a requester refused every
+       method gets ``Allow: OPTIONS`` whether the object exists or not, as a
+       GET of either is refused alike: OPTIONS is no existence oracle for
+       it. A method with
        an ``allowed_func`` passes step 3 for every requester (the hook has no
        object-free check), so the object is always loaded on such a view and
        a missing one is a 404 whoever asks: there, OPTIONS tells anyone which
@@ -271,6 +280,7 @@ from rest_framework.exceptions import (
 from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
 from rest_framework.decorators import api_view
 from rest_framework.fields import IntegerField
+from rest_framework.generics import GenericAPIView
 from rest_framework.metadata import BaseMetadata, SimpleMetadata
 from rest_framework.mixins import UpdateModelMixin
 from rest_framework.pagination import BasePagination
@@ -1743,24 +1753,63 @@ def _no_check(*args: Any) -> None:
     """In place of ``check_permissions`` / ``check_object_permissions``."""
 
 
-def _options_object(view: APIView) -> Any:
+def _options_object(view: APIView, request: Request, method: str) -> Any:
     """The object an OPTIONS of ``view`` is about, for the object-level checks
-    of its ``Allow``: ``view.get_object()`` on a detail route (one whose
-    ``lookup_url_kwarg``, else ``lookup_field``, is in the URL kwargs), with
+    of its ``Allow``, loaded as a ``method`` request loads it: the view's
+    ``get_object()``, with a request of ``method`` as ``view.request`` and,
+    on a viewset, the action ``method`` maps to as ``view.action`` (so that
+    a ``get_queryset`` scoped by action scopes it as for that method), and
     ``check_object_permissions`` suppressed (the checks of each method are
-    :func:`_allowed_methods`'s); ``None`` on any other route (a collection)
-    or for a view without ``get_object``. What ``get_object()`` raises
-    propagates (``Http404`` for a missing object).
+    :func:`_allowed_methods`'s); the view's state is put back after.
+    ``None`` where the view loads no object (:func:`_loads_object`: a
+    collection, or a view without ``get_object``). What ``get_object()``
+    raises propagates (``Http404`` for a missing object).
     """
-    get_object = getattr(view, "get_object", None)
+    values: dict[str, Any] = {
+        "request": _clone_request(request, method),
+        "check_object_permissions": _no_check,
+    }
+    action_map = getattr(view, "action_map", None)
+    if isinstance(action_map, dict):
+        values["action"] = action_map.get(method.lower())
+    if not _loads_object(view, values.get("action")):
+        return None
+    with _instance_attributes(view, **values):
+        return view.get_object()
+
+
+#: The actions of a viewset's item routes (``detail=True`` for an ``@action``).
+_DETAIL_ACTIONS = frozenset({"retrieve", "update", "partial_update", "destroy"})
+
+
+def _loads_object(view: APIView, action: str | None) -> bool:
+    """Whether ``view``'s route is an item's, whose object ``get_object()``
+    loads: the view has a ``get_object`` and
+
+    - its lookup kwarg (``lookup_url_kwarg``, else ``lookup_field``) is in
+      the URL kwargs; or, with a ``get_object`` of the view's own (DRF's
+      needs the lookup kwarg), whatever the kwarg is named,
+    - on a viewset, ``action`` (the checked method's) is an item action:
+      ``retrieve``, ``update``, ``partial_update``, ``destroy``, or an
+      ``@action(detail=True)``;
+    - on another view, the route has a URL kwarg (but DRF's ``format``).
+    """
+    if not callable(getattr(view, "get_object", None)):
+        return False
+    kwargs = getattr(view, "kwargs", None) or {}
     lookup = getattr(view, "lookup_url_kwarg", None) or getattr(
         view, "lookup_field", None
     )
-    kwargs = getattr(view, "kwargs", None) or {}
-    if not callable(get_object) or lookup is None or lookup not in kwargs:
-        return None
-    with _instance_attributes(view, check_object_permissions=_no_check):
-        return get_object()
+    if lookup is not None and lookup in kwargs:
+        return True
+    if inspect.unwrap(getattr(type(view), "get_object")) is GenericAPIView.get_object:
+        return False
+    if isinstance(getattr(view, "action_map", None), dict):
+        if action in _DETAIL_ACTIONS:
+            return True
+        handler = getattr(type(view), action, None) if action else None
+        return getattr(handler, "detail", None) is True
+    return any(name != "format" for name in kwargs)
 
 
 #: What a per-method check of OPTIONS raises for "not allowed".
@@ -1787,7 +1836,8 @@ def _allowed_methods(view: APIView, request: Request) -> list[str]:
     1. each method's view-level check: ``check_permissions``, or ``True``
        for a method with an ``allowed_func``, which needs the object;
     2. only when one of them passed, the object is loaded
-       (:func:`_options_object`), and each method that passed is checked
+       (:func:`_options_object`), as the first method that passed (GET,
+       when it did) loads it, and each method that passed is checked
        again on it: ``check_object_permissions`` (when there is an
        object), or its ``allowed_func``. When none passed, nothing is
        loaded: a missing and an existing object both give ``Allow:
@@ -1811,7 +1861,9 @@ def _allowed_methods(view: APIView, request: Request) -> list[str]:
         or _may_use(view, request, method, view.check_permissions)
         for method in checked
     }
-    obj = _options_object(view) if any(allowed.values()) else None
+    # Loaded as the first method that passed loads it: GET's, when it did.
+    loader = next((method for method in checked if allowed[method]), None)
+    obj = None if loader is None else _options_object(view, request, loader)
     for method in checked:
         hook = hooks[method]
         if hook is not None:
