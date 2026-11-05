@@ -89,9 +89,12 @@ Behaviour change (all adapters)
   ``SCRUDFUL["ERROR"]``); without an error helper it has no content. Where the
   operation's error entity differs from the API-wide one, the errors the
   framework answers before the operation have explicit entries with the
-  API-wide entity's content: ninja's 401, 422 and 429 (without content when
-  there is no API-wide entity) and its 403 when there is one; DRF's 401, 403,
-  406 and 415 when ``SCRUDFUL["ERROR"]`` is set.
+  API-wide entity's content: ninja's 401, 403, 422 and 429 (and every
+  response of the operation with one of these statuses carries that entity),
+  DRF's 401, 403, 406 and 415 when ``SCRUDFUL["ERROR"]`` is set. Without an
+  API-wide entity, ninja lists none of them: its own 401, 403, 422 and 429
+  for an operation with an ``error`` carry that ``error``, as its
+  ``default`` entry describes.
 * scrudful's early 400, 412 and 428 of an operation without ``error=`` carry
   the Links of the API-wide error entity (ninja and FastAPI
   ``add_error_links``, DRF ``SCRUDFUL["ERROR"]``), and its media type as

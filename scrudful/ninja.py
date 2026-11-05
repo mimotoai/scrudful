@@ -479,12 +479,14 @@ OPTIONS
     - a ``default`` response, the errors: with the content of the
       operation's ``error``, else of the API-wide error entity
       (:func:`add_error_links`). When the operation's ``error`` differs from
-      the API-wide entity, the 401, 403, 422 and 429 ninja answers itself,
-      which get the API-wide entity, are listed with its content (every 401
-      and 403 of the operation then carries it, raised by ninja's
-      authentication, a hook or the operation), unless ``responses=``
-      declares the status; without an API-wide entity, the 401, 422 and
-      429, without content;
+      the API-wide entity, the 401, 403, 422 and 429 are listed with the
+      API-wide entity's content, unless ``responses=`` declares the status:
+      every response of the operation with one of these statuses carries
+      that entity, whether ninja answered it (its authentication, CSRF
+      check, validation or throttles) or a hook, the operation or its
+      ``load`` raised it. Without an API-wide entity none of them is listed:
+      those of an operation with an ``error``, ninja's own included, carry
+      that ``error``, as ``default`` describes;
     - ``parameters``: the precondition headers of a conditional write.
 
     ``head`` (when an operation routes it) is described like ``get``, but
