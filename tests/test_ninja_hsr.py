@@ -16,8 +16,8 @@ from asgiref.sync import async_to_sync
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.http import Http404, HttpResponseForbidden
-from django.test import Client
-from ninja import NinjaAPI, Router
+from django.test import Client, override_settings
+from ninja import NinjaAPI, Router, Schema, Status
 from ninja.errors import (
     AuthenticationError,
     AuthorizationError,
@@ -1348,9 +1348,9 @@ def test_target_is_hsr_url_when_given():
 
 
 def test_target_from_the_hsr_url_setting(settings):
-    """The setting's callable gets the route Django resolved the request to
-    (ninja's ``TestClient`` resolves it among the API's patterns alone); the
-    router's own ``hsr_url`` gets the router's path."""
+    """The setting's callable gets the route Django resolved the request to;
+    for an API that isn't in the root URLconf, under ninja's ``TestClient``,
+    the route below the API's root."""
     seen = []
 
     def hsr_url(route):
@@ -1479,20 +1479,158 @@ def test_a_router_mounted_twice_links_the_mount_of_the_request(client, settings,
         assert hsr_link_problems(dict(response.items()), target) == [], mount_path
 
 
+def two_paths_router(name: str) -> ScrudfulRouter:
+    """``/search`` and ``/{pk}``, each with its own entity."""
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/search", response=ItemOut)
+    @scrudful(
+        schema_link_or_func=f"https://api.example/schemas/{name}-search",
+        context_link_or_func=f"https://api.example/contexts/{name}-search",
+    )
+    def search(request):
+        return {"id": 1, "name": "x", "version": 1}
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(load=lambda request, pk: {"id": pk, "name": "x", "version": 1}, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    return router
+
+
+def without_wraps(func):
+    """An operation decorator that doesn't use ``functools.wraps``: each
+    operation it wraps is named ``wrapper``."""
+
+    def wrapper(request, *args, **kwargs):
+        return func(request, *args, **kwargs)
+
+    return wrapper
+
+
+#: Operation decorators without functools.wraps, on a router and on an API.
+NO_WRAPS_ROUTER = two_paths_router("router")
+NO_WRAPS_ROUTER.add_decorator(without_wraps, mode="operation")
+NO_WRAPS_ROUTER_API = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+NO_WRAPS_ROUTER_API.add_router("/r", NO_WRAPS_ROUTER)
+NO_WRAPS_API_ROUTER = two_paths_router("api")
+NO_WRAPS_API = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+NO_WRAPS_API.add_decorator(without_wraps, mode="operation")
+NO_WRAPS_API.add_router("/r", NO_WRAPS_API_ROUTER, url_name_prefix="one")
+NO_WRAPS_API.add_router("/s", NO_WRAPS_API_ROUTER, url_name_prefix="two")
+urlpatterns += [path("nw1/", NO_WRAPS_ROUTER_API.urls), path("nw2/", NO_WRAPS_API.urls)]
+
+
+@pytest.mark.urls(__name__)
+def test_hsr_links_dont_depend_on_operation_decorators_keeping_names(client, db):
+    """An ``add_decorator(mode="operation")`` decorator without
+    ``functools.wraps`` renames the operations it wraps: the HSR routes'
+    names are scrudful's own, per mount, so each link still reverses to its
+    path's HSR route."""
+    for prefix in ("/nw1/r", "/nw2/r", "/nw2/s"):
+        for url, name in ((f"{prefix}/1", "pk"), (f"{prefix}/search", "search")):
+            target = f"https://api.example{prefix}/_hsr/{name}"
+            for response in (client.get(url), client.options(url)):
+                assert response.status_code in (200, 204), url
+                assert hsr_link_problems(dict(response.items()), target) == [], url
+            r = client.get(f"{prefix}/_hsr/{name}")
+            assert hsr_get_problems(r.status_code, dict(r.items()), r.content) == []
+    # Under ninja's TestClient too.
+    test_client = TestClient(NO_WRAPS_API)
+    response = test_client.get("/s/1")
+    assert hsr_link_problems(dict(response.headers), f"{BASE_URL}s/_hsr/pk") == []
+
+
+#: The documented project-wide map, keyed by the routes Django resolves.
+DOC_HSR_URLS = {
+    "doc/items/<pk>": "https://api.example.com/schemas/items/item",
+    "doc/items/search": "https://api.example.com/schemas/items/search",
+}
+DOC_SCRUDFUL = {"HSR_ROUTE": False, "HSR_URL": DOC_HSR_URLS.__getitem__}
+with override_settings(SCRUDFUL=DOC_SCRUDFUL):
+    DOC_ROUTER = two_paths_router("doc")
+DOC_API = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+DOC_API.add_router("/items", DOC_ROUTER)
+urlpatterns += [path("doc/", DOC_API.urls)]
+
+
+@pytest.mark.urls(__name__)
+def test_the_hsr_url_setting_gets_one_route_under_django_and_the_test_client(
+    client, settings, db
+):
+    """Under ninja's ``TestClient``, which resolves among the API's patterns,
+    the route is prefixed with the API's route in the root URLconf: the
+    documented map serves the tests as it serves the app."""
+    settings.SCRUDFUL = DOC_SCRUDFUL
+    test_client = TestClient(DOC_API)
+    for url, key in (
+        ("/items/1", "doc/items/<pk>"),
+        ("/items/search", "doc/items/search"),
+    ):
+        for response in (
+            client.get(f"/doc{url}"),
+            client.options(f"/doc{url}"),
+            test_client.get(url),
+            test_client.request("OPTIONS", url),
+        ):
+            assert response.status_code in (200, 204), url
+            assert hsr_link_problems(_headers(response), DOC_HSR_URLS[key]) == [], url
+
+
+def _headers(response: Any) -> dict[str, str]:
+    """The header fields of a Django or a ninja test client's response."""
+    items = getattr(response, "items", None)
+    return dict(items()) if callable(items) else dict(response.headers)
+
+
+def test_the_hsr_url_setting_needs_a_resolved_request(rf, settings):
+    settings.SCRUDFUL = {"HSR_URL": lambda route: "https://docs.example/h"}
+    router = target_router("unresolved")
+    with pytest.raises(ConfigError, match=r"resolver_match\.route.*has none"):
+        _hsr_target(rf.get("/1"), router, "/{pk}")
+
+
+class Message(Schema):
+    detail: str
+
+
+def test_a_declared_status_the_handler_returns_keeps_its_links():
+    """The wrapper gives a response it returns its entity's Links, with the
+    loaded object; scrudful doesn't apply them again for the declared
+    status (the callable would get ``None``)."""
+
+    def schema(request, obj):
+        return f"https://api.example/schemas/gone-{obj['id']}"
+
+    gone = Entity(schema, context_link_or_func="https://api.example/contexts/gone")
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/{pk}", response={200: ItemOut, 404: Message})
+    @scrudful(
+        load=lambda request, pk: {"id": pk, "name": "x"}, responses={404: gone}, **LINKS
+    )
+    def get_item(request, pk: int, obj):
+        return Status(404, {"detail": "gone"})
+
+    response = TestClient(mount(router)).get("/7")
+    assert response.status_code == 404
+    assert "<https://api.example/schemas/gone-7>" in response.headers["Link"]
+
+
 # --- the ninja internals the HSR routes and links rely on ----------------------
 
 
 @pytest.fixture
-def fresh_ninja_code():
+def fresh_ninja_code(monkeypatch):
     """The check of ninja's code is memoized per function, and warns once
     without the source: start afresh."""
     import scrudful.ninja
 
     scrudful.ninja._is_ninja_code.cache_clear()
-    scrudful.ninja._SOURCELESS_WARNED.clear()
+    monkeypatch.setattr(scrudful.ninja, "_sourceless_warned", False)
     yield
     scrudful.ninja._is_ninja_code.cache_clear()
-    scrudful.ninja._SOURCELESS_WARNED.clear()
 
 
 #: The warning of a ninja install without the source of its internals.

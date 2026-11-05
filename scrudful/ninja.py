@@ -597,7 +597,7 @@ from django.http import (
     HttpResponse,
     HttpResponseBase,
 )
-from django.urls import NoReverseMatch, URLResolver, reverse
+from django.urls import NoReverseMatch, Resolver404, URLResolver, resolve, reverse
 from django.urls.resolvers import RegexPattern
 from django.utils.encoding import iri_to_uri
 from ninja import NinjaAPI, Query, Router, Schema, Status
@@ -1865,10 +1865,10 @@ class ScrudfulRouter(Router):
         the route Django resolved the request to,
         ``request.resolver_match.route``: the full path template, in
         Django's syntax, with the prefixes of the URLconf, the API and the
-        routers mounting it (``"api/items/<pk>"``; ``"items/<pk>"`` under
-        ninja's ``TestClient``, which resolves among the API's patterns
-        alone), which tells every resource, and every mount of a router,
-        apart.
+        routers mounting it (``"api/items/<pk>"``, under ninja's
+        ``TestClient`` too, unless the API isn't in the root URLconf: then
+        the route below the API's root, ``"items/<pk>"``), which tells every
+        resource, and every mount of a router, apart.
     hsr_cache_control : str, optional
         The ``Cache-Control`` of the HTTP Schema Resource
         (``SCRUDFUL["HSR_CACHE_CONTROL"]``, default ``public, max-age=300``).
@@ -1920,8 +1920,8 @@ class ScrudfulRouter(Router):
         self._scrudful_paths: dict[str, Any] = {}
         #: The HTTP Schema Resource of each path, once built.
         self._scrudful_hsrs: dict[Any, dict[str, Any]] = {}
-        #: The URL name of the HSR route of each path that has one, in a
-        #: mount without ``url_name_prefix`` (see :func:`_hsr_url_name`).
+        #: The URL name of the HSR route of each path that has one, as the
+        #: router's operation has it (see :func:`_hsr_url_name`).
         self._scrudful_hsr_url_names: dict[str, str] = {}
         #: The path of the HSR route of each path that has one.
         self._scrudful_hsr_routes: dict[str, str] = {}
@@ -2146,11 +2146,11 @@ class ScrudfulRouter(Router):
         mount) and ``BoundRouter.urls_paths`` (which yields their URL
         patterns), checked to be ninja 1.7.0's and 1.7.1's.
 
-        The route has no explicit ``url_name``: ``urls_paths`` names it as it
-        names any operation, ``NinjaAPI.get_operation_url_name`` (by default
-        the view's name, ``scrudful_hsr_<serial>_<name>``, unique per
-        router) prefixed with the mount's ``url_name_prefix``, so a router
-        mounted twice in one API has one URL name per mount
+        The route's operation has an explicit ``url_name``,
+        ``scrudful_hsr_<serial>_<name>`` (unique per router), which
+        ``urls_paths`` uses as is, whatever decorator wraps the operation;
+        each mount's clone gets its own (see :meth:`_ScrudfulPathView.clone`),
+        so a router mounted twice in one API has one URL name per mount
         (:func:`_hsr_url_name`).
 
         Raises
@@ -2176,7 +2176,6 @@ class ScrudfulRouter(Router):
         url_name = f"scrudful_hsr_{self._scrudful_serial}_{name}"
         route = f"/{HSR_ROUTE_SEGMENT}/{name}"
         view = _hsr_route_view(self, path)
-        view.__name__ = view.__qualname__ = url_name
         super().add_api_operation(
             route,
             ["GET", "HEAD"],
@@ -2185,6 +2184,7 @@ class ScrudfulRouter(Router):
             throttle=[],
             response=NOT_SET,
             include_in_schema=False,
+            url_name=url_name,
         )
         _ScrudfulPathView.adopt(_path_view(self, view), self, route, hsr_route=True)
         # Each mount's clone serves the document of its API.
@@ -2268,6 +2268,9 @@ setting_changed.connect(_forget_router_hsrs)
 
 #: The serial number of each ``ScrudfulRouter``, in its HSR routes' URL names.
 _ROUTER_SERIALS = itertools.count(1)
+
+#: The serial number of each mount of an HSR route, in its URL name.
+_MOUNT_SERIALS = itertools.count(1)
 
 #: The entity :func:`add_error_links` gave each API, for the HTTP Schema
 #: Resources of the paths of the routers it mounts.
@@ -2486,8 +2489,10 @@ def http_schema_resource(
     :func:`add_error_links` entity of ``api``, as the HSR route of a mount of
     the router on ``api`` serves it. Without ``api``, of the APIs mounting
     the router (those :func:`add_error_links` was called for, and those
-    whose URL patterns were built): pass ``api`` for a router mounted on
-    APIs given different entities (or on one with and one without).
+    whose URL patterns were built: an API without :func:`add_error_links`
+    counts only once its ``api.urls`` is built, and ninja's
+    ``TestClient(router)`` mounts the router on a temporary API that
+    counts too): pass ``api`` for any router mounted on several APIs.
 
     Link callables are called in *describe* mode, ``func(None, None)``: with
     neither request nor object. They must return the same target as on the
@@ -2605,10 +2610,11 @@ def _hsr_target(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
        the route Django resolved the request to
        (``request.resolver_match.route``): the full path template, in
        Django's route syntax, with the prefixes of the URLconf's includes,
-       the API's and the routers' mounts (``"api/items/<pk>"``; ninja's
-       ``TestClient`` resolves among the API's patterns alone, so
-       ``"items/<pk>"``), so that one project-wide callable tells every
-       resource, and every mount of a router, apart;
+       the API's and the routers' mounts (``"api/items/<pk>"``; under ninja's
+       ``TestClient``, which resolves among the API's patterns alone, the
+       same, prefixed with the API's route in the root URLconf, see
+       :func:`_resolved_route`), so that one project-wide callable tells
+       every resource, and every mount of a router, apart;
     3. else the path of ``path``'s HSR route (a path has one if the route was
        on when its first scrudful or :func:`described` operation was added),
        reversed by its URL name in the mount the request came through
@@ -2662,14 +2668,24 @@ def _hsr_target(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
 
 def _resolved_route(request: HttpRequest) -> str:
     """The route Django resolved ``request`` to (``resolver_match.route``),
-    the argument of ``SCRUDFUL["HSR_URL"]``.
+    the argument of ``SCRUDFUL["HSR_URL"]``: the full path template, with the
+    prefixes of the root URLconf, the API and the routers.
+
+    A request resolved among the API's own patterns (ninja's ``TestClient``:
+    its ``resolver_match`` has no namespace) has the route below the API's
+    root, so it is prefixed with the API's own route in the root URLconf
+    (its root path, ``NinjaAPI.get_root_path``, resolved), so that it is
+    the route a request through Django's resolver gets. Without one (an API
+    that isn't in the root URLconf, or under an include with parameters or
+    a namespace of its own), the route below the API's root.
 
     Raises
     ------
     ConfigError
         If the request wasn't resolved (no ``resolver_match``).
     """
-    route = getattr(getattr(request, "resolver_match", None), "route", None)
+    match = getattr(request, "resolver_match", None)
+    route = getattr(match, "route", None)
     if not isinstance(route, str):
         raise ConfigError(
             'SCRUDFUL["HSR_URL"] is called with the route Django resolved the '
@@ -2677,18 +2693,28 @@ def _resolved_route(request: HttpRequest) -> str:
             "none: send it through Django's URL resolver (or ninja's "
             "TestClient), or give the ScrudfulRouter its own hsr_url"
         )
-    return route
+    if match.namespace:
+        return route
+    operation = _SERVING_ROUTER_OPERATION.get()
+    api = getattr(operation, "api", None)
+    if not isinstance(api, NinjaAPI):
+        return route
+    try:
+        api_route = resolve(api.get_root_path({})).route
+    except (NoReverseMatch, Resolver404):
+        return route
+    return f"{api_route}{route}"
 
 
 def _hsr_url_name(router: ScrudfulRouter, path: str) -> str:
     """The URL name of ``path``'s HSR route in the mount of ``router`` serving
-    the request, as ninja 1.7's ``BoundRouter.urls_paths`` names it: the
-    API's ``get_operation_url_name`` of the mount's clone of the route's
-    operation, prefixed with the mount's ``url_name_prefix``.
+    the request: the explicit ``url_name`` of the mount's clone of the
+    route's operation (see :meth:`_ScrudfulPathView.clone`), which ninja
+    1.7's ``BoundRouter.urls_paths`` uses as is.
 
     The mount is that of the operation running (:func:`_bound_mount`);
-    without one (it can't be found through ``Operation.run``), the name of
-    a mount without ``url_name_prefix``.
+    without one (it can't be found through ``Operation.run``), the router's
+    own name, which no mount has.
 
     Raises
     ------
@@ -2707,17 +2733,12 @@ def _hsr_url_name(router: ScrudfulRouter, path: str) -> str:
     operation = _SERVING_ROUTER_OPERATION.get()
     if operation is None:
         return url_name
-    api = _operation_api(operation)
-    bound_router, _ = _bound_mount(api, operation)
+    bound_router, _ = _bound_mount(_operation_api(operation), operation)
     route_view = bound_router.path_operations.get(router._scrudful_hsr_routes[path])
-    operations = getattr(route_view, "operations", None)
-    if not operations:
+    name = getattr(getattr(route_view, "operations", [None])[0], "url_name", None)
+    if not isinstance(name, str) or not name.startswith(f"{url_name}_"):
         raise _bound_path_error()
-    name = api.get_operation_url_name(operations[0], router=bound_router.template)
-    prefix = getattr(bound_router, "url_name_prefix", None)
-    if prefix and name:
-        name = f"{prefix}_{name}"
-    return name  # type: ignore[no-any-return]
+    return name
 
 
 def _hsr_route_path(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
@@ -3318,7 +3339,9 @@ class _Raised:
     hooks_allowed: bool = False
     #: The configuration of the operation running.
     operation: _Config | None = None
-    #: Whether its wrapper returned (its response then has its Links).
+    #: Whether its wrapper returned: its response then has its Links, whose
+    #: callables got the loaded object, so a declared status of it is not
+    #: described again (they would get ``None``).
     answered: bool = False
 
     def declared(self, status: int) -> _Config | None:
@@ -4251,7 +4274,7 @@ def _without_docstring(tokens: list[tokenize.TokenInfo]) -> list[tokenize.TokenI
 
 
 #: Whether :func:`_is_ninja_code` warned of a ninja without source (once).
-_SOURCELESS_WARNED: set[bool] = set()
+_sourceless_warned = False
 
 
 @functools.cache
@@ -4263,18 +4286,21 @@ def _is_ninja_code(func: Any, name: str) -> bool:
     changed release keeping them passes, of which a ``RuntimeWarning`` warns
     once. Memoized: each function is read once, whatever the number of
     operations and mounts."""
+    global _sourceless_warned
     digest = _source_digest(func)
     if digest is not None:
         return digest in _NINJA_SOURCES[name]
-    if not _SOURCELESS_WARNED:
-        _SOURCELESS_WARNED.add(True)
+    if not _sourceless_warned:
+        _sourceless_warned = True
+        # No stacklevel: the check runs deep in scrudful, where an
+        # operation, a router or a request reaches it, never at one frame of
+        # the app's own code.
         warnings.warn(
             f"scrudful can't read the source of ninja's {name} (nor, likely, of "
             "its other internals scrudful relies on): it checks only their "
             "names, locals and arguments, which a ninja release changing their "
             "code can keep. Install ninja with its source to check it fully.",
             RuntimeWarning,
-            stacklevel=2,
         )
     code = getattr(func, "__code__", None)
     if code is None:
@@ -5403,10 +5429,20 @@ class _ScrudfulPathView(PathView):
             setattr(path_view, name, value)
 
     def clone(self) -> PathView:
+        """ninja's clone (one per mount), of this class and with scrudful's
+        state; an HSR route's operation gets a URL name of its own (its
+        explicit ``url_name`` and a serial), which ninja's
+        ``BoundRouter.urls_paths`` uses as is and :func:`_hsr_url_name`
+        reads back: two mounts in one API never share one, whatever
+        decorator wraps the operation."""
         cloned = super().clone()
         cloned.__class__ = type(self)
         for name in self._SCRUDFUL_ATTRIBUTES:
             setattr(cloned, name, getattr(self, name))
+        if self._scrudful_hsr_route:
+            serial = next(_MOUNT_SERIALS)
+            for operation in cloned.operations:
+                operation.url_name = f"{operation.url_name}_{serial}"
         # A mount's: its operations get the API mounting it (see _api_error).
         self._scrudful_router._scrudful_mounts.add(cloned)
         return cloned
@@ -6156,7 +6192,9 @@ def _api_error(router: ScrudfulRouter) -> Entity | None:
     mount the router (nested or not, see :func:`_mounted_routers`), and
     those whose URL patterns were built with it (ninja binds a router to an
     API then, cloning its paths), whose entity is ``None`` without
-    :func:`add_error_links`.
+    :func:`add_error_links`. ninja keeps no list of its APIs, so one
+    without :func:`add_error_links` is seen only once bound, and the
+    temporary API of ``TestClient(router)`` is seen too.
 
     Raises
     ------

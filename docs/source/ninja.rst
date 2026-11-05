@@ -775,8 +775,12 @@ and every router mounting the path. With ``path("api/", api.urls)`` and
 ``api.add_router("/items", items)``, the item path gives ``"api/items/<pk>"``
 (``"api/items/<int:pk>"`` for ``"/{int:pk}"``), and a router mounted twice
 gives each mount's (``"api/orgs/<org>/items/<pk>"``). ninja's ``TestClient``
-resolves a request among the API's own patterns, so there it gets
-``"items/<pk>"``. A router's own ``hsr_url`` gets its path, ``"/{pk}"``.
+resolves a request among the API's own patterns, so scrudful prefixes that
+route with the API's own route in the root URLconf: a test gets
+``"api/items/<pk>"`` too, and the same map serves the app and its tests. For
+an API the root URLconf doesn't include (or includes under parameters, or a
+namespace of its own), a ``TestClient`` request gets the route below the API's
+root, ``"items/<pk>"``. A router's own ``hsr_url`` gets its path, ``"/{pk}"``.
 
 .. code-block:: python
 
@@ -841,9 +845,15 @@ Content"}}}``.
   APIs serves, on each API's HSR route, the document of that API's
   ``add_error_links`` entity (or of none). Pass ``api=`` to
   :func:`~scrudful.ninja.http_schema_resource` and
-  :func:`~scrudful.ninja.http_schema_resource_view` for such a router:
-  without it, they describe the entity of the APIs mounting it, and raise
-  ``ConfigError`` when those differ.
+  :func:`~scrudful.ninja.http_schema_resource_view` for any router mounted
+  on several APIs. Without it, they describe the entity of the APIs mounting
+  it, and raise ``ConfigError`` when those differ; but ninja keeps no list of
+  the APIs, so an API that never called ``add_error_links`` counts only once
+  its URL patterns are built (``api.urls``, when the URLconf loads): before
+  that, the other APIs' entity is described without a word. ninja's
+  ``TestClient(router)`` mounts the router on a temporary API of its own,
+  without ``add_error_links``, which then counts too: in tests, pass
+  ``api=`` (or test through ``TestClient(api)``).
 * Link callables are called in *describe* mode, ``func(None, None)``: they
   must return the target they return on the responses, without request or
   object, or the HSR disagrees with the Links. One that raises is a

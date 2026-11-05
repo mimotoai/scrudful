@@ -200,20 +200,25 @@ Behaviour change (ninja)
   of that API's ``add_error_links`` entity, or of none (was one document for
   all, whose ``default`` entry described the entity of the APIs that called
   ``add_error_links``, even on an API that didn't). ``http_schema_resource``
-  and ``http_schema_resource_view`` take ``api=`` to say which; without it,
-  APIs that differ (one with an entity and one without included) are a
-  ``ConfigError``. An API mounting the router after its HSR was built is
-  taken into account (``add_router`` discarded nothing).
+  and ``http_schema_resource_view`` take ``api=`` to say which (pass it for
+  a router mounted on several APIs); without it, APIs that differ (one with
+  an entity and one without included) are a ``ConfigError``, an API without
+  ``add_error_links`` counting once its ``api.urls`` is built. An API
+  mounting the router after its HSR was built is taken into account
+  (``add_router`` discarded nothing).
 * ``SCRUDFUL["HSR_URL"]`` is called with the route Django resolved the
   request to (``request.resolver_match.route``: the full path template, with
   the URLconf's, the API's and the routers' prefixes, e.g.
   ``"api/items/<pk>"``), so that it gives each resource its own HSR (it got
   the path relative to its router, ``"/{pk}"``, the same for every item
-  router). A router's own ``hsr_url`` still gets its path.
+  router). Under ninja's ``TestClient``, which resolves among the API's
+  patterns, the route is prefixed with the API's route in the root URLconf,
+  so tests get the same argument (the route below the API's root for an API
+  the root URLconf doesn't include). A router's own ``hsr_url`` still gets
+  its path.
 * A router mounted twice in one API links each response to the HSR route of
   the request's mount (it linked one of them, whichever Django reversed).
-  The HSR routes' URL names follow ninja's naming of the mount, its
-  ``url_name_prefix`` included; they stay private.
+  Each mount's HSR routes have URL names of their own; they stay private.
 * The ninja internals OPTIONS relies on are checked when a path gets its
   OPTIONS operation, at startup (were checked by the first OPTIONS request
   only, which then failed with ``ConfigError``). Where ninja's source isn't
