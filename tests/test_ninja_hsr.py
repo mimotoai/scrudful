@@ -3084,13 +3084,10 @@ def test_any_http_error_of_a_methods_own_load_leaves_only_it_out(
     assert len(records) == 1
     assert records[0].levelno == level
     assert records[0].exc_info is not None
-    assert (
-        records[0]
-        .getMessage()
-        .startswith(
-            f"scrudful's OPTIONS of '/{{pk}}' leaves PUT out of Allow: its own load "
-            f"raised HttpError {owned_status}"
-        )
+    # The URL requested names the mount, which the router's path doesn't.
+    assert records[0].getMessage() == (
+        "scrudful's OPTIONS of '/1' (the path '/{pk}') leaves PUT out of "
+        f"Allow: its own load raised HttpError {owned_status}"
     )
 
 
@@ -3708,9 +3705,9 @@ def test_another_exception_of_a_methods_path_validation_leaves_it_out(
     assert records[0].levelno == logging.WARNING
     assert records[0].exc_info is not None
     assert records[0].getMessage() == (
-        f"scrudful's OPTIONS leaves DELETE '/{{pk}}' ({delete_item.__qualname__}()) "
-        "out of Allow: validating its path parameters raised "
-        f"{type(error).__name__}"
+        f"scrudful's OPTIONS of '/2' leaves DELETE '/{{pk}}' "
+        f"({delete_item.__qualname__}()) out of Allow: validating its path "
+        f"parameters raised {type(error).__name__}"
     )
     if isinstance(error, TenantForbidden):
         assert client.delete("/2").status_code == 403
@@ -3756,9 +3753,9 @@ def test_the_loaders_path_validation_follows_the_same_rules(error, caplog):
         assert logged == []
     else:
         # What OPTIONS did about it: no object, and GET left out.
-        assert [message.split(" '/")[0] for message in logged] == [
-            "scrudful's OPTIONS loads no object with GET",
-            "scrudful's OPTIONS leaves GET",
+        assert [message.split(" '/{pk}'")[0] for message in logged] == [
+            "scrudful's OPTIONS of '/2' loads no object with GET",
+            "scrudful's OPTIONS of '/2' leaves GET",
         ]
     assert options(client, "/1").headers["Allow"] == "GET, DELETE, OPTIONS"
     assert calls == [1]

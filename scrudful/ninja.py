@@ -6440,7 +6440,9 @@ def _options_object(
     except ConfigError:
         raise
     except Exception as exc:
-        _path_error(exc, template, method, path, "loads no object with {route}")
+        _path_error(
+            exc, request, template, method, path, "loads no object with {route}"
+        )
         return None, None
     if values is None:
         return None, None
@@ -6555,17 +6557,24 @@ def _unchecked_path(
 
 
 def _path_error(
-    exc: Exception, template: Any, method: str, path: str, outcome: str
+    exc: Exception,
+    request: HttpRequest,
+    template: Any,
+    method: str,
+    path: str,
+    outcome: str,
 ) -> None:
-    """Log ``exc``, which ``method``'s path validation raised, once per
-    route, with its traceback, on the ``scrudful.ninja`` logger: what
-    OPTIONS did about it is ``outcome``, with ``{route}`` naming the route."""
+    """Log ``exc``, which ``method``'s path validation raised for the
+    OPTIONS ``request``, once per route, with its traceback, on the
+    ``scrudful.ninja`` logger: what OPTIONS did about it is ``outcome``,
+    with ``{route}`` naming the route; the URL requested names the mount."""
     key = (method, outcome)
     if key in _PATH_UNCHECKED.get(template, ()):
         return
     _PATH_UNCHECKED.setdefault(template, set()).add(key)
     logger.warning(
-        "scrudful's OPTIONS %s: validating its path parameters raised %s",
+        "scrudful's OPTIONS of %r %s: validating its path parameters raised %s",
+        request.path,
         outcome.format(route=_route_name(method, path, template)),
         type(exc).__name__,
         exc_info=exc,
@@ -6746,7 +6755,7 @@ def _may_use(
         raise
     except Exception as exc:
         # Its request raises it too: when in doubt, out.
-        _path_error(exc, template, method, path, "leaves {route} out of Allow")
+        _path_error(exc, request, template, method, path, "leaves {route} out of Allow")
         return False
     if values is None:
         return False
@@ -6821,8 +6830,9 @@ def _own_load_allows(
             # which only this log tells.
             logger.log(
                 logging.ERROR if exc.status_code >= 500 else logging.WARNING,
-                "scrudful's OPTIONS of %r leaves %s out of Allow: its own load "
-                "raised HttpError %s",
+                "scrudful's OPTIONS of %r (the path %r) leaves %s out of Allow: "
+                "its own load raised HttpError %s",
+                requester.path,
                 path,
                 method,
                 exc.status_code,
