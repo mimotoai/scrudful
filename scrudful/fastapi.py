@@ -13,6 +13,7 @@ import copy
 import functools
 import inspect
 import itertools
+import logging
 import re
 import types
 import warnings
@@ -151,6 +152,8 @@ CONDITIONAL_WRITE_RESPONSES: dict[int | str, dict[str, Any]] = (
 
 Endpoint = TypeVar("Endpoint", bound=Callable[..., Any])
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -588,6 +591,11 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
     it; Starlette's ``TestClient`` raises it unless created with
     ``raise_server_exceptions=False``). That middleware is outside every
     user middleware, so the 500 gets no headers of a ``CORSMiddleware``.
+    Its Links never replace the exception it answers: a link callable (or
+    ``hsr_url``) that fails while they are built (as the endpoint did, say,
+    with the database down) is logged on the ``scrudful.fastapi`` logger,
+    and the 500 sent without that Link; the exception raised again is the
+    endpoint's.
 
     Each wrapped handler returns the response the original makes, with the
     same status, headers and body, and when it has JSON content (an
@@ -717,26 +725,56 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
         handler = handlers[key]
         # Calling this again replaces the earlier entity.
         handler = getattr(handler, "_scrudful_error_handler", handler)
-        app.add_exception_handler(key, _error_handler(handler, error))
+        wrapped = _error_handler(handler, error, server=key in server)
+        app.add_exception_handler(key, wrapped)
 
 
 def _error_handler(
-    handler: Callable[[Request, Exception], Any], error: Entity
+    handler: Callable[[Request, Exception], Any],
+    error: Entity,
+    server: bool = False,
 ) -> Callable[[Request, Exception], Any]:
-    """``handler``, an exception handler of the app, adding ``error``'s Links."""
+    """``handler``, an exception handler of the app, adding ``error``'s Links.
+
+    ``server``: it is the app's server error handler, answering an exception
+    no other handler does. Building its Links calls user code (link
+    callables, ``hsr_url``), which may fail as the endpoint did (the
+    database is down): what fails is logged on this module's logger and the
+    500 sent without it, so that the exception being answered is the one
+    Starlette's ``ServerErrorMiddleware`` raises again (for the server's
+    log), not the link's. Another handler's failing link is an error of its
+    own, which the server error handler answers.
+    """
 
     @functools.wraps(handler)
     async def scrudful_handler(request: Request, exc: Exception) -> Any:
         if request.scope.get("type") != "http":
             return await _call_handler(handler, request, exc)
-        entity, kwargs = _raised_entity(request, error)
+
+        async def built(make: Callable[[], Any], fallback: Any) -> Any:
+            try:
+                result = make()
+                return (await result) if inspect.isawaitable(result) else result
+            except Exception:
+                if not server:
+                    raise
+                logger.exception(
+                    "scrudful: a Link of the 500 answering %r failed; the 500 "
+                    "is sent without it",
+                    exc,
+                )
+                return fallback
+
+        entity, kwargs = await built(
+            lambda: _raised_entity(request, error), (error, {"request": request})
+        )
         response = _problem_response(handler, exc, entity)
         if response is None:
             response = await _call_handler(handler, request, exc)
         if not isinstance(response, Response):
             return response
         headers = response.headers
-        hsr = _response_hsr_link(request)
+        hsr = await built(lambda: _response_hsr_link(request), None)
         schema = context = None
         if _has_json_content(response):
             route = request.scope.get("route")
@@ -744,7 +782,9 @@ def _error_handler(
             # scrudful's router-mode OPTIONS) leaves the router in "route".
             endpoint = getattr(route, "endpoint", None) or request.scope.get("endpoint")
             base = _live_base(request, endpoint)
-            schema, context = await _entity_links(entity, kwargs, base)
+            schema, context = await built(
+                lambda: _entity_links(entity, kwargs, base), (None, None)
+            )
             headers["Content-Type"] = entity.media_type
         elif hsr is None:
             # Other content (or none, e.g. a 304) gets no entity Links.

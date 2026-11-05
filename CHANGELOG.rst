@@ -364,7 +364,10 @@ Behaviour change (FastAPI)
   details with a problem-details entity) with the Links, in place of
   Starlette's ``text/plain`` one (only with ``debug`` off; the exception is
   raised again once the response is sent). Its handlers' responses on a
-  described path also get the HSR link.
+  described path also get the HSR link. A Link of that 500 failing to build (a link
+  callable or ``hsr_url`` raising, as the endpoint did) is logged on the
+  ``scrudful.fastapi`` logger and the 500 sent without it (the link's
+  exception replaced the endpoint's, and the server sent its bare 500).
 * scrudful's early 400, 412 and 428 keep the Links a dependency set on the
   injected ``Response``, merged by relation, except those with the
   ``describedby`` or an RDF context relation (0.9 dropped them all).

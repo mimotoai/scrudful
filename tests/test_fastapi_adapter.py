@@ -2,10 +2,11 @@
 
 import dataclasses
 import inspect
+import logging
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Annotated
+from typing import Annotated, Any
 
 import pytest
 from fastapi import (
@@ -3713,6 +3714,102 @@ def test_500_in_debug_is_starlette_s_traceback():
     assert response.status_code == 500
     assert response.headers["content-type"].startswith("text/plain")
     assert "link" not in response.headers
+
+
+def _failing_link_app() -> FastAPI:
+    """An endpoint failing (the database is down) whose ``error`` schema
+    callable fails too, outside it: its 500's Links can't be built."""
+
+    def flaky_schema(item_id: int = 0) -> str:
+        if not item_id:  # describe mode
+            return "/schemas/item-error"
+        raise ConnectionError("database is down (link callable)")
+
+    app = FastAPI()
+
+    @app.get("/items/{item_id}")
+    @scrudful(
+        **ITEM_LINKS,
+        error=Entity(schema_link_or_func=flaky_schema, context_link_or_func=CONTEXT),
+    )
+    def get_item(item_id: int):
+        raise ConnectionError("database is down (endpoint)")
+
+    add_options(app, base_url=TEST_BASE_URL)
+    add_error_links(app, PLAIN_ERROR)
+    return app
+
+
+def test_500_whose_links_fail_keeps_the_original_exception():
+    """A link callable failing in the server error handler doesn't replace
+    the endpoint's exception, which Starlette's ServerErrorMiddleware raises
+    again (for the server's log) as it was."""
+    with pytest.raises(ConnectionError, match=r"\(endpoint\)") as raised:
+        TestClient(_failing_link_app()).get("/items/1")
+    assert raised.value.__context__ is None
+
+
+def test_500_whose_links_fail_is_sent_without_them(caplog):
+    """The JSON 500 is sent without the Links that failed (the HSR link is
+    kept), and the link callable's error is logged on ``scrudful.fastapi``."""
+    client = TestClient(_failing_link_app(), raise_server_exceptions=False)
+    with caplog.at_level(logging.ERROR, logger="scrudful.fastapi"):
+        response = client.get("/items/1")
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal Server Error"}
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["link"] == ITEMS_HSR_LINK
+    (record,) = [r for r in caplog.records if r.name == "scrudful.fastapi"]
+    assert "(link callable)" in str(record.exc_info[1])
+    assert "database is down (endpoint)" in record.getMessage()
+
+
+def test_500_whose_hsr_link_fails_is_sent_without_it(caplog):
+    """So is one whose HSR link fails (an ``hsr_url`` raising): the error
+    entity's Links are kept."""
+    calls = []
+
+    def hsr_url(path: str) -> str:
+        calls.append(path)
+        if len(calls) > 1:
+            raise LookupError("no HSR URL now")
+        return "https://docs.example/items"
+
+    app = _boom_app()
+    add_error_links(app, ERROR)
+    add_options(app, base_url=TEST_BASE_URL, hsr_url=hsr_url)
+    with caplog.at_level(logging.ERROR, logger="scrudful.fastapi"):
+        response = TestClient(app, raise_server_exceptions=False).get("/items/1")
+    assert response.status_code == 500
+    assert response.headers["link"] == ERROR_LINKS
+    (record,) = [r for r in caplog.records if r.name == "scrudful.fastapi"]
+    assert isinstance(record.exc_info[1], LookupError)
+    calls.clear()
+    with pytest.raises(RuntimeError, match="boom"):
+        TestClient(app).get("/items/1")
+
+
+def test_a_failing_link_of_another_error_is_the_500(make_client):
+    """Outside the server error handler a failing link callable is the
+    error: Starlette's server error handler answers it (with the Links it
+    can build)."""
+
+    def broken(**kwargs: Any) -> str:
+        raise ConnectionError("broken link callable")
+
+    app = FastAPI()
+
+    @app.get("/items/{item_id}")
+    @scrudful(
+        **ITEM_LINKS,
+        error=Entity(schema_link_or_func=broken, context_link_or_func=CONTEXT),
+    )
+    async def get_item(item_id: int):
+        raise HTTPException(404)
+
+    add_error_links(app, PLAIN_ERROR)
+    with pytest.raises(ConnectionError, match="broken link callable"):
+        TestClient(app).get("/items/1")
 
 
 @pytest.mark.parametrize("key", [Exception, 500])

@@ -313,7 +313,11 @@ call it on that app too.
   ``raise_server_exceptions=False``). That middleware is outside every
   middleware added with ``add_middleware``, so a cross-origin 500 gets no
   ``Access-Control-Allow-Origin`` from a ``CORSMiddleware`` added that way:
-  serve the app wrapped in it instead, ``CORSMiddleware(app, ...)``.
+  serve the app wrapped in it instead, ``CORSMiddleware(app, ...)``. A
+  Link of the 500 that fails to build (a link callable or ``hsr_url``
+  raising, as the endpoint did) is logged on the ``scrudful.fastapi`` logger,
+  and the 500 sent without it: the exception the middleware raises again,
+  and the server logs, stays the endpoint's.
 * **Problem details.** With an ``application/problem+json`` entity, FastAPI's
   default validation 422 is RFC 9457 problem details, FastAPI's errors as the
   ``errors`` member (``problem_from_errors(422, exc.errors(), "Request
