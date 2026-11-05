@@ -342,10 +342,16 @@ With ``ScrudfulMetadata`` installed, OPTIONS is answered in this order:
    action (``retrieve`` for GET) its ``action``, so a ``get_queryset`` that
    scopes by ``self.action`` gives the queryset that method gets (not
    OPTIONS's ``metadata`` action's). Then it is loaded once for each other
-   action of a method that passed, as that action loads it: a 401, 403 or 404
-   such a load raises (a ``get_queryset`` that lets only the owner update or
-   delete, say) leaves out only the methods of that action, as their requests
-   would answer it. An item's route is one whose ``lookup_url_kwarg``,
+   action of a method that passed, as that action loads it; on a view that
+   isn't a viewset (it has no actions), once for each other method that
+   passed, on a request of that method, so a ``get_queryset`` scoped by
+   ``self.request.method`` scopes it. A 401, 403 or 404 such a load raises (a
+   ``get_queryset`` that lets only the owner update or delete, say) leaves out
+   only the methods it was loaded for, as their requests would answer it.
+   **The cost:** one ``get_object()`` (usually one query) per distinct action
+   (or method) of an allowed method, so an item OPTIONS of a ``ModelViewSet``
+   may run four (``retrieve``, ``update``, ``partial_update``, ``destroy``).
+   An item's route is one whose ``lookup_url_kwarg``,
    else ``lookup_field``, is in the URL kwargs; with a ``get_object`` of the
    view's own, whatever the URL kwarg is named: on a viewset, a route whose
    action is ``retrieve``, ``update``, ``partial_update``, ``destroy`` or an
@@ -359,8 +365,8 @@ With ``ScrudfulMetadata`` installed, OPTIONS is answered in this order:
    alike. The first load's ``get_object()`` that raises (the ``Http404`` of a
    missing object, or of one the requester may not read) is the answer,
    through the view's exception handler, with the HSR link.
-5. **Each method that passed is checked against the object** its action
-   loaded: ``check_object_permissions``, on the same request of that method
+5. **Each method that passed is checked against the object** loaded for
+   it: ``check_object_permissions``, on the same request of that method
    (with no object, a collection's, the method is allowed). DRF's
    ``PermissionDenied`` or ``NotAuthenticated``, any other 401 or 403
    ``APIException`` (``AuthenticationFailed``, or one of yours), or Django's
@@ -384,8 +390,10 @@ or ``None``. It returns a ``bool`` (``TypeError`` otherwise), and may raise
 DRF's ``PermissionDenied`` or ``NotAuthenticated``, any other 401 or 403
 ``APIException`` (``AuthenticationFailed``, or one of yours), or Django's
 ``PermissionDenied`` for ``False``, as ninja's and FastAPI's hooks may raise
-their 401 and 403; an ``Http404`` (or ``NotFound``) it raises is the OPTIONS's
-404, anything else propagates. Use it for
+their 401 and 403. An ``Http404`` (or ``NotFound``) it raises is the OPTIONS's
+404 for the first method loaded (GET, when it passed); for another method, once
+that one's request reaches the object, it leaves out only that method.
+Anything else propagates. Use it for
 authorization the permission classes don't hold (a policy checked in the
 view's code, say). A method with an ``allowed_func`` passes step 3 for every
 requester, since the hook has no object-free check: on such a view the object
@@ -394,16 +402,16 @@ anyone which objects exist, unless ``get_object()`` itself hides those a
 requester may not see (with a 404).
 
 **A 404 from a per-method check is the OPTIONS's answer.** A view-level
-permission (``has_permission``), the first loaded method's object permission
-(``has_object_permission``) or an ``allowed_func`` that raises ``Http404`` or
+permission (``has_permission``), or the first loaded method's object permission
+(``has_object_permission``) or ``allowed_func``, that raises ``Http404`` or
 ``NotFound`` for a method answers the whole OPTIONS with that 404 (error Links
 and HSR link), as the method's own request would be answered, so ``Allow``
 never reveals a resource a check hides. Once the first method's request
-reaches the object, the object permission of another method raising it, or
-that method's own load, leaves out only that method.
+reaches the object, another method's object permission or ``allowed_func``
+raising it, or that method's own load, leaves out only that method.
 This differs from ninja and FastAPI, where a 404 that a method's ``auth=`` /
-``before`` or security dependency raises refuses only that method (their hooks'
-404 is the answer, as here).
+``before`` or security dependency raises refuses only that method, and their
+hooks' 404 is always the answer.
 
 A 405 keeps DRF's ``Allow``, every method the view serves. An ``Accept`` that
 none of the view's renderers serves (e.g. ``text/html`` on a view without the

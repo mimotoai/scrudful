@@ -2808,9 +2808,14 @@ def test_a_denial_an_allowed_func_raises_means_not_allowed(settings, client, cas
 
 
 @pytest.mark.parametrize("case", ["http404", "not-found"])
-def test_a_404_an_allowed_func_raises_is_the_answer(settings, client, case):
+def test_a_404_another_methods_allowed_func_raises_refuses_it(settings, client, case):
+    """PUT's hook raising a 404, once GET's request reaches the object,
+    refuses only PUT (GET's own hook's 404 is the answer: see
+    test_options_leaves_out_a_method_whose_hook_hides_the_object)."""
     settings.ROOT_URLCONF = RaisingHookURLconf
-    assert client.options(f"/raising/{case}/").status_code == 404
+    response = client.options(f"/raising/{case}/")
+    assert response.status_code == 204
+    assert response["Allow"] == "GET, OPTIONS, HEAD"
 
 
 def test_another_exception_an_allowed_func_raises_propagates(settings, client):
@@ -3095,11 +3100,76 @@ slug_detail = SlugViewSet.as_view({"get": "retrieve", "put": "update"})
 slug_extra = SlugViewSet.as_view({"get": "extra", "put": "extra"})
 
 
+class OwnedWritesView(GenericAPIView):
+    """A generic view (no actions) whose queryset is scoped by the request's
+    method: anyone reads a group, only its owner (the user of its name)
+    replaces or deletes it."""
+
+    queryset = Group.objects.all()
+    permission_classes = []
+
+    def get_queryset(self):
+        SEEN_ACTIONS.append(self.request.method)
+        if self.request.method in ("PUT", "DELETE"):
+            return Group.objects.filter(name=self.request.user.username or None)
+        return Group.objects.all()
+
+    @scrudful(entity=GROUP)
+    def get(self, request, pk):
+        return Response({"pk": self.get_object().pk})
+
+    @scrudful(entity=GROUP)
+    def put(self, request, pk):
+        return Response({"pk": self.get_object().pk})
+
+    @scrudful(entity=GROUP)
+    def delete(self, request, pk):
+        self.get_object()
+        return Response(status=204)
+
+
+def hides_the_group(view, request, method, obj):
+    SEEN_ACTIONS.append(("hook", method))
+    raise Http404
+
+
+@scrudful_viewset
+class HookHidesDeleteViewSet(viewsets.ModelViewSet):
+    """DELETE's ``allowed_func`` hides the group (a 404) that GET finds."""
+
+    queryset = Group.objects.all()
+    permission_classes = []
+
+    class Meta:
+        entity = GROUP
+
+    def retrieve(self, request, pk):
+        return Response({"pk": self.get_object().pk})
+
+    @scrudful(entity=GROUP, allowed_func=hides_the_group)
+    def destroy(self, request, pk):
+        return Response(status=204)
+
+
+@scrudful_viewset
+class HookHidesGetViewSet(HookHidesDeleteViewSet):
+    """GET's ``allowed_func`` hides the group: GET loads first."""
+
+    @scrudful(entity=GROUP, allowed_func=hides_the_group)
+    def retrieve(self, request, pk):
+        return Response({"pk": self.get_object().pk})
+
+    def destroy(self, request, pk):
+        return Response(status=204)
+
+
 class LoadingURLconf:
     router = SimpleRouter()
     router.register("by-action", ByActionViewSet, basename="by-action")
     router.register("write-only", WriteOnlyViewSet, basename="write-only")
     router.register("scoped-writes", ScopedWritesViewSet, basename="scoped-writes")
+    router.register("hook-hides-delete", HookHidesDeleteViewSet, basename="hhd")
+    router.register("hook-hides-get", HookHidesGetViewSet, basename="hhg")
     urlpatterns = [
         path("", include(router.urls)),
         path("slugs/<slug:slug>/", slug_detail, name="slug-detail"),
@@ -3113,6 +3183,7 @@ class LoadingURLconf:
             name="org-groups",
         ),
         path("format-only.<str:format>", FormatOnlyView.as_view(), name="format-only"),
+        path("owned/<int:pk>", OwnedWritesView.as_view(), name="owned"),
         path("", include(hsr_urls())),
     ]
 
@@ -3186,6 +3257,42 @@ def test_options_leaves_out_a_method_its_own_load_or_check_refuses(loading, clie
     assert SEEN_ACTIONS == ["retrieve", "update", "partial_update", "destroy"]
 
 
+def test_options_of_a_generic_view_loads_the_object_for_each_method(loading, client):
+    """A view without actions loads the object once for each method that
+    passed, on a request of that method: a queryset scoped by
+    ``request.method`` (the owner's writes) leaves out the writes a
+    requester's requests would answer 404, and lists the owner's."""
+    group = Group.objects.create(name="owner")
+    r = client.options(f"/owned/{group.pk}")
+    assert r.status_code == 204
+    assert r["Allow"] == "GET, OPTIONS, HEAD"
+    assert SEEN_ACTIONS == ["GET", "PUT", "DELETE"]
+    assert client.put(f"/owned/{group.pk}").status_code == 404
+    assert client.delete(f"/owned/{group.pk}").status_code == 404
+    client.force_login(User.objects.create(username="owner"))
+    r = client.options(f"/owned/{group.pk}")
+    assert r.status_code == 204
+    assert set(r["Allow"].split(", ")) == {"GET", "PUT", "DELETE", "OPTIONS", "HEAD"}
+    # The first method's 404 still answers the OPTIONS.
+    SEEN_ACTIONS.clear()
+    assert client.options("/owned/999999").status_code == 404
+    assert SEEN_ACTIONS == ["GET"]
+
+
+def test_options_leaves_out_a_method_whose_hook_hides_the_object(loading, client):
+    """Another method's ``allowed_func`` raising ``Http404`` leaves out only
+    that method, once the first method's request reaches the object; the
+    first method's hook raising it answers the OPTIONS."""
+    group = Group.objects.create(name="g")
+    assert client.get(f"/hook-hides-delete/{group.pk}/").status_code == 200
+    r = client.options(f"/hook-hides-delete/{group.pk}/")
+    assert r.status_code == 204
+    assert "DELETE" not in r["Allow"].split(", ")
+    assert "GET" in r["Allow"].split(", ")
+    assert ("hook", "DELETE") in SEEN_ACTIONS
+    assert client.options(f"/hook-hides-get/{group.pk}/").status_code == 404
+
+
 def test_options_of_a_collection_loads_nothing(loading, client):
     r = client.options("/by-action/")
     assert r.status_code == 204
@@ -3197,8 +3304,8 @@ def test_options_of_a_collection_loads_nothing(loading, client):
     [
         ("/slugs/thing/", ["retrieve", "update"]),
         ("/slugs/thing/extra/", ["extra"]),
-        ("/slug-view/thing", ["GET"]),
-        ("/slug-lookup/thing", ["GET"]),
+        ("/slug-view/thing", ["GET", "PUT"]),
+        ("/slug-lookup/thing", ["GET", "PUT"]),
     ],
 )
 def test_options_loads_with_the_views_own_get_object_whatever_the_kwarg(

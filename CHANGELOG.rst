@@ -47,7 +47,8 @@ Behaviour change (all adapters)
   ninja's ``HttpError`` 401 or 403 (``AuthenticationError``,
   ``AuthorizationError``) or ``PermissionDenied`` from ``allowed``; FastAPI's
   ``HTTPException`` 401 or 403 from ``add_options(allowed=)``. A 404 a hook
-  raises is the OPTIONS's answer; anything else propagates.
+  raises is the OPTIONS's answer (DRF: the first loaded method's hook; another
+  method's leaves out only that method); anything else propagates.
 * The HSR route and views are public under Django's
   ``LoginRequiredMiddleware`` (Django 5.1+): DRF's ``hsr_urls()`` view and
   ``http_schema_resource_view``, ninja's HSR routes and
@@ -302,7 +303,13 @@ Behaviour change (DRF)
   404 that load raises (a ``get_queryset`` that lets only the owner update or
   delete) leaves out only that action's methods, as their requests would
   answer it, where ``Allow`` would otherwise list a PUT or DELETE answered
-  404. The first load's ``Http404`` is still the OPTIONS's answer. A
+  404. A view that isn't a viewset has no actions: it loads once for each
+  method that passed, on a request of that method, so a ``get_queryset``
+  scoped by ``request.method`` scopes it. Another method's
+  ``allowed_func`` or object check raising ``Http404`` leaves out only that
+  method too. The first load's ``Http404`` (and its object check's and
+  ``allowed_func``'s) is still the OPTIONS's answer. An item OPTIONS of a
+  ``ModelViewSet`` may so call ``get_object()`` up to four times. A
   ``get_object`` of the view's own
   is called whatever the URL kwarg is named (on a viewset's item action, or
   on a route with a URL kwarg of a generic view overriding ``get_object``),
