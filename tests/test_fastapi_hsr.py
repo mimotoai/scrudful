@@ -3432,6 +3432,73 @@ def test_a_security_dependency_needing_the_body_refuses_its_method(make_client):
     assert BODY_CALLS == []
 
 
+def test_a_body_below_the_security_dependency_refuses_its_method(make_client):
+    """The body is looked for at any depth: a ``Security(...)`` whose own
+    dependency takes an optional body (so would resolve, and allow, without
+    one) still can't be checked on OPTIONS. Its method is refused for every
+    requester, announced once, and nothing runs."""
+    BODY_CALLS.clear()
+
+    def optional_body(payload: NotePayload | None = None) -> None:
+        BODY_CALLS.append("optional_body")  # pragma: no cover
+
+    def wraps_optional(inner: None = Depends(optional_body)) -> None:
+        BODY_CALLS.append("wraps_optional")  # pragma: no cover
+
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {}
+
+    @app.put("/notes/{id}", dependencies=[Security(wraps_optional)])
+    @scrudful(**NOTE_LINKS)
+    async def write(id: int):
+        return {}  # pragma: no cover
+
+    with pytest.warns(RuntimeWarning, match=r"PUT '/notes/\{id\}' \(.*write\).*body"):
+        add_options(app, base_url=BASE)
+    options_204(
+        make_client(app), "/notes/1", "GET, OPTIONS", NOTE_TARGET, headers=ADMIN
+    )
+    assert BODY_CALLS == []
+
+
+def test_a_depends_with_a_scheme_and_a_body_refuses_its_method(make_client):
+    """A plain ``Depends`` is a security dependency when a security scheme is
+    below it (a ``get_user`` reading an ``HTTPBearer`` token); one that also
+    takes the body (a signed payload) can't be checked on OPTIONS either:
+    refused, announced once, and not called."""
+    BODY_CALLS.clear()
+
+    def get_user(
+        credentials: HTTPAuthorizationCredentials | None = Security(bearer),
+        signature: str = Body(embed=True),
+    ) -> str:
+        BODY_CALLS.append("get_user")  # pragma: no cover
+        return "user"  # pragma: no cover
+
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {}
+
+    @app.put("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def write(id: int, user: str = Depends(get_user)):
+        return {}  # pragma: no cover
+
+    with pytest.warns(RuntimeWarning, match=r"PUT '/notes/\{id\}' \(.*write\).*body"):
+        add_options(app, base_url=BASE)
+    client = make_client(app)
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET, headers=ADMIN)
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
+    assert BODY_CALLS == []
+
+
 def test_an_allowed_hook_decides_a_method_whose_security_needs_the_body(
     make_client,
 ):
