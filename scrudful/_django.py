@@ -415,8 +415,8 @@ def error_handler(
     once the handler returns, so a Link it can't build (an invalid
     ``SCRUDFUL["BASE_URL"]``; a relative link without a base URL, on a
     request whose host ``ALLOWED_HOSTS`` refuses) is logged, on the
-    ``scrudful`` logger with the exception, and the error is served without
-    the entity's Links.
+    ``scrudful._django`` logger with the exception, and the error is
+    served without the entity's Links.
 
     Raises
     ------

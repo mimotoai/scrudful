@@ -45,8 +45,9 @@ Every response of a scrudful view routed through the URLconf links its HSR, so
 routed request of a scrudful view, not only an OPTIONS, raises
 ``ImproperlyConfigured``, which names the line to add (``DEBUG`` on or off).
 The link is resolved once DRF's ``initial()`` has run, before the handler, so
-a link that can't be resolved (the include missing, an ``hsr_url`` that raises or returns a relative
-URL) fails the request before anything is written. A request that comes
+a link that can't be resolved (the include missing, an ``hsr_url`` that
+raises or returns a relative URL) fails the request before anything is
+written. A request that comes
 through no URL (a view called directly, with ``APIRequestFactory``) gets no
 HSR link.
 
@@ -116,8 +117,9 @@ Subclassing ``ScrudfulMetadata`` does nothing else: OPTIONS has no body and the
 HSR is built without the request, so a subclass may not define
 ``determine_metadata`` or one of 0.9's hooks (``determine_metadata_for_<method>``,
 ``_write``, ``required_conditional_headers``), nor ``get_method``, which
-scrudful never calls: each raises ``TypeError`` when the class is created. Shape the document with ``statuses=``, ``entity=`` and
-``Meta`` instead (see `The HTTP Schema Resource`_). A view that only sets
+scrudful never calls: each raises ``TypeError`` when the class is created.
+Shape the document with ``statuses=``, ``entity=`` and ``Meta`` instead (see
+`The HTTP Schema Resource`_). A view that only sets
 ``metadata_class = ScrudfulMetadata``, keeping DRF's ``options``, answers
 OPTIONS with the HSR as DRF's 200 body, which is not Semantic HTTP's OPTIONS.
 
@@ -337,8 +339,9 @@ With ``ScrudfulMetadata`` installed, OPTIONS is answered in this order:
    ``lookup_url_kwarg``. A ``get_object`` called so must handle every route
    it is called on (or raise ``Http404``): what else it raises is the
    OPTIONS's answer. So a requester refused every method gets ``Allow:
-   OPTIONS`` whether the object exists or not, as a GET of either is refused alike. A ``get_object()``
-   that raises (the ``Http404`` of a missing object, or of one the requester
+   OPTIONS`` whether the object exists or not, as a GET of either is refused
+   alike. A ``get_object()`` that raises (the ``Http404`` of a missing object,
+   or of one the requester
    may not read) is the answer, through the view's exception handler, with
    the HSR link.
 5. **Each method that passed is checked against the object**:
@@ -346,8 +349,9 @@ With ``ScrudfulMetadata`` installed, OPTIONS is answered in this order:
    object, a collection's, the method is allowed). DRF's ``PermissionDenied``
    or ``NotAuthenticated``, any other 401 or 403 ``APIException``
    (``AuthenticationFailed``, or one of yours), or Django's
-   ``PermissionDenied`` means not allowed; anything else raised propagates, answered as in step 4. An
-   ``Http404`` raised there (``DjangoObjectPermissions`` for an object the
+   ``PermissionDenied`` means not allowed; anything else raised propagates,
+   answered as in step 4. An ``Http404`` raised there
+   (``DjangoObjectPermissions`` for an object the
    requester may not read) is the OPTIONS's 404, as a GET's would be, not a
    method refused.
 6. **The answer** is a 204 without content or ``Content-Type`` (whatever
@@ -470,8 +474,8 @@ prefers ``text/html``, and always send ``Vary: Accept``. Django uses them with
 ``DEBUG`` off. They get no HSR link. They never raise for their Links: one
 they can't build (an invalid ``SCRUDFUL["BASE_URL"]``, or a relative link
 without a base URL on a request whose host ``ALLOWED_HOSTS`` refuses) is
-logged on the ``scrudful`` logger, and the error served without the Links, so
-Django still logs the error it answers.
+logged on the ``scrudful._django`` logger, and the error served without the
+Links, so Django still logs the error it answers.
 
 Callbacks
 ---------

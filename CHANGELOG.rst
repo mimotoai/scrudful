@@ -44,9 +44,10 @@ Behaviour change (all adapters)
 * A denial an ``Allow`` hook raises refuses that method, in every adapter:
   DRF's ``PermissionDenied`` or ``NotAuthenticated``, any other 401 or 403
   ``APIException`` (``AuthenticationFailed``, a project's own), or Django's
-  ``PermissionDenied`` from ``allowed_func`` (or a permission check); ninja's ``HttpError`` 401 or
-  403 (``AuthenticationError``, ``AuthorizationError``) or ``PermissionDenied``
-  from ``allowed``; FastAPI's ``HTTPException`` 401 or 403 from
+  ``PermissionDenied`` from ``allowed_func`` (or a permission check);
+  ninja's ``HttpError`` 401 or 403 (``AuthenticationError``,
+  ``AuthorizationError``) or ``PermissionDenied`` from ``allowed``; FastAPI's
+  ``HTTPException`` 401 or 403 from
   ``add_options(allowed=)`` (ninja and FastAPI failed the whole OPTIONS). A
   404 a hook raises is the OPTIONS's answer; anything else propagates.
 * The HSR route and views are public under Django's
@@ -206,11 +207,11 @@ Behaviour change (DRF)
   ``scrudful_viewset`` class without ``@scrudful``); and, as the warning
   ``scrudful.W001``, what may depend on the data: a link callable raising a
   ``django.db.DatabaseError`` when called as ``func(view, None)``, or
-  returning nothing for a context link or its type, so that ``migrate`` runs on a
-  fresh database whose tables a callable reads. Any other exception a
-  callable raises (``NoReverseMatch``, a signature's ``TypeError``) is
-  ``E005``. The
-  ``hsr_urls()`` pattern runs the check in Django's URL check; ``E003`` needs
+  returning nothing for a context link or its type, so that ``migrate``
+  runs on a fresh database whose tables a callable reads. Any other
+  exception a callable raises (``NoReverseMatch``, a signature's
+  ``TypeError``) is ``E005``. The ``hsr_urls()`` pattern runs the check in
+  Django's URL check; ``E003`` needs
   ``scrudful.rest_framework`` imported before the checks start, which
   registers the check (an ``AppConfig.ready()``).
 * OPTIONS is no longer gated by the view's permissions (DRF's ``initial()``
@@ -329,8 +330,9 @@ New
   entity's Links unless ``Accept`` prefers ``text/html``, with ``Vary:
   Accept``. They never raise for their Links: one they can't build (an
   invalid ``SCRUDFUL["BASE_URL"]``, a refused host for a relative link) is
-  logged on the ``scrudful`` logger and the error served without them; the
-  request's host is read only for a relative link without a base URL.
+  logged on the ``scrudful._django`` logger and the error served without
+  them; the request's host is read only for a relative link without a base
+  URL.
 * ninja: ``ScrudfulRouter(base_url=, hsr_route=, hsr_url=, hsr_cache_control=,
   allowed=)``; ``allowed=`` on ``scrudful``, ``scrudful_create`` and
   ``scrudful_list``; ``described(entity)`` and ``add_api_operation(...,
