@@ -2945,6 +2945,208 @@ def test_options_shares_the_loaders_load():
     assert calls == ["GET"]
 
 
+def shared_load_router(asynchronous: bool, refuse_get: str) -> Any:
+    """GET and PUT share one ``load``, which loads an item only for its owner
+    (alice) and raises a 404 for anyone else; GET's ``auth=`` (``"auth"``)
+    or ``before`` (``"before"``) refuses every requester, so the loader never
+    runs. ``calls`` records each load's requester and method."""
+    store, calls = Store(), []
+
+    def owned(request, pk, **params):
+        calls.append((getattr(request, "auth", None), request.method))
+        if request.auth != ALICE:
+            raise HttpError(404, "Not Found")
+        return store.load(request, pk, **params)
+
+    async def async_owned(request, pk, **params):
+        return owned(request, pk, **params)
+
+    def staff_only(request, **params):
+        raise HttpError(403, "staff only")
+
+    async def async_staff_only(request, **params):
+        staff_only(request, **params)
+
+    load = async_owned if asynchronous else owned
+    if refuse_get == "auth":
+        get_auth, get_item_options = {"auth": DenyAll()}, {}
+    else:
+        before = async_staff_only if asynchronous else staff_only
+        get_auth, get_item_options = {}, {"before": before}
+    router = ScrudfulRouter(base_url=BASE_URL)
+    if asynchronous:
+
+        @router.get("/{pk}", response=ItemOut, **get_auth)
+        @scrudful(load=load, **get_item_options, **LINKS)
+        async def get_item(request, pk: int, obj):
+            return obj  # pragma: no cover
+
+        @router.put("/{pk}", response=ItemOut)
+        @scrudful(load=load, **LINKS)
+        async def put_item(request, pk: int, payload: ItemIn, obj):
+            return obj  # pragma: no cover
+
+    else:
+
+        @router.get("/{pk}", response=ItemOut, **get_auth)
+        @scrudful(load=load, **get_item_options, **LINKS)
+        def get_item(request, pk: int, obj):
+            return obj  # pragma: no cover
+
+        @router.put("/{pk}", response=ItemOut)
+        @scrudful(load=load, **LINKS)
+        def put_item(request, pk: int, payload: ItemIn, obj):
+            return obj  # pragma: no cover
+
+    return mount(router, auth=KeyAuth()), calls
+
+
+@pytest.mark.parametrize("refuse_get", ["auth", "before"])
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_a_shared_load_runs_for_a_method_when_the_loader_didnt(
+    asynchronous, refuse_get
+):
+    """When the loading operation refused the requester, nothing loaded: a
+    method sharing its ``load`` runs it as a check of its own method, so a
+    PUT that would answer 404 isn't listed, as with a ``load`` of its own."""
+    api, calls = shared_load_router(asynchronous, refuse_get)
+    bob = options_of(api, asynchronous, "/1", headers=BOB_KEY)
+    assert bob.status_code == 204 and bob.headers["Allow"] == "OPTIONS"
+    assert calls == [(BOB, "PUT")]
+    alice = {"X-API-Key": ALICE}
+    owner = options_of(api, asynchronous, "/1", headers=alice)
+    assert owner.status_code == 204 and owner.headers["Allow"] == "PUT, OPTIONS"
+    # A missing item: the loader didn't run, so no 404 answers the OPTIONS;
+    # PUT's own load leaves PUT out.
+    missing = options_of(api, asynchronous, "/99", headers=alice)
+    assert missing.status_code == 204 and missing.headers["Allow"] == "OPTIONS"
+
+
+def test_a_shared_load_runs_again_with_other_path_parameters():
+    """A method sharing the loader's ``load`` but validating the path
+    parameters otherwise (an ``int``, not a ``str``) loads with its own: the
+    loader's object isn't the one its request would load."""
+    store, calls = Store(), []
+
+    def load(request, pk, **params):
+        calls.append((request.method, pk))
+        if not isinstance(pk, int):
+            raise HttpError(410, "Gone")
+        return store.load(request, pk, **params)
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(load=load, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj  # pragma: no cover
+
+    @router.put("/{pk}", response=ItemOut)
+    @scrudful(load=load, **LINKS)
+    def put_item(request, pk: int, payload: ItemIn, obj):
+        return obj  # pragma: no cover
+
+    @router.delete("/{pk}", response=ItemOut)
+    @scrudful(load=load, **LINKS)
+    def delete_item(request, pk: str, obj):
+        return obj  # pragma: no cover
+
+    response = options(TestClient(mount(router)), "/1")
+    assert response.status_code == 204
+    assert response.headers["Allow"] == "GET, PUT, OPTIONS"
+    assert calls == [("GET", 1), ("DELETE", "1")]
+
+
+class UpperKeyAuth(APIKeyHeader):
+    param_name = "X-API-Key"
+
+    def authenticate(self, request, key):
+        return key.upper() if key in (ALICE, BOB) else None
+
+
+def test_a_shared_load_runs_again_for_another_requester():
+    """A method sharing the loader's ``load`` but authenticating the
+    requester otherwise (another ``request.auth``) loads with its own: the
+    loader's object isn't the one its request would load."""
+    store, calls = Store(), []
+
+    def owned(request, pk, **params):
+        calls.append((request.method, request.auth))
+        if request.auth != ALICE:
+            raise HttpError(403, "not yours")
+        return store.load(request, pk, **params)
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/{pk}", response=ItemOut, auth=KeyAuth())
+    @scrudful(load=owned, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj  # pragma: no cover
+
+    @router.put("/{pk}", response=ItemOut, auth=UpperKeyAuth())
+    @scrudful(load=owned, **LINKS)
+    def put_item(request, pk: int, payload: ItemIn, obj):
+        return obj  # pragma: no cover
+
+    client = TestClient(mount(router))
+    response = options(client, "/1", headers={"X-API-Key": ALICE})
+    assert response.status_code == 204
+    assert response.headers["Allow"] == "GET, OPTIONS"
+    assert calls == [("GET", ALICE), ("PUT", ALICE.upper())]
+
+
+def path_422_router(put_load: Any) -> NinjaAPI:
+    """GET takes any ``pk`` (a ``str``), PUT and DELETE only an ``int``;
+    PUT's ``load`` is ``put_load``, when given, and DELETE isn't a
+    ``@scrudful`` operation."""
+
+    def any_item(request, pk, **params):
+        return {"id": 1, "name": str(pk), "version": 1}
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(load=any_item, **LINKS)
+    def get_item(request, pk: str, obj):
+        return obj  # pragma: no cover
+
+    put_options = {} if put_load is None else {"load": put_load}
+
+    @router.put("/{pk}", response=ItemOut)
+    @scrudful(**put_options, **LINKS)
+    def put_item(request, pk: int, payload: ItemIn, obj=None):
+        return obj  # pragma: no cover
+
+    @router.delete("/{pk}", response={204: None})
+    @described(Entity(**LINKS))
+    def delete_item(request, pk: int):
+        return 204, None  # pragma: no cover
+
+    return mount(router)
+
+
+@pytest.mark.parametrize("own_load", [False, True], ids=["no-load", "own-load"])
+def test_a_method_whose_path_parameters_dont_validate_is_left_out(own_load):
+    """A method whose request would be a 422 (its path parameters don't
+    validate) isn't listed, whether or not it has a ``load`` of its own, and
+    that ``load`` doesn't run."""
+    calls = []
+
+    def owned(request, pk, **params):
+        calls.append(pk)
+        return {"id": pk, "name": "x", "version": 1}
+
+    client = TestClient(path_422_router(owned if own_load else None))
+    response = options(client, "/abc")
+    assert response.status_code == 204
+    assert response.headers["Allow"] == "GET, OPTIONS"
+    assert client.put("/abc", json={"name": "x"}).status_code == 422
+    assert calls == []
+    valid = options(client, "/1")
+    assert valid.headers["Allow"] == "GET, PUT, DELETE, OPTIONS"
+    assert calls == ([1] if own_load else [])
+
+
 #: What PUT's own ``load`` saw of each request reaching it: ``request.method``
 #: and the request line's method (``request.META["REQUEST_METHOD"]``).
 LOCK_SEEN: list[tuple[str, str]] = []

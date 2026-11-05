@@ -1007,9 +1007,9 @@ for a preflight too. In this order:
    a method passes its object-free checks). An ``HttpError`` or ``Http404`` it raises (the 404 of a missing
    or hidden object) is the answer, by the API's exception handler, with
    ``add_error_links``'s Links and the HSR link: return ``None`` for a 204 on
-   a missing object (a PUT that may create, say). Another ``@scrudful``
-   operation whose ``load`` differs runs it too, in step 4, as a check of its
-   own method only.
+   a missing object (a PUT that may create, say). Every other ``@scrudful``
+   item operation with a ``load`` runs it too, in step 4, as a check of its
+   own method only, unless it is the very call this step made.
 4. **Each method is checked**, on a copy of the request with that method:
 
    * with an ``allowed`` hook (the operation's ``allowed=``, else the
@@ -1019,8 +1019,9 @@ for a preflight too. In this order:
      authenticate the requester (``request.auth``), and as it came otherwise;
    * without one, the method is allowed when the operation's ``auth=``
      callbacks authenticate the requester, its ``before`` (if any) returns
-     ``None``, and then, for a ``@scrudful`` operation whose ``load`` differs
-     from step 3's, that ``load`` (called as in step 3, on the copy) returns,
+     ``None``, its path parameters validate (a method whose request would be
+     a 422 is left out), and then, for a ``@scrudful`` item operation with a
+     ``load``, that ``load`` (called as in step 3, on the copy) returns,
      whatever it returns. So a ``load`` that authorizes (an owner-only PUT
      raising ``HttpError(403)`` for anyone else) leaves its method out of
      that requester's ``Allow``, the OPTIONS still answering 204, and it
@@ -1028,9 +1029,12 @@ for a preflight too. In this order:
      requester. Any ``HttpError`` such a ``load`` raises (a 410, a 400, not
      only a 401, 403 or 404), ``Http404`` or ``PermissionDenied`` leaves only
      its method out: only step 3's error answers the OPTIONS. A ``load``
-     shared with step 3's runs once, with step 3's method, so it never sees
-     the other methods: give a method its own ``load`` to authorize it
-     separately.
+     isn't called again for the very call step 3 made (the same function,
+     path parameters and ``request.auth``): that method gets step 3's answer,
+     and the ``load`` sees only step 3's method, so give a method its own
+     ``load`` to authorize it separately. When step 3 loaded nothing (its
+     operation's ``auth=`` or ``before`` refused the requester), a ``load``
+     it shares runs for each other method, as that method's check.
 
    A raised ``HttpError`` with status 401, 403 or 404 (as ninja's
    ``AuthenticationError`` and ``AuthorizationError`` are), ``Http404`` or

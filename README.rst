@@ -256,10 +256,11 @@ order:
    * django-ninja: the ``load`` of the GET operation (else of the first with
      one), once that operation's own ``auth=`` and ``before=`` allow the
      requester, with or without an ``allowed=`` hook. Without a hook, each
-     other item operation whose ``load`` differs also runs that ``load`` in
-     step 4, once its ``auth=`` and ``before=`` pass, as a check of its own
-     method: any ``HttpError``, ``Http404`` or ``PermissionDenied`` it raises
-     leaves out only that method;
+     other item operation with a ``load`` also runs it in step 4, once its
+     ``auth=`` and ``before=`` pass, as a check of its own method, unless it
+     is the very call the loading operation made (the same function, path
+     parameters and ``request.auth``): any ``HttpError``, ``Http404`` or
+     ``PermissionDenied`` it raises leaves out only that method;
    * FastAPI: ``add_options(load=...)``, once at least one method passes its
      security dependencies (every method does with ``allowed=``).
 
@@ -277,8 +278,9 @@ order:
    Adapter       Hook                                         Default checks
    ============  ===========================================  ==========================================
    django-ninja  ``allowed(request, method, obj)``, on the    the operation's ``auth=`` callbacks, its
-                 operation or the ``ScrudfulRouter``          ``before=``, then its own ``load`` when
-                                                              it differs from step 3's
+                 operation or the ``ScrudfulRouter``          ``before=``, its path parameters, then
+                                                              its own ``load`` unless step 3 made
+                                                              that same call
    DRF           ``allowed_func(view, request, method,        the permission classes:
                  obj)``, on the handler or ``Meta``           ``check_permissions``, then, with an
                                                               object, ``check_object_permissions``
@@ -1156,10 +1158,12 @@ this release, also need the 0.9.0 changes in the changelog):
       ``http_schema_resource`` and ``http_schema_resource_view`` for a router
       mounted on several APIs;
     * django-ninja: OPTIONS runs, besides the loading operation's ``load``,
-      each other item operation's own ``load`` (when it differs) as a check
-      of that method, once its ``auth=`` and ``before=`` pass: any
-      ``HttpError``, ``Http404`` or ``PermissionDenied`` it raises leaves out
-      only that method. Keep every ``load`` free of side effects;
+      each other item operation's own ``load`` as a check of that method,
+      once its ``auth=`` and ``before=`` pass, unless it is the very call the
+      loading operation made: any ``HttpError``, ``Http404`` or
+      ``PermissionDenied`` it raises leaves out only that method. A method
+      whose path parameters don't validate (its request would be a 422) is
+      left out. Keep every ``load`` free of side effects;
     * django-ninja, with ``add_error_links``: a 401, 403, 422 or 429 of a
       scrudful operation (ninja's own, or one the operation, its ``load``,
       ``before=`` or ``after_throttles=`` raises) carries the API-wide

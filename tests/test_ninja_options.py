@@ -786,8 +786,9 @@ def test_options_same_for_missing_and_hidden(store):
     assert dict(missing.headers) == dict(hidden.headers)
     assert hsr_link_problems(dict(missing.headers), target) == []
     assert "Allow" not in missing.headers
-    # A path parameter the operations would refuse (422): no object.
-    options_204(client, "/items/not-a-number", allow, target, headers=ALICE)
+    # A path parameter the operations would refuse (422): no object, and no
+    # method its request would refuse is listed.
+    options_204(client, "/items/not-a-number", "OPTIONS", target, headers=ALICE)
     # No handler ran.
     assert set(store.calls) == {"auth", "load"}
 

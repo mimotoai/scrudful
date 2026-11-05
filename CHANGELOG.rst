@@ -177,12 +177,17 @@ Behaviour change (ninja)
 * ``ScrudfulRouter``'s OPTIONS runs the operations' checks: the loading
   operation's ``auth=`` and ``before`` (then ``load``), and each method's
   ``auth=`` and ``before`` (or ``allowed``), then, for a ``@scrudful``
-  operation whose ``load`` differs from the loading operation's, its own
-  ``load``: any ``HttpError``, ``Http404`` or ``PermissionDenied`` it raises
-  leaves only that method out of ``Allow`` (only the loading operation's
-  error answers the OPTIONS; another exception still propagates), so
-  authorization in a method's ``load`` shapes ``Allow``; it runs only once
-  the method's ``auth=`` and ``before`` passed. Bad credentials make the
+  item operation with a ``load``, that ``load``, unless it is the very call
+  the loading operation made (the same function, path parameters and
+  ``request.auth``; so a ``load`` shared with the loading operation runs for
+  the other methods when the loading operation refused the requester and
+  loaded nothing): any ``HttpError``, ``Http404`` or ``PermissionDenied`` it
+  raises leaves only that method out of ``Allow`` (only the loading
+  operation's error answers the OPTIONS; another exception still
+  propagates), so authorization in a method's ``load`` shapes ``Allow``; it
+  runs only once the method's ``auth=`` and ``before`` passed. A method whose
+  path parameters don't validate (its request would be a 422) is left out of
+  ``Allow``, and its ``load`` doesn't run. Bad credentials make the
   requester anonymous (ninja's auth callbacks return ``None``), so they get
   the anonymous ``Allow``. A raised ``HttpError`` 401, 403 or 404,
   ``Http404`` or ``PermissionDenied`` from ``auth=`` or ``before`` refuses a
