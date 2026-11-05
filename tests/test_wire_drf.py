@@ -29,8 +29,7 @@ empty. One test per rule family:
 - ``test_expose_headers``: ``Link`` and ``Allow`` exposed, ``ETag`` and
   ``Location`` when present.
 
-The scenarios are those of the 0.9.0 audit's DRF harness (its ``run.py``,
-``extra.py``, ``probe2.py`` and ``probe3.py``), on two sets of views:
+The scenarios run on two sets of views:
 
 - the ``examples/scrudful_rest_framework`` project's (``items.urls``: the item
   viewsets and ``/stats/``), whose settings are this suite's;
@@ -467,7 +466,7 @@ def on(kind: str, default_url: str) -> Callable[..., Exchange]:
 
 
 def example_exchanges() -> list[Exchange]:
-    """The audit's exchanges with the example project (``run.py``)."""
+    """The exchanges with the example project."""
     item = on("item", "/items/{one}/")
     items = on("items", "/items/")
     fresh = {"If-None-Match": '"v1"'}
@@ -516,7 +515,7 @@ def example_exchanges() -> list[Exchange]:
 
 
 def wire_exchanges() -> list[Exchange]:
-    """The audit's exchanges with its extra views (``extra.py``, ``probe*``)."""
+    """The exchanges with the minimal views under ``/x/``."""
     perm = on("perm", "/x/perm-items/{one}/")
     listing = on("perm-list", "/x/perm-items/")
     touch = on("touch", "/x/perm-items/{one}/touch/")

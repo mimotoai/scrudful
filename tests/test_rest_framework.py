@@ -1107,7 +1107,7 @@ def test_get_sends_validators_and_links(client):
 
 
 def test_context_rel_and_type_are_honoured(client):
-    """D-I1: the context link used the schema rel/type."""
+    """Regression: the context link used the schema rel/type."""
     response = client.get("/things/1/")
     assert response["Link"] == with_hsr(
         f'{SCHEMA_LINK}, <{CONTEXT}>; rel="my-context-rel"; '
@@ -1188,7 +1188,7 @@ def test_428_lists_the_configured_validators(client, prefix, accepted):
 
 
 def test_last_modified_only_write_with_if_unmodified_since(client):
-    """D-C1: If-Unmodified-Since compared a string with an int (500)."""
+    """Regression: If-Unmodified-Since compared a string with an int (500)."""
     response = client.put("/lm-only/1/", headers={"If-Unmodified-Since": MODIFIED_HTTP})
     assert response.status_code == 200
     response = client.delete(
@@ -1198,13 +1198,13 @@ def test_last_modified_only_write_with_if_unmodified_since(client):
 
 
 def test_if_match_alone_is_enough(client):
-    """D-I6: both If-Match and If-Unmodified-Since were demanded."""
+    """Regression: both If-Match and If-Unmodified-Since were demanded."""
     response = client.put("/things/1/", headers={"If-Match": '"v1"'})
     assert response.status_code == 200
 
 
 def test_patch_requires_a_precondition_and_strips_partial(client):
-    """D-C2: PATCH crashed (partial kwarg) or skipped the If-Match check."""
+    """Regression: PATCH crashed (partial kwarg) or skipped the If-Match check."""
     assert client.patch("/things/1/").status_code == 428
     assert client.patch("/things/1/", headers={"If-Match": '"v0"'}).status_code == 412
     store.calls.clear()
@@ -1222,7 +1222,7 @@ def test_patch_requires_a_precondition_and_strips_partial(client):
 
 
 def test_write_response_has_fresh_validators(client):
-    """D-C3: the write response carried the pre-modification validators."""
+    """Regression: the write response carried the pre-modification validators."""
     response = client.put("/things/1/", headers={"If-Match": '"v1"'})
     assert response["ETag"] == '"v2"'
     assert response["Last-Modified"] == "Tue, 02 Jan 2024 04:04:05 GMT"
@@ -1346,7 +1346,7 @@ def test_list_uses_the_list_configuration(client):
     ],
 )
 def test_etag_values(client, key, expected):
-    """D-I4: valid tags were mangled and non-strings crashed."""
+    """Regression: valid tags were mangled and non-strings crashed."""
     response = client.get(f"/etag-format/{key}/")
     assert response["ETag"] == expected
     revalidated = client.get(
@@ -1374,7 +1374,7 @@ def test_invalid_etag_raises(client):
     ],
 )
 def test_last_modified_values(client, key, expected):
-    """D-I13: an aware non-UTC datetime was relabelled as UTC."""
+    """Regression: an aware non-UTC datetime was relabelled as UTC."""
     response = client.get(f"/lm-format/{key}/")
     assert response["Last-Modified"] == expected
 
@@ -1389,7 +1389,7 @@ def test_naive_last_modified_is_in_the_default_time_zone(client):
 
 
 def test_link_url_cannot_inject_links(client):
-    """D-I10: a URL built from request data could add links."""
+    """Regression: a URL built from request data could add links."""
     response = client.get(
         "/injection/1/", {"v": 'a>; rel="next", <https://evil.example'}
     )
@@ -1581,7 +1581,7 @@ def test_a_view_rdf_context_link_is_the_one_context_link():
 
 
 def test_options_json_for_browsable_accept(client):
-    """Review Focus 4: the browsable API does not take over OPTIONS: a 204
+    """The browsable API does not take over OPTIONS: a 204
     without content, whatever the Accept."""
     for path_ in ("/things/1/", "/errors/", "/api-described/7/"):
         response = client.options(path_, headers={"Accept": "text/html"})
@@ -1728,7 +1728,7 @@ def test_trace_ignores_preconditions(client):
 
 
 def test_options_action_without_links(client):
-    """Review Focus 5: a route mixing scrudful and plain methods."""
+    """A route mixing scrudful and plain methods."""
     response = client.options("/mixed-actions/1/mixed/")
     body = hsr_of(client, "/mixed-actions/1/mixed/")
     validate_http_schema_resource(body)
@@ -1791,7 +1791,7 @@ def test_agreement_drf_item(client):
 
 
 def test_class_attribute_is_the_wrapper_with_the_view_metadata():
-    """D-I3: the descriptor returned a functools.partial."""
+    """Regression: the descriptor returned a functools.partial."""
     wrapper = ThingViewSet.__dict__["retrieve"]
     assert isinstance(wrapper, ScrudfulViewFunc)
     assert ThingViewSet.retrieve is wrapper
@@ -1804,7 +1804,7 @@ def test_class_attribute_is_the_wrapper_with_the_view_metadata():
 
 
 def test_only_existing_methods_are_wrapped():
-    """D-I2: missing methods were wrapped as ScrudfulViewFunc(None)."""
+    """Regression: missing methods were wrapped as ScrudfulViewFunc(None)."""
 
     @scrudful_viewset
     class ReadOnly(viewsets.ViewSet):
@@ -1841,7 +1841,7 @@ def test_action_mapping_is_scrudful(client):
 
 
 def test_redecorated_subclass_uses_its_own_meta(client):
-    """D-I3: re-decorating a subclass raised AttributeError on every request."""
+    """Regression: re-decorating a subclass raised AttributeError on every request."""
     response = client.get("/child/1/")
     assert response.status_code == 200
     assert response["ETag"] == '"child-1"'
@@ -1880,7 +1880,7 @@ def test_view_without_a_request_is_rejected():
 
 
 def test_api_view_function_with_scrudful(client):
-    """D-I12: @scrudful on a function view raised IndexError."""
+    """Regression: @scrudful on a function view raised IndexError."""
     response = client.get("/function/1/")
     assert response.status_code == 200
     assert response["ETag"] == '"v1"'
@@ -1913,7 +1913,7 @@ def test_plain_django_view_with_scrudful(client):
 
 
 def test_api_view_method_list(client):
-    """D-I7: the method list was bound to etag_func."""
+    """Regression: the method list was bound to etag_func."""
     response = client.get("/api/1/")
     assert response.status_code == 200
     assert response["ETag"] == '"v1"'
@@ -1957,7 +1957,7 @@ def test_api_view_keeps_name_and_docstring():
 
 
 def test_api_view_honours_policy_decorators(client):
-    """D-I8: throttle/authentication/renderer decorators were ignored."""
+    """Regression: throttle/authentication/renderer decorators were ignored."""
     assert client.get("/api-throttled/").status_code == 429
     response = client.get("/api-authenticated/")
     assert response.status_code == 401
@@ -1971,8 +1971,9 @@ def test_api_view_honours_policy_decorators(client):
 
 
 def test_api_view_options_metadata(client):
-    """The HTTP Schema Resource is built without the URL arguments (D-I9
-    passed them): a link callable that needs one can't be described."""
+    """The HTTP Schema Resource is built without the URL arguments (0.9's
+    OPTIONS metadata passed them): a link callable that needs one can't be
+    described."""
     with pytest.raises(ImproperlyConfigured, match=r"func\(view, None\)"):
         hsr_of(client, "/api/7/")
     # OPTIONS builds no document: it only links to it.

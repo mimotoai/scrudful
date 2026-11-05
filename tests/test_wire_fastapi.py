@@ -31,9 +31,7 @@ asserts that its problem list is empty. One test per rule family:
   ``Location`` when present, same-origin and (through ``CORSMiddleware``)
   cross-origin.
 
-The scenarios are those of the 0.9.0 audit's FastAPI harness (its
-``harness.py``, ``check_example.py``, ``check_minimal.py`` and
-``check_accept.py``), on four apps:
+The scenarios run on four apps:
 
 - ``examples/fastapi/api.py``, with the test client's URL as its base URL;
 - ``WIRE``, a minimal app for what the example doesn't show: security
@@ -586,7 +584,7 @@ MALFORMED = {"If-Match": "v1"}
 
 
 def example_exchanges() -> list[Exchange]:
-    """The audit's exchanges with the example app (``check_example.py``)."""
+    """The exchanges with the example app."""
     user = on("user", "/users/2")
     users = on("users")
     body = {"name": "Eve", "age": 99}
@@ -628,8 +626,7 @@ def example_exchanges() -> list[Exchange]:
 
 
 def wire_exchanges() -> list[Exchange]:
-    """The audit's exchanges with its minimal apps (``check_minimal.py``,
-    ``check_accept.py``)."""
+    """The exchanges with the minimal apps."""
     note = on("note")
     notes = on("notes")
     admin = on("admin")
@@ -1157,8 +1154,8 @@ def test_undescribed(clients, accept, label, app, method, url, kind):
 
 @pytest.mark.parametrize("accept", [None, "application/json"], ids=["absent", "json"])
 def test_the_csv_entity_is_described_whatever_the_accept(clients, accept):
-    """The audit's ``check_accept.py``: a ``text/csv`` entity is described by
-    its HSR, so it may answer an absent or a JSON-only ``Accept``."""
+    """A ``text/csv`` entity is described by its HSR, so it may answer an
+    absent or a JSON-only ``Accept``."""
     hsr = hsr_of(clients, "csv")
     client = TestClient(WIRE)
     del client.headers["accept"]
@@ -1238,7 +1235,7 @@ def test_the_validation_422_is_problem_details(clients, url, headers, body):
 
 @pytest.mark.parametrize("headers", [{}, JSON, {"Accept": "text/html"}])
 def test_the_500_is_problem_details(clients, headers):
-    """The audit's text/plain 500: now problem details with the error Links
+    """The 500 (text/plain in 0.9) is problem details with the error Links
     and the HSR link, whatever the ``Accept``."""
     response = clients["wire"].get("/boom/1", headers=headers)
     assert response.status_code == 500
@@ -1263,8 +1260,8 @@ def test_the_500_is_problem_details(clients, headers):
     ],
 )
 def test_a_dependency_link_is_kept(clients, method, headers, status):
-    """The audit's dependency Link, dropped on the early 400/412/428: kept,
-    beside the content's (or the error's) Links and the HSR link."""
+    """A Link a dependency sets (0.9 dropped it on the early 400/412/428) is
+    kept, beside the content's (or the error's) Links and the HSR link."""
     response = clients["wire"].request(method, "/linked/1", headers=headers)
     assert response.status_code == status
     links = parse_links(response.headers["link"])

@@ -420,7 +420,7 @@ def test_relative_links_resolved(client, db):
 
 
 def test_mixed_path_agrees(store):
-    """Review Focus 5: a scrudful GET and a plain ninja PUT on one path."""
+    """A scrudful GET and a plain ninja PUT on one path."""
     router = ScrudfulRouter(base_url=TEST_BASE_URL)
     item_router(store, router, methods=("GET",))
 
@@ -1219,7 +1219,7 @@ def test_options_on_a_path_of_described_operations_only():
 
 
 def test_options_mixed_operations(store):
-    """Review Focus 5: only some operations of the path are scrudful."""
+    """Only some operations of the path are scrudful."""
     router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.put("/items/{pk}", response={200: ItemOut, 404: Message})
@@ -1277,7 +1277,7 @@ def test_options_mixed_operations(store):
 
 
 def test_options_nested_router_api_auth(store):
-    """Review Focus 3: nested in a router with a prefix, under API auth."""
+    """Nested in a router with a prefix, under API auth."""
     parent = Router()
     child = item_router(store)
     parent.add_router("/v1", child)

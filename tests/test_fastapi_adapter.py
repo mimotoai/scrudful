@@ -2612,7 +2612,7 @@ def test_add_options_skips_existing_options(make_client):
 
 
 def test_add_options_mixed_path(make_client, store):
-    """Review Focus 5: a plain method on a scrudful path is described without
+    """A plain method on a scrudful path is described without
     content or a request body, and ``Allow`` still lists the methods the
     body describes (none of them has a check)."""
     app = FastAPI()

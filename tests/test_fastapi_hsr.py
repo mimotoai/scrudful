@@ -240,7 +240,7 @@ def test_routes_added_later_are_described():
 
 def test_requests_dont_walk_the_routes_again(make_client, monkeypatch):
     """The resources are indexed once per change of the routes: a request
-    doesn't walk every route of the app (the final review's F1)."""
+    doesn't walk every route of the app (each walk costs O(routes))."""
     import scrudful.fastapi as module
 
     walks = []

@@ -1247,7 +1247,8 @@ def test_one_name_for_two_scrudful_views_is_improperly_configured(settings, clie
 
 
 class OneBadRouteURLconf:
-    """A named scrudful route beside an unnamed one (the final review's probe)."""
+    """A named scrudful route beside an unnamed one: only the unnamed one
+    fails."""
 
     thing = drf_hsr_urls.ItemViewSet.as_view({"get": "retrieve", "put": "update"})
     urlpatterns = [
@@ -3057,7 +3058,7 @@ class SlugLookupView(APIView):
 class OwnGetObjectView(APIView):
     """An ``APIView`` (no lookup kwarg) with a ``get_object`` of its own for
     its item routes, also mounted on a nested collection route: OPTIONS
-    there must not call it (the reviewer's probe)."""
+    there must not call it (it has no object to load)."""
 
     def get_object(self):
         SEEN_ACTIONS.append(("own", self.kwargs["pk"]))

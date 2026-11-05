@@ -24,8 +24,7 @@ every case asserts that its problem list is empty. One test per rule family:
 - ``test_expose_headers``: ``Link`` and ``Allow`` exposed, ``ETag`` and
   ``Location`` when present.
 
-The scenarios are those of the 0.9.0 audit's harness (its ``agree.py``,
-``validate.py`` and ``wire*`` scripts), on two APIs:
+The scenarios run on two APIs:
 
 - ``WIRE_API`` (``/wire/``), minimal apps for what the example doesn't show: a
   router with its own ``auth`` (a reader and a writer, a ``before`` refusing
@@ -462,7 +461,7 @@ def wire_exchanges() -> list[Exchange]:
 
 
 def example_exchanges() -> list[Exchange]:
-    """The audit's exchanges with the example (``wire1``, ``agree``)."""
+    """The exchanges with the example."""
     role = on("item", "/api/roles/{pk}")
     roles = on("collection", "/api/roles")
     search = on("search", "/api/roles/search")
