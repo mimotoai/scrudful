@@ -687,13 +687,14 @@ def test_options_auto_added(store):
     client = TestClient(item_router(store))
     target = hsr_target("/items/{pk}")
     options_204(client, "/items/1", "GET, PUT, DELETE, OPTIONS", target)
-    # The object is loaded (for an exact Allow); no handler runs.
-    assert store.calls == {"load": 1}
+    # The object is loaded (for an exact Allow), and the load runs again for
+    # PUT and DELETE, which share it, with their methods; no handler runs.
+    assert store.calls == {"load": 3}
     body = hsr_get(client, "/items/{pk}")
     assert list(body) == ["get", "put", "delete", "options"]
     assert "If-Match" in [parameter["name"] for parameter in body["put"]["parameters"]]
     assert body["put"]["requestBody"]["content"] == ITEM_CONTENT
-    assert store.calls == {"load": 1}
+    assert store.calls == {"load": 3}
 
 
 def test_options_body(store):
@@ -765,10 +766,11 @@ def test_options_needs_no_credentials(store):
     assert client.get("/items/1").status_code == 401
     assert client.get("/items/1", headers=ALICE).status_code == 200
     assert store.calls["load"] == 1
-    # With them, OPTIONS offers every method, on the object loaded.
+    # With them, OPTIONS offers every method, on the object loaded (and
+    # loaded again for PUT and DELETE, which share the load).
     allow = "GET, PUT, DELETE, OPTIONS"
     options_204(client, "/items/1", allow, target, headers=ALICE)
-    assert store.calls["load"] == 2
+    assert store.calls["load"] == 4
 
 
 def test_options_same_for_missing_and_hidden(store):

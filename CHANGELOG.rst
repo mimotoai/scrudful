@@ -180,11 +180,12 @@ Behaviour change (ninja)
 * ``ScrudfulRouter``'s OPTIONS runs the operations' checks: the loading
   operation's ``auth=`` and ``before`` (then ``load``), and each method's
   ``auth=`` and ``before`` (or ``allowed``), then, for a ``@scrudful``
-  item operation with a ``load``, that ``load``, unless it is the very call
-  the loading operation made (the same function, path parameters and
-  ``request.auth``; so a ``load`` shared with the loading operation runs for
-  the other methods when the loading operation refused the requester and
-  loaded nothing): any ``HttpError``, ``Http404`` or ``PermissionDenied`` it
+  item operation with a ``load``, that ``load``, on a copy of the request
+  with that method, unless it is the very call the loading operation made
+  (the same function, method, path parameters and ``request.auth``; so a
+  ``load`` shared with the loading operation runs again for each other
+  method, and one authorizing by ``request.method`` is checked per method,
+  as DRF loads per action): any ``HttpError``, ``Http404`` or ``PermissionDenied`` it
   raises leaves only that method out of ``Allow`` (only the loading
   operation's error answers the OPTIONS; another exception still
   propagates), so authorization in a method's ``load`` shapes ``Allow``; it

@@ -413,13 +413,14 @@ OPTIONS
        nothing loads for a method its ``auth=`` or ``before`` refused. Any
        ``HttpError`` that ``load`` raises (whatever its status), ``Http404``
        or ``PermissionDenied`` leaves only that method out: only step 3's
-       error answers the OPTIONS. A ``load`` isn't called again for the
-       very call step 3 made (the same function, path parameters and
-       ``request.auth``): that method gets step 3's answer, and the ``load``
-       sees only step 3's method, so give a method its own ``load`` to
-       authorize it separately. When step 3 loaded nothing (its operation's
-       ``auth=`` or ``before`` refused the requester), a ``load`` it shares
-       runs for each other method, as that method's check. A raised
+       error answers the OPTIONS. A ``load`` isn't called again only for
+       the very call step 3 made (the same function, method, path
+       parameters and ``request.auth``): step 3's method gets step 3's
+       answer. A ``load`` step 3's operation shares with another method runs
+       again for that method, with its method, so a ``load`` authorizing by
+       ``request.method`` is checked per method; so it does for every
+       method when step 3 loaded nothing (its operation's ``auth=`` or
+       ``before`` refused the requester). A raised
        ``HttpError`` with status 401, 403 or
        404 (as ninja's ``AuthenticationError`` and ``AuthorizationError``
        are), ``Http404`` or ``PermissionDenied`` refuses the method, except
@@ -6274,9 +6275,11 @@ def _scrudful_config(operation: Any) -> _Config | None:
 
 class _Loaded(NamedTuple):
     """The call :func:`_options_object` made: the ``load`` it called, the
-    path parameters it called it with and the requester's ``auth``."""
+    method of the request it called it with (the loading operation's), the
+    path parameters and the requester's ``auth``."""
 
     load: Callable[..., Any]
+    method: str
     values: dict[str, Any]
     auth: Any
 
@@ -6329,7 +6332,7 @@ def _options_object(
     values = _path_values(requester, api, bound, url_params)
     if values is None:
         return None, None
-    loaded = _Loaded(config.load, values, getattr(requester, "auth", None))
+    loaded = _Loaded(config.load, method, values, getattr(requester, "auth", None))
     return _settled(config.load(requester, **values)), loaded
 
 
@@ -6543,7 +6546,7 @@ def _may_use(
         # A path scrudful can't validate (a custom path model's ConfigError)
         # or a validator's other error: the check is best effort, skipped,
         # unless the method's own load must run, which needs those values.
-        if _load_must_run(config, loaded):
+        if _load_must_run(config, loaded, method):
             raise
         return True
     if values is None:
@@ -6551,13 +6554,13 @@ def _may_use(
     return _own_load_allows(config, requester, values, loaded)
 
 
-def _load_must_run(config: _Config | None, loaded: _Loaded | None) -> bool:
-    """Whether an item operation's own ``load`` is to run on OPTIONS, before
-    its path parameters are known: it has one, and it isn't the function
-    ``loaded`` called."""
+def _load_must_run(config: _Config | None, loaded: _Loaded | None, method: str) -> bool:
+    """Whether an item operation's own ``load`` is to run on OPTIONS for
+    ``method``, before its path parameters are known: it has one, and it
+    isn't the function ``loaded`` called for that same method."""
     if config is None or config.kind != "item" or config.load is None:
         return False
-    return loaded is None or config.load != loaded.load
+    return loaded is None or config.load != loaded.load or method != loaded.method
 
 
 def _own_load_allows(
@@ -6571,9 +6574,11 @@ def _own_load_allows(
     ``before``) use the method: it is called as the operation calls it, with
     its validated path parameters ``values``, unless ``loaded`` (the call
     :func:`_options_object` made, whose answer is the OPTIONS') is that same
-    call: the same function, path parameters and ``auth``. So a ``load``
-    shared with the loader runs for the method when the loader didn't run
-    (its own method refused the requester) or ran with other arguments. Any
+    call: the same function, method, path parameters and ``auth``. So a
+    ``load`` shared with the loader runs again for each other method, with
+    that method (one that authorizes by ``request.method`` is checked per
+    method), and for the loader's own method when the loader didn't run (it
+    refused the requester) or ran with other arguments. Any
     ``HttpError`` (whatever its status), ``Http404`` or ``PermissionDenied``
     it raises refuses that method only: the loader's error alone answers the
     OPTIONS, and a method whose load fails is left out, as when in doubt.
@@ -6584,7 +6589,11 @@ def _own_load_allows(
     if config is None or config.kind != "item" or config.load is None:
         return True
     if loaded is not None and _same_call(
-        loaded, config.load, values, getattr(requester, "auth", None)
+        loaded,
+        config.load,
+        requester.method or "",
+        values,
+        getattr(requester, "auth", None),
     ):
         return True
     try:
@@ -6595,13 +6604,19 @@ def _own_load_allows(
 
 
 def _same_call(
-    loaded: _Loaded, load: Callable[..., Any], values: dict[str, Any], auth: Any
+    loaded: _Loaded,
+    load: Callable[..., Any],
+    method: str,
+    values: dict[str, Any],
+    auth: Any,
 ) -> bool:
-    """Whether calling ``load`` with ``values`` for a requester with ``auth``
-    is the call ``loaded`` made, so that its object is the one being checked.
+    """Whether calling ``load`` with ``values`` for a ``method`` request of a
+    requester with ``auth`` is the call ``loaded`` made, so that its object
+    is the one being checked.
     """
     return (
         load == loaded.load
+        and method == loaded.method
         and values == loaded.values
         and (auth is loaded.auth or auth == loaded.auth)
     )

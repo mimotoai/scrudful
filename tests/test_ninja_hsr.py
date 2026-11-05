@@ -2286,7 +2286,8 @@ def test_loader_gets_the_validated_path_parameters():
     api, _ = make_api(auth=KeyAuth(), load=load)
     client = TestClient(api)
     assert options(client, "/7", headers={"X-API-Key": BOB}).status_code == 204
-    assert seen == [(7, {}, BOB)]  # an int, as the GET gets it
+    # An int, as the GET gets it; again for the PUT, which shares the load.
+    assert seen == [(7, {}, BOB)] * 2
     seen.clear()
     # Not authenticated for the loading operation: nothing is loaded.
     assert options(client, "/7").headers["Allow"] == "OPTIONS"
@@ -2460,7 +2461,8 @@ def test_non_preflight_options_runs_the_checks():
     calls = []
     api, _ = make_api(auth=CountingAuth(calls), load=counting_load(calls))
     assert options(TestClient(api), "/1").status_code == 204
-    assert calls.count("load") == 1 and "auth" in calls
+    # The loader's load, and the PUT's (the same function, for another method).
+    assert calls.count("load") == 2 and "auth" in calls
 
 
 def test_options_consumes_no_throttle_for_allow(clear_cache):
@@ -2964,8 +2966,9 @@ def test_options_answers_the_loaders_404_before_any_methods_own_load():
     assert calls == []
 
 
-def test_options_shares_the_loaders_load():
-    """A method with the loader's own ``load`` doesn't load again."""
+def test_options_runs_the_loaders_load_again_only_for_another_method():
+    """The loader's own method doesn't load twice; a method sharing its
+    ``load`` runs it again, with its own method: its request would."""
     store, calls = Store(), []
 
     def load(request, pk, **params):
@@ -2975,7 +2978,68 @@ def test_options_shares_the_loaders_load():
     api, _ = make_api(load=load)
     response = options(TestClient(api), "/1")
     assert response.headers["Allow"] == "GET, PUT, OPTIONS"
-    assert calls == ["GET"]
+    assert calls == ["GET", "PUT"]
+
+
+def method_scoped_router(asynchronous: bool) -> tuple[NinjaAPI, list[Any]]:
+    """GET and PUT share one ``load``, which lets anyone read and only alice
+    write: it refuses a PUT, PATCH or DELETE of anyone else with a 403, by
+    ``request.method``. ``calls`` records each load's requester and method."""
+    store, calls = Store(), []
+
+    def load(request, pk, **params):
+        calls.append((request.auth, request.method))
+        if request.method in ("PUT", "PATCH", "DELETE") and request.auth != ALICE:
+            raise HttpError(403, "owner only")
+        return store.load(request, pk, **params)
+
+    async def async_load(request, pk, **params):
+        return load(request, pk, **params)
+
+    shared = async_load if asynchronous else load
+    router = ScrudfulRouter(base_url=BASE_URL)
+    if asynchronous:
+
+        @router.get("/{pk}", response=ItemOut)
+        @scrudful(load=shared, **LINKS)
+        async def get_item(request, pk: int, obj):
+            return obj
+
+        @router.put("/{pk}", response=ItemOut)
+        @scrudful(load=shared, **LINKS)
+        async def put_item(request, pk: int, payload: ItemIn, obj):
+            return obj
+
+    else:
+
+        @router.get("/{pk}", response=ItemOut)
+        @scrudful(load=shared, **LINKS)
+        def get_item(request, pk: int, obj):
+            return obj
+
+        @router.put("/{pk}", response=ItemOut)
+        @scrudful(load=shared, **LINKS)
+        def put_item(request, pk: int, payload: ItemIn, obj):
+            return obj
+
+    return mount(router, auth=KeyAuth()), calls
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_a_shared_load_authorizing_by_method_is_checked_per_method(asynchronous):
+    """A ``load`` shared with the loader that refuses by ``request.method``
+    runs for each method with that method: a PUT it refuses isn't listed,
+    as with a ``load`` of its own."""
+    api, calls = method_scoped_router(asynchronous)
+    bob = options_of(api, asynchronous, "/1", headers=BOB_KEY)
+    assert bob.status_code == 204 and bob.headers["Allow"] == "GET, OPTIONS"
+    assert calls == [(BOB, "GET"), (BOB, "PUT")]
+    if not asynchronous:
+        put = TestClient(api).put("/1", json={"name": "x"}, headers=BOB_KEY)
+        assert put.status_code == 403
+    alice = options_of(api, asynchronous, "/1", headers={"X-API-Key": ALICE})
+    assert alice.status_code == 204
+    assert alice.headers["Allow"] == "GET, PUT, OPTIONS"
 
 
 def shared_load_router(asynchronous: bool, refuse_get: str) -> Any:
@@ -3056,8 +3120,8 @@ def test_a_shared_load_runs_for_a_method_when_the_loader_didnt(
 
 
 def test_a_shared_load_runs_again_with_other_path_parameters():
-    """A method sharing the loader's ``load`` but validating the path
-    parameters otherwise (an ``int``, not a ``str``) loads with its own: the
+    """A method sharing the loader's ``load`` loads with its own path
+    parameters, as validated for it (a ``str``, not an ``int``): the
     loader's object isn't the one its request would load."""
     store, calls = Store(), []
 
@@ -3087,7 +3151,7 @@ def test_a_shared_load_runs_again_with_other_path_parameters():
     response = options(TestClient(mount(router)), "/1")
     assert response.status_code == 204
     assert response.headers["Allow"] == "GET, PUT, OPTIONS"
-    assert calls == [("GET", 1), ("DELETE", "1")]
+    assert calls == [("GET", 1), ("PUT", 1), ("DELETE", "1")]
 
 
 class UpperKeyAuth(APIKeyHeader):
