@@ -43,7 +43,8 @@ Validators
     answered with 400, a failed precondition with 412 and a matching GET/HEAD
     with 304 carrying the validators. These responses are returned without
     calling the view: 400/412/428 as a DRF ``Response`` (a ``JsonResponse`` for
-    plain Django views) with a JSON body, 304 without a body or Link. With an
+    plain Django views) with a JSON body, 304 without a body or content Links
+    (each gets the HTTP Schema Resource link, see "Headers"). With an
     ``error`` entity the 400/412/428 carry its Links and are served as JSON
     with its media type, whatever renderer DRF's content negotiation picked
     (the browsable API's included): the view's first JSON renderer renders
@@ -73,8 +74,9 @@ Headers
     The Link header is added to the responses whose content the view's links
     describe: the 2xx but 204 it returns, to any method but TRACE (whose
     content is the echoed request). Another response it returns (an error,
-    a 204, a redirect) gets no Links from scrudful, and keeps any Link the
-    view set. Raise an error rather than return it to give it the ``error``
+    a 204, a redirect) gets none of these Links (only the HTTP Schema
+    Resource link, below), and keeps any Link the view set. Raise an error
+    rather than return it to give it the ``error``
     entity's Links, through :func:`exception_handler`. The Link header is
     appended to any Link value the view set; a Link of the view's with the
     relation of the schema link (``describedby`` by default) replaces that
@@ -85,13 +87,34 @@ Headers
     the HTTP Schema Resource, else against the request's absolute URI
     (``request.build_absolute_uri()``), so relative values such as
     ``"/schemas/item"`` are sent absolute.
-    ``Access-Control-Expose-Headers`` is extended with whichever of ``ETag``,
-    ``Link`` and ``Location`` the response carries (django-cors-headers
-    replaces that header when ``CORS_EXPOSE_HEADERS`` is set; list the names
-    there instead). Exceptions raised by the view (e.g. ``Http404``) propagate
-    unchanged and are rendered by DRF without these headers, unless the
+    Every response of a scrudful view routed through the URLconf also links
+    the view's HTTP Schema Resource (Semantic HTTP 0.1, "Finding the HTTP
+    Schema Resource"): the 2xx, 304 and HEAD, scrudful's 400/412/428, an
+    error or a 204 the view returns, and every error DRF answers through the
+    view's exception handler (whichever it is: a serializer's 400, the
+    401/403/404/405/406/415/429 of ``initial()`` and the handler, OPTIONS's
+    included): a link with the HTTP Schema Resource relation
+    (``scrudful._hsr.HSR_LINK_REL``) and ``type="application/json"`` to the
+    :func:`hsr_urls` route (else ``hsr_url``'s URL), appended to the Link (a
+    Link with that relation the view sets wins). The view class's
+    ``finalize_response`` adds it, as scrudful sets the class up with its
+    OPTIONS (see :func:`_install_metadata`).
+    A request that came through no URL (a view called directly, as with
+    ``APIRequestFactory``) gets none, nor does a CORS preflight or a view
+    whose routed function serves no HTTP Schema Resource (``@api_view`` +
+    ``@scrudful``); a routed request of a scrudful view without the
+    :func:`hsr_urls` include raises ``ImproperlyConfigured`` (see
+    :func:`_response_hsr_link`). When one of the view's ``renderer_classes``
+    renders something other than JSON (the browsable API), its responses
+    also send ``Vary: Accept``.
+    ``Access-Control-Expose-Headers`` is extended with ``Link`` and ``Allow``,
+    and whichever of ``ETag`` and ``Location`` the response carries
+    (django-cors-headers replaces that header when ``CORS_EXPOSE_HEADERS`` is
+    set; list the names there instead). Exceptions raised by the view (e.g.
+    ``Http404``) are rendered by DRF without the error Links, unless the
     project's ``EXCEPTION_HANDLER`` is :func:`exception_handler`, which gives
-    them the Links of the view's ``error`` entity.
+    them the Links of the view's ``error`` entity (and, with a
+    problem-details entity, makes a validation 400 problem details).
 
 OPTIONS
     With :class:`ScrudfulMetadata` (installed in place of DRF's default
@@ -122,9 +145,14 @@ OPTIONS
     4. Only if one method passed step 3 is the object loaded, on a detail
        route (one whose ``lookup_url_kwarg``, else ``lookup_field``, is in
        the URL kwargs), with ``get_object()``, its
-       ``check_object_permissions`` suppressed. So a requester refused every
-       method gets ``Allow: OPTIONS`` whether the object exists or not, as a
-       GET of either is refused alike: OPTIONS is no existence oracle. A
+       ``check_object_permissions`` suppressed. So on a view whose methods
+       are all gated by permissions, a requester refused every method gets
+       ``Allow: OPTIONS`` whether the object exists or not, as a GET of either
+       is refused alike: OPTIONS is no existence oracle for it. A method with
+       an ``allowed_func`` passes step 3 for every requester (the hook has no
+       object-free check), so the object is always loaded on such a view and
+       a missing one is a 404 whoever asks: there, OPTIONS tells anyone which
+       objects exist, unless ``get_object()`` itself hides them. A
        ``get_object()`` that raises (``Http404`` for a missing object, or the
        404 of an object the requester may not read) is answered with that
        error, through the view's exception handler (:func:`exception_handler`
@@ -185,6 +213,7 @@ from django.urls import (
     path,
     reverse,
 )
+from django.utils.cache import patch_vary_headers
 from django.utils.encoding import iri_to_uri
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework.exceptions import (
@@ -222,11 +251,13 @@ from scrudful._adapter import (
     describe_content,
     describe_read,
     describe_write,
+    essence,
     evaluates_create_preconditions,
     evaluates_preconditions,
     expose_headers,
     has_default_entity,
     is_json,
+    is_json_syntax,
     merge_links,
     parse_query_int,
     reason_phrase,
@@ -269,6 +300,7 @@ from scrudful.collection import (
     page_envelope,
 )
 from scrudful.entity import Entity
+from scrudful.problem import PROBLEM_JSON, problem_from_errors
 from scrudful.utils import join_links, link_content, resolve_uri
 
 __all__ = [
@@ -461,7 +493,7 @@ class ScrudfulViewFunc:
         browsable API's included): the view's first JSON renderer (one of its
         ``renderer_classes`` with an ``application/json`` or ``+json`` media
         type, else DRF's ``JSONRenderer``) renders them. Without ``error``
-        these responses carry no Link and are rendered as before.
+        these responses carry no error Links and are rendered as before.
     error_body_func : callable, optional
         ``error_body_func(request, result)`` returns the body (a ``dict``;
         ``request`` is the DRF ``Request``; a plain function, not ``async``)
@@ -1412,7 +1444,9 @@ def _install_metadata(cls: type) -> None:
     :func:`_options`; an ``options`` the class defines is kept. The class's
     ``dispatch`` and ``initial`` are wrapped (:func:`_preflight_dispatch`,
     :func:`_options_initial`), once; the wrappers act only when scrudful
-    answers the request's OPTIONS (:func:`_answers_options`).
+    answers the request's OPTIONS (:func:`_answers_options`). So is its
+    ``finalize_response`` (:func:`_finalize_response`), which gives every
+    response of a scrudful view the HTTP Schema Resource link.
     """
     if getattr(cls, "metadata_class", None) is SimpleMetadata:
         cls.metadata_class = ScrudfulMetadata  # type: ignore[attr-defined]
@@ -1420,9 +1454,11 @@ def _install_metadata(cls: type) -> None:
         cls.options = _options  # type: ignore[attr-defined]
     _wrap_once(cls, "dispatch", _preflight_dispatch)
     _wrap_once(cls, "initial", _options_initial)
+    _wrap_once(cls, "finalize_response", _finalize_response)
 
 
-#: Marks the ``dispatch`` and ``initial`` wrappers of :func:`_install_metadata`.
+#: Marks the ``dispatch``, ``initial`` and ``finalize_response`` wrappers of
+#: :func:`_install_metadata`.
 _OPTIONS_WRAPPER = "_scrudful_options_wrapper"
 
 
@@ -1478,11 +1514,13 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
     after :func:`_options_initial` authenticated and throttled the request
     (a CORS preflight never gets here: :func:`_preflight_dispatch`):
 
-    1. the HSR link's target is resolved (:func:`_hsr_target`; its
-       ``ImproperlyConfigured`` propagates);
+    1. the HSR link is resolved (:func:`_response_hsr_link`, before anything
+       is loaded; its ``ImproperlyConfigured`` propagates; an unrouted
+       request has none);
     2. each method the view serves is checked for this requester, with its
        view-level permissions, then the object is loaded only if one of them
-       passed, then the methods that passed are checked against the object
+       passed (a method with an ``allowed_func`` always does), then the
+       methods that passed are checked against the object
        (:func:`_allowed_methods`);
     3. the answer is a 204 without content or ``Content-Type`` (rendered by
        DRF's ``JSONRenderer``, whatever renderer DRF's content negotiation
@@ -1494,7 +1532,8 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
     scoped-rbac gives an object the requester may not read, an object check
     raising ``Http404``, a check's unexpected error) is answered by the
     view's ``handle_exception``, as DRF answers a handler's: with the error
-    Links of :func:`exception_handler` and the HSR link; one the exception
+    Links of :func:`exception_handler`, and the HSR link that
+    :func:`_finalize_response` gives every response; one the exception
     handler doesn't answer propagates.
 
     Otherwise (``metadata_class = None`` or a metadata class that isn't a
@@ -1504,16 +1543,12 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
     """
     if not _answers_options(self):
         return APIView.options(self, request, *args, **kwargs)
-    target = _hsr_target(request)
+    hsr = _response_hsr_link(self, request)
     try:
         allowed = _allowed_methods(self, request)
     except Exception as exc:
-        response = self.handle_exception(exc)
-        link = merge_links(response.get("Link"), None, None, hsr_link(target))
-        if link is not None:
-            response["Link"] = link
-        expose_headers(response)
-        return response
+        # finalize_response adds the HSR link and the expose headers.
+        return self.handle_exception(exc)
     allow = allow_value(allowed)
     request.accepted_renderer = JSONRenderer()
     request.accepted_media_type = JSONRenderer.media_type
@@ -1524,7 +1559,8 @@ def _options(self: APIView, request: Request, *args: Any, **kwargs: Any) -> Any:
     headers = getattr(self, "headers", None)
     if isinstance(headers, dict):
         headers["Allow"] = allow
-    response["Link"] = hsr_link(target)
+    if hsr is not None:
+        response["Link"] = hsr
     expose_headers(response)
     return response
 
@@ -1592,6 +1628,64 @@ def _options_initial(initial: Callable[..., Any]) -> Callable[..., Any]:
     return scrudful_initial
 
 
+def _finalize_response(finalize: Callable[..., Any]) -> Callable[..., Any]:
+    """The ``finalize_response`` of a view class with scrudful's OPTIONS
+    (see :func:`_install_metadata`): DRF's, then, on a scrudful view
+    (:func:`_is_scrudful_view`), what every response it answers gets.
+
+    DRF finalizes every response ``dispatch`` answers: the handler's,
+    scrudful's own 304/400/412/428, and the errors its exception handler
+    answers, those of ``initial()`` (401, 403, 406, 429 ...) and of OPTIONS
+    included, whatever the project's ``EXCEPTION_HANDLER``. Each gets:
+
+    - the HTTP Schema Resource link (:func:`_response_hsr_link`), merged
+      into the response's Link (a Link with the HSR relation the handler
+      set wins, see :func:`scrudful._adapter.merge_links`);
+    - ``Vary: Accept`` when one of the view's ``renderer_classes`` renders
+      something other than JSON (the browsable API's HTML): the view then
+      chooses between described and undescribed content by ``Accept``;
+    - the expose headers (``Link`` and ``Allow`` always).
+
+    A CORS preflight scrudful answers never gets here
+    (:func:`_preflight_dispatch`), and an exception the exception handler
+    doesn't answer (a 500) propagates past it, to Django's ``handler500``.
+    """
+
+    @functools.wraps(finalize)
+    def scrudful_finalize_response(
+        self: APIView,
+        request: Request,
+        response: HttpResponseBase,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        response = finalize(self, request, response, *args, **kwargs)
+        if not _is_scrudful_view(self):
+            return response
+        hsr = _response_hsr_link(self, request)
+        if hsr is not None:
+            link = merge_links(response.get("Link"), None, None, hsr)
+            if link is not None:
+                response["Link"] = link
+        if _renders_non_json(self):
+            patch_vary_headers(response, ("Accept",))
+        expose_headers(response)
+        return response
+
+    return scrudful_finalize_response
+
+
+def _renders_non_json(view: APIView) -> bool:
+    """Whether one of ``view``'s ``renderer_classes`` has a media type that
+    isn't written as JSON (``application/json`` or ``+json``, JSON-LD's
+    included)."""
+    for renderer_class in getattr(view, "renderer_classes", ()):
+        media_type = getattr(renderer_class, "media_type", None)
+        if not (isinstance(media_type, str) and is_json_syntax(media_type)):
+            return True
+    return False
+
+
 def _no_check(*args: Any) -> None:
     """In place of ``check_permissions`` / ``check_object_permissions``."""
 
@@ -1633,8 +1727,9 @@ def _allowed_methods(view: APIView, request: Request) -> list[str]:
     handler, is GET's answer; it is listed only when the view serves it (a
     ``scrudful_api_view(["GET"])`` doesn't).
 
-    In two passes (:func:`_may_use`), so that OPTIONS is no existence oracle
-    (ruling R17):
+    In two passes (:func:`_may_use`), so that a requester whom the view-level
+    permissions refuse every method can't tell which objects exist (ruling
+    R17):
 
     1. each method's view-level check: ``check_permissions``, or ``True``
        for a method with an ``allowed_func``, which needs the object;
@@ -1644,6 +1739,12 @@ def _allowed_methods(view: APIView, request: Request) -> list[str]:
        object), or its ``allowed_func``. When none passed, nothing is
        loaded: a missing and an existing object both give ``Allow:
        OPTIONS``, as a GET of either is refused alike.
+
+    A method with an ``allowed_func`` always passes pass 1 (ruling R17a), so
+    a view with one loads the object for every requester: OPTIONS of a
+    missing object is then its 404 whoever asks, an existence oracle unless
+    ``get_object()`` (its queryset) hides the objects the requester may not
+    see.
     """
     served = [method.upper() for method in view.allowed_methods]
     checked = [
@@ -1891,7 +1992,7 @@ def http_schema_resource(view_func: Callable[..., Any]) -> dict[str, Any]:
     ``SCRUDFUL["ERROR"]`` is set and the handler's ``error`` differs from
     it, the 401, 403, 406 and 415 that DRF answers itself, which carry
     ``SCRUDFUL["ERROR"]``, have entries of their own with its content.
-    Without scrudful's exception handler the raised errors carry no Links,
+    Without scrudful's exception handler the raised errors carry no error Links,
     and ``default`` has no content. HEAD's entries have no content.
     Methods whose handler is not scrudful are described without content or
     preconditions.
@@ -2185,9 +2286,46 @@ def _same_view_func(a: Callable[..., Any], b: Callable[..., Any]) -> bool:
     )
 
 
+def _response_hsr_link(view: APIView, request: HttpRequest | Request) -> str | None:
+    """The HTTP Schema Resource link of ``view``'s response to ``request``
+    (see "Headers" in the module docstring), or ``None`` when it has none.
+
+    The rule: a response gets the link exactly when the request was routed
+    to a scrudful view's route, the resource the link is about.
+
+    - An *unrouted* request, one without ``resolver_match`` (a view called
+      directly, as with DRF's ``APIRequestFactory``), gets none: it came
+      through no URL, so there is no resource to describe, and no route
+      whose HSR :func:`hsr_urls` serves. Django's request handler resolves
+      every request it serves, so this never hides a misconfiguration.
+    - A request routed to a view function that isn't a scrudful view's
+      (:func:`_is_scrudful_view_func`: an ``@api_view`` + ``@scrudful`` view,
+      whose handlers are DRF's), or that isn't ``view``'s (``view`` called
+      by another view), gets none: no HSR is served for that route.
+    - A CORS preflight gets none (it carries no Links).
+    - Otherwise the link targets :func:`_hsr_target`, whose
+      ``ImproperlyConfigured`` propagates: a routed request of a scrudful
+      view without the :func:`hsr_urls` include (or ``hsr_url``) raises, on
+      every response.
+    """
+    match = getattr(request, "resolver_match", None)
+    if match is None:
+        return None
+    func = match.func
+    if getattr(func, "cls", None) is not type(view):
+        return None
+    if not _is_scrudful_view_func(func):
+        return None
+    if is_preflight(request.method or "", request.headers.get):
+        return None
+    return hsr_link(_hsr_target(request))
+
+
 def _hsr_target(request: HttpRequest | Request) -> str:
     """The URL of the HTTP Schema Resource of the view ``request`` was routed
-    to: the target of the HSR link of its responses (and OPTIONS).
+    to: the target of the HSR link of its responses (and OPTIONS). Whether a
+    response carries the link at all is :func:`_response_hsr_link`'s rule
+    (an unrouted request's doesn't).
 
     Resolved in this order, with ``view_name`` the request's
     ``resolver_match.view_name``:
@@ -2733,6 +2871,16 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
     resolved as the handler's (its ``base_url``, else ``Meta.base_url``,
     else ``SCRUDFUL["BASE_URL"]``, else the request).
 
+    With an entity whose media type is ``application/problem+json``, a
+    ``ValidationError``'s 400 (a serializer's) is RFC 9457 problem details,
+    the content that entity describes:
+    ``problem_from_errors(400, errors, "Request validation failed")``
+    (:func:`scrudful.problem.problem_from_errors`), DRF's error data as the
+    ``errors`` member. Every response of a scrudful view exposes ``Link``
+    and ``Allow``, with an entity or not; the HTTP Schema Resource link is
+    added by the view's ``finalize_response`` (see "Headers" in the module
+    docstring), whatever the exception handler.
+
     Settings must name it, as the example project does::
 
         REST_FRAMEWORK = {
@@ -2764,9 +2912,20 @@ def exception_handler(exc: Exception, context: dict[str, Any]) -> Response | Non
         return response
     if not isinstance(request, Request):
         return response
+    if _is_scrudful_view(view):
+        # Link and Allow always, with an error entity or not.
+        expose_headers(response)
     error = _raised_error_entity(view, request.method, response.status_code)
     if error is None:
         return response
+    if (
+        isinstance(exc, ValidationError)
+        and response.status_code == 400
+        and essence(error.media_type) == PROBLEM_JSON
+    ):
+        response.data = problem_from_errors(
+            400, response.data, "Request validation failed"
+        )
     args, kwargs = _callback_arguments((view, request), {}, 1)
     base_url = _handler_base_url(view, _request_handler(view, request.method))
     link = merge_links(

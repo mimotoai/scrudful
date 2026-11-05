@@ -17,6 +17,7 @@ from scrudful.rest_framework import (
     _NEVER_CREATES,
     Entity,
     ScrudfulViewFunc,
+    hsr_urls,
     http_schema_resource,
     scrudful,
     scrudful_viewset,
@@ -159,10 +160,12 @@ router.register("modifieds", ModifiedViewSet, basename="modified")
 router.register("nolists", NoListValidatorsViewSet, basename="nolist")
 urlpatterns = [
     path("", include(router.urls)),
-    path("explicit/", ExplicitCreateView.as_view()),
-    path("function/", collection_view),
-    path("parents/<int:parent_pk>/children/", children_view),
-    path("none/", no_validators_view),
+    path("explicit/", ExplicitCreateView.as_view(), name="explicit"),
+    path("function/", collection_view, name="function"),
+    path("parents/<int:parent_pk>/children/", children_view, name="children"),
+    path("none/", no_validators_view, name="none"),
+    # Every response of a scrudful view links its HTTP Schema Resource.
+    path("", include(hsr_urls())),
 ]
 
 

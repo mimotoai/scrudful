@@ -15,8 +15,8 @@ from items.models import Item
 from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient
 
-from scrudful._hsr import allow_value, options_operation
-from scrudful.rest_framework import http_schema_resource
+from scrudful._hsr import allow_value, hsr_link, options_operation
+from scrudful.rest_framework import hsr_urls, http_schema_resource
 from tests.semantic_http import (
     hsr_get_problems,
     hsr_link_problems,
@@ -89,6 +89,12 @@ def hsr_path(path):
     return f"/_hsr/{resolve(path).view_name}"
 
 
+def with_hsr(links, path):
+    """``links`` and the HTTP Schema Resource link that every response of the
+    route of ``path`` carries."""
+    return f"{links}, {hsr_link(BASE + hsr_path(path))}"
+
+
 def options_problems(response, path, allow=None):
     """How the OPTIONS ``response`` of ``path`` breaks the rules: a 204
     without content, with ``Allow`` (listing the methods of ``allow``, an
@@ -128,7 +134,7 @@ def test_retrieve_sends_validators_links_and_expose_headers(client, item):
     assert response.json()["name"] == "One"
     assert response["ETag"] == '"v1"'
     assert response["Last-Modified"] == MODIFIED_HTTP
-    assert response["Link"] == LINKS
+    assert response["Link"] == with_hsr(LINKS, detail(item))
     assert response["Access-Control-Expose-Headers"] == "ETag, Link, Allow"
 
 
@@ -277,7 +283,7 @@ def test_write_response_carries_the_new_validators(client, item, method):
     assert response["ETag"] == after["ETag"]
     assert response["Last-Modified"] == after["Last-Modified"]
     assert response["Last-Modified"] != MODIFIED_HTTP
-    assert response["Link"] == LINKS
+    assert response["Link"] == with_hsr(LINKS, detail(item))
     assert response["Access-Control-Expose-Headers"] == "ETag, Link, Allow"
 
 
@@ -309,8 +315,9 @@ def test_delete_with_if_match(client, item):
     assert response.status_code == 204
     assert "ETag" not in response
     assert "Last-Modified" not in response
-    # A 204 has no content for the item's Links to describe.
-    assert "Link" not in response
+    # A 204 has no content for the item's Links to describe: only the link
+    # to its HTTP Schema Resource.
+    assert response["Link"] == hsr_link(BASE + hsr_path(detail(item)))
     assert not Item.objects.filter(pk=item.pk).exists()
 
 
@@ -391,7 +398,11 @@ class ScopedItemViewSet(views.ItemViewSet):
 
 scoped_router = SimpleRouter()
 scoped_router.register("scoped-items", ScopedItemViewSet, basename="scoped-item")
-urlpatterns = [path("", include("items.urls")), path("", include(scoped_router.urls))]
+urlpatterns = [
+    path("", include("items.urls")),
+    path("", include(scoped_router.urls)),
+    path("", include(hsr_urls())),
+]
 
 
 @pytest.mark.urls(__name__)
@@ -443,7 +454,7 @@ def test_create_exposes_location_and_sends_no_validators(client):
     assert response["Location"] == f"{BASE}/items/{item.pk}/"
     assert "ETag" not in response
     assert "Last-Modified" not in response
-    assert response["Link"] == LINKS
+    assert response["Link"] == with_hsr(LINKS, "/items/")
     assert response["Access-Control-Expose-Headers"] == "Link, Location, Allow"
 
 
@@ -471,11 +482,12 @@ def test_list_has_a_collection_etag(client, item):
     assert [entry["name"] for entry in response.json()] == ["One"]
     etag = response["ETag"]
     assert "Last-Modified" not in response
-    assert response["Link"] == (
+    assert response["Link"] == with_hsr(
         f'<{BASE}/schemas/items.json>; rel="describedby"; '
         'type="application/schema+json", '
         f'<{BASE}/contexts/item.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; '
-        'type="application/ld+json"'
+        'type="application/ld+json"',
+        "/items/",
     )
     assert response["Access-Control-Expose-Headers"] == "ETag, Link, Allow"
     assert client.get("/items/", headers={"If-None-Match": etag}).status_code == 304
@@ -503,7 +515,7 @@ def test_readonly_viewset_reads(client, item):
     response = client.get(f"/readonly-items/{item.pk}/")
     assert response.status_code == 200
     assert response["ETag"] == '"v1"'
-    assert response["Link"] == LINKS
+    assert response["Link"] == with_hsr(LINKS, f"/readonly-items/{item.pk}/")
     etag = client.get("/readonly-items/")["ETag"]
     response = client.get("/readonly-items/", headers={"If-None-Match": etag})
     assert response.status_code == 304
@@ -767,7 +779,7 @@ def test_format_suffix_routes(client, item):
         assert "ETag" in response
         assert link_problems("GET", 200, dict(response.items()), True, hsr) == []
     response = client.get(f"/items/{item.pk}.json")
-    assert response["Link"] == LINKS
+    assert response["Link"] == with_hsr(LINKS, f"/items/{item.pk}.json")
     response = client.put(f"/items/{item.pk}.json", {"name": "Two"}, format="json")
     assert response.status_code == 428
 
@@ -776,7 +788,7 @@ def test_format_query_parameter_stays_out_of_the_links(client, item):
     """``?format=json`` is negotiation, not part of the linked documents' URLs."""
     response = client.get(detail(item) + "?format=json")
     assert response.status_code == 200
-    assert response["Link"] == LINKS
+    assert response["Link"] == with_hsr(LINKS, detail(item))
     response = client.put(detail(item) + "?format=json", {"name": "Two"}, format="json")
     assert response.status_code == 428
     for target, _ in parse_links(response["Link"]):

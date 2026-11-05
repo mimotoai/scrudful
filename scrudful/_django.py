@@ -194,9 +194,24 @@ def _plain_links(entity: Entity, request: HttpRequest) -> str | None:
     """The Link field value of ``entity``'s plain schema and context links.
 
     The same rels, types and defaults as the adapters' error Links; a
-    relative URL resolves against the request.
+    relative URL resolves against ``SCRUDFUL["BASE_URL"]`` when it is set,
+    as the adapters' Links and HTTP Schema Resources do, else against the
+    request.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If ``SCRUDFUL["BASE_URL"]`` is not an absolute URL.
     """
-    base = request.build_absolute_uri()
+    base = scrudful_setting("BASE_URL", None)
+    if base is None:
+        base = request.build_absolute_uri()
+    else:
+        parts = urlsplit(base) if isinstance(base, str) else None
+        if parts is None or not (parts.scheme and parts.netloc):
+            raise ImproperlyConfigured(
+                f'SCRUDFUL["BASE_URL"] must be an absolute URL, not {base!r}'
+            )
     candidates = [
         (
             entity.schema_link_or_func,

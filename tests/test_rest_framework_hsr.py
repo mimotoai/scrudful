@@ -28,6 +28,7 @@ from rest_framework.views import APIView
 from scrudful._hsr import (
     HsrConfigError,
     hsr_etag,
+    hsr_link,
     hsr_response_links,
     serialize_hsr,
 )
@@ -228,15 +229,29 @@ HOST_A = ItemViewSet.as_view({"get": "retrieve", "put": "update"})
 HOST_B = ItemViewSet.as_view({"get": "retrieve", "put": "update"})
 
 urlpatterns = [
-    path("items/<str:pk>/", ItemViewSet.as_view({"get": "retrieve", "put": "update"})),
-    path("no-error/<str:pk>/", NoErrorViewSet.as_view({"get": "retrieve"})),
-    path("locked/<str:pk>/", LockedViewSet.as_view({"get": "retrieve"})),
-    path("a/<str:pk>/", HOST_A),
-    path("b/<str:pk>/", HOST_B),
-    path("csv/", CsvView.as_view()),
-    path("csv-items/<str:pk>/", CsvViewSet.as_view({"get": "retrieve"})),
-    path("stats/", stats),
-    path("own-base/", own_base),
+    path(
+        "items/<str:pk>/",
+        ItemViewSet.as_view({"get": "retrieve", "put": "update"}),
+        name="items",
+    ),
+    path(
+        "no-error/<str:pk>/",
+        NoErrorViewSet.as_view({"get": "retrieve"}),
+        name="no-error",
+    ),
+    path("locked/<str:pk>/", LockedViewSet.as_view({"get": "retrieve"}), name="locked"),
+    path("a/<str:pk>/", HOST_A, name="a"),
+    path("b/<str:pk>/", HOST_B, name="b"),
+    path("csv/", CsvView.as_view(), name="csv"),
+    path(
+        "csv-items/<str:pk>/",
+        CsvViewSet.as_view({"get": "retrieve"}),
+        name="csv-items",
+    ),
+    path("stats/", stats, name="stats"),
+    path("own-base/", own_base, name="own-base"),
+    # Every response of a scrudful view links its HTTP Schema Resource.
+    path("", include(hsr_urls())),
 ]
 
 
@@ -620,8 +635,9 @@ def test_entity_option_describes_csv():
 
 
 def test_entity_links_on_the_wire(client):
-    assert client.get("/csv/")["Link"] == CSV_LINKS
-    assert client.get("/csv-items/1/")["Link"] == CSV_LINKS
+    for url, name in (("/csv/", "csv"), ("/csv-items/1/", "csv-items")):
+        hsr = hsr_link(f"https://api.example/_hsr/{name}")
+        assert client.get(url)["Link"] == f"{CSV_LINKS}, {hsr}"
     body = http_schema_resource(CsvViewSet.as_view({"get": "retrieve"}))
     assert "text/csv" in body["get"]["responses"]["200"]["content"]
 

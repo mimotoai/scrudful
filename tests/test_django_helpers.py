@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from django.core.exceptions import ImproperlyConfigured
 from django.http import Http404
 from django.test import RequestFactory
 
@@ -110,6 +111,37 @@ def test_adapters_reexport_handlers(module, rf):
     assert {"handler404", "handler500"} <= set(adapter.__all__)
     assert adapter.handler404(PROBLEM_ERROR)(rf.get("/"), Http404()).status_code == 404
     assert adapter.handler500(PROBLEM_ERROR)(rf.get("/")).status_code == 500
+
+
+@pytest.mark.parametrize("module", ["scrudful.ninja", "scrudful.rest_framework"])
+def test_handler_links_resolve_against_the_base_url(module, rf, settings):
+    """Relative links resolve against ``SCRUDFUL["BASE_URL"]`` when it is
+    set, as the HTTP Schema Resource's do, else against the request."""
+    adapter = importlib.import_module(module)
+    error = Entity("/schemas/error", context_link_or_func="/contexts/error")
+    request = rf.get("/nowhere", HTTP_ACCEPT="application/json")
+    links = [
+        '<{0}schemas/error>; rel="describedby"; type="application/schema+json"',
+        '<{0}contexts/error>; rel="http://www.w3.org/ns/json-ld#context"; '
+        'type="application/ld+json"',
+    ]
+    for base, expected in (
+        ("https://api.example/", "https://api.example/"),
+        (None, "http://testserver/"),
+    ):
+        settings.SCRUDFUL = None if base is None else {"BASE_URL": base}
+        for response in (
+            adapter.handler404(error)(request, Http404()),
+            adapter.handler500(error)(request),
+        ):
+            assert response["Link"] == ", ".join(links).format(expected)
+
+
+def test_handler_rejects_a_relative_base_url(rf, settings):
+    settings.SCRUDFUL = {"BASE_URL": "/v1/"}
+    view = error_handler(404, Entity("/s", context_link_or_func="/c"))
+    with pytest.raises(ImproperlyConfigured, match="absolute URL"):
+        view(rf.get("/nowhere"), Http404())
 
 
 def test_handler_rejects_callable_links():

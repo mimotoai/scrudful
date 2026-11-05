@@ -13,6 +13,7 @@ from scrudful.problem import PROBLEM_JSON, problem_details
 from scrudful.rest_framework import (
     Entity,
     exception_handler,
+    hsr_urls,
     http_schema_resource,
     scrudful,
     scrudful_api_view,
@@ -228,8 +229,10 @@ router.register("objects", ObjectViewSet, basename="object")
 router.register("legacy", LegacyViewSet, basename="legacy")
 urlpatterns = [
     path("", include(router.urls)),
-    path("explicit/<int:pk>/", ExplicitView.as_view()),
-    path("explicit-create/", ExplicitCreateView.as_view()),
+    path("explicit/<int:pk>/", ExplicitView.as_view(), name="explicit"),
+    path("explicit-create/", ExplicitCreateView.as_view(), name="explicit-create"),
+    # Every response of a scrudful view links its HTTP Schema Resource.
+    path("", include(hsr_urls())),
 ]
 
 
