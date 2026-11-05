@@ -406,7 +406,8 @@ OPTIONS
     So OPTIONS isn't gated itself: an anonymous requester on a locked path
     gets a 204 with ``Allow: OPTIONS``, not a 401. The ``auth=`` callbacks
     are those of the mount the request came through: a router mounted twice
-    with different ``auth`` gets each mount's ``Allow``.
+    with different ``auth`` gets each mount's ``Allow``, and the HSR link of
+    its own mount.
 
     The semantic-http 0.1 "HTTP Schema Resource" (an OpenAPI 3.1 Path Item,
     see :func:`http_schema_resource`) describes the path, built once per path
@@ -1788,8 +1789,8 @@ class ScrudfulRouter(Router):
     before the router's other paths, so ``"/{kind}/{pk}"`` doesn't match
     them, and ``/_hsr/`` is reserved: an operation under it, or two paths
     with one name (``"/a/{x}"`` and ``"/a/{x}/"``), is a ``ConfigError``.
-    Their URL names are private (unique per router), so don't ``reverse()``
-    them. With ``hsr_route=False``, serve the document elsewhere with
+    Their URL names are private (unique per router and mount), so don't
+    ``reverse()`` them. With ``hsr_route=False``, serve the document elsewhere with
     :func:`http_schema_resource_view` and say where with ``hsr_url``.
 
     Every operation on a ``ScrudfulRouter`` is described in its path's HTTP
