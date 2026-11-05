@@ -179,11 +179,14 @@ a validator, and a throttled client gets 429 only once ``before`` allowed it,
 as on DRF. The path parameters are the URL's values, not validated yet:
 strings, unless the path uses a converter (``pk`` is an ``int`` below). Never
 deny by testing a raw string for a value: ``"07"`` is 7 to an ``int``
-parameter (see :ref:`below <ninja-hooks>`). Called directly (outside ninja,
-e.g. in a unit test), the decorated function of an operation with a hook
-raises ``RuntimeError``, since the hooks didn't run: test it through ninja's
-``TestClient``. A hook gets the raw request, and may read the body as the
-operation's parameters do:
+parameter (see :ref:`below <ninja-hooks>`). Called directly, the decorated
+function of an operation with a hook raises ``RuntimeError``, since its hooks
+didn't run for that call: outside ninja (in a unit test, say: test it
+through ninja's ``TestClient``), from inside another operation's function,
+from inside itself while it runs (for other path values), or after its
+operation's run ended (from a task or thread it left running). To share its
+code, move the code into a plain function and call that. A hook gets the raw
+request, and may read the body as the operation's parameters do:
 
 - a JSON body through ``request.body``, which ninja then reads again from
   memory. A body over Django's ``DATA_UPLOAD_MAX_MEMORY_SIZE`` fails there as
@@ -345,9 +348,14 @@ OPTIONS runs that ``load`` too (see `OPTIONS`_), on a copy of the request
 whose ``method`` is the method checked (``"PUT"``): with a transaction open
 (``ATOMIC_REQUESTS``), it holds the row lock until the OPTIONS response ends.
 Lock only for the write: test ``request.META.get("REQUEST_METHOD") !=
-"OPTIONS"`` (the request line's method, which the copy keeps), or give the
-path an ``allowed`` hook, which runs no method's own ``load`` (step 3's
-still runs). Without a transaction, ``select_for_update()`` raises
+"OPTIONS"`` (the request line's method, which the copy keeps). ninja's
+``TestClient`` builds requests without that key: scrudful sets it to
+``"OPTIONS"`` on an OPTIONS whose ``META`` lacks it, so the test holds in
+tests too, and a ``META=`` dict passed to several requests gets the key on
+all of them: give each request a fresh one. An ``allowed`` hook runs no
+method's own ``load``, but step 3's still runs, with its operation's method
+(GET's, else the first item operation's), so it doesn't avoid the lock.
+Without a transaction, ``select_for_update()`` raises
 ``TransactionManagementError`` for the write as well: that is a
 misconfiguration, not an OPTIONS matter.
 
@@ -759,7 +767,10 @@ optional ``SCRUDFUL`` Django setting, then to scrudful's default:
    * - ``hsr_cache_control``
      - ``"HSR_CACHE_CONTROL"``
      - The ``Cache-Control`` of the HSR route (default ``public,
-       max-age=300``).
+       max-age=300``): a non-empty ``str`` without control characters (a
+       tab aside) or characters outside Latin-1, which no field can carry
+       (``ConfigError`` for the argument, ``ImproperlyConfigured`` for the
+       setting).
    * - ``allowed``
      - (none)
      - ``allowed(request, method, obj)``, the ``Allow`` hook of the router's
@@ -853,8 +864,8 @@ which wins over all of these: every response with that status carries it,
 those ninja answers before the operation (its authentication's 401, its
 validation's 422, the latter as problem details for a problem-details
 entity) included. ``head`` (where an operation routes it) is described like
-``get``, without content, and ``options`` is exactly ``{"responses": {"204": {"description": "No
-Content"}}}``.
+``get``, without content, and ``options`` is exactly
+``{"responses": {"204": {"description": "No Content"}}}``.
 
 * It is built once per path template, without a request: on the first GET of
   its route (or :func:`~scrudful.ninja.http_schema_resource` call), and again
@@ -941,13 +952,15 @@ your operations included, are not: that middleware gates them.)
   leaves the route unchecked; a prefix whose sample values give more than 243
   combinations (six parameters that each accept all three values, say; six
   ``int`` ones give one) gets each parameter's values tried but not every
-  combination of them (at most 243 URLs per route): either way a
-  ``RuntimeWarning`` names the route and the reason, once. The check relies on ninja's own
-  ``NinjaAPI._get_urls`` and ``_get_bound_routers`` (the order of the API's
-  patterns): a ``NinjaAPI`` subclass overriding either gets ``ConfigError``
-  when its URL patterns are built, once it mounts a ``ScrudfulRouter`` with
-  HSR routes (add URLs in your URLconf instead, or serve the documents
-  elsewhere with ``hsr_route=False``).
+  combination of them (at most 243 URLs per route); a prefix converter whose
+  ``to_python`` raises something else than ``ValueError`` for a sample value
+  (a model lookup's ``DoesNotExist``) has that value left out: in each case a
+  ``RuntimeWarning`` names the route and the reason, once. The check relies
+  on ninja's own ``NinjaAPI._get_urls`` and ``_get_bound_routers`` (the
+  order of the API's patterns): a ``NinjaAPI`` subclass overriding either
+  gets ``ConfigError`` when its URL patterns are built, once it mounts a
+  ``ScrudfulRouter`` with HSR routes (add URLs in your URLconf instead, or
+  serve the documents elsewhere with ``hsr_route=False``).
 * **The** ``add_decorator`` **decorators still wrap it.** ninja applies the
   API's and routers' ``add_decorator`` decorators (either mode) to every
   operation, the HSR route included: a gate added that way (a permission
@@ -998,20 +1011,21 @@ for a preflight too. In this order:
    the request with that operation's method, only once its ``auth=`` callbacks
    and ``before`` allow the requester (so a requester refused there can't
    learn which objects exist), with the path parameters validated as the
-   operation validates them (no object for one it would refuse with a 422),
-   and only them: give ``load``'s other parameters defaults, or take
-   ``**kwargs``. ``None`` is no object, and the object-level checks are
-   skipped. So an ``allowed`` hook gets ``obj=None`` both when nothing was
-   loaded (no loader, a collection, the loading operation's ``auth=`` or
-   ``before`` refusing the requester, path parameters it would refuse) and
-   when ``load`` returned ``None`` (no object): it can't tell them apart, so
-   decide from the request alone when ``obj`` is ``None`` (DRF loads whenever
-   a method passes its object-free checks). An ``HttpError`` or ``Http404`` it raises (the 404 of a missing
-   or hidden object) is the answer, by the API's exception handler, with
-   ``add_error_links``'s Links and the HSR link: return ``None`` for a 204 on
-   a missing object (a PUT that may create, say). Every other ``@scrudful``
-   item operation with a ``load`` runs it too, in step 4, as a check of its
-   own method only, unless it is the very call this step made.
+   operation validates them (no object for one it would refuse with a 422, or
+   whose validation fails or can't run, under step 4's rules), and only them:
+   give ``load``'s other parameters defaults, or take ``**kwargs``. ``None``
+   is no object, and the object-level checks are skipped. So an ``allowed``
+   hook gets ``obj=None`` both when nothing was loaded (no loader, a
+   collection, the loading operation's ``auth=`` or ``before`` refusing the
+   requester, path parameters it would refuse) and when ``load`` returned
+   ``None`` (no object): it can't tell them apart, so decide from the request
+   alone when ``obj`` is ``None`` (DRF loads whenever a method passes its
+   object-free checks). An ``HttpError`` or ``Http404`` it raises (the 404 of
+   a missing or hidden object) is the answer, by the API's exception handler,
+   with ``add_error_links``'s Links and the HSR link: return ``None`` for a
+   204 on a missing object (a PUT that may create, say). Every other
+   ``@scrudful`` item operation with a ``load`` runs it too, in step 4, as a
+   check of its own method only, unless it is the very call this step made.
 4. **Each method is checked**, on a copy of the request with that method:
 
    * with an ``allowed`` hook (the operation's ``allowed=``, else the
@@ -1021,28 +1035,47 @@ for a preflight too. In this order:
      authenticate the requester (``request.auth``), and as it came otherwise;
    * without one, the method is allowed when the operation's ``auth=``
      callbacks authenticate the requester, its ``before`` (if any) returns
-     ``None``, its path parameters validate (a method whose request would be
-     a 422 is left out, and so is one whose path validation raises an
-     ``HttpError``, ``Http404`` or ``PermissionDenied``; the check is best
-     effort, skipped for a path scrudful can't validate as ninja does, such
-     as one with a custom path model, or a validator raising anything else),
-     and then, for a ``@scrudful`` item operation with a ``load``, that
-     ``load`` (called as in step 3, on the copy) returns,
-     whatever it returns. So a ``load`` that authorizes (an owner-only PUT
-     raising ``HttpError(403)`` for anyone else) leaves its method out of
-     that requester's ``Allow``, the OPTIONS still answering 204, and it
-     never runs for a method whose ``auth=`` or ``before`` refused the
-     requester. Any ``HttpError`` such a ``load`` raises (a 410, a 400, not
-     only a 401, 403 or 404), ``Http404`` or ``PermissionDenied`` leaves only
-     its method out: only step 3's error answers the OPTIONS. DRF differs
-     here: an error other than a 401, 403 or 404 from another method's load
-     answers the whole OPTIONS. A ``load`` isn't called again for the very
-     call step 3 made (the same function, path parameters and
-     ``request.auth``): that method gets step 3's answer, and the ``load``
-     sees only step 3's method, so give a method its own ``load`` to
-     authorize it separately. When step 3 loaded nothing (its
-     operation's ``auth=`` or ``before`` refused the requester), a ``load``
-     it shares runs for each other method, as that method's check.
+     ``None``, its path parameters validate, and then, for a ``@scrudful``
+     item operation with a ``load``, that ``load`` (called as in step 3, on
+     the copy) returns, whatever it returns. So a ``load`` that authorizes
+     (an owner-only PUT raising ``HttpError(403)`` for anyone else) leaves
+     its method out of that requester's ``Allow``, the OPTIONS still
+     answering 204, and it never runs for a method whose ``auth=`` or
+     ``before`` refused the requester. Any ``HttpError`` such a ``load``
+     raises (a 410, a 400, not only a 401, 403 or 404), ``Http404`` or
+     ``PermissionDenied`` leaves only its method out: only step 3's error
+     answers the OPTIONS. An ``HttpError`` other than a 401, 403 or 404 is
+     also logged, with its traceback, on the ``scrudful.ninja`` logger (as an
+     error for a 5xx, else as a warning), since nothing else tells that the
+     method was left out. DRF differs here: an error other than a 401, 403
+     or 404 from another method's load answers the whole OPTIONS. A ``load``
+     isn't called again only for the very call step 3 made (the same
+     function, method, path parameters and ``request.auth``; a HEAD counts
+     as a GET): step 3's method, and a HEAD beside its GET, get step 3's
+     answer. A ``load`` step 3's operation shares with another method runs
+     again for that method, on a copy with that method, so a ``load`` that
+     authorizes by ``request.method`` is checked per method, as DRF loads
+     per action. So it does for every method when step 3 loaded nothing
+     (its operation's ``auth=`` or ``before`` refused the requester).
+
+     **The path parameters** are validated as the operation validates them,
+     and OPTIONS never answers a 500 or raises ``ConfigError`` for a path it
+     can't check:
+
+     * a method whose request would be a 422 is left out, and so is one
+       whose path validation raises an ``HttpError``, ``Http404`` or
+       ``PermissionDenied`` (a lookup validator's 404, say);
+     * one whose path validation raises anything else (an app's own error,
+       a lookup's ``ObjectDoesNotExist``) is left out too, as its request
+       would fail, and that is logged once per route, with its traceback,
+       on the ``scrudful.ninja`` logger;
+     * a path scrudful can't validate as ninja does (one with a custom path
+       model) gets a ``RuntimeWarning`` once per route naming it, and its
+       method is listed without that check, unless it has its own ``load``
+       to run, which can't be called without the path parameters: the
+       method is then left out;
+     * step 3's path follows the same rules: when it fails or can't be
+       validated, step 3 loads no object, and the OPTIONS still answers.
 
    A raised ``HttpError`` with status 401, 403 or 404 (as ninja's
    ``AuthenticationError`` and ``AuthorizationError`` are), ``Http404`` or
@@ -1294,13 +1327,21 @@ answer to ``HttpError(405, "Method not allowed")``, so it carries
 ``Router``'s 405 stays ninja's. Django's 404 for a URL no pattern matches and
 its 500 page come from Django: install :func:`~scrudful.ninja.handler404` and
 :func:`~scrudful.ninja.handler500` in the root URLconf (see `Setup`_). They
-take an ``Entity`` of plain (non-callable) link values, answer JSON (problem
-details for an ``application/problem+json`` entity, else ``{"detail":
-<reason phrase>}``) with its Links, resolved against
+take an ``Entity`` of plain (non-callable) link values, of a JSON media type
+(checked when the handler is made: ``TypeError``, ``ValueError``,
+``ImproperlyConfigured`` for a link URL that can't be parsed), answer JSON
+(problem details for an ``application/problem+json`` entity, else
+``{"detail": <reason phrase>}``) with its Links, resolved against
 ``SCRUDFUL["BASE_URL"]``, unless ``Accept`` prefers ``text/html``, and always
 send ``Vary: Accept``. Django uses them with ``DEBUG`` off; with ``DEBUG =
 True`` it shows its debug pages (and ninja its traceback page). They get no
-HSR link: a URL no route serves is no described path.
+HSR link: a URL no route serves is no described path. They never raise for
+their Links: a Link they can't build, whatever the cause (an invalid
+``SCRUDFUL["BASE_URL"]``, a relative link without a base URL on a request
+whose host ``ALLOWED_HOSTS`` refuses, a ``reverse_lazy`` link that doesn't
+reverse, or a lazy link that raises), is logged on the ``scrudful._django``
+logger, with its traceback and the request's path, and the error served
+without the Links, so Django still logs the error it answers.
 
 Async operations
 ----------------
