@@ -998,7 +998,12 @@ for a preflight too. In this order:
      raising ``HttpError(403)`` for anyone else) leaves its method out of
      that requester's ``Allow``, the OPTIONS still answering 204, and it
      never runs for a method whose ``auth=`` or ``before`` refused the
-     requester. A ``load`` shared with step 3's runs once.
+     requester. Any ``HttpError`` such a ``load`` raises (a 410, a 400, not
+     only a 401, 403 or 404), ``Http404`` or ``PermissionDenied`` leaves only
+     its method out: only step 3's error answers the OPTIONS. A ``load``
+     shared with step 3's runs once, with step 3's method, so it never sees
+     the other methods: give a method its own ``load`` to authorize it
+     separately.
 
    A raised ``HttpError`` with status 401, 403 or 404 (as ninja's
    ``AuthenticationError`` and ``AuthorizationError`` are), ``Http404`` or

@@ -170,8 +170,9 @@ Behaviour change (ninja)
   operation's ``auth=`` and ``before`` (then ``load``), and each method's
   ``auth=`` and ``before`` (or ``allowed``), then, for a ``@scrudful``
   operation whose ``load`` differs from the loading operation's, its own
-  ``load``: a 401, 403 or 404 it raises leaves only that method out of
-  ``Allow`` (the loading operation's 404 is still the OPTIONS's answer), so
+  ``load``: any ``HttpError``, ``Http404`` or ``PermissionDenied`` it raises
+  leaves only that method out of ``Allow`` (only the loading operation's
+  error answers the OPTIONS; another exception still propagates), so
   authorization in a method's ``load`` shapes ``Allow``; it runs only once
   the method's ``auth=`` and ``before`` passed. Bad credentials make the
   requester anonymous (ninja's auth callbacks return ``None``), so they get

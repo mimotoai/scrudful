@@ -400,8 +400,12 @@ OPTIONS
        whose ``load`` differs from the one of step 3, that ``load`` (called
        as in step 3, on the copy) returns, whatever it returns: so
        authorization in a method's own ``load`` shapes ``Allow``, and
-       nothing loads for a method its ``auth=`` or ``before`` refused. A
-       raised ``HttpError`` with status 401, 403 or
+       nothing loads for a method its ``auth=`` or ``before`` refused. Any
+       ``HttpError`` that ``load`` raises (whatever its status), ``Http404``
+       or ``PermissionDenied`` leaves only that method out: only step 3's
+       error answers the OPTIONS. A ``load`` shared with step 3's runs once,
+       with step 3's method: give a method its own ``load`` to authorize it
+       separately. A raised ``HttpError`` with status 401, 403 or
        404 (as ninja's ``AuthenticationError`` and ``AuthorizationError``
        are), ``Http404`` or ``PermissionDenied`` refuses the method, except
        a 404 (``HttpError`` or ``Http404``) an ``allowed`` hook raises, which
@@ -6431,12 +6435,14 @@ def _own_load_allows(
     the OPTIONS request with the method, authenticated and allowed by
     ``before``) use the method: it is called as the operation calls it, when
     it differs from ``loader`` (the one :func:`_options_object` loads with,
-    whose answer is the OPTIONS'), and a denial it raises (a 401, 403 or 404
-    ``HttpError``, ``Http404`` or ``PermissionDenied``: :func:`_is_denial`)
-    refuses that method only. What it returns, ``None`` included, allows
-    it: the method's own flow answers that. An ``async def`` load is awaited.
-    With path parameters the operation would refuse (a 422), nothing loads,
-    as for the loader. Anything else it raises propagates.
+    whose answer is the OPTIONS'), and any ``HttpError`` (whatever its
+    status), ``Http404`` or ``PermissionDenied`` it raises refuses that
+    method only: the loader's error alone answers the OPTIONS, and a method
+    whose load fails is left out, as when in doubt. What it returns,
+    ``None`` included, allows it: the method's own flow answers that. An
+    ``async def`` load is awaited. With path parameters the operation would
+    refuse (a 422), nothing loads, as for the loader. Any other exception
+    (a bug) propagates.
     """
     if (
         config is None
@@ -6450,10 +6456,8 @@ def _own_load_allows(
         return True
     try:
         _settled(config.load(requester, **values))
-    except Exception as exc:
-        if _is_denial(exc):
-            return False
-        raise
+    except (HttpError, Http404, PermissionDenied):
+        return False
     return True
 
 

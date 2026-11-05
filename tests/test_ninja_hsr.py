@@ -2728,6 +2728,35 @@ def test_options_runs_each_methods_own_load(asynchronous, owned_status):
 
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("owned_status", [400, 410, 500])
+def test_any_http_error_of_a_methods_own_load_leaves_only_it_out(
+    asynchronous, owned_status
+):
+    """Only the loading operation's error answers the OPTIONS: whatever
+    ``HttpError`` another method's own ``load`` raises leaves that method out
+    of ``Allow``, as when in doubt."""
+    api, calls = owner_router(asynchronous, owned_status)
+    bob = options_of(api, asynchronous, "/1", headers=BOB_KEY)
+    assert bob.status_code == 204 and bob.headers["Allow"] == "GET, OPTIONS"
+    assert calls == [(BOB, "PUT")]
+
+
+def test_another_exception_of_a_methods_own_load_propagates():
+    store = Store()
+
+    def broken(request, pk, **params):
+        raise ValueError("a bug")
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+    router.get("/{pk}", response=ItemOut)(
+        scrudful(load=store.load, **LINKS)(pk_handler)
+    )
+    router.put("/{pk}", response=ItemOut)(scrudful(load=broken, **LINKS)(pk_handler))
+    with pytest.raises(ValueError, match="a bug"):
+        options(TestClient(mount(router)), "/1")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
 def test_options_loads_a_methods_own_object_only_once_it_passed(asynchronous):
     """A method whose ``auth=`` refuses the requester never loads: nothing
     loads for a method the requester may not use."""
