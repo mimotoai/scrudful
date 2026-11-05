@@ -2201,12 +2201,6 @@ class ScrudfulRouter(Router):
         """``hsr_route``, else ``SCRUDFUL["HSR_ROUTE"]``, else ``True``."""
         return _route_on(self._scrudful_hsr_route)
 
-    def _hsr_url(self) -> Callable[[str], str] | None:
-        """``hsr_url``, else ``SCRUDFUL["HSR_URL"]``, else ``None``."""
-        if self._scrudful_hsr_url is not None:
-            return self._scrudful_hsr_url
-        return _setting(setting_hsr_url)  # type: ignore[no-any-return]
-
     def _hsr_cache_control(self) -> str:
         """``hsr_cache_control``, else ``SCRUDFUL["HSR_CACHE_CONTROL"]``, else
         ``public, max-age=300``."""
