@@ -919,10 +919,12 @@ your operations included, are not: that middleware gates them.)
   caught; one capturing a single literal value (``"/orgs/acme/{a}/{b}"``) is
   not. A value counts when the converter's regex and its ``to_python``
   accept it. A prefix converter accepting none of these (nor a short run of
-  one character) leaves the route unchecked, and a prefix of more than five
-  parameters gets each parameter's values tried but not every combination of
-  them (at most 243 URLs per route): either way a ``RuntimeWarning`` names the
-  route and the reason, once. The check relies on ninja's own
+  one character), or sample values that build no URL the route matches,
+  leaves the route unchecked; a prefix whose sample values give more than 243
+  combinations (six parameters that each accept all three values, say; six
+  ``int`` ones give one) gets each parameter's values tried but not every
+  combination of them (at most 243 URLs per route): either way a
+  ``RuntimeWarning`` names the route and the reason, once. The check relies on ninja's own
   ``NinjaAPI._get_urls`` and ``_get_bound_routers`` (the order of the API's
   patterns): a ``NinjaAPI`` subclass overriding either gets ``ConfigError``
   when its URL patterns are built, once it mounts a ``ScrudfulRouter`` with
