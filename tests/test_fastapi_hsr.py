@@ -3862,6 +3862,59 @@ def test_a_security_annotation_that_cant_be_evaluated_refuses_its_method(
     assert security_annotations.CALLS == []
 
 
+def test_an_unread_annotation_of_a_dependency_fastapi_built_refuses_its_method(
+    make_client,
+):
+    """An annotation that can't be evaluated and names ``Depends(`` or
+    ``Security(`` refuses its method for every requester (fail closed), with
+    a ``RuntimeWarning`` naming the route and the remedy, also where FastAPI
+    read it as plain when it built the route: a parameter FastAPI took for a
+    query parameter, and one it made a sub-dependant, of the endpoint or of
+    a dependency."""
+    app = security_annotations.unread_annotation_app()
+    with pytest.warns(RuntimeWarning) as caught:
+        add_options(app, base_url=BASE)
+    messages = sorted(str(warning.message) for warning in caught)
+    assert len(messages) == 3, messages
+    for method, name, text in (
+        ("PUT", "lookup", "Depends(bearer_writer)"),
+        ("POST", "act", "Security(writer)"),
+        ("PATCH", "outer", "Security(writer)"),
+    ):
+        assert any(
+            message.startswith(f"{method} '/notes/{{id}}'")
+            and f"{name}, whose annotation" in message
+            and text in message
+            and "import its names outside TYPE_CHECKING" in message
+            for message in messages
+        ), (method, messages)
+    client = make_client(app)
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
+    options_204(
+        client,
+        "/notes/1",
+        "GET, OPTIONS",
+        NOTE_TARGET,
+        headers=security_annotations.WRITER,
+    )
+
+
+def test_a_scheme_below_an_unreadable_signature_decides(make_client):
+    """A dependency whose own signature, or a sibling dependency's, can't be
+    read, but with a security scheme below it, is a security dependency all
+    the same: it is resolved, refuses whom it refuses, and nothing is
+    announced (the suite runs with warnings as errors)."""
+    client = make_client(security_annotations.scheme_below_app())
+    writer = security_annotations.WRITER
+    assert client.put("/notes/1").status_code in (401, 403)
+    assert client.put("/notes/1", headers=writer).status_code == 200
+    assert client.post("/notes/1", headers=writer).status_code == 200
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
+    options_204(
+        client, "/notes/1", "GET, PUT, POST, OPTIONS", NOTE_TARGET, headers=writer
+    )
+
+
 def test_an_allowed_hook_decides_a_method_whose_security_cant_be_read(
     make_client,
 ):

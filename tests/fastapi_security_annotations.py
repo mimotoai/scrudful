@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import decimal
 import functools
+import inspect
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from scrudful.fastapi import add_options, scrudful
 
@@ -248,5 +250,126 @@ def callables_app() -> FastAPI:
     async def patch(id: int, user: ClassUser = Depends(ClassUser)):
         return {"id": id}
 
+    add_options(app, base_url=BASE)
+    return app
+
+
+# --- What FastAPI built, read otherwise -------------------------------------
+# FastAPI reads a dependency's signature once, when it builds the route: an
+# annotation or a signature made unreadable after is read so by OPTIONS only.
+
+#: The writers' bearer scheme.
+bearer = HTTPBearer()
+
+
+def bearer_writer(credentials: HTTPAuthorizationCredentials = Depends(bearer)) -> str:
+    """A user resolved from a bearer token: a plain ``Depends`` with a
+    security scheme below it."""
+    if credentials.credentials != "writer":
+        raise HTTPException(403, "writers only")
+    return "writer"
+
+
+def unread_annotation_app() -> FastAPI:
+    """``/notes/{id}``: GET for anyone; PUT, POST and PATCH each through a
+    dependency FastAPI read as plain, whose annotation was then made one
+    that can't be evaluated and names ``Depends(`` or ``Security(``:
+
+    - PUT: ``lookup``'s ``q`` (a query parameter to FastAPI) names a
+      ``Depends(`` of a user resolved from a token;
+    - POST: the endpoint's own ``user``, a sub-dependant FastAPI built,
+      names ``Security(``;
+    - PATCH: the same, of the dependency ``outer``'s ``user``, one level
+      down.
+
+    OPTIONS is not given ``add_options`` here."""
+    app = FastAPI()
+
+    def lookup(q: str = "") -> str:
+        return q  # pragma: no cover
+
+    def plain(q: str = "") -> str:
+        return q  # pragma: no cover
+
+    def outer(user: str = Depends(plain)) -> str:
+        return user  # pragma: no cover
+
+    @app.get("/notes/{id}")
+    @scrudful(**LINKS)
+    async def read(id: int):
+        return {"id": id}
+
+    @app.put("/notes/{id}")
+    @scrudful(**LINKS)
+    async def write(id: int, found: str = Depends(lookup)):
+        return {"id": id}  # pragma: no cover
+
+    @app.post("/notes/{id}")
+    @scrudful(**LINKS)
+    async def act(id: int, user: str = Depends(plain)):
+        return {"id": id}  # pragma: no cover
+
+    @app.patch("/notes/{id}")
+    @scrudful(**LINKS)
+    async def patch(id: int, found: str = Depends(outer)):
+        return {"id": id}  # pragma: no cover
+
+    lookup.__annotations__["q"] = "Annotated[Missing, Depends(bearer_writer)]"
+    # The endpoint's signature is the one scrudful's wrapper gives it.
+    signature = inspect.signature(act)
+    act.__signature__ = signature.replace(  # type: ignore[attr-defined]
+        parameters=[
+            (
+                parameter.replace(annotation="Annotated[Missing, Security(writer)]")
+                if parameter.name == "user"
+                else parameter
+            )
+            for parameter in signature.parameters.values()
+        ]
+    )
+    outer.__annotations__["user"] = "Annotated[Missing, Security(writer)]"
+    return app
+
+
+def scheme_below_app() -> FastAPI:
+    """``/notes/{id}``: GET for anyone; PUT and POST for bearer writers,
+    each through a dependency with a security scheme below it, which still
+    decides when a signature above it can't be read (made so after the route
+    was built):
+
+    - PUT: the dependency's own signature (``opaque_user``);
+    - POST: a sibling dependency's, before the scheme's (``opaque``, of
+      ``sibling_user``).
+    """
+    app = FastAPI()
+
+    def opaque_user(user: str = Depends(bearer_writer)) -> str:
+        return user
+
+    def opaque(q: str = "") -> str:
+        return q
+
+    def sibling_user(
+        other: str = Depends(opaque), user: str = Depends(bearer_writer)
+    ) -> str:
+        return user
+
+    @app.get("/notes/{id}")
+    @scrudful(**LINKS)
+    async def read(id: int):
+        return {"id": id}
+
+    @app.put("/notes/{id}")
+    @scrudful(**LINKS)
+    async def write(id: int, user: str = Depends(opaque_user)):
+        return {"id": id}
+
+    @app.post("/notes/{id}")
+    @scrudful(**LINKS)
+    async def act(id: int, user: str = Depends(sibling_user)):
+        return {"id": id}
+
+    opaque_user.__signature__ = "not a signature"  # type: ignore[attr-defined]
+    opaque.__signature__ = "not a signature"  # type: ignore[attr-defined]
     add_options(app, base_url=BASE)
     return app
