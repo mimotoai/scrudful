@@ -212,7 +212,13 @@ def _response_entry(operation: Any, status: int, explicit: bool) -> Any:
     """The response object for ``status``: its own key (``"412"`` or ``"4XX"``),
     else, unless ``explicit``, ``default``."""
     responses = (operation or {}).get("responses") or {}
-    keys = [str(status), f"{status // 100}XX"] + ([] if explicit else ["default"])
+    # Below 400 only the exact key is explicit: a ``2XX`` would hide a
+    # missing 204.
+    keys = [str(status)]
+    if status >= 400:
+        keys.append(f"{status // 100}XX")
+    if not explicit:
+        keys.append("default")
     return next((responses[key] for key in keys if key in responses), None)
 
 
@@ -222,14 +228,19 @@ def status_entry_problems(
     """How the HSR's entry for ``method`` and ``status`` breaks the rules.
 
     A success or redirect (below 400) and scrudful's own 400, 412 and 428 need
-    an explicit key (``"204"`` or ``"2XX"``, not ``default``), which a ``default``
-    entry with the same content would hide. A 204 and a 304 have no ``content``.
-    HEAD is checked against the ``head`` operation, not ``get``. A 405 answers a
-    method the HSR has no entry for, so it has none.
+    the exact status key (not ``default``, which would hide a missing entry; below
+    400 not a range such as ``2XX`` either; ``4XX`` counts for the errors). A
+    204 and a 304 have no ``content``.
+    HEAD is checked against the ``head`` operation, not ``get``. A 405
+    answers a method the HSR has no entry for: it is a problem for a method the
+    HSR describes.
     """
-    if status == 405:
-        return []
     key = method.lower()
+    if status == 405:
+        if isinstance(hsr.get(key), Mapping):
+            return [f"a 405 for {method}, which the HSR describes"]
+        return []
+
     operation = hsr.get(key)
     if not isinstance(operation, Mapping):
         return [f"the HSR has no {key} operation for the {status} response"]

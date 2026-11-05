@@ -229,24 +229,33 @@ def test_link_problems_head_needs_a_head_entry_and_agrees_with_get():
 
 
 @pytest.mark.parametrize(
-    "method, status, responses, has_content",
+    "method, status, responses",
     [
-        ("GET", 304, {"200": {}}, False),  # no 304 entry
-        ("DELETE", 204, {"200": {}}, False),  # the 204 entry became 200
-        ("PUT", 428, {"default": {}}, True),  # a default entry hides a 428
-        ("GET", 200, {"default": {}}, True),  # so does it hide a 200
-        ("GET", 412, {"4XX": {}, "default": {}}, True),  # 4XX is a key, so passes
+        ("GET", 304, {"200": {}}),  # no 304 entry
+        ("DELETE", 204, {"200": {}}),  # the 204 entry became 200
+        ("DELETE", 204, {"2XX": {}}),  # a range key hides a missing 204
+        ("GET", 304, {"3XX": {}}),
+        ("PUT", 428, {"default": {}}),  # a default entry hides a 428
+        ("GET", 200, {"default": {}}),  # so does it hide a 200
     ],
 )
-def test_status_entry_problems_need_an_explicit_key(
-    method, status, responses, has_content
-):
-    problems = status_entry_problems(
-        method, status, {method.lower(): {"responses": responses}}
-    )
-    assert bool(problems) == (
-        str(status) not in responses and f"{status // 100}XX" not in responses
-    )
+def test_status_entry_problems_fail_without_an_explicit_key(method, status, responses):
+    hsr = {method.lower(): {"responses": responses}}
+    assert status_entry_problems(method, status, hsr)
+
+
+@pytest.mark.parametrize(
+    "method, status, responses",
+    [
+        ("GET", 304, {"304": {}}),
+        ("DELETE", 204, {"204": {}, "default": {}}),
+        ("GET", 412, {"412": {}}),
+        ("GET", 412, {"4XX": {}, "default": {}}),  # an error class is a key
+    ],
+)
+def test_status_entry_problems_pass_with_an_explicit_key(method, status, responses):
+    hsr = {method.lower(): {"responses": responses}}
+    assert status_entry_problems(method, status, hsr) == []
 
 
 def test_status_entry_problems_other_errors_may_use_default():
@@ -266,6 +275,7 @@ def test_status_entry_problems_204_and_304_entries_have_no_content():
 
 def test_status_entry_problems_a_405_has_no_entry():
     assert status_entry_problems("POST", 405, {"get": {}}) == []
+    assert status_entry_problems("POST", 405, {"post": {"responses": {}}})
 
 
 def test_link_problems_no_content_responses_need_their_entry():

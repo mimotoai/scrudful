@@ -1004,6 +1004,8 @@ def test_hsr_etag_follows_the_document(urls, client, settings):
     assert after.content != before.content
     assert after["ETag"] != before["ETag"]
     assert after["ETag"] == hsr_etag(after.content)
+    again = client.get("/_hsr/item-detail", HTTP_IF_NONE_MATCH=after["ETag"])
+    assert again.status_code == 304
 
 
 def test_hsr_get_answers_if_none_match_with_304_and_serves_head(urls, client):

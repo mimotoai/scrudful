@@ -5860,7 +5860,7 @@ def _is_conditional(config: _Config, method: str) -> bool:
 
 
 def _answered_statuses(operation: Any, config: _Config | None) -> list[int]:
-    """The statuses ``operation`` answers with, for OPTIONS.
+    """The statuses ``operation`` answers with, for the HTTP Schema Resource.
 
     Those it declares in ``response=`` (with a 201 first for a create, whose
     plain return value is a 201), else ninja's default, 200.
@@ -5878,7 +5878,7 @@ def _answered_statuses(operation: Any, config: _Config | None) -> list[int]:
 def _described_entity(
     config: _Config, method: str, status: int, conditional: bool
 ) -> Any:
-    """The entity of the ``method`` responses with ``status``, for OPTIONS.
+    """The entity of the ``method`` responses with ``status``, for the HSR.
 
     scrudful's own early responses (listed when ``conditional``) get the
     ``error`` entity, if declared; the others the declared entity.

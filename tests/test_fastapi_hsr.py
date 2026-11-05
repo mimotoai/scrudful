@@ -1249,6 +1249,10 @@ def test_hsr_etag_follows_the_document(make_client):
     assert after.content != before.content
     assert after.headers["etag"] != before.headers["etag"]
     assert after.headers["etag"] == hsr_etag(after.content)
+    again = client.get(
+        "/_hsr/users.id", headers={"If-None-Match": after.headers["etag"]}
+    )
+    assert again.status_code == 304
 
 
 @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
