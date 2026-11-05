@@ -2023,7 +2023,9 @@ class ScrudfulRouter(Router):
             include_in_schema=False,
             url_name=url_name,
         )
-        _adopt_path_view(self, route, _path_view(self, view))
+        hsr_path_view = _path_view(self, view)
+        _adopt_path_view(self, route, hsr_path_view)
+        hsr_path_view._scrudful_hsr_route = True
         self._scrudful_hsr_url_names[path] = url_name
         self._scrudful_hsr_names[name] = path
         hsr_routes = {f"/{HSR_ROUTE_SEGMENT}/{n}" for n in self._scrudful_hsr_names}
@@ -2279,8 +2281,9 @@ def http_schema_resource_view(
         path("schemas/items/item", http_schema_resource_view(items, "/{pk}"))
 
     Like the route, it runs no authentication, permission check or throttle,
-    and is CSRF-exempt. ``path`` is checked on the first request, as
-    :func:`http_schema_resource` checks it.
+    is CSRF-exempt, and is public under Django's ``LoginRequiredMiddleware``
+    (``login_required = False``). ``path`` is checked on the first request,
+    as :func:`http_schema_resource` checks it.
 
     Raises
     ------
@@ -2298,6 +2301,8 @@ def http_schema_resource_view(
         return _hsr_response(request, router, path)
 
     scrudful_hsr_view.csrf_exempt = True  # type: ignore[attr-defined]
+    # Public under Django's LoginRequiredMiddleware (Django >= 5.1).
+    scrudful_hsr_view.login_required = False  # type: ignore[attr-defined]
     return scrudful_hsr_view
 
 
@@ -2307,7 +2312,9 @@ def _hsr_route_view(
     """The view of ``path``'s HSR route (see :meth:`ScrudfulRouter._add_hsr_route`).
 
     It declares no parameters, so ninja passes and validates none (a prefix
-    such as ``"/orgs/{org}/items"`` has some), and is CSRF-exempt.
+    such as ``"/orgs/{org}/items"`` has some), and is CSRF-exempt. The view
+    ninja routes the path to is public under Django's
+    ``LoginRequiredMiddleware`` (see :meth:`_ScrudfulPathView.get_view`).
     """
 
     def scrudful_hsr(request: HttpRequest, **params: Any) -> HttpResponseBase:
@@ -4827,7 +4834,8 @@ def _path_view(router: Router, view_func: Callable[..., Any]) -> Any:
 
 #: The methods of ninja's ``PathView`` that :class:`_ScrudfulPathView` relies
 #: on: ``clone`` (one per mount, whose class it keeps), ``get_view`` (whose
-#: wrappers call the two others) and ``_sync_view`` / ``_async_view`` (which
+#: wrappers call the two others, and whose view an HSR route marks
+#: ``login_required = False``) and ``_sync_view`` / ``_async_view`` (which
 #: it overrides with ninja 1.7's code but for the 405).
 _PATH_VIEW_METHODS = ("clone", "get_view", "_sync_view", "_async_view")
 
@@ -4862,13 +4870,29 @@ class _ScrudfulPathView(PathView):
     #: The router and the path (as given to the operation decorator).
     _scrudful_router: ScrudfulRouter
     _scrudful_path: str
+    #: Whether the path is an HTTP Schema Resource route
+    #: (:meth:`ScrudfulRouter._add_hsr_route`).
+    _scrudful_hsr_route: bool = False
 
     def clone(self) -> PathView:
         cloned = super().clone()
         cloned.__class__ = type(self)
         cloned._scrudful_router = self._scrudful_router  # type: ignore[attr-defined]
         cloned._scrudful_path = self._scrudful_path  # type: ignore[attr-defined]
+        cloned._scrudful_hsr_route = (  # type: ignore[attr-defined]
+            self._scrudful_hsr_route
+        )
         return cloned
+
+    def get_view(self) -> Callable[..., Any]:
+        """ninja's view of the path, the one its URL pattern routes to
+        (``BoundRouter.urls_paths``); an HSR route's is public under
+        Django's ``LoginRequiredMiddleware`` (Django >= 5.1), which reads
+        ``login_required`` from it."""
+        view = super().get_view()
+        if self._scrudful_hsr_route:
+            view.login_required = False  # type: ignore[attr-defined]
+        return view  # type: ignore[no-any-return]
 
     def _sync_view(self, request: HttpRequest, *a: Any, **kw: Any) -> HttpResponseBase:
         operation = self._find_operation(request)

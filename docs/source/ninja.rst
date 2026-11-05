@@ -812,7 +812,11 @@ under its prefix, ``<name>`` being the path's segments joined with ``.``:
 the HSR's own JSON Schema and JSON-LD context, a strong ``ETag`` (304 for a
 matching ``If-None-Match``) and the router's ``Cache-Control``; another method
 gets the router's JSON 405 (``Allow: GET, HEAD``). It has ``auth=None`` and no
-throttles, is CSRF-exempt and is not in the OpenAPI document.
+throttles, is CSRF-exempt and is not in the OpenAPI document. It is public
+under Django's ``LoginRequiredMiddleware`` (Django 5.1+): the view ninja routes
+the route's URL to is ``login_required = False``, as is
+:func:`~scrudful.ninja.http_schema_resource_view`'s. (ninja's other views,
+your operations included, are not: that middleware gates them.)
 
 * **The** ``_hsr`` **segment is reserved.** The routes come before the
   router's other paths, so ``"/{kind}/{pk}"`` doesn't match them; an
@@ -842,7 +846,8 @@ throttles, is CSRF-exempt and is not in the OpenAPI document.
       ]
 
   Like the route, the view runs no authentication, permission check or
-  throttle, and is CSRF-exempt; ``path`` is checked on its first request.
+  throttle, is CSRF-exempt and is public under ``LoginRequiredMiddleware``;
+  ``path`` is checked on its first request.
 
 OPTIONS
 ~~~~~~~

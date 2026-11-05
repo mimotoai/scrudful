@@ -227,7 +227,10 @@ compact ``application/json``, the HSR's own schema and context Links, a strong
 another method with a 405 (``Allow: GET, HEAD``, no content); a name that is
 no scrudful route's, or whose view has its route turned off, with a JSON 404,
 ``{"detail": "Not found."}``, without Links. It runs no authentication,
-permission check or throttle, and is CSRF-exempt.
+permission check or throttle, is CSRF-exempt, and is public under Django's
+``LoginRequiredMiddleware`` (Django 5.1+): the route and
+:func:`~scrudful.rest_framework.http_schema_resource_view` are
+``login_required = False``.
 
 * Give every route of a scrudful view a URL name: an unnamed one raises
   ``ImproperlyConfigured`` on its requests, and two scrudful views sharing one

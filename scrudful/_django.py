@@ -260,7 +260,9 @@ def error_handler(
     ``text/html`` to the entity's media type, else with a JSON body (RFC 9457
     problem details for ``application/problem+json``, else
     ``{"detail": <reason phrase>}``) served as ``error.media_type`` with the
-    entity's Links. It always sends ``Vary: Accept``.
+    entity's Links. It always sends ``Vary: Accept``. It is
+    ``login_required = False``, public under Django's
+    ``LoginRequiredMiddleware`` (Django exempts its error handlers anyway).
 
     Raises
     ------
@@ -301,6 +303,9 @@ def error_handler(
         _adapter.expose_headers(response)
         return response
 
+    # Public under LoginRequiredMiddleware (Django >= 5.1), as Django's own
+    # error handlers are.
+    view.login_required = False  # type: ignore[attr-defined]
     return view
 
 

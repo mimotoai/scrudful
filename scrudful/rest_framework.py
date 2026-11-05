@@ -2115,7 +2115,9 @@ def hsr_urls() -> list[URLPattern]:
     :func:`http_schema_resource` of its view function.
 
     The view is a plain Django view: it runs no authentication, permission
-    check or throttle, is CSRF-exempt, and answers GET and HEAD with:
+    check or throttle, is CSRF-exempt, is public under Django's
+    ``LoginRequiredMiddleware`` (``login_required = False``), and answers GET
+    and HEAD with:
 
     - a 200, ``application/json``, the compact JSON of the document, the
       Links of the HTTP Schema Resource's own schema and context, a strong
@@ -2168,6 +2170,11 @@ def _hsr_view(request: HttpRequest, view_name: str) -> HttpResponseBase:
     )
 
 
+# Public under Django's LoginRequiredMiddleware (Django >= 5.1), which
+# reads the attribute of the view a URL resolves to.
+_hsr_view.login_required = False  # type: ignore[attr-defined]
+
+
 def http_schema_resource_view(
     view_func: Callable[..., Any],
 ) -> Callable[[HttpRequest], HttpResponseBase]:
@@ -2181,7 +2188,8 @@ def http_schema_resource_view(
     does (the document, Links, strong ``ETag``, the view's ``Cache-Control``
     and a 304 for a matching ``If-None-Match``), and any other method with a
     405 (``Allow: GET, HEAD``). Like the route, it runs no authentication,
-    permission check or throttle, and is CSRF-exempt. The document is built
+    permission check or throttle, is CSRF-exempt and is public under
+    ``LoginRequiredMiddleware``. The document is built
     on the first request, as :func:`http_schema_resource` builds it.
 
     It is for serving the document elsewhere than :func:`hsr_urls`, with the
@@ -2228,7 +2236,9 @@ def http_schema_resource_view(
             request, _built_hsr(view_func), _hsr_cache_control(view_func.cls)
         )
 
-    return csrf_exempt(scrudful_hsr_view)
+    view = csrf_exempt(scrudful_hsr_view)
+    view.login_required = False  # type: ignore[attr-defined]
+    return view
 
 
 class _Scan(NamedTuple):
