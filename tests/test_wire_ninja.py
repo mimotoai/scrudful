@@ -31,8 +31,10 @@ The scenarios are those of the 0.9.0 audit's harness (its ``agree.py``,
   router with its own ``auth`` (a reader and a writer, a ``before`` refusing
   the reader's writes, an ``allowed`` hook denying a DELETE per object), a
   ``@described`` operation, a throttled router, non-JSON and in-band entities,
-  a handler setting its own Links, a 500, and ``add_error_links`` with problem
-  details;
+  a handler setting its own Links, a 500, ``add_error_links`` with problem
+  details, and a conditional item without ``error=`` (whose early errors
+  carry the API's entity) mounted once, twice (one mount under a
+  parameterized prefix) and nested in another router;
 - the ``examples/ninja`` project's API (``/api/``), whose ``roles`` app needs
   the example's settings: under this suite's settings (the DRF example's),
   ``test_wire_suite_on_the_example_project`` runs this module again, in a
@@ -296,6 +298,14 @@ WIRE_API.add_router("/secured", secured)
 WIRE_API.add_router("/throttled", throttled)
 WIRE_API.add_router("/media", media)
 WIRE_API.add_router("/fallback", item_router())
+#: One router mounted twice (each mount its own URL names, one under a
+#: parameterized prefix), and a router nested in another.
+TWICE = item_router()
+WIRE_API.add_router("/plain", TWICE, url_name_prefix="plain")
+WIRE_API.add_router("/orgs/{org}/items", TWICE, url_name_prefix="orgs")
+OUTER = item_router()
+OUTER.add_router("/inner", item_router())
+WIRE_API.add_router("/outer", OUTER)
 add_error_links(WIRE_API, PROBLEM)
 
 #: The error entity of Django's 404 and 500 (plain links): the example's
@@ -324,6 +334,18 @@ HSR_ROUTES = {
     "own": "/wire/media/_hsr/own.pk",
     "boom": "/wire/media/_hsr/boom",
     "fallback": "/wire/fallback/_hsr/pk",
+    "plain": "/wire/plain/_hsr/pk",
+    "orgs": "/wire/orgs/acme/items/_hsr/pk",
+    "outer": "/wire/outer/_hsr/pk",
+    "inner": "/wire/outer/inner/_hsr/pk",
+}
+#: The base URL of each mount of an :func:`item_router`.
+ITEM_MOUNTS = {
+    "fallback": "/wire/fallback",
+    "plain": "/wire/plain",
+    "orgs": "/wire/orgs/acme/items",
+    "outer": "/wire/outer",
+    "inner": "/wire/outer/inner",
 }
 if EXAMPLE:
     HSR_ROUTES.update(
@@ -431,7 +453,11 @@ def wire_exchanges() -> list[Exchange]:
         on("turtle", "/wire/media/turtle/1")("GET text/turtle", "GET", 200),
         on("own", "/wire/media/own/1")("GET own Links", "GET", 200),
         on("own", "/wire/media/own/9")("GET 404 load", "GET", 404),
-        *item_exchanges("fallback", "/wire/fallback"),
+        *(
+            exchange
+            for kind, base in ITEM_MOUNTS.items()
+            for exchange in item_exchanges(kind, base)
+        ),
     ]
 
 
@@ -604,7 +630,7 @@ OPTIONS = [
     ("turtle", "/wire/media/turtle/1", {}),
     ("own", "/wire/media/own/1", {}),
     ("boom", "/wire/media/boom", {}),
-    ("fallback", "/wire/fallback/1", {}),
+    *((kind, f"{base}/1", {}) for kind, base in ITEM_MOUNTS.items()),
 ] + (
     [
         ("item", "/api/roles/{pk}", ACME),
@@ -685,7 +711,10 @@ ALLOW = [
     ("anonymous described", "/wire/secured/1/summary", {}, {"OPTIONS"}),
     ("reader described", "/wire/secured/1/summary", READER, {"GET", "HEAD", "OPTIONS"}),
     ("anonymous media", "/wire/media/csv/1", {}, {"GET", "OPTIONS"}),
-    ("anonymous fallback", "/wire/fallback/1", {}, {"GET", "HEAD", "PUT", "OPTIONS"}),
+    *(
+        (f"anonymous {kind}", f"{base}/1", {}, {"GET", "HEAD", "PUT", "OPTIONS"})
+        for kind, base in ITEM_MOUNTS.items()
+    ),
 ] + (
     [
         ("anonymous role", "/api/roles/{pk}", {}, {"OPTIONS"}),
