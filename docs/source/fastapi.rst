@@ -321,7 +321,10 @@ Things to know:
   that can't be told, and so may a signature (of the endpoint or of a
   dependency) that can't be read: its method is **not allowed**, for every
   requester, and a ``RuntimeWarning`` names the route, once, as above. Import
-  the annotation's names outside ``TYPE_CHECKING``, or give ``allowed``.
+  the annotation's names outside ``TYPE_CHECKING``, or give ``allowed``. The
+  names are matched as written: an alias (``from fastapi import Security as
+  Sec``) in such an annotation isn't seen, though FastAPI can't evaluate that
+  annotation either, so it runs no check for it on the request.
 * **Object-level rules need** ``allowed`` (and ``load``): the security
   dependencies have no object. With ``allowed``, every requester passes step 2,
   so the object is loaded for each: ``load`` should then hide (``None``, or a

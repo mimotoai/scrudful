@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from fastapi import routing as fastapi_routing
 from fastapi import (
     APIRouter,
     Depends,
@@ -400,19 +401,15 @@ def hooked_app(router: APIRouter) -> FastAPI:
 # --- The mounted routers (MOUNTS) -----------------------------------------------
 
 
-def includes_lazily() -> bool:
-    """Whether this FastAPI serves a route added to a router after
-    ``include_router`` (it includes routers lazily); older releases copy the
-    router's routes when it is included, so they never serve such a route."""
-    router, app = APIRouter(), FastAPI()
-    app.include_router(router)
-    router.add_api_route("/probe", lambda: None)
-    return TestClient(app).get("/probe").status_code == 200
-
-
-#: The kinds of resource added to an included router after its inclusion,
-#: which only a FastAPI that includes routers lazily serves.
-LATE_KINDS = () if includes_lazily() else ("nested late", "parent late")
+#: Whether this FastAPI serves a route added to a router after
+#: ``include_router``: it includes routers lazily (and has
+#: ``iter_route_contexts`` to flatten them); older releases copy the router's
+#: routes when it is included, so they never serve such a route.
+INCLUDES_LAZILY = hasattr(fastapi_routing, "iter_route_contexts")
+#: The kinds of resource added to an included router after its inclusion.
+LATE = {"nested late": "/v1/c/late/items/1", "parent late": "/v1/plate/items/1"}
+#: Those this FastAPI doesn't serve (see :func:`test_late_routes_unserved`).
+LATE_KINDS = () if INCLUDES_LAZILY else tuple(LATE)
 
 
 def item_routes(router: APIRouter, prefix: str = "") -> None:
@@ -880,6 +877,25 @@ def test_options(clients, kind, headers):
     headers_ = headers_of(response)
     assert options_204_problems(response.status_code, headers_, response.content) == []
     assert hsr_link_problems(headers_, target(kind)) == []
+
+
+@pytest.mark.parametrize("url", sorted(LATE.values()))
+def test_late_routes_unserved(clients, url):
+    """On a FastAPI that copies an included router's routes, the routes added
+    to the router after its inclusion are not served, so they are not
+    described either: a 404 with no HSR link, no OPTIONS answer, and no HSR
+    route for them on the app. (A FastAPI that includes routers lazily
+    serves and describes them: they are wire kinds of their own.)"""
+    if INCLUDES_LAZILY:
+        pytest.skip("this FastAPI serves the routes added after the inclusion")
+    client = clients["mounts"]
+    for method in ("GET", "OPTIONS"):
+        response = client.request(method, url)
+        assert response.status_code in (404, 405), (method, url)
+        links = parse_links(response.headers.get("link"))
+        assert all(params.get("rel") != HSR_DOCUMENT_REL for _, params in links)
+    name = url.removeprefix("/v1/").replace("/1", ".iid").replace("/", ".")
+    assert client.get(f"/v1/_hsr/{name}").status_code == 404
 
 
 @pytest.mark.parametrize("kind", sorted(KINDS))

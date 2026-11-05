@@ -2625,10 +2625,12 @@ def _complete(
         new = _record(completion, _flat(router.routes) if entries is None else entries)
         if completion.simple:
             try:
-                _complete_routes(router, options, completion, new)
+                keys, names = _check_completion(options, completion, new)
             except BaseException:
+                # Nothing committed yet: the routes stay unseen.
                 completion.rollback(mark)
                 raise
+            _complete_routes(router, completion, new, keys, names)
             completion.count = len(router.routes)
             return
     routes = router.routes
@@ -2640,17 +2642,19 @@ def _complete(
     options.completion = _completion_of(router, names)
 
 
-def _complete_routes(
-    router: APIRouter,
-    options: _HsrOptions,
-    completion: _Completion,
-    new: Sequence[Any],
-) -> None:
-    """:func:`_complete` of the ``new`` routes of ``router``: check their
-    scrudful endpoints' callables, name the resources they add, and give
-    those their HSR and OPTIONS routes; register the endpoints' router.
-    Everything is checked before anything is committed: a ``ValueError``
-    leaves the names unchanged (and :func:`_complete` the routes unseen)."""
+def _check_completion(
+    options: _HsrOptions, completion: _Completion, new: Sequence[Any]
+) -> tuple[dict[str, None], dict[str, str]]:
+    """Check the ``new`` routes of a router's :func:`_complete`, committing
+    nothing: their scrudful endpoints' callables, and the resources they add
+    (none under ``/_hsr/``, no clashing HSR route name). Return those
+    resources' keys, and the resource key of each new HSR route name.
+
+    Raises
+    ------
+    ValueError
+        As :func:`add_options`.
+    """
     keys: dict[str, None] = {}
     for route in new:
         endpoint = getattr(route, "endpoint", None)
@@ -2679,7 +2683,19 @@ def _complete_routes(
                 "turn the route off (hsr_route=False) and give hsr_url="
             )
         names[name] = key
-    # All checked: the names and the routes are committed together.
+    return keys, names
+
+
+def _complete_routes(
+    router: APIRouter,
+    completion: _Completion,
+    new: Sequence[Any],
+    keys: Mapping[str, None],
+    names: Mapping[str, str],
+) -> None:
+    """Commit what :func:`_check_completion` checked of the ``new`` routes of
+    ``router``: the resources' names (``names``), their HSR and OPTIONS
+    routes (those of ``keys`` that have none), and the endpoints' router."""
     for name, key in names.items():
         completion.key_of[name] = key
         completion.name_of[key] = name
