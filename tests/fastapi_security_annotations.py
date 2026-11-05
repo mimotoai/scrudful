@@ -10,6 +10,7 @@ itself leaves OPTIONS unable to tell what it declares. Used by
 
 from __future__ import annotations
 
+import decimal
 import functools
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -181,6 +182,38 @@ class MixedUser:
         self, user: Annotated[str, Security(writer)], db: Session = Depends(get_db)
     ) -> None:
         self.user = user  # pragma: no cover
+
+
+def missing_attribute(a: int, b: decimal.Nope = None) -> None:  # type: ignore
+    """An annotation whose evaluation raises ``AttributeError``."""
+
+
+def lookup(user: str = "") -> str:
+    """A plain dependency; its annotation is replaced after the route is
+    built (see :func:`missing_attribute_app`)."""
+    return user  # pragma: no cover
+
+
+def missing_attribute_app() -> FastAPI:
+    """``/notes/{id}``: GET for anyone; PUT with ``Depends(lookup)``, whose
+    ``user`` annotation then becomes ``Annotated[decimal.Nope,
+    Security(writer)]``, which raises ``AttributeError`` when evaluated
+    (FastAPI itself refuses such an annotation when it builds a route, so
+    it is set after). OPTIONS is not given ``add_options`` here."""
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**LINKS)
+    async def read(id: int):
+        return {"id": id}
+
+    @app.put("/notes/{id}")
+    @scrudful(**LINKS)
+    async def write(id: int, user: str = Depends(lookup)):
+        return {"id": id}  # pragma: no cover
+
+    lookup.__annotations__["user"] = "Annotated[decimal.Nope, Security(writer)]"
+    return app
 
 
 def callables_app() -> FastAPI:

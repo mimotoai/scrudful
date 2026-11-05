@@ -11,6 +11,7 @@ still be. Used by ``test_ninja_adapter.py``.
 
 from __future__ import annotations
 
+import decimal
 from typing import TYPE_CHECKING
 
 from django.http import HttpRequest, HttpResponse
@@ -80,6 +81,26 @@ def make_router() -> Router:
     router = Router()
     router.get("/items/{pk}")(get_item)
     router.put("/items/{pk}")(put_item)
+    return router
+
+
+def make_missing_attribute_router() -> Router:
+    """``PUT /items/{pk}`` whose hidden parameter's annotation raises
+    ``AttributeError`` when evaluated (``decimal.Nope``): it stays a string,
+    and the handler is decorated and served (ninja never sees it)."""
+
+    @scrudful(load=load, load_as="item", etag_func=etag)
+    def put_item_missing_attribute(
+        request: HttpRequest, pk: int, body: Body, item: decimal.Nope
+    ) -> dict[str, object]:
+        item.name = body.name
+        item.version += 1
+        return {"pk": item.pk, "name": item.name}
+
+    ITEMS.clear()
+    ITEMS[1] = Item(1, "a")
+    router = Router()
+    router.put("/items/{pk}")(put_item_missing_attribute)
     return router
 
 

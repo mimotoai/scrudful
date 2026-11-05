@@ -3655,6 +3655,39 @@ def test_resolved_signature_reads_a_non_function_in_its_globals(call):
     assert parameters["db"].annotation == "Session"
 
 
+def test_resolved_signature_leaves_an_attribute_error_annotation_a_string():
+    """An annotation whose evaluation raises something other than
+    ``NameError`` (``decimal.Nope``: an ``AttributeError``) stays a string,
+    and the others are evaluated."""
+    from scrudful._adapter import resolved_signature
+
+    parameters = resolved_signature(security_annotations.missing_attribute).parameters
+    assert parameters["a"].annotation is int
+    assert parameters["b"].annotation == "decimal.Nope"
+
+
+def test_a_security_annotation_raising_attribute_error_refuses_its_method(
+    make_client,
+):
+    """A dependency's ``Security(...)`` annotation that raises
+    ``AttributeError`` when evaluated can't be told either: ``add_options``
+    doesn't fail, the method is refused for every requester, and the route
+    is announced, once."""
+    app = security_annotations.missing_attribute_app()
+    try:
+        with pytest.warns(RuntimeWarning, match=r"PUT '/notes/\{id\}'.*decimal\.Nope"):
+            add_options(app, base_url=BASE)
+        options_204(
+            make_client(app),
+            "/notes/1",
+            "GET, OPTIONS",
+            NOTE_TARGET,
+            headers=security_annotations.WRITER,
+        )
+    finally:
+        security_annotations.lookup.__annotations__["user"] = "str"
+
+
 def unreadable_app() -> FastAPI:
     """:func:`tests.fastapi_security_annotations.unreadable_app`, skipping on
     a FastAPI that refuses the annotation itself, when the route is created

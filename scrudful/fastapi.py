@@ -77,7 +77,6 @@ from scrudful._adapter import (
     describe_read,
     describe_write,
     essence,
-    evaluated_signature,
     evaluates_preconditions,
     resolved_signature,
     expose_headers,
@@ -4414,7 +4413,7 @@ def _param_names(endpoint: Callable[..., Any]) -> frozenset[str]:
     variadic = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
     return frozenset(
         name
-        for name, param in evaluated_signature(endpoint).parameters.items()
+        for name, param in resolved_signature(endpoint).parameters.items()
         if param.kind not in variadic
     )
 

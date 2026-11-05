@@ -682,6 +682,17 @@ def test_future_annotations_with_an_unresolvable_hidden_annotation():
     assert response.status_code == 428
 
 
+def test_a_hidden_annotation_raising_attribute_error_is_left_a_string():
+    """An annotation whose evaluation raises something other than
+    ``NameError`` (``decimal.Nope``, an ``AttributeError``) stays a string,
+    as one naming something missing does: the handler is decorated and
+    served."""
+    client = TestClient(future_endpoints.make_missing_attribute_router())
+    response = client.put("/items/1", json={"name": "b"}, headers={"If-Match": '"v1"'})
+    assert response.status_code == 200
+    assert response.json() == {"pk": 1, "name": "b"}
+
+
 def test_resolved_signature_evaluates_each_annotation():
     signature = resolved_signature(future_endpoints.put_unchecked_item.__wrapped__)
     annotations = {

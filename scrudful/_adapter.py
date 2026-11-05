@@ -286,7 +286,10 @@ def resolved_signature(func: Callable[..., Any]) -> inspect.Signature:
     """
     try:
         signature = inspect.signature(func, eval_str=True)
-    except NameError:
+    except Exception:
+        # One annotation can't be evaluated (a NameError, or an
+        # AttributeError, SyntaxError or TypeError, as for
+        # ``module.Missing``): each is evaluated on its own below.
         try:
             signature = inspect.signature(func)
         except NameError:
