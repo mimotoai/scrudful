@@ -1726,16 +1726,18 @@ def test_options_action_without_links(client):
     assert body["put"] == {
         "responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}
     }
+    # The mixed route's undecorated PUT gets no HSR link (scrudful.E007).
+    assert "Link" not in client.put("/mixed-actions/1/mixed/")
+    # A route of an undecorated action alone is not described: no HSR, and
+    # an OPTIONS without its link.
     plain = client.options("/actions/1/plain/")
-    plain_body = hsr_of(client, "/actions/1/plain/")
-    validate_http_schema_resource(plain_body)
-    assert plain_body == {
-        "get": {"responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}},
-        "options": options_operation(),
-        "head": {"responses": {"200": {"description": "OK"}, "default": DEFAULT_ERROR}},
-    }
+    assert plain.status_code == 204
     assert plain["Allow"] == "GET, OPTIONS, HEAD"
-    assert options_problems(plain, "/actions/1/plain/") == []
+    assert "Link" not in plain
+    assert (
+        client.get(f"/_hsr/{resolve('/actions/1/plain/').view_name}").status_code == 404
+    )
+    assert "Link" not in client.get("/actions/1/plain/")
 
 
 def test_agreement_drf_item(client):

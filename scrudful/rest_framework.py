@@ -222,7 +222,12 @@ System checks
     - ``scrudful.E006``: an invalid ``SCRUDFUL`` setting: not a dict of its
       keys, or a key whose value is invalid (one error for each). While the
       setting is invalid, what depends on it is not checked (no document
-      is built).
+      is built);
+    - ``scrudful.E007``: an action of a :func:`scrudful_viewset` class
+      without ``@scrudful`` (an ``@action``, or a method its ``mapping``
+      adds), which the class decorator doesn't wrap: nothing describes its
+      responses, so they get no HTTP Schema Resource link (and a route of
+      such actions alone has no document).
 
     and as a warning:
 
@@ -1246,6 +1251,12 @@ def scrudful_viewset(cls: type) -> type:
     Decorating a subclass of a decorated viewset again re-wraps the original
     methods with the subclass's configuration.
 
+    Extra actions (``@action``, and the methods an action's ``mapping``
+    adds) are not wrapped: decorate each with :func:`scrudful` (an
+    ``entity=``, or the link options). One without it is described by
+    nothing, so its responses get no HTTP Schema Resource link, and the
+    system check reports it (``scrudful.E007``).
+
     Callbacks are called as ``func(view, request, **url_kwargs)``; callables
     stored on ``Meta`` are plain functions (``staticmethod`` works too).
 
@@ -1313,8 +1324,8 @@ def scrudful_viewset(cls: type) -> type:
         the item and ``list_`` link options (see :class:`ScrudfulViewFunc`).
     statuses : mapping, optional
         The success statuses of each method (see :class:`ScrudfulViewFunc`),
-        for every handler of the class, those it doesn't wrap (``@action``
-        methods) included unless they give their own.
+        for every handler of the class, the ``@scrudful`` ``@action``
+        methods included unless they give their own.
     allowed_func : callable, optional
         ``allowed_func(view, request, method, obj)``, for the ``Allow`` of
         OPTIONS (see :class:`ScrudfulViewFunc`).
@@ -2117,7 +2128,9 @@ def http_schema_resource(view_func: Callable[..., Any]) -> dict[str, Any]:
     Without scrudful's exception handler the raised errors carry no error Links,
     and ``default`` has no content. HEAD's entries have no content.
     Methods whose handler is not scrudful are described without content or
-    preconditions.
+    preconditions (on a :func:`scrudful_viewset` class, such an action is
+    the system check's ``scrudful.E007``, and its responses get no HSR
+    link).
 
     Raises
     ------
@@ -2230,7 +2243,8 @@ def hsr_urls() -> list[URLPattern]:
     other name is served. Django's system checks (``manage.py check``, and
     ``runserver`` and ``migrate`` before they start) report both, and a
     missing include, before any request (``scrudful.E001`` to
-    ``scrudful.E006``, see "System checks" in the module docstring).
+    ``scrudful.E007`` and ``scrudful.W001``, see "System checks" in the
+    module docstring).
 
     Raises
     ------
@@ -2343,6 +2357,10 @@ class _Scan(NamedTuple):
     #: ``(view function, error)`` of each scrudful view's route without a URL
     #: name.
     unnamed: list[tuple[Callable[..., Any], str]]
+    #: The route of each ``(class, action name)`` of a
+    #: :func:`scrudful_viewset` class's routes whose handler isn't scrudful
+    #: (:func:`_undescribed_actions`).
+    undescribed: dict[tuple[type, str], str]
     #: The first :func:`hsr_urls` pattern, if the URLconf includes it.
     hsr_pattern: URLPattern | None = None
 
@@ -2373,6 +2391,7 @@ def _scan_scrudful_views(resolver: URLResolver) -> _Scan:
     clashes: dict[str, str] = {}
     unnamed: list[tuple[Callable[..., Any], str]] = []
     hsr_patterns: list[URLPattern] = []
+    undescribed: dict[tuple[type, str], str] = {}
 
     def visit(patterns: Sequence[Any], namespaces: list[str], prefix: str) -> None:
         for pattern in patterns:
@@ -2388,6 +2407,8 @@ def _scan_scrudful_views(resolver: URLResolver) -> _Scan:
             if isinstance(pattern, _HsrURLPattern) and not hsr_patterns:
                 hsr_patterns.append(pattern)
             callback = getattr(pattern, "callback", None)
+            for name in _undescribed_actions(callback):
+                undescribed.setdefault((callback.cls, name), route)
             if not _is_scrudful_view_func(callback):
                 continue
             if pattern.name is None:
@@ -2410,7 +2431,13 @@ def _scan_scrudful_views(resolver: URLResolver) -> _Scan:
         for view_name, (callback, _) in found.items()
         if view_name not in clashes
     }
-    return _Scan(views, clashes, unnamed, hsr_patterns[0] if hsr_patterns else None)
+    return _Scan(
+        views,
+        clashes,
+        unnamed,
+        undescribed,
+        hsr_patterns[0] if hsr_patterns else None,
+    )
 
 
 @checks.register(checks.Tags.urls)
@@ -2494,6 +2521,19 @@ def _hsr_url_errors(
             errors.append(checks.Error(message, obj=callback.cls, id="scrudful.E001"))
     for message in scan.clashes.values():
         errors.append(checks.Error(message, id="scrudful.E002"))
+    for (cls, name), route in scan.undescribed.items():
+        errors.append(
+            checks.Error(
+                f"{cls.__module__}.{cls.__qualname__}.{name}, the handler of the "
+                f"route {route!r}, is an action of a scrudful_viewset class "
+                "without @scrudful: no HTTP Schema Resource describes its "
+                "responses, so they get no HSR link (nor Meta's entity and "
+                "Links). Decorate it with @scrudful(entity=...) (or the link "
+                "options).",
+                obj=cls,
+                id="scrudful.E007",
+            )
+        )
     needs_route = []
     for view_name, view_func in scan.views.items():
         try:
@@ -2584,15 +2624,47 @@ def _unnamed_message(callback: Any, route: str) -> str:
 
 
 def _is_scrudful_view_func(callback: Any) -> bool:
-    """Whether ``callback`` is a DRF view function of a scrudful view: of a
-    :func:`scrudful_viewset` class, or with a :class:`ScrudfulViewFunc` handler
-    (:func:`scrudful_api_view`'s included) for a method it routes."""
+    """Whether ``callback`` is a DRF view function of a scrudful view: with a
+    :class:`ScrudfulViewFunc` handler (:func:`scrudful_api_view`'s included)
+    for a method it routes, or of a :func:`scrudful_viewset` class (but a
+    route of its undecorated actions alone, see
+    :func:`_undescribed_actions`, which nothing describes)."""
     cls = getattr(callback, "cls", None)
     if not (isinstance(cls, type) and issubclass(cls, APIView)):
         return False
     if getattr(cls, _META_OPTIONS_ATTR, None) is not None:
-        return True
+        actions = getattr(callback, "actions", None)
+        if not isinstance(actions, Mapping):
+            return True
+        return set(actions.values()) != set(_undescribed_actions(callback))
     return bool(_view_func_handlers(callback))
+
+
+def _undescribed_actions(callback: Any) -> list[str]:
+    """The actions a route of a :func:`scrudful_viewset` class maps a method
+    to whose handler isn't a :class:`ScrudfulViewFunc`: an ``@action`` (or
+    a method an ``@action``'s ``mapping`` adds) without ``@scrudful``, which
+    the class decorator doesn't wrap. Nothing describes their responses, so
+    they get no HSR link (:func:`_response_hsr_link`); the system check
+    reports them (``scrudful.E007``). Empty for any other view function."""
+    cls = getattr(callback, "cls", None)
+    actions = getattr(callback, "actions", None)
+    if not isinstance(cls, type) or not isinstance(actions, Mapping):
+        return []
+    if getattr(cls, _META_OPTIONS_ATTR, None) is None:
+        return []
+    names = dict.fromkeys(actions.values())
+    return [name for name in names if _class_handler(cls, name) is None]
+
+
+def _class_handler(cls: type, name: str) -> ScrudfulViewFunc | None:
+    """The :class:`ScrudfulViewFunc` behind the view class ``cls``'s
+    ``name``, as :func:`_handler` finds it on an instance (DRF's stock
+    ``partial_update`` is the scrudful ``update``'s)."""
+    handler = getattr(cls, name, None)
+    if handler is _STOCK_PARTIAL_UPDATE:
+        handler = getattr(cls, "update", None)
+    return handler if isinstance(handler, ScrudfulViewFunc) else None
 
 
 def _view_func_handlers(view_func: Callable[..., Any]) -> list[ScrudfulViewFunc]:
@@ -2635,6 +2707,9 @@ def _response_hsr_link(view: APIView, request: HttpRequest | Request) -> str | N
       (:func:`_is_scrudful_view_func`: an ``@api_view`` + ``@scrudful`` view,
       whose handlers are DRF's), or that isn't ``view``'s (``view`` called
       by another view), gets none: no HSR is served for that route.
+    - A request that a :func:`scrudful_viewset` class's action without
+      ``@scrudful`` handles (:func:`_undescribed_actions`) gets none: no
+      HSR describes its responses.
     - A CORS preflight gets none (it carries no Links).
     - Otherwise the link targets :func:`_hsr_target`, whose
       ``ImproperlyConfigured`` propagates: a routed request of a scrudful
@@ -2649,6 +2724,8 @@ def _response_hsr_link(view: APIView, request: HttpRequest | Request) -> str | N
     if getattr(func, "cls", None) is not type(view):
         return None
     if not _is_scrudful_view_func(func):
+        return None
+    if getattr(view, "action", None) in _undescribed_actions(func):
         return None
     if is_preflight(request.method or "", request.headers.get):
         return None

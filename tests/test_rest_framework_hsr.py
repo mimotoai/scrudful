@@ -1240,6 +1240,73 @@ def test_system_check_reports_a_route_off_without_hsr_url(settings):
     assert "hsr_url" in error.msg
 
 
+@scrudful_viewset
+class UndescribedActionViewSet(viewsets.ViewSet):
+    """Extra actions without ``@scrudful``: ``raw`` alone on its route, and
+    ``mixed_put`` beside a described GET."""
+
+    class Meta:
+        entity = Entity(
+            "https://api.example/schemas/thing",
+            context_link_or_func="https://api.example/contexts/thing",
+        )
+
+    def retrieve(self, request, pk):
+        return Response({"id": pk})
+
+    @action(detail=True, methods=["get"])
+    def raw(self, request, pk):
+        return Response({"raw": pk})
+
+    @action(detail=True, methods=["get"])
+    @scrudful(entity=Meta.entity)
+    def mixed(self, request, pk):
+        return Response({"mixed": pk})
+
+    @mixed.mapping.put
+    def mixed_put(self, request, pk):
+        return Response({"mixed_put": pk})
+
+
+class UndescribedActionURLconf:
+    router = SimpleRouter()
+    router.register("undescribed", UndescribedActionViewSet, basename="u")
+    urlpatterns = [path("", include(router.urls)), path("", include(hsr_urls()))]
+
+
+def test_system_check_reports_an_undecorated_action(settings):
+    settings.ROOT_URLCONF = UndescribedActionURLconf
+    errors = scrudful_check_errors()
+    assert [error.id for error in errors] == ["scrudful.E007"] * 2
+    assert {error.obj for error in errors} == {UndescribedActionViewSet}
+    messages = sorted(error.msg for error in errors)
+    assert "UndescribedActionViewSet.mixed_put" in messages[0]
+    assert "UndescribedActionViewSet.raw" in messages[1]
+    assert all("@scrudful" in message for message in messages)
+
+
+def test_an_undecorated_action_is_not_described(settings, client):
+    """Its responses get no HSR link, as no HSR describes them; a route of
+    such actions alone has no HSR; the described methods beside one keep
+    theirs."""
+    settings.ROOT_URLCONF = UndescribedActionURLconf
+    response = client.get("/undescribed/1/raw/")
+    assert response.status_code == 200 and response.json() == {"raw": "1"}
+    assert "Link" not in response
+    assert client.get("/_hsr/u-raw").status_code == 404
+    options = client.options("/undescribed/1/raw/")
+    assert options.status_code == 204 and "Link" not in options
+    # The mixed route: its GET is described, its PUT isn't.
+    target = f"{BASE_URL}_hsr/u-mixed"
+    get = client.get("/undescribed/1/mixed/")
+    assert hsr_link_problems(dict(get.items()), target) == []
+    put = client.put("/undescribed/1/mixed/")
+    assert put.status_code == 200 and "Link" not in put
+    options = client.options("/undescribed/1/mixed/")
+    assert hsr_link_problems(dict(options.items()), target) == []
+    assert client.get("/_hsr/u-mixed").status_code == 200
+
+
 def test_system_check_reports_an_invalid_setting(urls, settings):
     settings.SCRUDFUL = {"BASE_URL": BASE_URL, "HSR_ROUTE": "yes"}
     [error] = scrudful_check_errors()

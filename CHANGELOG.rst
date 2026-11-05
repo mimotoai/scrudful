@@ -197,7 +197,9 @@ Behaviour change (DRF)
   without a type, or whatever else its build raises, so that one view never
   stops the check) and ``E006`` (an invalid ``SCRUDFUL`` setting: one
   error for each invalid key, ``HSR_CACHE_CONTROL`` and ``ERROR`` included,
-  reported beside the routes' errors); and, as the warning ``scrudful.W001``,
+  reported beside the routes' errors), ``E007`` (an action of a
+  ``scrudful_viewset`` class without ``@scrudful``); and, as the warning
+  ``scrudful.W001``,
   a link callable raising when called as ``func(view, None)``, so that
   ``migrate`` runs on a fresh database whose tables a callable reads. The
   ``hsr_urls()`` pattern runs the check in Django's URL check; ``E003`` needs
@@ -210,6 +212,11 @@ Behaviour change (DRF)
   (``DjangoObjectPermissions`` for an object the requester may not read) is
   the OPTIONS's 404. A method with an ``allowed_func`` passes the first pass
   for every requester, so on such a view the object is loaded for anyone.
+* An action of a ``scrudful_viewset`` class without ``@scrudful`` (an
+  ``@action``, or a method its ``mapping`` adds) gets no HSR link on its
+  responses, which no HSR describes, and a route of such actions alone has no
+  HSR route and no HSR link on its OPTIONS (they were linked to an HSR
+  describing them without content). ``scrudful.E007`` reports them.
 * OPTIONS loads the object as the first method that passed its view-level
   checks loads it (GET, when it did): a request of that method and, on a
   viewset, its action (``retrieve``), not OPTIONS's ``metadata``, so a

@@ -66,7 +66,14 @@ misconfigurations before any request, as errors of Django's URL system check:
   callable);
 * ``scrudful.E006``: the ``SCRUDFUL`` setting is invalid: it isn't a dict of
   its keys, or a key's value is invalid (one error for each key). While it is,
-  the checks that depend on it are skipped (no HSR is built).
+  the checks that depend on it are skipped (no HSR is built);
+* ``scrudful.E007``: an action of a ``scrudful_viewset`` class without
+  ``@scrudful`` (an ``@action``, or a method its ``mapping`` adds).
+  ``scrudful_viewset`` wraps only ``list``, ``create``, ``retrieve``,
+  ``update``, ``partial_update`` and ``destroy``: an extra action needs its
+  own ``@scrudful(entity=...)`` (or link options). Without it nothing
+  describes its responses: they still answer, but get no HSR link (nor
+  ``Meta``'s entity and Links), and a route of such actions alone has no HSR;
 
 and, as a warning:
 
