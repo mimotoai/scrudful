@@ -769,8 +769,9 @@ optional ``SCRUDFUL`` Django setting, then to scrudful's default:
      - The ``Cache-Control`` of the HSR route (default ``public,
        max-age=300``): a non-empty ``str`` without control characters (a
        tab aside) or characters outside Latin-1, which no field can carry
-       (``ConfigError`` for the argument, ``ImproperlyConfigured`` for the
-       setting).
+       (``ConfigError`` for the argument, when given; the setting is read
+       when the HSR is served, so a bad one makes each HSR ``GET`` fail with
+       ``ConfigError``, and no header is ever split).
    * - ``allowed``
      - (none)
      - ``allowed(request, method, obj)``, the ``Allow`` hook of the router's
@@ -1116,8 +1117,9 @@ Things to know:
   and its responses link to the HSR route of the request's mount.
 * An error answering OPTIONS (the 404 of ``load``, a 429) has no entry of its
   own in the HSR, whose ``options`` entry is exactly the 204's.
-* ``load`` runs on OPTIONS: step 3's, and each other item operation's own in
-  step 4. Keep it free of side effects (no writes, no audit records): an
+* ``load`` runs on OPTIONS: step 3's, and in step 4 each other method's
+  operation's own (for that method, unless step 3 made that same call; HEAD
+  shares GET's). Keep it free of side effects (no writes, no audit records): an
   OPTIONS calls it as that method's request would, without the handler that
   follows it there. A ``select_for_update()`` in it locks the row on OPTIONS
   too, inside a transaction: see `Choosing what load returns`_ for how to
@@ -1247,7 +1249,7 @@ scrudful's own 400, 412 and 428 are returned by the operation, not raised, so
 no exception handler sees them: they carry the Links of the decorator's
 ``error``, else of the entity ``responses=`` declares for their status, else
 of the serving API's :func:`~scrudful.ninja.add_error_links` entity (whose
-link callables get ``None``), and the HTTP Schema Resource each API serves
+link callables get ``obj=None``), and the HTTP Schema Resource each API serves
 describes them so. Without any of these they carry no error Links: give
 every conditional ``@scrudful`` and ``@scrudful_list`` an ``error=``, or the
 API an ``add_error_links``.

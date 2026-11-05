@@ -40,8 +40,8 @@ Behaviour change (all adapters)
   or not (else the hook gets ``obj=None``). A 404 the loader raises is the
   OPTIONS's answer, with the error Links and the HSR link; ``None`` is no
   object. DRF loads again for each other action (or, off a viewset, method)
-  that passed, and ninja runs each other item operation's own ``load``, as
-  checks of those methods (see below). OPTIONS calls the loader, so it must
+  that passed, and ninja runs each other passing method's own ``load``, for
+  that method, as a check of it (see below). OPTIONS calls the loader, so it must
   be free of side effects (no writes, no audit records).
 * A denial an ``Allow`` hook raises refuses that method, in every adapter:
   DRF's ``PermissionDenied`` or ``NotAuthenticated``, any other 401 or 403
@@ -168,7 +168,9 @@ Behaviour change (all adapters)
   characters (CR, LF ...; a tab is allowed) or characters outside Latin-1,
   which no field can carry: such a value is refused when given, with the
   same error types (``ImproperlyConfigured`` for DRF's
-  ``Meta.hsr_cache_control``), rather than fail every HSR response. A base
+  ``Meta.hsr_cache_control``). ninja reads the setting when it serves the
+  HSR, so a bad one makes each HSR ``GET`` fail with ``ConfigError``; no
+  header is ever split. A base
   URL that doesn't make a relative link absolute is refused too.
 * ``scrudful.entity.HsrConfigError`` is the public name of the error the
   shared HSR code raises.
