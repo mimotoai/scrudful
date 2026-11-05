@@ -400,8 +400,11 @@ Behaviour change (FastAPI)
   silently, until ``add_options`` was called again): ``add_options(router)``
   wraps those methods on the routers. A route appended to the router's
   ``routes`` (or by ``APIRouter.add_api_route(router, ...)``) still gets none
-  until ``add_options`` is called again, and a ``RuntimeWarning`` now names
-  it, at the latest when the route first responds. A copy of such a router
+  until the next route is added with the router's methods or ``add_options``
+  is called again, and a ``RuntimeWarning`` now names it, at the latest when
+  the route first responds. An HSR route replaced in (or removed from) the
+  routes makes OPTIONS answer without the HSR link until then (it raised
+  ``NoMatchFound``). A copy of such a router
   (``copy.copy``) shares the wrapped methods, and ``copy.deepcopy`` fails.
 * ``add_options`` called again on a router already included and serving
   serves the HSR routes it adds at once, where FastAPI includes routers

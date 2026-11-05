@@ -2068,6 +2068,115 @@ def test_router_resource_added_later_to_an_included_router_is_described(
     _described(client, "/v1/c/l/later/1", f"{base}/c.l.later.id", "GET, OPTIONS")
 
 
+def test_a_router_included_twice_is_completed_under_both_prefixes(make_client):
+    """A router included twice in the router, under two prefixes, gives its
+    routes under each: both are completed, whether included after the call
+    or given a route after it (FastAPI versions that copy an included
+    router's routes don't serve the latter)."""
+    import scrudful.fastapi as module
+
+    child, router = APIRouter(), APIRouter()
+    child.get("/k/{id}")(_late_endpoint())
+    add_options(router, base_url=BASE)
+    router.include_router(child, prefix="/x")
+    router.include_router(child, prefix="/y")
+    lazy = module._iter_route_contexts is not None
+    if lazy:
+        child.get("/late/{id}")(_late_endpoint())
+    app = FastAPI()
+    app.include_router(router, prefix="/v")
+    client = make_client(app)
+    base = "https://api.example/v/_hsr"
+    for prefix in ("x", "y"):
+        _described(client, f"/v/{prefix}/k/1", f"{base}/{prefix}.k.id", "GET, OPTIONS")
+        if lazy:
+            target = f"{base}/{prefix}.late.id"
+            _described(client, f"/v/{prefix}/late/1", target, "GET, OPTIONS")
+
+
+def test_a_route_appended_is_completed_by_the_next_route_added(make_client):
+    """A route appended to the router's ``routes`` is completed by the next
+    route added with its methods, with no warning."""
+    from fastapi.routing import APIRoute
+
+    router = APIRouter()
+    add_options(router, base_url=BASE)
+    router.get("/a/{id}")(_late_endpoint())
+    router.routes.append(APIRoute("/b/{id}", _late_endpoint(), methods=["GET"]))
+    router.get("/c/{id}")(_late_endpoint())
+    app = FastAPI()
+    app.include_router(router, prefix="/v")
+    client = make_client(app)
+    for name in ("a", "b", "c"):
+        target = f"https://api.example/v/_hsr/{name}.id"
+        _described(client, f"/v/{name}/1", target, "GET, OPTIONS")
+
+
+@pytest.mark.parametrize("owner", ["router", "app"])
+def test_a_replaced_hsr_route_degrades_until_completed_again(make_client, owner):
+    """An HSR route replaced in its router's routes (``routes[i] = ...``), or
+    removed from an app's, is forgotten: OPTIONS answers without the HSR
+    link (it raised ``NoMatchFound``), the responses carry none, and a
+    ``RuntimeWarning`` names the resource for a router; the next route added
+    (or ``add_options`` again) gives it back."""
+    from fastapi.routing import APIRoute
+
+    import scrudful.fastapi as module
+
+    if owner == "router":
+        router = APIRouter()
+        router.get("/a/{id}")(_late_endpoint())
+        add_options(router, base_url=BASE)
+        index = next(i for i, r in enumerate(router.routes) if r.path == "/_hsr/a.id")
+        router.routes[index] = APIRoute(
+            "/a/{id}", _late_endpoint(), methods=["GET", "PUT"]
+        )
+        app = FastAPI()
+        app.include_router(router)
+    else:
+        app = FastAPI()
+        app.get("/a/{id}")(_late_endpoint())
+        add_options(app, base_url=BASE)
+        app.router.routes.remove(getattr(app, module._HSR_ROUTE_ATTRIBUTE))
+    client = make_client(app)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        response = client.options("/a/1")
+        assert response.status_code == 204
+        assert "link" not in response.headers
+        assert HSR_DOCUMENT_REL not in client.get("/a/1").headers.get("link", "")
+    if owner == "router":
+        assert [str(w.message) for w in caught if "'/a/{id}'" in str(w.message)]
+        router.get("/b/{id}")(_late_endpoint())
+        # Included anew: a FastAPI that copies the routes serves those it had.
+        app = FastAPI()
+        app.include_router(router)
+        client = make_client(app)
+    else:
+        add_options(app, base_url=BASE)
+    target = f"{BASE}_hsr/a.id"
+    assert hsr_link_problems(client.get("/a/1").headers, target) == []
+    assert hsr_link_problems(client.options("/a/1").headers, target) == []
+    assert client.get("/_hsr/a.id").status_code == 200
+
+
+def test_dead_watched_routers_are_pruned_when_scanned(make_client):
+    """The routers given ``add_options`` are held weakly, and the dead ones
+    dropped when an uncovered endpoint scans them."""
+    import gc
+
+    import scrudful.fastapi as module
+
+    router = APIRouter()
+    add_options(router, base_url=BASE)
+    del router
+    gc.collect()
+    app = FastAPI()
+    app.get("/u/{id}")(_late_endpoint())
+    assert make_client(app).get("/u/1").status_code == 200
+    assert all(ref() is not None for ref in module._WATCHED)
+
+
 def test_router_included_after_add_options_is_described(make_client):
     """A router included in the router after the call gets its routes, on
     every FastAPI version (one that copies its routes adds them with

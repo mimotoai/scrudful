@@ -192,9 +192,13 @@ it is not in the OpenAPI document.
   Each is completed alone, so adding routes after ``add_options`` costs no
   walk of the others. One whose route is appended to the router's ``routes``,
   or added by ``APIRouter.add_api_route(router, ...)``, gets neither, and no
-  HSR link: a ``RuntimeWarning`` names its resource, once, when the router's
-  resources are next indexed (a request to one of them, or the route's own
-  first response); call ``add_options`` again, which serves the routes it
+  HSR link, until the next route added with the router's methods (which
+  completes it too): a ``RuntimeWarning`` names its resource, once, when the
+  router's resources are next indexed (a request to one of them, or the
+  route's own first response). An HSR route replaced in, or removed from,
+  the routes is forgotten then: its resource's OPTIONS answers without the
+  HSR link, and its responses carry none, until the next route added. Or
+  call ``add_options`` again, which serves the routes it
   adds at once, also on a router already included and serving (where FastAPI
   includes routers lazily; older versions copy a router's routes when it is
   included).

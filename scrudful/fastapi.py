@@ -1336,11 +1336,16 @@ def add_options(
     wrappers, which add to, and complete, the original; ``copy.deepcopy``
     of a router given this fails (``RecursionError``). A route added to a
     router otherwise (appended to its ``routes``, or by
-    ``APIRouter.add_api_route(router, ...)``) gets neither, so it isn't
-    described and its responses get no HSR link (it would lead to a 404): a
-    ``RuntimeWarning`` names its resource, once, when the router's resources
-    are next indexed (a request to one of them, or the route's own first
-    response); call this again. Calling it again replaces the options, and
+    ``APIRouter.add_api_route(router, ...)``) gets neither until the next
+    route is added with the router's methods (which completes it too), so
+    until then it isn't described and its responses get no HSR link (it
+    would lead to a 404): a ``RuntimeWarning`` names its resource, once,
+    when the router's resources are next indexed (a request to one of them,
+    or the route's own first response); call this again. An HSR route
+    replaced or removed from the routes (``routes[i] = ...``) is forgotten
+    when they are next indexed: its resource's OPTIONS answers without the
+    HSR link, and its responses carry none, until the next route added or
+    call gives it back. Calling it again replaces the options, and
     adds the routes still missing: the HSR route on an app (when
     ``hsr_route`` is now on), the OPTIONS and HSR routes of a router's
     resources, served at once, also by a router already included and
@@ -1731,10 +1736,41 @@ def _paths_index(owner: FastAPI | APIRouter) -> _PathsIndex:
     if fingerprint is not None:
         options.index = index
     if options.explicit:
+        _forget_removed(owner, options)
         _announce_bodies(options, paths)
         if not isinstance(owner, FastAPI):
             _announce_unserved(owner, options, paths)
     return index
+
+
+def _forget_removed(owner: FastAPI | APIRouter, options: _HsrOptions) -> None:
+    """Forget the HSR routes of ``owner`` that are no longer among its routes
+    (one replaced, ``router.routes[i] = ...``, or removed): reversing them
+    would fail, so the resources they served are taken as having none (no
+    HSR link, see :func:`_response_hsr_link`; OPTIONS answers without it),
+    and :func:`_announce_unserved` warns of them. A router's next completion
+    then walks it whole (as one whose routes seen changed otherwise), which
+    gives them their routes again, as calling :func:`add_options` again
+    does."""
+    routes = owner.router.routes if isinstance(owner, FastAPI) else owner.routes
+    present = {id(route) for route in routes}
+    hsr = getattr(owner, _HSR_ROUTE_ATTRIBUTE, None)
+    gone = False
+    if isinstance(hsr, Route) and id(hsr) not in present:
+        delattr(owner, _HSR_ROUTE_ATTRIBUTE)
+        gone = True
+    elif isinstance(hsr, dict):
+        for key in [key for key, route in hsr.items() if id(route) not in present]:
+            del hsr[key]
+            gone = True
+    completion = options.completion
+    if completion is None or not completion.simple:
+        return
+    if not gone:
+        current = {_entry_key(route) for route in _flat(routes)}
+        gone = any(key not in current for key in completion.seen)
+    if gone:
+        completion.simple = False
 
 
 def _find_scrudful_paths(routes: Sequence[Any]) -> dict[str, _Resource]:
@@ -2355,8 +2391,8 @@ class _Completion:
     (:func:`_complete`), without walking every route again."""
 
     #: The original route of each entry of ``_flat(router.routes)`` seen, by
-    #: ``id`` (kept, so that the ids stay theirs).
-    seen: dict[int, Any]
+    #: :func:`_entry_key` (kept, so that the ids stay theirs).
+    seen: dict[tuple[int, str | None], Any]
     #: The template of the first route of each resource key seen (scrudful or
     #: not): the resource's template, which names it.
     templates: dict[str, str]
@@ -2367,8 +2403,12 @@ class _Completion:
     with_options: set[str]
     #: Whether every entry is a route: no ``Mount``, ``Host`` or other entry
     #: whose contents the full walk (:func:`_collect_paths`) looks into, so a
-    #: route added later is under nothing that shadows it.
+    #: route added later is under nothing that shadows it; and no route seen
+    #: was removed or replaced since (see :func:`_forget_removed`).
     simple: bool
+    #: The length of ``router.routes`` when last completed: a call that
+    #: finds another length, a route was added to it past its methods.
+    count: int = 0
 
 
 def _completion_of(router: APIRouter, names: Mapping[str, str]) -> _Completion:
@@ -2377,7 +2417,15 @@ def _completion_of(router: APIRouter, names: Mapping[str, str]) -> _Completion:
     completion = _Completion({}, {}, dict(names), {}, set(), True)
     completion.name_of = {key: name for name, key in names.items()}
     _record(completion, _flat(router.routes))
+    completion.count = len(router.routes)
     return completion
+
+
+def _entry_key(route: Any) -> tuple[int, str | None]:
+    """What tells the entries of ``_flat(router.routes)`` apart: the original
+    route, and the path the entry has (a router included twice, under two
+    prefixes, gives two entries of one original route)."""
+    return id(getattr(route, "original_route", route)), getattr(route, "path", None)
 
 
 def _record(completion: _Completion, entries: Iterable[Any]) -> list[Any]:
@@ -2387,9 +2435,10 @@ def _record(completion: _Completion, entries: Iterable[Any]) -> list[Any]:
     new = []
     for route in entries:
         original = getattr(route, "original_route", route)
-        if id(original) in completion.seen:
+        key = _entry_key(route)
+        if key in completion.seen:
             continue
-        completion.seen[id(original)] = original
+        completion.seen[key] = original
         if not isinstance(original, Route):
             completion.simple = False
             continue
@@ -2405,14 +2454,18 @@ def _complete(
     router: APIRouter,
     changed: APIRouter | None = None,
     added: Sequence[Any] | None = None,
+    before: int | None = None,
 ) -> None:
     """Give the resources of the routes added to ``router`` since its
     :func:`add_options` their routes, checked as :func:`add_options` checks
     them: only the routes added, and the resource keys they are on, are
     looked at (see :class:`_Completion`). ``added`` are the entries a call
-    on ``changed`` appended to its ``routes``; without them (a router
-    included in ``router`` changed), the router's routes are compared with
-    those seen. A router with an entry that isn't a route (a ``Mount``) is
+    on ``changed`` appended to its ``routes``, which had ``before`` entries.
+    When a router included in ``router`` changed, or ``router``'s routes
+    changed past its methods since it was last completed (a route appended
+    to them), the router's routes are compared with those seen, so that
+    such a route is completed too. A router with an entry that isn't a
+    route (a ``Mount``), or whose routes seen were removed or replaced, is
     walked whole, as :func:`add_options` walks it.
 
     Raises
@@ -2425,17 +2478,15 @@ def _complete(
     completion = options.completion
     if completion is not None and completion.simple:
         entries: Iterable[Any] | None = None
-        if changed is router and added is not None:
+        if changed is router and added is not None and before == completion.count:
             entries = _flat(added)
             # Appended, so none seen yet; else they weren't appended.
-            if any(
-                id(getattr(route, "original_route", route)) in completion.seen
-                for route in entries
-            ):
+            if any(_entry_key(route) in completion.seen for route in entries):
                 entries = None
         new = _record(completion, _flat(router.routes) if entries is None else entries)
         if completion.simple:
             _complete_routes(router, options, completion, new)
+            completion.count = len(router.routes)
             return
     routes = router.routes
     _check_options_callables(routes)
@@ -2553,6 +2604,7 @@ def _uncovered_router(endpoint: Any) -> APIRouter | None:
             return None
     except TypeError:  # not weakly referenceable
         return None
+    _WATCHED[:] = [ref for ref in _WATCHED if ref() is not None]
     for ref in list(_WATCHED):
         router = ref()
         if router is None or not _hsr_options(router).explicit:
@@ -2641,7 +2693,7 @@ def _completing(
             for ref in list(vars(router).get(_WATCHERS_ATTRIBUTE) or ()):
                 owner = ref()
                 if owner is not None and _hsr_options(owner).explicit:
-                    _complete(owner, router, added)
+                    _complete(owner, router, added, before)
                     if name == "include_router":
                         _watch(owner)
         return result
@@ -2800,7 +2852,11 @@ async def _options_answer(
         return Response(status_code=204)
     options = _hsr_options(owner)
     resource = _resource(owner, _scrudful_paths(owner), path)
-    target = _hsr_target(request, path, owner=owner)
+    target: str | None = None
+    if options.hsr_url is not None or not options.hsr_route:
+        target = _hsr_target(request, path, owner=owner)
+    elif _hsr_route_of(owner, _template_key(resource.template)) is not None:
+        target = _hsr_target(request, path, owner=owner)
     found = {method: routed(method) for method in _served_methods(resource)}
     served = {method: f for method, f in found.items() if f is not None}
     if params is None:
@@ -2828,7 +2884,8 @@ async def _options_answer(
         return await _options_error(subject, exc, target)
     response = Response(status_code=204)
     response.headers["Allow"] = allow_value(m for m, ok in allowed.items() if ok)
-    response.headers["Link"] = hsr_link(target)
+    if target is not None:
+        response.headers["Link"] = hsr_link(target)
     expose_headers(response.headers)
     return response
 
@@ -2879,7 +2936,9 @@ async def _hooked(
     return result
 
 
-async def _options_error(request: Request, exc: HTTPException, target: str) -> Response:
+async def _options_error(
+    request: Request, exc: HTTPException, target: str | None
+) -> Response:
     """The app's exception handlers' answer to ``exc``, raised for the OPTIONS
     ``request``, with the HSR link to ``target`` merged into its Link (a Link
     with the HSR relation the handler set wins) and the exposed headers.
@@ -2897,7 +2956,8 @@ async def _options_error(request: Request, exc: HTTPException, target: str) -> R
     if not isinstance(response, Response):
         return response  # type: ignore[no-any-return]
     headers = response.headers
-    link = merge_links(", ".join(headers.getlist("link")), None, None, hsr_link(target))
+    hsr = None if target is None else hsr_link(target)
+    link = merge_links(", ".join(headers.getlist("link")), None, None, hsr)
     if link is not None:
         headers["Link"] = link
     _join_expose_lines(headers)
