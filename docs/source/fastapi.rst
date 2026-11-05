@@ -189,9 +189,21 @@ it is not in the OpenAPI document.
   router later, with its route decorators, ``add_api_route`` or
   ``include_router`` (its own or those of a router included in it), gets its
   OPTIONS and HSR routes as it is added, and its callables are checked then.
-  One whose route is appended to the router's ``routes`` gets neither, and no
-  HSR link: a ``RuntimeWarning`` names it, once, when the router's resources
-  are next indexed; call ``add_options`` again.
+  Each is completed alone, so adding routes after ``add_options`` costs no
+  walk of the others. One whose route is appended to the router's ``routes``,
+  or added by ``APIRouter.add_api_route(router, ...)``, gets neither, and no
+  HSR link: a ``RuntimeWarning`` names its resource, once, when the router's
+  resources are next indexed (a request to one of them, or the route's own
+  first response); call ``add_options`` again, which serves the routes it
+  adds at once, also on a router already included and serving (where FastAPI
+  includes routers lazily; older versions copy a router's routes when it is
+  included).
+* **Copies of a router.** The route-adding methods are wrapped on the router
+  instance: a ``copy.copy`` of a router given ``add_options`` shares them, so
+  a route added to the copy goes to the original (and only it is
+  completed); ``copy.deepcopy`` of such a router fails with
+  ``RecursionError``. Copy a router before calling ``add_options`` on it, and
+  call it on the copy.
 * **Paths under** ``/_hsr/`` **are reserved**, and two resources can't share a
   name (``/a.b`` beside ``/a/b``): ``add_options`` raises ``ValueError`` for
   the paths there are, and the app's HSR route raises it on a request for

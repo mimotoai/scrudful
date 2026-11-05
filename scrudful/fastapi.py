@@ -22,6 +22,7 @@ from collections.abc import (
     Awaitable,
     Callable,
     Generator,
+    Iterable,
     Iterator,
     Mapping,
     Sequence,
@@ -1047,6 +1048,9 @@ class _HsrOptions:
     #: The resource keys of a router announced as having no OPTIONS or HSR
     #: route (see :func:`_announce_unserved`), each once.
     announced: set[str] = field(default_factory=set, compare=False, repr=False)
+    #: A router's routes as :func:`add_options` and the completions since
+    #: left them (see :func:`_complete`).
+    completion: _Completion | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(eq=False)
@@ -1326,13 +1330,22 @@ def add_options(
     ``add_api_route`` or ``include_router``, its own or those of a router
     included in it: they get their OPTIONS and HSR routes then, and their
     callables are checked then (this ``ValueError`` is raised by the call
-    adding them). A route added to a router otherwise (appended to its
-    ``routes``) gets neither, so it isn't described and its responses get no
-    HSR link (it would lead to a 404): a ``RuntimeWarning`` names it, once,
-    when the router's resources are next indexed; call this again. Calling
-    it again replaces the options, and adds the routes still missing: the
-    HSR route on an app (when ``hsr_route`` is now on), the OPTIONS and HSR
-    routes of a router's resources.
+    adding them); each is completed alone, without a walk of the router's
+    other routes. Those methods are wrapped on the router instances (and
+    those included in them): a ``copy.copy`` of the router shares the
+    wrappers, which add to, and complete, the original; ``copy.deepcopy``
+    of a router given this fails (``RecursionError``). A route added to a
+    router otherwise (appended to its ``routes``, or by
+    ``APIRouter.add_api_route(router, ...)``) gets neither, so it isn't
+    described and its responses get no HSR link (it would lead to a 404): a
+    ``RuntimeWarning`` names its resource, once, when the router's resources
+    are next indexed (a request to one of them, or the route's own first
+    response); call this again. Calling it again replaces the options, and
+    adds the routes still missing: the HSR route on an app (when
+    ``hsr_route`` is now on), the OPTIONS and HSR routes of a router's
+    resources, served at once, also by a router already included and
+    serving requests (on FastAPI versions that include routers lazily; the
+    others copy a router's routes when it is included).
 
     Parameters
     ----------
@@ -1422,11 +1435,14 @@ def add_options(
             # First, so that it sees every OPTIONS request, including those
             # under a Mount; it matches only those it answers.
             routes.insert(0, _OptionsRoute(app))
+            _routes_changed(app.router)
         if options.hsr_route:
             _add_hsr_routes(app, routes, paths, names)
     else:
         _add_router_routes(app, paths, names)
+        options.completion = _completion_of(app, names)
         _watch(app)
+        _remember_watched(app)
     # Indexed now, at startup: what indexing reports is reported here.
     _paths_index(app)
 
@@ -2332,22 +2348,224 @@ def _add_router_routes(
             _ROUTER_ENDPOINTS[endpoint] = weakref.ref(router)
 
 
-def _complete(router: APIRouter) -> None:
-    """Give the resources added to ``router`` since its :func:`add_options`
-    their routes, checked as :func:`add_options` checks them.
+@dataclass(eq=False)
+class _Completion:
+    """What a router's :func:`add_options` (and the completions since) gave
+    its routes, so that a route added later is completed alone
+    (:func:`_complete`), without walking every route again."""
+
+    #: The original route of each entry of ``_flat(router.routes)`` seen, by
+    #: ``id`` (kept, so that the ids stay theirs).
+    seen: dict[int, Any]
+    #: The template of the first route of each resource key seen (scrudful or
+    #: not): the resource's template, which names it.
+    templates: dict[str, str]
+    #: The resource key of each HSR route name given, and its inverse.
+    key_of: dict[str, str]
+    name_of: dict[str, str]
+    #: The keys some route serves OPTIONS for (one of scrudful's included).
+    with_options: set[str]
+    #: Whether every entry is a route: no ``Mount``, ``Host`` or other entry
+    #: whose contents the full walk (:func:`_collect_paths`) looks into, so a
+    #: route added later is under nothing that shadows it.
+    simple: bool
+
+
+def _completion_of(router: APIRouter, names: Mapping[str, str]) -> _Completion:
+    """The :class:`_Completion` of ``router`` once :func:`add_options` gave
+    its resources (HSR route ``names``) their routes."""
+    completion = _Completion({}, {}, dict(names), {}, set(), True)
+    completion.name_of = {key: name for name, key in names.items()}
+    _record(completion, _flat(router.routes))
+    return completion
+
+
+def _record(completion: _Completion, entries: Iterable[Any]) -> list[Any]:
+    """Record ``entries`` of a router's ``_flat`` routes in ``completion``,
+    and return the routes among them it hadn't seen. ``simple`` turns off at
+    an entry that isn't a route."""
+    new = []
+    for route in entries:
+        original = getattr(route, "original_route", route)
+        if id(original) in completion.seen:
+            continue
+        completion.seen[id(original)] = original
+        if not isinstance(original, Route):
+            completion.simple = False
+            continue
+        key = _template_key(route.path)
+        completion.templates.setdefault(key, route.path)
+        if route.methods is None or "OPTIONS" in route.methods:
+            completion.with_options.add(key)
+        new.append(route)
+    return new
+
+
+def _complete(
+    router: APIRouter,
+    changed: APIRouter | None = None,
+    added: Sequence[Any] | None = None,
+) -> None:
+    """Give the resources of the routes added to ``router`` since its
+    :func:`add_options` their routes, checked as :func:`add_options` checks
+    them: only the routes added, and the resource keys they are on, are
+    looked at (see :class:`_Completion`). ``added`` are the entries a call
+    on ``changed`` appended to its ``routes``; without them (a router
+    included in ``router`` changed), the router's routes are compared with
+    those seen. A router with an entry that isn't a route (a ``Mount``) is
+    walked whole, as :func:`add_options` walks it.
 
     Raises
     ------
     ValueError
         As :func:`add_options`.
     """
+    _WATCH_GENERATION[0] += 1
+    options = _hsr_options(router)
+    completion = options.completion
+    if completion is not None and completion.simple:
+        entries: Iterable[Any] | None = None
+        if changed is router and added is not None:
+            entries = _flat(added)
+            # Appended, so none seen yet; else they weren't appended.
+            if any(
+                id(getattr(route, "original_route", route)) in completion.seen
+                for route in entries
+            ):
+                entries = None
+        new = _record(completion, _flat(router.routes) if entries is None else entries)
+        if completion.simple:
+            _complete_routes(router, options, completion, new)
+            return
     routes = router.routes
     _check_options_callables(routes)
     paths = _find_scrudful_paths(routes)
     _check_reserved(paths)
-    names = _hsr_names(paths) if _hsr_options(router).hsr_route else {}
+    names = _hsr_names(paths) if options.hsr_route else {}
     _add_router_routes(router, paths, names)
-    _watch(router)
+    options.completion = _completion_of(router, names)
+
+
+def _complete_routes(
+    router: APIRouter,
+    options: _HsrOptions,
+    completion: _Completion,
+    new: Sequence[Any],
+) -> None:
+    """:func:`_complete` of the ``new`` routes of ``router``: check their
+    scrudful endpoints' callables, name the resources they add, and give
+    those their HSR and OPTIONS routes; register the endpoints' router."""
+    keys: dict[str, None] = {}
+    for route in new:
+        endpoint = getattr(route, "endpoint", None)
+        config = _endpoint_config(endpoint)
+        if config is None:
+            continue
+        _check_endpoint_callables(endpoint, config)
+        keys[_template_key(route.path)] = None
+    names: dict[str, str] = {}
+    for key in keys:
+        template = completion.templates[key]
+        if template.startswith(f"/{HSR_ROUTE_SEGMENT}/"):
+            raise ValueError(
+                f"{template!r} is under '/{HSR_ROUTE_SEGMENT}/', which is "
+                "reserved for scrudful's HTTP Schema Resource routes"
+            )
+        if not options.hsr_route or key in completion.name_of:
+            continue
+        name = _hsr_route_name(template)
+        other = completion.key_of.get(name)
+        if other is not None:
+            raise ValueError(
+                f"{completion.templates[other]!r} and {template!r} have the "
+                f"same HTTP Schema Resource route name {name!r} "
+                f"('/{HSR_ROUTE_SEGMENT}/{name}'): rename a path segment, or "
+                "turn the route off (hsr_route=False) and give hsr_url="
+            )
+        completion.key_of[name] = key
+        completion.name_of[key] = name
+        names[name] = key
+    if names:
+        _add_hsr_routes(router, router.routes, {}, names)
+        by_key = getattr(router, _HSR_ROUTE_ATTRIBUTE)
+        _record(completion, [by_key[key] for key in names.values()])
+    for key in keys:
+        if key in completion.with_options:
+            continue
+        router.add_route(
+            completion.templates[key],
+            _options_endpoint(router, key),
+            methods=["OPTIONS"],
+            name="scrudful_options",
+            include_in_schema=False,
+        )
+        _record(completion, router.routes[-1:])
+    for route in new:
+        endpoint = getattr(route, "endpoint", None)
+        if _endpoint_config(endpoint) is not None:
+            with contextlib.suppress(TypeError):  # not weakly referenceable
+                _ROUTER_ENDPOINTS[endpoint] = weakref.ref(router)
+
+
+def _routes_changed(router: Any) -> None:
+    """Tell FastAPI that ``router``'s routes changed when scrudful inserted
+    some (``routes.insert``), as its route-adding methods do: FastAPI
+    versions that include routers lazily keep each included router's routes
+    until then (``APIRouter._mark_routes_changed``, absent elsewhere)."""
+    mark = getattr(router, "_mark_routes_changed", None)
+    if callable(mark):
+        mark()
+
+
+#: The routers given :func:`add_options` (weakly), where a scrudful endpoint
+#: no :func:`add_options` covers is looked for (see :func:`_uncovered_router`).
+_WATCHED: list[weakref.ref[APIRouter]] = []
+#: Bumped whenever a watched router's routes are completed: an endpoint found
+#: on none of them is looked for again only after that.
+_WATCH_GENERATION = [0]
+#: The scrudful endpoints found on no watched router, with the generation.
+_UNCOVERED: weakref.WeakKeyDictionary[Any, int] = weakref.WeakKeyDictionary()
+
+
+def _remember_watched(router: APIRouter) -> None:
+    _WATCH_GENERATION[0] += 1
+    _WATCHED[:] = [ref for ref in _WATCHED if ref() is not None]
+    if not any(ref() is router for ref in _WATCHED):
+        _WATCHED.append(weakref.ref(router))
+
+
+def _uncovered_router(endpoint: Any) -> APIRouter | None:
+    """The router given :func:`add_options` that the scrudful ``endpoint``
+    is on although nothing registered it: its route was added past the
+    router's route-adding methods (appended to ``routes``, or by
+    ``APIRouter.add_api_route(router, ...)``, see :func:`_watch`).
+
+    The endpoint is registered now, so its responses get the HSR link when
+    its resource has an HSR route; and the router's index, rebuilt since
+    its routes changed, announces a resource without its routes
+    (:func:`_announce_unserved`). An endpoint found on none is looked for
+    again only after a watched router's routes change.
+    """
+    if _endpoint_config(endpoint) is None:
+        return None
+    try:
+        if _UNCOVERED.get(endpoint) == _WATCH_GENERATION[0]:
+            return None
+    except TypeError:  # not weakly referenceable
+        return None
+    for ref in list(_WATCHED):
+        router = ref()
+        if router is None or not _hsr_options(router).explicit:
+            continue
+        if any(
+            found is endpoint
+            for found, _, _ in _endpoints(router.routes, for_options=True)
+        ):
+            _ROUTER_ENDPOINTS[endpoint] = weakref.ref(router)
+            _scrudful_paths(router)
+            return router
+    _UNCOVERED[endpoint] = _WATCH_GENERATION[0]
+    return None
 
 
 #: The attribute of a router holding weak references to the routers whose
@@ -2371,7 +2589,9 @@ def _watch(owner: APIRouter) -> None:
     Each of those routers' route-adding methods (:data:`_ADDING_METHODS`)
     is wrapped, once, on the router itself: after a call adds routes, the
     routers watching it are completed. A route added otherwise (appended to
-    ``routes``) is not seen: :func:`_announce_unserved` warns of it.
+    ``routes``, or by the class's method) is not seen: its endpoint is found
+    when it responds (:func:`_uncovered_router`), and
+    :func:`_announce_unserved` warns of its resource.
     """
     pending: list[Any] = [owner]
     seen: set[int] = set()
@@ -2385,7 +2605,8 @@ def _watch(owner: APIRouter) -> None:
             watchers = []
             setattr(router, _WATCHERS_ATTRIBUTE, watchers)
             for name in _ADDING_METHODS:
-                setattr(router, name, _completing(router, getattr(router, name)))
+                method = getattr(router, name)
+                setattr(router, name, _completing(router, method, name))
         if not any(ref() is owner for ref in watchers):
             watchers.append(weakref.ref(owner))
         for route in router.routes:
@@ -2396,23 +2617,33 @@ def _watch(owner: APIRouter) -> None:
                 pending.append(inner)
 
 
-def _completing(router: APIRouter, method: Callable[..., T]) -> Callable[..., T]:
-    """``method``, a route-adding method of ``router``, completing the
-    routers watching it (see :func:`_watch`) once it has added the routes."""
+def _completing(
+    router: APIRouter, method: Callable[..., T], name: str
+) -> Callable[..., T]:
+    """``method``, the route-adding method ``name`` of ``router``,
+    completing the routers watching it (see :func:`_watch`) once it has
+    added the routes, with those it appended to ``router.routes``
+    (:func:`_complete`); after an ``include_router``, the routers newly
+    included are watched too."""
 
     @functools.wraps(method)
     def adding(*args: Any, **kwargs: Any) -> T:
         depth = vars(router).get(_ADDING_ATTRIBUTE, 0)
         setattr(router, _ADDING_ATTRIBUTE, depth + 1)
+        routes = router.routes
+        before = len(routes)
         try:
             result = method(*args, **kwargs)
         finally:
             setattr(router, _ADDING_ATTRIBUTE, depth)
         if depth == 0:
+            added = routes[before:] if router.routes is routes else None
             for ref in list(vars(router).get(_WATCHERS_ATTRIBUTE) or ()):
                 owner = ref()
                 if owner is not None and _hsr_options(owner).explicit:
-                    _complete(owner)
+                    _complete(owner, router, added)
+                    if name == "include_router":
+                        _watch(owner)
         return result
 
     return adding
@@ -3174,6 +3405,7 @@ def _add_hsr_routes(
             # First, ahead of a path such as "/{kind}/{id}" that matches it.
             routes.insert(0, route)
             setattr(owner, _HSR_ROUTE_ATTRIBUTE, route)
+            _routes_changed(owner.router)
         return
     by_key = getattr(owner, _HSR_ROUTE_ATTRIBUTE, None)
     if not isinstance(by_key, dict):
@@ -3189,6 +3421,7 @@ def _add_hsr_routes(
             include_in_schema=False,
         )
         routes.insert(0, by_key[key])
+    _routes_changed(owner)
 
 
 def _hsr_route_of(owner: FastAPI | APIRouter, key: str) -> Route | None:
@@ -3432,10 +3665,13 @@ def _covering_owners(request: Request) -> list[FastAPI | APIRouter]:
     if isinstance(app, FastAPI) and isinstance(options, _HsrOptions):
         if options.explicit:
             owners.append(app)
+    endpoint = request.scope.get("endpoint")
     router_ref = None
     with contextlib.suppress(TypeError):  # not weakly referenceable
-        router_ref = _ROUTER_ENDPOINTS.get(request.scope.get("endpoint"))
+        router_ref = _ROUTER_ENDPOINTS.get(endpoint)
     router = None if router_ref is None else router_ref()
+    if router is None and not owners:
+        router = _uncovered_router(endpoint)
     if router is not None:
         owners.append(router)
     return owners
@@ -3759,10 +3995,15 @@ def _check_options_callables(routes: Sequence[Any]) -> None:
     """Check the link callables the HTTP Schema Resource calls, as ``func()``
     (see :func:`add_options`): an endpoint's, and its ``error``'s."""
     for endpoint, config, _ in _endpoints(routes, for_options=True):
-        where = f"endpoint {_endpoint_name(endpoint)}"
-        _check_describe_call(config, "", where)
-        if config.error is not None:
-            _check_describe_call(config.error, "error.", where)
+        _check_endpoint_callables(endpoint, config)
+
+
+def _check_endpoint_callables(endpoint: Any, config: _EndpointConfig) -> None:
+    """:func:`_check_options_callables` of one endpoint."""
+    where = f"endpoint {_endpoint_name(endpoint)}"
+    _check_describe_call(config, "", where)
+    if config.error is not None:
+        _check_describe_call(config.error, "error.", where)
 
 
 def _check_describe_call(

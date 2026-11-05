@@ -399,8 +399,13 @@ Behaviour change (FastAPI)
   its callables checked then (it had none, and its responses no HSR link,
   silently, until ``add_options`` was called again): ``add_options(router)``
   wraps those methods on the routers. A route appended to the router's
-  ``routes`` still gets none until ``add_options`` is called again, and a
-  ``RuntimeWarning`` now names it.
+  ``routes`` (or by ``APIRouter.add_api_route(router, ...)``) still gets none
+  until ``add_options`` is called again, and a ``RuntimeWarning`` now names
+  it, at the latest when the route first responds. A copy of such a router
+  (``copy.copy``) shares the wrapped methods, and ``copy.deepcopy`` fails.
+* ``add_options`` called again on a router already included and serving
+  serves the HSR routes it adds at once, where FastAPI includes routers
+  lazily (it kept serving the routes it had).
 * A custom path convertor whose ``convert`` raises something other than
   ``ValueError`` or ``TypeError`` while the HSR link of a router's resource is
   built makes the request fail with it (it was taken as a refusal, and the
