@@ -821,6 +821,21 @@ def test_a_subclass_defining_a_removed_hook_is_a_type_error(name):
     assert "0.10.0 changelog" in message
 
 
+@pytest.mark.parametrize(
+    "name", ["determine_metadata_for_get", "_write", "required_conditional_headers"]
+)
+def test_a_mixin_defining_a_removed_hook_is_a_type_error(name):
+    """A metadata mixin before ScrudfulMetadata in the MRO would win as a
+    subclass's hook does (the final review's M6)."""
+    mixin = type("OldHooks", (), {name: lambda self, *args: {}})
+    with pytest.raises(TypeError) as info:
+        type("Custom", (mixin, ScrudfulMetadata), {})
+    message = str(info.value)
+    assert f"Custom.{name}" in message and "OldHooks" in message
+    # After ScrudfulMetadata in the MRO, the mixin's hook is never reached.
+    type("Fine", (ScrudfulMetadata, mixin), {})
+
+
 def test_determine_metadata_served_nowhere_is_a_type_error():
     """R18: OPTIONS has no body and the HSR route builds the document
     itself, so an override would silently do nothing, mixed in too."""

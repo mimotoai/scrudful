@@ -1933,14 +1933,15 @@ class ScrudfulMetadata(BaseMetadata):
     Raises
     ------
     TypeError
-        When a subclass defines one of the hooks of 0.9
-        (``determine_metadata_for_<method>``, ``_write``,
-        ``required_conditional_headers``): they took the request, and the
-        HTTP Schema Resource is built without one, so they would silently do
-        nothing. When a subclass, or a class it mixes in before this one,
-        defines ``determine_metadata``: its output would be served nowhere,
-        as scrudful's OPTIONS has no body and the :func:`hsr_urls` route
-        builds the document with :func:`http_schema_resource`.
+        When a subclass, or a class it mixes in before this one, defines
+        one of the hooks of 0.9 (``determine_metadata_for_<method>``,
+        ``_write``, ``required_conditional_headers``): they took the
+        request, and the HTTP Schema Resource is built without one, so they
+        would silently do nothing. When a subclass, or a class it mixes in
+        before this one, defines ``determine_metadata``: its output would be
+        served nowhere, as scrudful's OPTIONS has no body and the
+        :func:`hsr_urls` route builds the document with
+        :func:`http_schema_resource`.
     """
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -1959,13 +1960,17 @@ class ScrudfulMetadata(BaseMetadata):
                 "viewset's Meta instead (see the 0.10.0 changelog)"
             )
         for name in _REMOVED_METADATA_HOOKS:
-            if name in vars(cls):
+            # As for determine_metadata: a mixed-in class's would win too.
+            owner = next((k for k in overriding if name in vars(k)), None)
+            if owner is not None:
+                where = "" if owner is cls else f" (defined by {owner.__qualname__})"
                 raise TypeError(
-                    f"{cls.__qualname__}.{name}: ScrudfulMetadata no longer has "
-                    f"{name}. scrudful 0.10 builds the HTTP Schema Resource "
-                    "without a request, so customise it with the statuses= and "
-                    "entity= options of @scrudful / scrudful_api_view or the "
-                    "viewset's Meta instead (see the 0.10.0 changelog)"
+                    f"{cls.__qualname__}.{name}{where}: ScrudfulMetadata no "
+                    f"longer has {name}. scrudful 0.10 builds the HTTP Schema "
+                    "Resource without a request, so customise it with the "
+                    "statuses= and entity= options of @scrudful / "
+                    "scrudful_api_view or the viewset's Meta instead (see the "
+                    "0.10.0 changelog)"
                 )
 
     def determine_metadata(self, request: Request, view: APIView) -> dict[str, Any]:
