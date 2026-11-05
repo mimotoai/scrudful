@@ -2576,24 +2576,27 @@ def test_dependency_overrides_apply_to_the_checks(make_client):
     options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
 
 
-def test_body_reading_dependency_is_skipped_and_method_allowed(make_client):
-    """A security dependency that needs the body can't run without it: it is skipped,
-    and its method allowed (exact object-level ``Allow`` needs
-    ``allowed=``). The method's other dependencies still run."""
-    calls = []
+def body_security_app() -> FastAPI:
+    """``/notes/{id}``: PUT, POST and PATCH, each with a security dependency
+    that needs the request's body (at some depth), and a GET without one."""
 
     def needs_body(payload: NotePayload) -> None:
-        calls.append("needs_body")
+        BODY_CALLS.append("needs_body")
         raise HTTPException(status_code=403)
 
     def needs_field(name: str = Body(embed=True)) -> None:
-        calls.append("needs_field")
+        BODY_CALLS.append("needs_field")
         raise HTTPException(status_code=403)
 
     def wraps_body(inner: None = Depends(needs_body)) -> None:
-        calls.append("wraps_body")
+        BODY_CALLS.append("wraps_body")
 
     app = FastAPI()
+
+    @app.get("/notes/{id}", dependencies=[Security(require_role("reader"))])
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {}
 
     @app.put("/notes/{id}", dependencies=[Security(needs_body), Security(wraps_body)])
     @scrudful(**NOTE_LINKS)
@@ -2613,13 +2616,76 @@ def test_body_reading_dependency_is_skipped_and_method_allowed(make_client):
     async def patch(id: int):
         return {}
 
-    add_options(app, base_url=BASE)
+    return app
+
+
+#: The calls of :func:`body_security_app`'s security dependencies.
+BODY_CALLS: list[str] = []
+
+
+def test_a_security_dependency_needing_the_body_refuses_its_method(make_client):
+    """A security dependency that needs the body can't run on OPTIONS, which
+    has none: its method is not allowed, for every requester (fail closed),
+    and a ``RuntimeWarning`` names each such route, once, when the routes are
+    indexed (here by ``add_options``)."""
+    BODY_CALLS.clear()
+    app = body_security_app()
+    with pytest.warns(RuntimeWarning) as caught:
+        add_options(app, base_url=BASE)
+    messages = sorted(str(warning.message) for warning in caught)
+    assert len(messages) == 3
+    for method, endpoint in (("PATCH", "patch"), ("POST", "act"), ("PUT", "write")):
+        assert any(
+            f"{method} '/notes/{{id}}'" in message and f"{endpoint}" in message
+            for message in messages
+        ), method
+    assert all("allowed=" in message for message in messages)
     client = make_client(app)
-    options_204(client, "/notes/1", "PUT, POST, OPTIONS", NOTE_TARGET)
-    options_204(
-        client, "/notes/1", "PUT, POST, OPTIONS, PATCH", NOTE_TARGET, headers=ADMIN
-    )
-    assert calls == []
+    # No warning again (the suite runs with warnings as errors).
+    options_204(client, "/notes/1", "OPTIONS", NOTE_TARGET)
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET, headers=READER)
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET, headers=ADMIN)
+    assert BODY_CALLS == []
+
+
+def test_an_allowed_hook_decides_a_method_whose_security_needs_the_body(
+    make_client,
+):
+    """With ``allowed``, no security dependency runs: the hook decides, and
+    nothing is announced."""
+    BODY_CALLS.clear()
+    app = body_security_app()
+    add_options(app, base_url=BASE, allowed=lambda request, method, obj: True)
+    options_204(make_client(app), "/notes/1", "GET, PUT, POST, OPTIONS, PATCH")
+    assert BODY_CALLS == []
+
+
+def test_a_route_added_later_whose_security_needs_the_body_is_announced(
+    make_client,
+):
+    """A route added after ``add_options`` is announced when the routes are
+    indexed again (its first request)."""
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {}
+
+    add_options(app, base_url=BASE)
+
+    def needs_body(payload: NotePayload) -> None:  # pragma: no cover
+        raise HTTPException(status_code=403)
+
+    @app.put("/notes/{id}", dependencies=[Security(needs_body)])
+    @scrudful(**NOTE_LINKS)
+    async def write(id: int):
+        return {}
+
+    client = make_client(app)
+    with pytest.warns(RuntimeWarning, match=r"PUT '/notes/\{id\}'"):
+        options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
 
 
 def test_a_yield_dependency_is_cleaned_up(make_client):

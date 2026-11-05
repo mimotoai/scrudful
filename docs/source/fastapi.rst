@@ -273,8 +273,12 @@ Things to know:
   it with ``Security(...)``, or give ``allowed``. A security dependency runs
   whole, with its sub-dependencies, plain ones included: a database session or
   a throttle a ``get_current_user`` depends on runs for each method checked.
-  One that needs the request body can't be resolved: it is skipped, and does
-  not refuse its method.
+  One that needs the request body (a body, form or file parameter, at any
+  depth) can't be resolved on OPTIONS, which has none: its method is **not
+  allowed**, for every requester (it fails closed, rather than listing a
+  method its check never ran for), and a ``RuntimeWarning`` names the route,
+  once, when the routes are indexed (by ``add_options``, or by a request
+  after routes were added). Give ``allowed`` to decide such a method.
 * **Object-level rules need** ``allowed`` (and ``load``): the security
   dependencies have no object. With ``allowed``, every requester passes step 2,
   so the object is loaded for each: ``load`` should then hide (``None``, or a

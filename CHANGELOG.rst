@@ -355,6 +355,11 @@ Behaviour change (FastAPI)
   body; a plain dependency, a throttle in ``dependencies=`` say, is not run.
   ``load(request, **path_params)`` is called only for a URL with path
   parameters, with all of them.
+* A security dependency that needs the request's body (a body, form or file
+  parameter, at any depth) refuses its method in ``Allow``, for every
+  requester, unless ``add_options(allowed=)`` decides (it was skipped, and the
+  method listed for everyone); a ``RuntimeWarning`` names each such route,
+  once, when the routes are indexed.
 * The HSR describes the route's ``status_code=`` and the statuses of its
   ``responses=`` (was the status code only), the endpoint's ``entity=`` media
   type (was always ``application/json``); a declared success media type

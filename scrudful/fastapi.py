@@ -1142,7 +1142,11 @@ def add_options(
        on OPTIONS too. Keep such work out of security dependencies, or
        give ``allowed``. A security dependency that needs the
        request's body (a body, form or file parameter, at any depth) can't
-       be resolved: it is skipped, and does not refuse its method. ``HEAD``
+       be resolved on OPTIONS, which has none: its method is not allowed,
+       for every requester (it fails closed), and a ``RuntimeWarning``
+       names the route, once, when the routes are indexed (by this call,
+       or by a request after routes were added); give ``allowed`` to
+       decide such a method. ``HEAD``
        is listed only when a route serves it (FastAPI's GET route doesn't;
        list ``"HEAD"`` in its methods, as ``@app.head`` does), with that
        route's checks.
@@ -1682,8 +1686,10 @@ def _paths_index(owner: FastAPI | APIRouter) -> _PathsIndex:
     index = _PathsIndex(fingerprint or (), paths, by_route, by_endpoint)
     if fingerprint is not None:
         options.index = index
-    if options.explicit and not isinstance(owner, FastAPI):
-        _announce_unserved(owner, options, paths)
+    if options.explicit:
+        _announce_bodies(options, paths)
+        if not isinstance(owner, FastAPI):
+            _announce_unserved(owner, options, paths)
     return index
 
 
@@ -2661,39 +2667,53 @@ async def _may_use(method: str, found: tuple[Any, Scope]) -> bool:
     ``found`` (with the scope it gets), by the route's security dependencies
     (:func:`_security_dependencies`), resolved on a copy of the scope with
     ``method`` (:func:`_resolves`). A route without dependencies (a Starlette
-    ``Route``) has none: allowed."""
+    ``Route``) has none: allowed. One with a security dependency that needs
+    the request's body, which OPTIONS doesn't have, can't be checked: not
+    allowed, for every requester (announced, see :func:`_announce_body`)."""
     route, scope = found
     dependant = getattr(route, "dependant", None)
     if dependant is None:
         return True
-    checks = _security_dependencies(route, dependant)
+    checks, body = _security_dependencies(route, dependant)
+    if body:
+        _announce_body(route)
+        return False
     if not checks:
         return True
     return await _resolves(route, checks, {**scope, "method": method})
 
 
-def _security_dependencies(route: Any, dependant: Any) -> list[Any]:
+def _security_dependencies(route: Any, dependant: Any) -> tuple[list[Any], bool]:
     """The sub-dependants of ``route``'s ``dependant`` that the per-method
-    checks of OPTIONS resolve: the security dependencies, wherever they are
-    declared (a parameter of the endpoint, or ``dependencies=`` of the
-    route, its routers, ``include_router`` or the app). A security
-    dependency is one declared with ``Security(...)`` (see
-    :func:`_parameterless_security` for those of ``dependencies=``), or one
-    whose subtree has a security scheme (a ``fastapi.security`` class such
-    as ``HTTPBearer``) or a ``Security(...)``: the ``Depends(get_current_user)``
-    of a user resolved from a token (:func:`_uses_security`). Of those, any
-    that needs the request's body (a body, form or file parameter anywhere
-    below it) is left out: it can't be resolved without the body. No other
+    checks of OPTIONS resolve, and whether one of them needs the request's
+    body.
+
+    The security dependencies, wherever they are declared (a parameter of
+    the endpoint, or ``dependencies=`` of the route, its routers,
+    ``include_router`` or the app). A security dependency is one declared
+    with ``Security(...)`` (see :func:`_parameterless_security` for those
+    of ``dependencies=``), or one whose subtree has a security scheme (a
+    ``fastapi.security`` class such as ``HTTPBearer``) or a
+    ``Security(...)``: the ``Depends(get_current_user)`` of a user resolved
+    from a token (:func:`_uses_security`). One that needs the request's body
+    (a body, form or file parameter anywhere below it) can't be resolved
+    without it: the caller refuses the method (it fails closed). No other
     dependency of the route (a plain ``Depends`` without a scheme below it,
     even in ``dependencies=``: a throttle, a database write) and never the
     endpoint is resolved. A security dependency is resolved whole, though,
     its plain sub-dependencies included: what those consume or write (a
     throttle or a session a ``get_current_user`` depends on), the checks do
     too.
+
+    Raises
+    ------
+    RuntimeError
+        As :func:`_parameterless_security`.
     """
     declared = _declared_security(getattr(dependant, "call", None))
     parameterless = _parameterless_security(route, dependant)
     checks = []
+    body = False
     for sub in getattr(dependant, "dependencies", None) or ():
         name = getattr(sub, "name", None)
         secured = (
@@ -2701,9 +2721,58 @@ def _security_dependencies(route: Any, dependant: Any) -> list[Any]:
             if name is None
             else name in declared
         )
-        if (secured or _uses_security(sub)) and not _needs_body(sub):
-            checks.append(sub)
-    return checks
+        if secured or _uses_security(sub):
+            if _needs_body(sub):
+                body = True
+            else:
+                checks.append(sub)
+    return checks, body
+
+
+#: The attribute of a route marking that :func:`_announce_body` announced it.
+_BODY_ANNOUNCED_ATTRIBUTE = "_scrudful_body_announced"
+
+
+def _announce_body(route: Any) -> None:
+    """Warn, once per route, that ``route`` has a security dependency that
+    needs the request's body, so that OPTIONS leaves its methods out of
+    ``Allow`` for every requester (see :func:`_may_use`)."""
+    original = getattr(route, "original_route", route)
+    if getattr(original, _BODY_ANNOUNCED_ATTRIBUTE, False):
+        return
+    with contextlib.suppress(AttributeError, TypeError):
+        setattr(original, _BODY_ANNOUNCED_ATTRIBUTE, True)
+    methods = ", ".join(sorted(getattr(route, "methods", None) or ()))
+    endpoint = _endpoint_name(getattr(route, "endpoint", None))
+    warnings.warn(
+        f"{methods} {getattr(route, 'path', route)!r} ({endpoint}) has a "
+        "security dependency that needs the request's body, which OPTIONS "
+        "doesn't have: Allow leaves the method out for every requester. "
+        "Give add_options allowed= to decide it, or declare the dependency "
+        "without the body",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+def _announce_bodies(options: _HsrOptions, paths: Mapping[str, _Resource]) -> None:
+    """:func:`_announce_body` of the routes of ``paths`` whose security
+    dependencies need the body, when they decide ``Allow`` (no ``allowed``
+    hook). A route whose dependencies can't be read is left to OPTIONS,
+    which raises its ``RuntimeError``."""
+    if options.allowed is not None:
+        return
+    for resource in paths.values():
+        for route in resource.routes:
+            dependant = getattr(route, "dependant", None)
+            if dependant is None:
+                continue
+            try:
+                _, body = _security_dependencies(route, dependant)
+            except RuntimeError:
+                continue
+            if body:
+                _announce_body(route)
 
 
 def _parameterless_security(route: Any, dependant: Any) -> list[Any]:
