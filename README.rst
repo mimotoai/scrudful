@@ -227,9 +227,9 @@ order:
    * DRF authenticates the requester and throttles the request as its
      ``initial()`` does, so bad credentials get DRF's 401 (or 403);
    * django-ninja throttles the request once, as ninja would throttle the
-     operation, but runs no authentication of its own: each method's
-     ``auth=`` callbacks run in step 4, and bad credentials make the requester
-     anonymous;
+     operation, but runs no authentication of its own: each operation's
+     ``auth=`` callbacks run in steps 3 and 4, and bad credentials make the
+     requester anonymous;
    * FastAPI runs no dependency for OPTIONS itself: only the per-method
      security checks of step 4.
 3. On an item URL, the object is loaded with the view's own loader, only once
@@ -237,14 +237,27 @@ order:
    tell which objects exist:
 
    * DRF: ``get_object()``, once at least one method passes its view-level
-     permissions (a method with an ``allowed_func`` always passes);
+     permissions (a method with an ``allowed_func`` always passes). It loads
+     once for each distinct action of the methods that passed (``retrieve``
+     first, when GET passed), as that action loads it, so a ``get_queryset``
+     scoped by ``self.action`` is checked per action; a view that isn't a
+     viewset loads once for each method that passed. The first load's 404
+     is the answer; a 401, 403 or 404 from another method's load, object
+     permission or ``allowed_func`` leaves out only that method. An item
+     OPTIONS of a ``ModelViewSet`` may so run four ``get_object()`` calls;
    * django-ninja: the ``load`` of the GET operation (else of the first with
      one), once that operation's own ``auth=`` and ``before=`` allow the
-     requester, with or without an ``allowed=`` hook;
+     requester, with or without an ``allowed=`` hook. Without a hook, each
+     other item operation whose ``load`` differs also runs that ``load`` in
+     step 4, once its ``auth=`` and ``before=`` pass, as a check of its own
+     method: any ``HttpError``, ``Http404`` or ``PermissionDenied`` it raises
+     leaves out only that method;
    * FastAPI: ``add_options(load=...)``, once at least one method passes its
      security dependencies (every method does with ``allowed=``).
 
-   Without an object (a collection, a loader returning ``None``, or a gate
+   Since they run on OPTIONS, loaders must be free of side effects (no
+   writes, no audit records): an OPTIONS runs each one it calls as the
+   method's own request would. Without an object (a collection, a loader returning ``None``, or a gate
    that refused) the object-level checks get ``obj=None``; a 404 the loader
    raises is the answer, with the error entity's Links and the HSR link.
 4. Each method the path serves is checked for this requester, on a copy of
@@ -254,8 +267,9 @@ order:
    ============  ===========================================  ==========================================
    Adapter       Hook                                         Default checks
    ============  ===========================================  ==========================================
-   django-ninja  ``allowed(request, method, obj)``, on the    the operation's ``auth=`` callbacks and
-                 operation or the ``ScrudfulRouter``          its ``before=``
+   django-ninja  ``allowed(request, method, obj)``, on the    the operation's ``auth=`` callbacks, its
+                 operation or the ``ScrudfulRouter``          ``before=``, then its own ``load`` when
+                                                              it differs from step 3's
    DRF           ``allowed_func(view, request, method,        the permission classes:
                  obj)``, on the handler or ``Meta``           ``check_permissions``, then, with an
                                                               object, ``check_object_permissions``
@@ -266,10 +280,10 @@ order:
 
    No throttle and no handler runs per method, so computing ``Allow`` uses
    no throttle quota. The checks themselves run per method: django-ninja's
-   ``auth=`` callbacks and ``before``, DRF's permission classes and, for
-   FastAPI, each security dependency whole, with the plain dependencies
-   nested inside it (a database session, a throttle a ``get_current_user``
-   depends on). Whatever they write, they write for each method checked.
+   ``auth=`` callbacks, ``before`` and own ``load``, DRF's permission classes
+   (and ``get_object()`` per action) and, for FastAPI, each security
+   dependency whole, with the plain dependencies nested inside it (a
+   database session, a throttle a ``get_current_user`` depends on). Whatever they write, they write for each method checked.
 5. ``Allow`` lists the allowed methods and ``OPTIONS``; ``HEAD`` only when the
    path serves it. A 405 keeps RFC 9110's ``Allow`` for django-ninja and DRF:
    every method the path serves, whoever asks (FastAPI's 405 is
@@ -310,8 +324,9 @@ Link callables in describe mode
 -------------------------------
 
 The HSR is built without a request, so scrudful calls the link callables (the
-schema and context URL, ``rel`` and ``type`` of every entity, error entities
-included) in *describe* mode:
+schema and context URL and ``type`` of every entity, error entities
+included; ``rel`` callables are only called on responses) in *describe*
+mode:
 
 * django-ninja: ``func(None, None)``, neither request nor object;
 * DRF: ``func(view, None)``, with a request-less view instance: the route's
@@ -836,7 +851,8 @@ application does what the next list says, scrudful guarantees that:
   authorization, or your hook, decides) and the HTTP Schema Resource link;
 * the HTTP Schema Resource is served by ``GET`` as ``application/json``, with
   the published HTTP Schema Resource Links, the same bytes for every
-  requester, a strong ``ETag`` and ``Cache-Control: public``; it lists every
+  requester, a strong ``ETag`` and ``Cache-Control`` (``public, max-age=300``
+  unless you set another); it lists every
   method of the path with its success statuses and media types, a ``default``
   error entry, and ``options`` as a 204 without content;
 * Link header targets and every URI in the HTTP Schema Resource are absolute,
