@@ -3262,9 +3262,9 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
 
                 @functools.wraps(handler)
                 async def wrapper(request: HttpRequest, **values: Any) -> Any:
-                    _check_hooks_allowed(config, label)
                     try:
-                        content = await _run_async(flow(request, values, answers))
+                        with _entered(config, label):
+                            content = await _run_async(flow(request, values, answers))
                     except Exception as exc:
                         _note_raised(exc, config)
                         raise
@@ -3275,9 +3275,9 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
 
                 @functools.wraps(handler)
                 def wrapper(request: HttpRequest, **values: Any) -> Any:
-                    _check_hooks_allowed(config, label)
                     try:
-                        content = _run_sync(flow(request, values, answers))
+                        with _entered(config, label):
+                            content = _run_sync(flow(request, values, answers))
                     except Exception as exc:
                         _note_raised(exc, config)
                         raise
@@ -3462,6 +3462,9 @@ class _Raised:
     #: Whether the operation's hooks (``before``, ``after_throttles``) ran
     #: and allowed the request (see :func:`_check_hooks_allowed`).
     hooks_allowed: bool = False
+    #: Whether its wrapper is running (the handler with hooks, see
+    #: :func:`_entered`): calling it again then is a nested call.
+    running: bool = False
     #: Whether its wrapper returned: its response then has its Links, whose
     #: callables got the loaded object, so a declared status of it is not
     #: described again (they would get ``None``).
@@ -4710,7 +4713,9 @@ def _check_hooks_allowed(config: _Config, label: str) -> None:
     re-applying ``Operation.run``'s decorators), the request fails instead
     of going on unchecked. So does a call of the decorated handler from
     inside another operation (its function calling it directly): that
-    operation's hooks ran for the request, not this one's.
+    operation's hooks ran for the request, not this one's; and so does a
+    call of it from inside itself, while it runs (see :func:`_entered`): its
+    hooks ran for the request's path parameters, not for that call's.
     """
     if not config.hooks:
         return
@@ -4723,11 +4728,39 @@ def _check_hooks_allowed(config: _Config, label: str) -> None:
             "Refusing the request: move the code both need into a plain "
             "function and call that, not the decorated handler."
         )
+    if raised is not None and raised.running:
+        raise RuntimeError(
+            f"{label} was called directly from inside itself, while its "
+            f"operation runs, so its {config.hooks_label} ran for the "
+            "request's path parameters, not for this call's. Refusing the "
+            "request: move the code both need into a "
+            "plain function and call that, not the decorated handler."
+        )
     if raised is None or not raised.hooks_allowed:
         raise RuntimeError(
             f"{label}: {config.hooks_label} didn't run for this request: the operation "
             "ninja served lacks scrudful's checks. Refusing the request."
         )
+
+
+@contextlib.contextmanager
+def _entered(config: _Config, label: str) -> Iterator[None]:
+    """Run the wrapper of ``config``'s operation within, once
+    :func:`_check_hooks_allowed` allowed it; with hooks, marked running in
+    the request's :class:`_Raised` meanwhile, so that the handler calling
+    itself (for other path values, say) is refused as a nested call, while
+    calling it again once it returned (an operation decorator retrying it)
+    isn't."""
+    _check_hooks_allowed(config, label)
+    raised = _running(config) if config.hooks else None
+    if raised is None:
+        yield
+        return
+    raised.running = True
+    try:
+        yield
+    finally:
+        raised.running = False
 
 
 def _refuse_hook_result(name: str, result: Any, asynchronous: bool) -> NoReturn:

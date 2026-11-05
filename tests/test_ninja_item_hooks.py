@@ -5,6 +5,7 @@ throttles, ``after_throttles``, then the parameters and body, ``load`` and
 the preconditions (412, 428, 304)."""
 
 import asyncio
+import functools
 import json
 import types
 import uuid
@@ -752,6 +753,77 @@ def test_a_handler_with_hooks_called_from_another_operation_fails_closed(
     assert "get_b()" in message and "get_a()" in message and f"{hook}=" in message
     assert "plain function" in message
     assert log == (["a.before", "a.handler"] if caller_hooks else ["a.handler"])
+
+
+def reentering_router(asynchronous: bool, log: list[Any]) -> Router:
+    """``/i/{pk}``, whose ``before`` allows only pk 1, and whose handler for
+    pk 1 calls itself, the decorated handler, for pk 2 with ``?peek=1``."""
+
+    def only_one(request, pk, **params):
+        log.append(("before", pk))
+        if int(pk) != 1:
+            raise HttpError(403, "only pk 1")
+
+    def load(request, pk, **params):
+        log.append(("load", pk))
+        return {"id": pk, "name": "secret", "version": 1}
+
+    router = Router()
+    if asynchronous:
+
+        @router.get("/i/{pk}", response=ItemOut)
+        @scrudful(load=load, before=only_one)
+        async def get_item(request, pk: int, response: HttpResponse, obj):
+            if pk == 1 and request.GET.get("peek"):
+                return await get_item(request, pk=2, response=response)
+            return obj
+
+    else:
+
+        @router.get("/i/{pk}", response=ItemOut)
+        @scrudful(load=load, before=only_one)
+        def get_item(request, pk: int, response: HttpResponse, obj):
+            if pk == 1 and request.GET.get("peek"):
+                return get_item(request, pk=2, response=response)
+            return obj
+
+    return router
+
+
+@ASYNC
+def test_a_handler_with_hooks_calling_itself_fails_closed(asynchronous):
+    """A handler with hooks calling itself, the decorated handler, while its
+    operation runs (for other path values) raises the nested-call
+    ``RuntimeError``: its ``before`` ran for the request's values only."""
+    log: list[Any] = []
+    request = requester(asynchronous, api_for(reentering_router(asynchronous, log)))
+    assert request("GET", "/i/2").status_code == 403
+    assert request("GET", "/i/1").status_code == 200
+    log.clear()
+    with pytest.raises(RuntimeError, match="called directly from inside") as raised:
+        request("GET", "/i/1?peek=1")
+    message = str(raised.value)
+    assert "get_item()" in message and "before=" in message
+    assert "plain function" in message
+    assert log == [("before", "1"), ("load", 1)]
+
+
+def test_an_operation_decorator_may_run_the_handler_twice():
+    """Calling the handler again once it returned (an operation decorator
+    retrying it) isn't a nested call."""
+
+    def twice(func):
+        @functools.wraps(func)
+        def retried(request, *args, **kwargs):
+            func(request, *args, **kwargs)
+            return func(request, *args, **kwargs)
+
+        return retried
+
+    log: list[Any] = []
+    api = api_for(reentering_router(False, log), decorator=twice)
+    assert TestClient(api).get("/i/1").status_code == 200
+    assert log == [("before", "1"), ("load", 1), ("load", 1)]
 
 
 def test_a_handler_called_from_another_operation_notes_nothing_of_it():
