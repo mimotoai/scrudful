@@ -210,7 +210,10 @@ The optional ``SCRUDFUL`` Django setting is a dict of these keys; a viewset's
    * - ``"HSR_CACHE_CONTROL"``
      - ``Meta.hsr_cache_control``
      - The ``Cache-Control`` of the HSR route (default ``public,
-       max-age=300``).
+       max-age=300``): a non-empty ``str`` without control characters (a
+       tab aside) or characters outside Latin-1, which no field can carry
+       (``ImproperlyConfigured`` when given; ``scrudful.E006`` for the
+       setting).
    * - ``"ERROR"``
      - ``error=``, ``Meta.error``, ``Meta.list_error``
      - The API-wide error ``Entity``: the errors DRF answers itself for a
@@ -393,6 +396,14 @@ With ``ScrudfulMetadata`` installed, OPTIONS is answered in this order:
    ``Access-Control-Expose-Headers``. No throttle and no handler runs per
    method.
 
+Each check and load of steps 3 to 5 runs on a clone of the request with the
+method checked in ``request.method``, while ``request.META["REQUEST_METHOD"]``
+stays ``"OPTIONS"``, the request line's method (scrudful sets it to
+``"OPTIONS"`` on an OPTIONS whose ``META`` lacks it, as a request built by
+hand may): a ``get_queryset`` that locks its row with
+``select_for_update()`` should lock only when it isn't ``"OPTIONS"`` (see
+"Concurrency" in :doc:`usage`).
+
 ``allowed_func(view, request, method, obj) -> bool`` (on a handler, or
 ``Meta.allowed_func`` for every handler of a viewset), when given, alone decides
 its method: ``request`` is a request of ``method``, ``obj`` the loaded object
@@ -418,7 +429,8 @@ permission (``has_permission``), or the first loaded method's object permission
 and HSR link), as the method's own request would be answered, so ``Allow``
 never reveals a resource a check hides. Once the first method's request
 reaches the object, another method's object permission or ``allowed_func``
-raising it, or that method's own load, leaves out only that method.
+raising it leaves out only that method, and another load raising it only
+the methods it was loaded for (its action's, on a viewset).
 This differs from ninja and FastAPI, where a 404 that a method's ``auth=`` /
 ``before`` or security dependency raises refuses only that method, and their
 hooks' 404 is always the answer.

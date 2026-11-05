@@ -90,7 +90,9 @@ again), and adds the routes still missing:
        responses link to it as it returns it.
    * - ``hsr_cache_control``
      - The ``Cache-Control`` of the HSR route (default ``public,
-       max-age=300``).
+       max-age=300``): a non-empty ``str`` without control characters (a
+       tab aside) or characters outside Latin-1, which no field can carry
+       (``ValueError``).
    * - ``allowed``
      - ``allowed(request, method, obj) -> bool``: when given, it alone
        decides each method of ``Allow`` (see `OPTIONS and Allow`_).
