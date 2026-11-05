@@ -118,13 +118,16 @@ def is_preflight(method: str, get_header: Callable[[str], str | None]) -> bool:
 def absolute_for_hsr(url: str, base_url: str | None, what: str) -> str:
     """``url`` as an absolute URI for the HSR, which never depends on the request.
 
+    A URL with a scheme is absolute (RFC 3986 section 4.3), with an
+    authority or without one (``urn:example:schema``, ``tag:...``), and kept
+    as is; any other is resolved against ``base_url``.
+
     Raises
     ------
     HsrConfigError
         If ``url`` is relative and there is no ``base_url``.
     """
-    parts = urlsplit(url)
-    if parts.scheme and parts.netloc:
+    if urlsplit(url).scheme:
         return url
     if base_url:
         return resolve_uri(url, base_url)

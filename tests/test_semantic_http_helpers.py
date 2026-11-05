@@ -311,6 +311,21 @@ def test_hsr_get_problems_person_fixture():
     assert hsr_get_problems(200, h, body) == []
 
 
+def test_hsr_get_problems_wants_a_strong_etag():
+    """The HSR's ETag is strong (Semantic HTTP 0.1): a weak one is a problem
+    (the final review's M3)."""
+    body = (FIXTURES / "person.http-schema-resource.json").read_bytes()
+    h = {
+        "Content-Type": "application/json",
+        "Link": HSR_RESPONSE_LINKS,
+        "ETag": 'W/"x"',
+        "Cache-Control": "public, max-age=300",
+    }
+    assert hsr_get_problems(200, h, body) == ["HSR with a weak ETag 'W/\"x\"'"]
+    assert hsr_get_problems(200, {**h, "ETag": 'w/"x"'}, body)
+    assert hsr_get_problems(200, {**h, "ETag": '"x"'}, body) == []
+
+
 def test_undescribed_problems():
     hsr = json.loads((FIXTURES / "person.http-schema-resource.json").read_text())
     html = {"Content-Type": "text/html; charset=utf-8"}

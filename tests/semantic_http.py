@@ -317,8 +317,13 @@ def hsr_get_problems(
         problems.append("the HSR describedby link is not the HTTP Schema Resource's")
     if [t for t, _ in _context_links(links)] != [HSR_CONTEXT_URL]:
         problems.append("the HSR context link is not the HTTP Schema Resource's")
-    if _header(headers, "etag") is None:
+    etag = _header(headers, "etag")
+    if etag is None:
         problems.append("HSR without ETag")
+    elif etag.startswith("W/"):
+        problems.append(f"HSR with a weak ETag {etag!r}")
+    elif not (len(etag) >= 2 and etag[0] == etag[-1] == '"'):
+        problems.append(f"HSR ETag {etag!r} is not a strong entity-tag")
     cache_control = _header(headers, "cache-control") or ""
     if "public" not in [d.strip().lower() for d in cache_control.split(",")]:
         problems.append(f"HSR Cache-Control {cache_control!r} lacks public")
