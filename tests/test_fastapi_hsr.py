@@ -1144,7 +1144,34 @@ def test_add_options_stores_its_options():
         options.hsr_route = True  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
         options.config.base_url = None  # type: ignore[misc, union-attr]
+    # Nor can the configuration be swapped for another one, unchecked.
+    with pytest.raises(AttributeError):
+        options.config = None  # type: ignore[misc]
+    assert options.config is not None and options.config.load is load
     assert options.explicit and not _hsr_options(FastAPI()).explicit
+
+
+@pytest.mark.parametrize(
+    "fields, error, match",
+    [
+        ({"hsr_route": False}, ValueError, "hsr_route=False needs hsr_url"),
+        ({"base_url": "/v1/"}, ValueError, "base_url"),
+        ({"hsr_cache_control": ""}, ValueError, "hsr_cache_control"),
+        ({"hsr_cache_control": "a\r\nb"}, ValueError, "hsr_cache_control"),
+        ({"hsr_cache_control": 300}, TypeError, "hsr_cache_control"),
+        ({"hsr_route": "yes"}, TypeError, "hsr_route"),
+        ({"hsr_url": "https://x/"}, TypeError, "hsr_url"),
+        ({"allowed": True}, TypeError, "allowed"),
+        ({"load": "x"}, TypeError, "load"),
+    ],
+)
+def test_the_options_configuration_checks_itself(fields, error, match):
+    """The rules of the options are the configuration's own: one made
+    anywhere, not only by add_options, is checked."""
+    from scrudful.fastapi import _HsrConfig
+
+    with pytest.raises(error, match=match):
+        _HsrConfig(**fields)
 
 
 @pytest.mark.parametrize(

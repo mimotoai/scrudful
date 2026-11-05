@@ -27,7 +27,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import Annotated, Any, NamedTuple, TypeVar, get_args, get_origin
 from urllib.parse import quote
 
@@ -1004,9 +1004,22 @@ class _Serialized(NamedTuple):
 
 @dataclass(frozen=True)
 class _HsrConfig:
-    """The :func:`add_options` options of an app or router, checked
-    (:func:`_check_hsr_options`): fixed once given, since the caches of its
-    :class:`_HsrOptions` are valid only for them."""
+    """The :func:`add_options` options of an app or router, checked when
+    made, wherever it is made: fixed once given, since the caches of its
+    :class:`_HsrOptions` are valid only for them. :func:`_check_hsr_options`
+    gives it ``add_options``' arguments, their ``None`` defaults resolved.
+
+    Raises
+    ------
+    TypeError
+        If ``hsr_cache_control`` is not a ``str``, ``hsr_route`` not a
+        ``bool``, or ``hsr_url``, ``allowed`` or ``load`` not callable (nor
+        ``None``).
+    ValueError
+        If ``base_url`` is not an absolute URL, ``hsr_cache_control`` is not
+        a usable ``Cache-Control`` value (both ``HsrConfigError``), or
+        ``hsr_route`` is off without ``hsr_url``.
+    """
 
     base_url: str | None = None
     hsr_route: bool = True
@@ -1016,6 +1029,31 @@ class _HsrConfig:
     allowed: Callable[..., Any] | None = None
     #: ``load(request, **path_params)``, the object of the OPTIONS checks.
     load: Callable[..., Any] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.hsr_cache_control, str):
+            raise TypeError(
+                "hsr_cache_control must be a str, not "
+                f"{type(self.hsr_cache_control).__name__}"
+            )
+        if not isinstance(self.hsr_route, bool):
+            raise TypeError(
+                "hsr_route must be a bool or None, not "
+                f"{type(self.hsr_route).__name__}"
+            )
+        for name in ("hsr_url", "allowed", "load"):
+            value = getattr(self, name)
+            if value is not None and not callable(value):
+                raise TypeError(f"{name} must be callable, not {type(value).__name__}")
+        if self.base_url is not None:
+            check_base_url(self.base_url, "base_url")
+        check_hsr_cache_control(self.hsr_cache_control, "hsr_cache_control")
+        if not self.hsr_route and self.hsr_url is None:
+            raise ValueError(
+                "hsr_route=False needs hsr_url=, hsr_url(path): the URL each "
+                "path's HTTP Schema Resource is served at (see "
+                "http_schema_resource_endpoint), which every resource links to"
+            )
 
 
 #: The options of an app or router :func:`add_options` wasn't given, for
@@ -1027,11 +1065,13 @@ _DEFAULT_HSR_CONFIG = _HsrConfig()
 class _HsrOptions:
     """An app's or router's :func:`add_options` configuration (``config``,
     ``None`` without it), and what scrudful keeps for it: its built HTTP
-    Schema Resources, its index and its completion. The configuration's
-    fields read through, and can't be assigned: calling :func:`add_options`
-    again replaces the whole."""
+    Schema Resources, its index and its completion. The configuration, given
+    when made, and its fields read through, and can't be assigned: calling
+    :func:`add_options` again replaces the whole."""
 
-    config: _HsrConfig | None = None
+    #: The configuration (see :attr:`config`), set only when made.
+    given: InitVar[_HsrConfig | None] = None
+    _given: _HsrConfig | None = field(init=False, default=None, repr=False)
     #: Each built document, by resource key and ``id`` of the
     #: :func:`add_error_links` entity it describes (a router included in
     #: several apps has one per app's entity, ``None``'s for an app without
@@ -1053,15 +1093,23 @@ class _HsrOptions:
     #: left them (see :func:`_complete`).
     completion: _Completion | None = field(default=None, compare=False, repr=False)
 
+    def __post_init__(self, given: _HsrConfig | None) -> None:
+        self._given = given
+
+    @property
+    def config(self) -> _HsrConfig | None:
+        """The :func:`add_options` options, ``None`` without it."""
+        return self._given
+
     @property
     def explicit(self) -> bool:
         """Whether :func:`add_options` gave the options (else they are the
         defaults, for :func:`http_schema_resource` on an app without it)."""
-        return self.config is not None
+        return self._given is not None
 
     @property
     def _config(self) -> _HsrConfig:
-        return _DEFAULT_HSR_CONFIG if self.config is None else self.config
+        return _DEFAULT_HSR_CONFIG if self._given is None else self._given
 
     @property
     def base_url(self) -> str | None:
@@ -1507,31 +1555,11 @@ def _check_hsr_options(
     allowed: Any,
     load: Any,
 ) -> _HsrConfig:
-    """The :func:`add_options` options, checked."""
-    if hsr_cache_control is not None and not isinstance(hsr_cache_control, str):
-        raise TypeError(
-            f"hsr_cache_control must be a str, not {type(hsr_cache_control).__name__}"
-        )
+    """The :func:`add_options` options, checked (by :class:`_HsrConfig`),
+    their ``None`` defaults resolved."""
     if hsr_route is None:
         # As ninja's and DRF's None, which read a setting FastAPI hasn't.
         hsr_route = True
-    if not isinstance(hsr_route, bool):
-        raise TypeError(
-            f"hsr_route must be a bool or None, not {type(hsr_route).__name__}"
-        )
-    for name, value in (("hsr_url", hsr_url), ("allowed", allowed), ("load", load)):
-        if value is not None and not callable(value):
-            raise TypeError(f"{name} must be callable, not {type(value).__name__}")
-    if base_url is not None:
-        check_base_url(base_url, "base_url")
-    if hsr_cache_control is not None:
-        check_hsr_cache_control(hsr_cache_control, "hsr_cache_control")
-    if not hsr_route and hsr_url is None:
-        raise ValueError(
-            "hsr_route=False needs hsr_url=, hsr_url(path): the URL each "
-            "path's HTTP Schema Resource is served at (see "
-            "http_schema_resource_endpoint), which every resource links to"
-        )
     return _HsrConfig(
         base_url=base_url,
         hsr_route=hsr_route,
