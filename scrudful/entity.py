@@ -70,8 +70,8 @@ class Entity:
         Resource's ``content``, but scrudful sets a response's Content-Type
         to it only for error responses (its own 400, 412 and 428, those of
         the error helpers and, with django-ninja, the JSON responses to
-        errors an operation raises), never for a success response. The operation must serve the media
-        type its entities declare.
+        errors an operation raises), never for a success response. The
+        operation must serve the media type its entities declare.
 
     Raises
     ------
