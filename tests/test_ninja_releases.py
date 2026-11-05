@@ -53,3 +53,33 @@ def test_a_verified_releases_code_is_ninjas(fixture, tmp_path):
     expected = scrudful.ninja._NINJA_CODE[name]
     fingerprints = expected if isinstance(expected, frozenset) else {expected}
     assert (code.co_names, code.co_varnames, code.co_argcount) in fingerprints
+
+
+# --- scripts/ninja_digests.py, the procedure for a new release ---------------
+
+_SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "ninja_digests.py"
+_spec = importlib.util.spec_from_file_location("ninja_digests_script", _SCRIPT)
+ninja_digests = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ninja_digests)
+
+
+def test_the_script_digests_every_checked_internal():
+    assert ninja_digests.TARGETS.keys() == scrudful.ninja._NINJA_SOURCES.keys()
+
+
+def test_the_script_digests_the_installed_ninja_as_scrudful_does():
+    """Run on the installed ninja, every digest and fingerprint it prints is
+    one scrudful accepts."""
+    import ninja
+
+    root = pathlib.Path(ninja.__file__).parent.parent
+    for name, (digest, code) in ninja_digests.digests(root, with_code=True).items():
+        assert digest in scrudful.ninja._NINJA_SOURCES[name], name
+        expected = scrudful.ninja._NINJA_CODE[name]
+        fingerprints = expected if isinstance(expected, frozenset) else {expected}
+        assert code in fingerprints, name
+
+
+def test_the_script_without_a_directory_prints_its_usage(capsys):
+    assert ninja_digests.main([]) == 2
+    assert "Usage:" in capsys.readouterr().err
