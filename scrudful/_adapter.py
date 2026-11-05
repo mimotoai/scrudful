@@ -126,11 +126,11 @@ BODY_HEADERS = frozenset(
     }
 )
 
-#: :data:`READ_DESCRIPTIONS` as OPTIONS responses (string status keys).
+#: :data:`READ_DESCRIPTIONS` as HTTP Schema Resource responses (string status keys).
 READ_RESPONSES = {
     str(status): {"description": text} for status, text in READ_DESCRIPTIONS.items()
 }
-#: :data:`WRITE_DESCRIPTIONS` as OPTIONS responses (string status keys).
+#: :data:`WRITE_DESCRIPTIONS` as HTTP Schema Resource responses (string status keys).
 WRITE_RESPONSES = {
     str(status): {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
 }
@@ -202,8 +202,8 @@ def evaluates_preconditions(method: str) -> bool:
     Not for CONNECT, OPTIONS and TRACE (:data:`NO_PRECONDITION_METHODS`),
     whose response is no representation of the target resource: the
     resource's validators don't describe it, so a server ignores the
-    conditional headers (RFC 9110 §13.2.1). Their OPTIONS description lists
-    neither scrudful's early responses nor the precondition headers.
+    conditional headers (RFC 9110 §13.2.1). Their HTTP Schema Resource entries
+    list neither scrudful's early responses nor the precondition headers.
     """
     return method not in NO_PRECONDITION_METHODS
 
@@ -714,9 +714,10 @@ def _accept_rank(ranges: list[tuple[str, float]], media_type: str) -> tuple[floa
 def prefers_html(accept: str | None, media_type: str) -> bool:
     """Whether an Accept field value prefers ``text/html`` to ``media_type``.
 
-    True iff the quality of ``text/html`` is strictly greater than that of
-    ``media_type``'s essence; at equal quality the more specific range wins
-    (RFC 9110 section 12.5.1), so ``text/html,*/*;q=0.8`` prefers HTML and
+    True iff ``text/html`` is acceptable (a quality above 0) and ranks above
+    ``media_type``'s essence: by quality first, then, at equal quality, by the
+    specificity of the range that matches it (RFC 9110 section 12.5.1). So
+    ``text/html,*/*;q=0.8`` and ``text/html, application/*`` prefer HTML, and
     ``*/*`` does not. An absent or empty ``accept`` prefers nothing.
     """
     if not accept or not accept.strip():

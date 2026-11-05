@@ -101,7 +101,7 @@ Behaviour change (all adapters)
   ``Location`` still only when present.
 * A schema link without an RDF context link, for a non-in-band media type, is
   refused (its Media Type Object would fail the spec's JSON Schema): an
-  ``Entity`` with a plain schema link raises ``scrudful._hsr.HsrConfigError``,
+  ``Entity`` with a plain schema link raises ``scrudful.entity.HsrConfigError``,
   a ``ValueError``, when created, and the ninja decorators when given one;
   a callable one raises the adapter's configuration error when the HSR is
   built (was accepted).
@@ -120,7 +120,16 @@ Behaviour change (all adapters)
   value, or an unknown key, raises ``ImproperlyConfigured``. A base URL that
   isn't absolute is a configuration error (``ConfigError`` for ninja,
   ``ImproperlyConfigured`` for DRF and the 404 and 500 handlers,
-  ``ValueError`` for FastAPI).
+  ``ValueError`` for FastAPI). A ``base_url`` that isn't a ``str`` is refused
+  the same way (ninja and FastAPI raised ``TypeError``).
+* A ``hsr_url`` callable must return an absolute URL (a non-empty ``str`` with
+  a scheme): ``None``, an empty string or a relative URL is a configuration
+  error, raised when the link is built (it was sent as a broken link).
+  ``hsr_cache_control`` (and ``SCRUDFUL["HSR_CACHE_CONTROL"]``) must not be
+  empty (an empty ``Cache-Control`` field was sent). A base URL that doesn't
+  make a relative link absolute is refused too.
+* ``scrudful.entity.HsrConfigError`` is the public name of the error the
+  shared HSR code raises.
 
 Behaviour change (ninja)
 ------------------------
