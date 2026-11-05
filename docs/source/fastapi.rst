@@ -285,8 +285,12 @@ Things to know:
   404) the objects a requester may not see, or OPTIONS tells anyone which
   exist.
 * OPTIONS relies on ``fastapi.dependencies.utils.solve_dependencies`` (and the
-  ``Dependant`` and exit stack it takes): an installed FastAPI whose differ
-  from the releases scrudful supports raises ``RuntimeError`` on OPTIONS.
+  ``Dependant`` and exit stack it takes), and on how FastAPI builds a route's
+  dependants from its ``dependencies=``: an installed FastAPI whose differ
+  from the releases scrudful supports raises ``RuntimeError``, from
+  ``add_options`` when a route has security dependencies to check (no
+  ``allowed``), else from OPTIONS (for a route added later, or the
+  ``Dependant`` and exit stack).
 * Given an ``APIRouter``, ``add_options`` adds an OPTIONS route to each of its
   resources (at its first route's path), those of the routers included in it
   (at any depth, under their prefixes) too, answered with the router's

@@ -1377,11 +1377,16 @@ def add_options(
         one HSR route name (with ``hsr_route``); or a link callable of a
         scrudful endpoint (or of its ``error``) can't be called with no
         arguments.
-
-    An OPTIONS request raises ``RuntimeError`` if the installed FastAPI's
-    ``fastapi.dependencies.utils.solve_dependencies`` (or the ``Dependant``
-    and exit stack it takes), which the security checks rely on, differs
-    from those of the FastAPI releases scrudful supports.
+    RuntimeError
+        If the installed FastAPI's
+        ``fastapi.dependencies.utils.solve_dependencies``, which the
+        security checks rely on, or the way it builds a route's dependants
+        from its ``dependencies=``, differs from those of the FastAPI
+        releases scrudful supports (or a route's ``dependencies`` were
+        changed after it was created), when a route has security
+        dependencies to check (no ``allowed``). An OPTIONS request raises
+        it for the routes added since, and if the ``Dependant`` or exit
+        stack ``solve_dependencies`` takes differ.
     """
     _check_owner(app)
     options = _check_hsr_options(
@@ -1393,6 +1398,7 @@ def add_options(
     paths = _find_scrudful_paths(routes)
     _check_reserved(paths)
     names = _hsr_names(paths) if options.hsr_route else {}
+    _check_internals(options, paths)
     setattr(app, _OPTIONS_ATTRIBUTE, options)
     if isinstance(app, FastAPI):
         if not any(isinstance(route, _OptionsRoute) for route in routes):
@@ -2902,9 +2908,52 @@ def _solver_error(detail: str) -> RuntimeError:
     )
 
 
+def _check_internals(options: _HsrOptions, paths: Mapping[str, _Resource]) -> None:
+    """Check, when :func:`add_options` is called, the FastAPI internals the
+    per-method checks of OPTIONS rely on, rather than on the first OPTIONS
+    request: how the routes' ``dependencies=`` map onto their dependants
+    (:func:`_parameterless_security`) and ``solve_dependencies``
+    (:func:`_solver`). Only when they run: without an ``allowed`` hook, for
+    the routes of ``paths``, and the solver when one has a security
+    dependency to resolve. OPTIONS still checks a route added since.
+
+    Raises
+    ------
+    RuntimeError
+        As those do.
+    """
+    if options.allowed is not None:
+        return
+    resolves = False
+    for resource in paths.values():
+        for route in resource.routes:
+            dependant = getattr(route, "dependant", None)
+            if dependant is not None:
+                checks, _ = _security_dependencies(route, dependant)
+                resolves = resolves or bool(checks)
+    if resolves:
+        _solver()
+
+
 def _solver() -> tuple[Callable[..., Any], frozenset[str]]:
     """FastAPI's ``solve_dependencies``, and the parameters it takes of
-    :data:`_SOLVER_OPTIONAL`.
+    :data:`_SOLVER_OPTIONAL` (:func:`_checked_solver`, inspected once per
+    function).
+
+    Raises
+    ------
+    RuntimeError
+        As :func:`_checked_solver`.
+    """
+    return _checked_solver(
+        getattr(fastapi_dependency_utils, "solve_dependencies", None)
+    )
+
+
+@functools.lru_cache(maxsize=8)
+def _checked_solver(solve: Any) -> tuple[Callable[..., Any], frozenset[str]]:
+    """``solve``, FastAPI's ``solve_dependencies``, and the parameters it
+    takes of :data:`_SOLVER_OPTIONAL`.
 
     Raises
     ------
@@ -2914,7 +2963,6 @@ def _solver() -> tuple[Callable[..., Any], frozenset[str]]:
         whose other parameters have defaults, but those of
         :data:`_SOLVER_OPTIONAL`.
     """
-    solve = getattr(fastapi_dependency_utils, "solve_dependencies", None)
     if not inspect.iscoroutinefunction(solve):
         raise _solver_error("the installed FastAPI doesn't have as an async function")
     keyword = (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)

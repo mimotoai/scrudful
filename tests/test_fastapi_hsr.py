@@ -2844,17 +2844,70 @@ def test_another_exception_from_a_check_propagates(make_client):
 
 def test_solve_dependencies_is_version_guarded(make_client, monkeypatch):
     """scrudful relies on FastAPI's ``solve_dependencies``: one it can't call
-    as it expects is a ``RuntimeError`` naming it."""
+    as it expects is a ``RuntimeError`` naming it, raised by ``add_options``
+    (at startup, not by the first OPTIONS) when a route has security
+    dependencies to check, and by OPTIONS for one added later."""
     from fastapi.dependencies import utils
+
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {}
+
+    add_options(app, base_url=BASE)
 
     async def solve_dependencies(*, request, dependant, other):  # pragma: no cover
         raise AssertionError
 
     monkeypatch.setattr(utils, "solve_dependencies", solve_dependencies)
     with pytest.raises(RuntimeError, match=r"fastapi\.dependencies\.utils\.solve_dep"):
-        make_client(note_app()).options("/notes/1")
-    # A method without dependencies to check needs none of it.
+        note_app()
+    # Nothing to check: neither needs it.
     options_204(make_client(make_app()), "/users", "POST, OPTIONS")
+    note_app(allowed=lambda request, method, obj: True)
+
+    @app.put("/notes/{id}", dependencies=[Security(require_role("writer"))])
+    @scrudful(**NOTE_LINKS)
+    async def write(id: int):
+        return {}
+
+    with pytest.raises(RuntimeError, match=r"fastapi\.dependencies\.utils\.solve_dep"):
+        make_client(app).options("/notes/1")
+
+
+def test_the_solver_guard_costs_options_nothing(make_client):
+    """The guard's inspection of ``solve_dependencies`` is done once per
+    function, not on each OPTIONS."""
+    from scrudful import fastapi as module
+
+    client = make_client(note_app())
+    options_204(client, "/notes/1", "GET, PUT, OPTIONS, HEAD", headers=ADMIN)
+    misses = module._checked_solver.cache_info().misses
+    for _ in range(3):
+        options_204(client, "/notes/1", "GET, PUT, OPTIONS, HEAD", headers=ADMIN)
+    assert module._checked_solver.cache_info().misses == misses
+
+
+def test_dependencies_changed_before_add_options_raise_there():
+    """The routes' dependencies are read when ``add_options`` is called."""
+    app = FastAPI()
+
+    @app.put("/notes/{id}", dependencies=[Security(require_role("writer"))])
+    @scrudful(**NOTE_LINKS)
+    async def write(id: int):
+        return {}
+
+    for route in app.router.routes:
+        if getattr(route, "methods", None) == {"PUT"}:
+            route.dependencies = [Security(lambda: None)]
+    with pytest.raises(RuntimeError, match=r"APIRoute\.dependencies"):
+        add_options(app, base_url=BASE)
+    # Left as it was: no add_options applies.
+    assert not any(
+        type(route).__name__ == "_OptionsRoute" for route in app.router.routes
+    )
 
 
 def test_allow_covers_every_route_of_the_resource(make_client):

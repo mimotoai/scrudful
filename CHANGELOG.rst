@@ -360,6 +360,12 @@ Behaviour change (FastAPI)
   requester, unless ``add_options(allowed=)`` decides (it was skipped, and the
   method listed for everyone); a ``RuntimeWarning`` names each such route,
   once, when the routes are indexed.
+* The FastAPI internals the ``Allow`` checks rely on (``solve_dependencies``,
+  and how a route's ``dependencies=`` map onto its dependant) are checked by
+  ``add_options``, at startup, when a route has security dependencies to
+  check: its ``RuntimeError`` was raised by the first authenticated OPTIONS
+  only. OPTIONS still checks the routes added later; its own check of
+  ``solve_dependencies`` is done once per function.
 * The HSR describes the route's ``status_code=`` and the statuses of its
   ``responses=`` (was the status code only), the endpoint's ``entity=`` media
   type (was always ``application/json``); a declared success media type
