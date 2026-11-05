@@ -2230,9 +2230,11 @@ _HSRS: weakref.WeakKeyDictionary[Callable[..., Any], dict[str, Any]] = (
 
 
 def _forget_hsrs(sender: Any, setting: str, **kwargs: Any) -> None:
-    """Discard the built documents (and the :func:`hsr_urls` scans) when a
-    setting they depend on changes (``override_settings``, in tests): link
-    callables may ``reverse()`` in the root URLconf."""
+    """Discard what was built from a setting that changes
+    (``override_settings``, in tests): the documents on a change of
+    ``SCRUDFUL``, ``REST_FRAMEWORK`` or ``ROOT_URLCONF`` (link callables may
+    ``reverse()`` in the root URLconf), and the :func:`hsr_urls` scans on a
+    change of ``ROOT_URLCONF``, the URLconf they scan."""
     if setting in ("SCRUDFUL", "REST_FRAMEWORK", "ROOT_URLCONF"):
         _HSRS.clear()
     if setting == "ROOT_URLCONF":
