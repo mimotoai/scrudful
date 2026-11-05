@@ -234,8 +234,12 @@ say), but neither the request nor the URL kwargs. They must return the target
 they return on the responses, or the HSR disagrees with the Links. One that
 needs the request or a URL kwarg raises when called so, which is an
 ``ImproperlyConfigured`` naming it when the HSR is built; so is a relative URL
-without a base URL, and a schema link without an RDF context link (for a
-non-in-band media type). Return a ``django.urls.reverse(...)`` path: DRF's
+without a base URL, and a callable schema link without an RDF context link
+(for a non-in-band media type). A plain schema link without a context link is
+refused sooner, when decorating (``scrudful``, ``scrudful_api_view``, and
+``scrudful_viewset`` for ``Meta``'s item and ``list_`` links), as
+``Entity(...)`` refuses it: ``scrudful.entity.HsrConfigError``, a
+``ValueError``. Return a ``django.urls.reverse(...)`` path: DRF's
 ``reverse(..., request=request)`` keeps the request's host and ``?format=``.
 
 The HSR route

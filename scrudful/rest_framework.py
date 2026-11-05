@@ -664,7 +664,12 @@ class ScrudfulViewFunc:
         ``destroy``).
     ValueError
         If ``error``'s media type is not JSON content, or ``statuses`` names
-        a method that is not one or a status that is not a 2xx.
+        a method that is not one or a status that is not a 2xx; if the link
+        options are what an :class:`Entity` of them refuses (a plain
+        ``schema_link_or_func`` without ``context_link_or_func`` is
+        :class:`~scrudful.entity.HsrConfigError`, a ``ValueError``: the HTTP
+        Schema Resource would lack its ``x-rdf-context``; a callable one is
+        checked when the document is built).
     ImproperlyConfigured
         If ``base_url`` is not an absolute URL.
     """
@@ -1351,6 +1356,11 @@ def scrudful_viewset(cls: type) -> type:
         ``href_func(view, request, obj)``, the URL of an item, for
         :class:`ScrudfulPagination` (required by it; not used by the wrapped
         methods).
+
+    The item and ``list_`` link options are checked when the class is
+    decorated, whether or not it has the methods they configure, as the
+    decorators check theirs (:class:`~scrudful.entity.HsrConfigError` for a
+    plain schema link without a context link, naming ``Meta``'s options).
     """
     meta = getattr(cls, "Meta", None)
 
@@ -1359,6 +1369,20 @@ def scrudful_viewset(cls: type) -> type:
 
     shared = options("", _VIEW_OPTIONS)
     shared["statuses"] = _check_view_options(None, **shared)
+    for prefix in ("", "list_"):
+        # Checked whether or not the class has the methods they configure:
+        # ScrudfulPagination reads the item links of a list-only viewset.
+        links = options(prefix, _LINK_OPTIONS)
+        try:
+            _check_view_options(
+                getattr(meta, f"{prefix}entity", None), None, None, None, **links
+            )
+        except HsrConfigError as exc:
+            given = [name for name, value in links.items() if value is not None]
+            raise HsrConfigError(
+                f"{cls.__qualname__}.Meta ({', '.join(prefix + n for n in given)})"
+                f": {exc}"
+            ) from exc
     hsr = options("", _HSR_OPTIONS)
     _check_hsr_options(**hsr)
     # For the handlers it doesn't wrap (an @action's, say), the errors and
@@ -3668,7 +3692,10 @@ def _check_view_options(
     """Check the ``entity``, ``statuses``, ``allowed_func`` and ``base_url``
     options (see :class:`ScrudfulViewFunc`); return ``statuses`` checked, as
     a dict of tuples (or ``None``). ``links`` are the link options given
-    with them, which ``entity`` replaces."""
+    with them, which ``entity`` replaces; without ``entity``, they are
+    checked as an ``Entity`` of them would be (``Entity(**links)``), so
+    that a schema link without a context link is refused now rather than
+    when the HTTP Schema Resource is built."""
     if entity is not None:
         if not isinstance(entity, Entity):
             raise TypeError(f"entity must be an Entity, not {type(entity).__name__}")
@@ -3677,6 +3704,8 @@ def _check_view_options(
             raise TypeError(
                 f"entity replaces {', '.join(given)}: give the links in the " "Entity"
             )
+    elif links:
+        Entity(**links)
     if allowed_func is not None and not callable(allowed_func):
         raise TypeError(
             f"allowed_func must be callable, not {type(allowed_func).__name__}"
@@ -3807,9 +3836,15 @@ class ScrudfulPagination(BasePagination):
         modified_func = (
             getattr(meta, "last_modified_func", None) if validators else None
         )
-        entity = getattr(meta, "entity", None) or Entity(
-            **{name: getattr(meta, name, None) for name in _LINK_OPTIONS}
-        )
+        try:
+            entity = getattr(meta, "entity", None) or Entity(
+                **{name: getattr(meta, name, None) for name in _LINK_OPTIONS}
+            )
+        except HsrConfigError as exc:
+            # A view scrudful_viewset decorates had it refused already.
+            raise ImproperlyConfigured(
+                f"{type(view).__qualname__}.Meta, for ScrudfulPagination: {exc}"
+            ) from exc
         base_url = _view_base_url(view)
         entries = []
         for obj, item in zip(self.objects, data, strict=True):

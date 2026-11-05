@@ -238,6 +238,7 @@ class LastModifiedOnlyViewSet(ThingViewSetBase):
 class LinksOnlyViewSet(ThingViewSetBase):
     class Meta:
         schema_link_or_func = SCHEMA
+        context_link_or_func = CONTEXT
 
 
 @scrudful_viewset
@@ -491,7 +492,9 @@ class OwnErrorLinkViewSet(viewsets.ViewSet):
 class HeaderViewSet(viewsets.ViewSet):
     """Handlers that set the headers scrudful also sets."""
 
-    @scrudful(etag_func=etag_func, schema_link_or_func=SCHEMA)
+    @scrudful(
+        etag_func=etag_func, schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT
+    )
     def retrieve(self, request, pk):
         return Response(
             {},
@@ -714,14 +717,22 @@ def django_error_view(request):
 
 
 @api_view(["GET", "PUT"])
-@scrudful(etag_func=lambda request, pk: f"v{store.version}", schema_link_or_func=SCHEMA)
+@scrudful(
+    etag_func=lambda request, pk: f"v{store.version}",
+    schema_link_or_func=SCHEMA,
+    context_link_or_func=CONTEXT,
+)
 def function_view(request, pk):
     if request.method == "PUT":
         store.update()
     return Response({"id": pk})
 
 
-@scrudful(etag_func=lambda request: f"v{store.version}", schema_link_or_func=SCHEMA)
+@scrudful(
+    etag_func=lambda request: f"v{store.version}",
+    schema_link_or_func=SCHEMA,
+    context_link_or_func=CONTEXT,
+)
 def django_view(request):
     return HttpResponse("plain django")
 
@@ -1268,7 +1279,8 @@ def test_views_without_validators_ignore_preconditions(client):
         )
         assert response.status_code in (200, 204)
         assert response.get("Link") == with_hsr(
-            SCHEMA_LINK if response.status_code == 200 else None, "/links-only/1/"
+            f"{SCHEMA_LINK}, {CONTEXT_LINK}" if response.status_code == 200 else None,
+            "/links-only/1/",
         )
         assert "ETag" not in response
 
@@ -1277,7 +1289,8 @@ def test_handler_headers_are_kept_and_merged(client):
     response = client.get("/headers/1/")
     assert response["ETag"] == '"handler"'
     assert response["Link"] == with_hsr(
-        f'<http://example.com/other>; rel="other", {SCHEMA_LINK}', "/headers/1/"
+        f'<http://example.com/other>; rel="other", {SCHEMA_LINK}, {CONTEXT_LINK}',
+        "/headers/1/",
     )
     assert response["Access-Control-Expose-Headers"] == "X-Custom, link, ETag, Allow"
 
@@ -1871,7 +1884,7 @@ def test_api_view_function_with_scrudful(client):
     response = client.get("/function/1/")
     assert response.status_code == 200
     assert response["ETag"] == '"v1"'
-    assert response["Link"] == SCHEMA_LINK
+    assert response["Link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
     assert client.get(
         "/function/1/", headers={"If-None-Match": '"v1"'}
     ).status_code == (304)
@@ -1885,7 +1898,7 @@ def test_plain_django_view_with_scrudful(client):
     response = client.get("/django/")
     assert response.content == b"plain django"
     assert response["ETag"] == '"v1"'
-    assert response["Link"] == SCHEMA_LINK
+    assert response["Link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
     response = client.get("/django/", headers={"If-None-Match": '"v1"'})
     assert response.status_code == 304
     assert response["ETag"] == '"v1"'

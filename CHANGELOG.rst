@@ -103,9 +103,13 @@ Behaviour change (all adapters)
 * A schema link without an RDF context link, for a non-in-band media type, is
   refused (its Media Type Object would fail the spec's JSON Schema): an
   ``Entity`` with a plain schema link raises ``scrudful.entity.HsrConfigError``,
-  a ``ValueError``, when created, and the ninja decorators when given one;
-  a callable one raises the adapter's configuration error when the HSR is
-  built (was accepted).
+  a ``ValueError``, when created, and the ninja decorators when given one, as
+  do the DRF decorators (``scrudful``, ``scrudful_api_view``,
+  ``ScrudfulViewFunc``, and ``scrudful_viewset`` for ``Meta``'s item and
+  ``list_`` links, whatever methods the class has); a callable one raises the
+  adapter's configuration error when the HSR is built (was accepted).
+  ``ScrudfulPagination`` names the view's ``Meta`` in an
+  ``ImproperlyConfigured`` for an undecorated view's.
 * Problem details: with an ``application/problem+json`` error entity, the
   framework's validation errors are rewritten as RFC 9457 problem details,
   ``problem_from_errors(status, errors, "Request validation failed")``, its

@@ -680,6 +680,49 @@ def test_entity_and_link_options_are_exclusive():
                 schema_link_or_func = "https://x/s"
 
 
+def test_a_schema_link_without_a_context_link_is_refused_when_decorating():
+    """As ``Entity()`` refuses it: the HSR's x-rdf-context would be missing,
+    and the decorators would otherwise accept what the document can't
+    describe."""
+    with pytest.raises(HsrConfigError, match="no RDF context link"):
+        scrudful(schema_link_or_func="https://x/s")
+    with pytest.raises(HsrConfigError, match="no RDF context link"):
+        scrudful_api_view(["GET"], schema_link_or_func="https://x/s")
+    with pytest.raises(HsrConfigError, match="no RDF context link"):
+        ScrudfulViewFunc(lambda self, request: None, schema_link_or_func="/s")
+    # A callable is checked when the HSR is built; a context alone is fine.
+    scrudful(schema_link_or_func=lambda view, request, **kwargs: "https://x/s")
+    scrudful(context_link_or_func="https://x/c")
+
+
+@pytest.mark.parametrize("prefix", ["", "list_"])
+def test_a_meta_schema_link_without_a_context_link_is_refused(prefix):
+    """Whether or not the class has the methods the options apply to (a
+    ``ScrudfulPagination`` reads the item links of a list-only viewset)."""
+    meta = type("Meta", (), {f"{prefix}schema_link_or_func": "https://x/s"})
+    with pytest.raises(HsrConfigError, match=f"Meta.*{prefix}schema_link_or_func"):
+        scrudful_viewset(type("V", (viewsets.ViewSet,), {"Meta": meta}))
+
+
+def test_scrudful_pagination_names_the_view_of_a_link_without_context(rf):
+    from scrudful.rest_framework import ScrudfulPagination
+
+    class Undecorated(viewsets.GenericViewSet):
+        class Meta:
+            schema_link_or_func = "https://x/s"
+
+            def href_func(view, request, obj):
+                return f"https://x/{obj}"
+
+    paginator = ScrudfulPagination()
+    view = Undecorated()
+    request = Request(rf.get("/"))
+    view.request, view.args, view.kwargs = request, (), {}
+    paginator.paginate_queryset([1], request, view)
+    with pytest.raises(ImproperlyConfigured, match="Undecorated.Meta.*RDF context"):
+        paginator.get_paginated_response([{}])
+
+
 # --- allowed_func= ------------------------------------------------------------
 
 
