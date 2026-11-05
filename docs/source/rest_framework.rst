@@ -51,8 +51,9 @@ written. A request that comes
 through no URL (a view called directly, with ``APIRequestFactory``) gets no
 HSR link.
 
-``manage.py check`` (which ``runserver`` and ``migrate`` run too) reports these
-misconfigurations before any request, as errors of Django's URL system check:
+``manage.py check`` (which ``runserver``, ``migrate`` and Django's test runner
+run too, and which its errors fail) reports these misconfigurations before any
+request, as errors of Django's URL system check:
 
 * ``scrudful.E001``: a scrudful view's route has no URL name (unless the view
   has an ``hsr_url``, which needs none);
