@@ -11,7 +11,7 @@ from django.http import HttpResponse
 from django.test import override_settings
 from django.urls import path
 from ninja import NinjaAPI, Router, Status
-from ninja.errors import HttpError
+from ninja.errors import ConfigError, HttpError
 from ninja.testing import TestAsyncClient, TestClient
 from rest_framework import viewsets
 from rest_framework.response import Response
@@ -561,8 +561,8 @@ def test_options_media_type_objects():
 
 @pytest.mark.parametrize("context_type", [None, "", "application/csvm+json"])
 def test_a_context_type_callable_of_non_json_content(context_type):
-    """It must give a type: without one, GET and the HTTP Schema Resource fail
-    the same way."""
+    """It must give a type: without one, GET fails, and so does the HTTP
+    Schema Resource, as a ``ConfigError`` naming the entry."""
     csv = Entity(
         "/schemas/rows",
         schema_type_or_func="application/csvm+json",
@@ -579,14 +579,12 @@ def test_a_context_type_callable_of_non_json_content(context_type):
 
     client = TestClient(router)
     if not context_type:
-        for request in (
-            lambda: client.get("/rows/1"),
-            lambda: client.get("/_hsr/rows.pk"),
+        with pytest.raises(ValueError, match="the context of 'text/csv' needs a type"):
+            client.get("/rows/1")
+        with pytest.raises(
+            ConfigError, match=r"get_rows\(\)'s 200 response: .*needs a type"
         ):
-            with pytest.raises(
-                ValueError, match="the context of 'text/csv' needs a type"
-            ):
-                request()
+            client.get("/_hsr/rows.pk")
         return
     body = hsr_get(client, "/rows/{pk}")
     response = client.get("/rows/1")
