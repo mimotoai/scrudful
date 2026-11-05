@@ -621,6 +621,34 @@ def test_early_errors_without_error_are_json(store):
     assert response.headers["Link"] == hsr_link("http://testlocation/_hsr/items.pk")
 
 
+def test_early_error_link_callables_of_the_api_wide_entity_get_none(store):
+    """Without ``error``, scrudful's own 412 carries the API-wide entity, whose
+    link callables get ``None`` (as for the errors its handlers answer, and as
+    its HTTP Schema Resource entry is built), not the loaded object."""
+    calls = []
+
+    def schema(request, obj):
+        calls.append(obj)
+        return "/schemas/api-error"
+
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
+
+    @router.get("/items/{pk}", response=ItemOut)
+    @scrudful(load=store.load, etag_func=etag, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    api.add_router("", router)
+    add_error_links(
+        api, Entity(schema_link_or_func=schema, context_link_or_func="/contexts/e")
+    )
+    response = TestClient(api).get("/items/1", headers={"If-Match": '"x"'})
+    assert response.status_code == 412
+    assert "<http://testlocation/schemas/api-error>" in response.headers["Link"]
+    assert calls == [None]
+
+
 @pytest.mark.parametrize("media_type", ["text/turtle", "text/csv", "application/xml"])
 def test_error_media_type_must_be_json(media_type):
     context = (
