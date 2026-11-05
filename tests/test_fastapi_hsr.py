@@ -1304,8 +1304,10 @@ def test_entity_defaults_to_json_from_the_link_options():
         return {}
 
     config = endpoint._scrudful
-    assert config.entity is None
-    assert config.media_type == "application/json"
+    assert config.entity == Entity(
+        schema_link_or_func="/s.json", context_link_or_func="/c.jsonld"
+    )
+    assert config.entity.media_type == "application/json"
 
     @scrudful(entity=CSV)
     async def csv_endpoint():
@@ -1313,9 +1315,7 @@ def test_entity_defaults_to_json_from_the_link_options():
 
     config = csv_endpoint._scrudful
     assert config.entity is CSV
-    assert config.media_type == "text/csv"
-    assert config.schema_link_or_func == CSV.schema_link_or_func
-    assert config.context_type_or_func == CSV.context_type_or_func
+    assert config.entity.media_type == "text/csv"
 
 
 def test_entity_replaces_the_link_options():

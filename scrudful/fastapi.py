@@ -168,26 +168,15 @@ class _EndpointConfig:
 
     etag_func: Callable[..., Any] | None
     last_modified_func: Callable[..., Any] | None
-    schema_link_or_func: Any
-    schema_rel_or_func: Any
-    schema_type_or_func: Any
-    context_link_or_func: Any
-    context_rel_or_func: Any
-    context_type_or_func: Any
+    #: The entity of the endpoint's success content: the ``entity=`` given,
+    #: else the link options' (an ``application/json`` entity).
+    entity: Entity
     error: Entity | None
     #: The name of the endpoint's own ``Request`` parameter, if it declares one.
     request_name: str | None
     #: The names of the endpoint's own parameters: the keyword arguments its
     #: callables get inside it, of which a path parameter is passed outside.
     param_names: frozenset[str]
-    #: The ``entity=`` given, whose link fields are the ones above; ``None``
-    #: for the link options (an ``application/json`` entity).
-    entity: Entity | None = None
-
-    @property
-    def media_type(self) -> str:
-        """The media type of the endpoint's success content (its entity's)."""
-        return _ENDPOINT_MEDIA_TYPE if self.entity is None else self.entity.media_type
 
 
 def scrudful(
@@ -438,23 +427,14 @@ def scrudful(
         context_type_or_func=context_type_or_func,
     )
     _check_entity(entity, links_given)
-    if entity is None:
-        # The link options are an application/json entity: Entity holds the
-        # rules (a schema link with no context link is refused now, not when
-        # the HTTP Schema Resource is first built).
-        Entity(**links_given)
+    # The endpoint's links: those of ``entity``, else the link options, an
+    # application/json entity (Entity holds the rules: a schema link with no
+    # context link is refused now, not when the HTTP Schema Resource is
+    # first built).
+    endpoint_entity = entity if entity is not None else Entity(**links_given)
     _check_error(error)
     check_error_body_func(error_body_func)
     has_validators = etag_func is not None or last_modified_func is not None
-    # The endpoint's links: those of ``entity``, else the link options (an
-    # ``application/json`` entity).
-    link_fields = (
-        links_given
-        if entity is None
-        else {name: getattr(entity, name) for name in links_given}
-    )
-    source = types.SimpleNamespace(**link_fields)
-    media_type = _ENDPOINT_MEDIA_TYPE if entity is None else entity.media_type
 
     async def validators(kwargs: Mapping[str, Any]) -> tuple[str | None, int | None]:
         funcs = [f for f in (etag_func, last_modified_func) if f is not None]
@@ -470,7 +450,7 @@ def scrudful(
     async def links(
         kwargs: Mapping[str, Any], base: str
     ) -> tuple[str | None, str | None]:
-        return await _source_links(source, media_type, kwargs, base)
+        return await _entity_links(endpoint_entity, kwargs, base)
 
     async def early_response(
         request: Request,
@@ -501,11 +481,10 @@ def scrudful(
         config = _EndpointConfig(
             etag_func=etag_func,
             last_modified_func=last_modified_func,
-            **link_fields,
+            entity=endpoint_entity,
             error=error,
             request_name=request_name if pass_request else None,
             param_names=_param_names(endpoint),
-            entity=entity,
         )
 
         @functools.wraps(endpoint)
@@ -926,8 +905,6 @@ def _has_json_content(response: Response) -> bool:
 
 # --- OPTIONS and the HTTP Schema Resource ---------------------------------------
 
-#: The media type of an endpoint's own content without ``entity=`` (DRF's).
-_ENDPOINT_MEDIA_TYPE = "application/json"
 #: The fields of an endpoint or entity whose callables the HTTP Schema Resource
 #: calls (the rels are not needed there).
 _LINK_FIELDS = (
@@ -2077,7 +2054,7 @@ def _describe_route(
 
     content = error_content = None
     if config is not None and with_content and method != "trace":
-        content = yield from media(config, config.media_type, str(status))
+        content = yield from media(config.entity, config.entity.media_type, str(status))
     # The entity of scrudful's own 400, 412 and 428: the endpoint's error,
     # else the app's (see early_response in scrudful).
     own_error = api_error if config is None or config.error is None else config.error
@@ -4289,14 +4266,12 @@ def _check_options_callables(routes: Sequence[Any]) -> None:
 def _check_endpoint_callables(endpoint: Any, config: _EndpointConfig) -> None:
     """:func:`_check_options_callables` of one endpoint."""
     where = f"endpoint {_endpoint_name(endpoint)}"
-    _check_describe_call(config, "", where)
+    _check_describe_call(config.entity, "", where)
     if config.error is not None:
         _check_describe_call(config.error, "error.", where)
 
 
-def _check_describe_call(
-    source: _EndpointConfig | Entity, prefix: str, where: str
-) -> None:
+def _check_describe_call(source: Entity, prefix: str, where: str) -> None:
     """Raise ``ValueError`` unless each link callable of ``source`` can be
     called with no arguments."""
     for name in _LINK_FIELDS:
@@ -4369,7 +4344,7 @@ def _param_names(endpoint: Callable[..., Any]) -> frozenset[str]:
 
 
 def _check_call(
-    source: _EndpointConfig | Entity,
+    source: Entity,
     prefix: str,
     where: str,
     names: set[str],
@@ -4486,15 +4461,7 @@ async def _entity_links(
     The context link's defaults come from ``entity.media_type``; in-band RDF
     has none.
     """
-    return await _source_links(entity, entity.media_type, kwargs, base)
-
-
-async def _source_links(
-    entity: Any, media_type: str, kwargs: Mapping[str, Any], base: str
-) -> tuple[str | None, str | None]:
-    """:func:`_entity_links` of the link fields of ``entity`` (an
-    :class:`Entity`, or an endpoint's link options) describing ``media_type``
-    content."""
+    media_type = entity.media_type
     schema = await _link(
         kwargs,
         (

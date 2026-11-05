@@ -1912,12 +1912,7 @@ def test_endpoint_config_is_attached():
     assert get_item._scrudful == _EndpointConfig(
         etag_func=etag,
         last_modified_func=None,
-        schema_link_or_func=SCHEMA,
-        schema_rel_or_func=None,
-        schema_type_or_func=None,
-        context_link_or_func=CONTEXT,
-        context_rel_or_func=None,
-        context_type_or_func=None,
+        entity=Entity(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT),
         error=ERROR,
         request_name="req",
         param_names=frozenset({"item_id", "req"}),
