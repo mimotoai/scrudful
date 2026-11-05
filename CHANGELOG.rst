@@ -39,7 +39,10 @@ Behaviour change (all adapters)
   loading operation's own ``auth=`` and ``before`` allow the requester, hook
   or not (else the hook gets ``obj=None``). A 404 the loader raises is the
   OPTIONS's answer, with the error Links and the HSR link; ``None`` is no
-  object.
+  object. DRF loads again for each other action (or, off a viewset, method)
+  that passed, and ninja runs each other item operation's own ``load``, as
+  checks of those methods (see below). A loader must so be free of side
+  effects (no writes, no audit records): OPTIONS calls it.
 * A denial an ``Allow`` hook raises refuses that method, in every adapter:
   DRF's ``PermissionDenied`` or ``NotAuthenticated``, any other 401 or 403
   ``APIException`` (``AuthenticationFailed``, a project's own), or Django's
@@ -555,6 +558,14 @@ Examples and tests
 * The suite's Django settings module is now ``tests.settings`` (the DRF
   example's settings without ``SCRUDFUL``), no longer
   ``scrudful_rest_framework.settings``.
+* CI runs the FastAPI modules on the lowest FastAPI the extra allows
+  (``floor-fastapi``: 0.100, with pydantic 2.3), and the ninja modules, with
+  the shared ones that have ninja cases, on the oldest and the newest
+  django-ninja it allows (``floor-ninja``: 1.7.0; ``latest-ninja``).
+* ``scripts/ninja_digests.py`` prints the digests of the django-ninja
+  internals ``scrudful.ninja`` checks, for a ninja release, without importing
+  it: compare them with ``scrudful.ninja``'s before admitting the release in
+  the ``ninja`` extra.
 
 0.9.0 (since 0.8.0)
 ===================
