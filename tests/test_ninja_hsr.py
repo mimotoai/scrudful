@@ -2,6 +2,7 @@
 
 import dataclasses
 import functools
+import gc
 import json
 import re
 import types
@@ -564,7 +565,11 @@ def test_head_error_entries_have_no_content():
     def get_item(request, pk: int, obj):
         return obj
 
-    add_error_links(mount(router), API_ERROR)
+    # Kept: add_error_links holds its API weakly, so an API nothing refers to
+    # loses its entity whenever the garbage collector runs.
+    api = mount(router)
+    add_error_links(api, API_ERROR)
+    gc.collect()
     hsr = http_schema_resource(router, "/{pk}")
     assert hsr["get"]["responses"]["401"]["content"] == entity_content(API_ERROR)
     responses = hsr["head"]["responses"]
