@@ -7,8 +7,8 @@ context ``Link`` headers of the semantic-http spec, collections in the scrud
 list envelope, an automatic OPTIONS answer with a per-requester ``Allow``, and
 each path's "HTTP Schema Resource", served by GET and linked from every
 response. Install it with ``pip install "scrudful[ninja]"`` (django-ninja
-1.7 or newer, below 2: the adapter relies on django-ninja internals). It does
-not need Django REST Framework.
+1.7.0 to 1.7.3: the adapter relies on django-ninja internals, verified per
+release). It does not need Django REST Framework.
 
 The example project in ``examples/ninja`` uses the three decorators, entities,
 error Links, OPTIONS and the 404 and 500 handlers on a ``Role`` resource scoped
@@ -603,9 +603,9 @@ must use ``functools.wraps`` (``ConfigError`` otherwise, when the operation is
 built). ``before`` runs in scrudful's own copy of ninja's per-operation checks
 (CSRF flag, authentication, throttles), which relies on ``Operation.run``
 answering their response before it reads any parameter. Both are verified
-against ninja 1.7.0 and 1.7.1; the ``ninja`` extra allows any ninja from 1.7
-below 2, so a later release may be installed before scrudful has verified
-it. When the
+against ninja 1.7.0 to 1.7.3, the releases the ``ninja`` extra allows
+(``django-ninja>=1.7,<1.7.4``); a later release installed without the extra
+may differ. When the
 operation is built, scrudful compares ninja's ``_run_checks`` and ``run``
 with those releases': by a digest of their source (comments, docstrings and
 blank lines aside), or, where the source isn't installed (``.pyc`` only),

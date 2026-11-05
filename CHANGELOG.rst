@@ -166,6 +166,11 @@ Behaviour change (all adapters)
 Behaviour change (ninja)
 ------------------------
 
+* The ``ninja`` extra requires **django-ninja 1.7.0 to 1.7.3**
+  (``django-ninja>=1.7,<1.7.4``; was ``>=1.7,<2``): the releases scrudful
+  checks the ninja internals it relies on against, 1.7.2 and 1.7.3 now
+  included. A later ninja installed without the extra may be refused with
+  ``ConfigError`` at startup until scrudful has verified it.
 * ``ScrudfulRouter``'s OPTIONS runs the operations' checks: the loading
   operation's ``auth=`` and ``before`` (then ``load``), and each method's
   ``auth=`` and ``before`` (or ``allowed``), then, for a ``@scrudful``

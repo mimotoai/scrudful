@@ -27,7 +27,7 @@ Changelog = "https://gitlab.com/openteams/scrudful/-/blob/master/CHANGELOG.rst"
 [project.optional-dependencies]
 drf = ["django>=4.2", "djangorestframework>=3.15"]
 fastapi = ["fastapi>=0.100"]
-ninja = ["django>=4.2", "django-ninja>=1.7,<2"]
+ninja = ["django>=4.2", "django-ninja>=1.7,<1.7.4"]
 
 [dependency-groups]
 dev = [
