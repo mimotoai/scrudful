@@ -459,7 +459,11 @@ of plain (non-callable) link values and answer JSON (problem details for an
 ``application/problem+json`` entity, else ``{"detail": <reason phrase>}``)
 with its Links, resolved against ``SCRUDFUL["BASE_URL"]``, unless ``Accept``
 prefers ``text/html``, and always send ``Vary: Accept``. Django uses them with
-``DEBUG`` off. They get no HSR link.
+``DEBUG`` off. They get no HSR link. They never raise for their Links: one
+they can't build (an invalid ``SCRUDFUL["BASE_URL"]``, or a relative link
+without a base URL on a request whose host ``ALLOWED_HOSTS`` refuses) is
+logged on the ``scrudful`` logger, and the error served without the Links, so
+Django still logs the error it answers.
 
 Callbacks
 ---------

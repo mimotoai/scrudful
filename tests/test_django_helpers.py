@@ -138,11 +138,42 @@ def test_handler_links_resolve_against_the_base_url(module, rf, settings):
             assert response["Link"] == ", ".join(links).format(expected)
 
 
-def test_handler_rejects_a_relative_base_url(rf, settings):
+@pytest.mark.parametrize("status", [404, 500])
+def test_handler_serves_its_error_without_links_it_cant_build(
+    rf, settings, caplog, status
+):
+    """A handler404/handler500 never raises: a Link it can't build (an
+    invalid ``SCRUDFUL["BASE_URL"]``) is logged, and the error is served
+    without it, so the original error is still answered (and logged)."""
     settings.SCRUDFUL = {"BASE_URL": "/v1/"}
-    view = error_handler(404, Entity("/s", context_link_or_func="/c"))
-    with pytest.raises(ImproperlyConfigured, match="absolute URL"):
-        view(rf.get("/nowhere"), Http404())
+    view = error_handler(status, Entity("/s", context_link_or_func="/c"))
+    request = rf.get("/nowhere", HTTP_ACCEPT="application/json")
+    with caplog.at_level("ERROR", logger="scrudful"):
+        response = view(request, Http404()) if status == 404 else view(request)
+    assert response.status_code == status
+    assert response["Content-Type"] == "application/json"
+    assert "Link" not in response
+    [record] = caplog.records
+    assert record.name == "scrudful._django" and record.levelname == "ERROR"
+    assert f"handler{status}" in record.getMessage()
+    assert isinstance(record.exc_info[1], ImproperlyConfigured)
+
+
+def test_handler_needs_the_request_only_for_a_relative_link(rf, settings, caplog):
+    """Absolute links don't read the request's host (which may be one
+    ALLOWED_HOSTS refuses); relative ones without a base URL do, and a host
+    refused is logged and the links left out."""
+    settings.SCRUDFUL = None
+    settings.ALLOWED_HOSTS = ["testserver"]
+    request = rf.get("/nowhere", HTTP_HOST="evil.example")
+    absolute = Entity("https://x.example/s", context_link_or_func="https://x/c")
+    response = error_handler(500, absolute)(request)
+    assert response["Link"].startswith("<https://x.example/s>")
+    with caplog.at_level("ERROR", logger="scrudful"):
+        response = error_handler(500, Entity("/s", context_link_or_func="/c"))(request)
+    assert response.status_code == 500 and "Link" not in response
+    [record] = caplog.records
+    assert type(record.exc_info[1]).__name__ == "DisallowedHost"
 
 
 def test_handler_rejects_callable_links():

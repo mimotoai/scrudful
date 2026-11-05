@@ -317,7 +317,10 @@ New
   ``scrudful.rest_framework``: Django error views answering JSON (problem
   details for a problem-details entity, else ``{"detail": ...}``) with the
   entity's Links unless ``Accept`` prefers ``text/html``, with ``Vary:
-  Accept``.
+  Accept``. They never raise for their Links: one they can't build (an
+  invalid ``SCRUDFUL["BASE_URL"]``, a refused host for a relative link) is
+  logged on the ``scrudful`` logger and the error served without them; the
+  request's host is read only for a relative link without a base URL.
 * ninja: ``ScrudfulRouter(base_url=, hsr_route=, hsr_url=, hsr_cache_control=,
   allowed=)``; ``allowed=`` on ``scrudful``, ``scrudful_create`` and
   ``scrudful_list``; ``described(entity)`` and ``add_api_operation(...,

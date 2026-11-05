@@ -6,6 +6,7 @@ can be used without the other.
 
 from __future__ import annotations
 
+import logging
 import math
 import warnings
 from collections.abc import Callable, Mapping
@@ -93,6 +94,8 @@ class ScrudfulSettings(TypedDict, total=False):
     #: (:func:`setting_hsr_url`); each adapter says what it is called with.
     HSR_URL: Callable[[str], str]
 
+
+logger = logging.getLogger(__name__)
 
 #: The keys of the ``SCRUDFUL`` setting.
 SETTING_KEYS = frozenset(ScrudfulSettings.__annotations__)
@@ -338,16 +341,27 @@ def _plain_links(entity: Entity, request: HttpRequest) -> str | None:
     The same rels, types and defaults as the adapters' error Links; a
     relative URL resolves against ``SCRUDFUL["BASE_URL"]`` when it is set,
     as the adapters' Links and HTTP Schema Resources do, else against the
-    request.
+    request (``build_absolute_uri()``, called only then: an absolute link
+    needs no host of the request's).
 
     Raises
     ------
     ImproperlyConfigured
         If ``SCRUDFUL["BASE_URL"]`` is not an absolute URL.
+    django.core.exceptions.DisallowedHost
+        If a relative link needs the request's host and ``ALLOWED_HOSTS``
+        refuses it.
     """
     base = setting_base_url()
-    if base is None:
-        base = request.build_absolute_uri()
+
+    def resolve(url: Any) -> str:
+        nonlocal base
+        if base is None:
+            if urlsplit(str(url)).scheme:
+                return str(url)
+            base = request.build_absolute_uri()
+        return resolve_uri(url, base)
+
     candidates = [
         (
             entity.schema_link_or_func,
@@ -376,7 +390,7 @@ def _plain_links(entity: Entity, request: HttpRequest) -> str | None:
             content_type = _adapter.context_link_type(context_of, content_type)
         parts.append(
             link_content(
-                resolve_uri(url, base),
+                resolve(url),
                 rel or defaults_[0],
                 content_type or defaults_[1],
             )
@@ -396,6 +410,13 @@ def error_handler(
     entity's Links. It always sends ``Vary: Accept``. It is
     ``login_required = False``, public under Django's
     ``LoginRequiredMiddleware`` (Django exempts its error handlers anyway).
+
+    It never raises for its Links: Django logs the error it answers only
+    once the handler returns, so a Link it can't build (an invalid
+    ``SCRUDFUL["BASE_URL"]``; a relative link without a base URL, on a
+    request whose host ``ALLOWED_HOSTS`` refuses) is logged, on the
+    ``scrudful`` logger with the exception, and the error is served without
+    the entity's Links.
 
     Raises
     ------
@@ -429,7 +450,17 @@ def error_handler(
             else:
                 body = {"detail": _adapter.reason_phrase(status)}
             response = json_response(body, status, error.media_type)
-            link = _plain_links(error, request)
+            try:
+                link = _plain_links(error, request)
+            except Exception:
+                # Serve the error, and keep Django's own log of what it is
+                # answering, rather than fail inside the error handler.
+                logger.exception(
+                    "scrudful handler%s: the error entity's Links can't be "
+                    "built; answering without them",
+                    status,
+                )
+                link = None
             if link:
                 response["Link"] = link
         patch_vary_headers(response, ["Accept"])
