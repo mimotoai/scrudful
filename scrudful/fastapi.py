@@ -2296,14 +2296,16 @@ def _field(
     source: Any, name: str, where: str, memo: dict[tuple[int, str], Any]
 ) -> _Flow[Any]:
     """The value of ``source``'s field ``name``: a callable's result, called
-    once per build (``memo``)."""
+    once per build (``memo``, by ``(id(source), name)``, with the source, so
+    its ``id`` isn't reused, and is checked)."""
     value = getattr(source, name)
     if not callable(value):
         return value
     key = (id(source), name)
-    if key not in memo:
-        memo[key] = yield value, where
-    return memo[key]
+    kept = memo.get(key)
+    if kept is None or kept[0] is not source:
+        kept = memo[key] = (source, (yield value, where))
+    return kept[1]
 
 
 class _OptionsRoute(BaseRoute):

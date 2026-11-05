@@ -3429,3 +3429,22 @@ def test_options_of_a_collection_of_another_view_loads_nothing(loading, client, 
     assert r.status_code == 204
     assert r["Allow"] == "GET, OPTIONS, HEAD"
     assert SEEN_ACTIONS == []
+
+
+def test_describing_keeps_a_content_with_its_source():
+    """The contents built for an HTTP Schema Resource are kept by ``id`` of
+    their source, with the source itself: a source whose ``id`` an earlier,
+    gone one had gets its own content, not the earlier one's."""
+    from scrudful.rest_framework import _Describing
+
+    describing = _Describing(object(), "get", "https://api.example/")
+    first = Entity("https://api.example/s/first", context_link_or_func="/c")
+    second = Entity("https://api.example/s/second", context_link_or_func="/c")
+    media_type = "application/json"
+    content = describing.content(first, media_type, "200")
+    assert content[media_type]["schema"] == {"$ref": "https://api.example/s/first"}
+    # As if ``first`` were gone and ``second`` had its id.
+    key = (id(first), media_type)
+    describing._contents[(id(second), media_type)] = describing._contents.pop(key)
+    content = describing.content(second, media_type, "200")
+    assert content[media_type]["schema"] == {"$ref": "https://api.example/s/second"}

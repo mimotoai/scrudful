@@ -4459,3 +4459,51 @@ def test_options_under_a_mount(make_client):
     options_204(client, "/m/acme/notes/1", "OPTIONS", target)
     options_204(client, "/m/acme/notes/1", "GET, OPTIONS", target, headers=READER)
     assert loaded == [{"tenant": "acme", "id": "1"}]
+
+
+def _driven(flow, results):
+    """Run the ``_Flow`` ``flow``, answering each callable it yields with
+    ``results[callable]``; its result, and the callables it yielded."""
+    called = []
+    try:
+        func, _ = next(flow)
+        while True:
+            called.append(func)
+            func, _ = flow.send(results[func])
+    except StopIteration as stop:
+        return stop.value, called
+
+
+def test_a_build_keeps_a_callables_value_with_its_source():
+    """The link callables called for an HTTP Schema Resource are kept by
+    ``id`` of their source, with the source itself: a source whose ``id`` an
+    earlier, gone one had gets its own callable called, not the earlier
+    one's value."""
+    from scrudful.fastapi import _field
+
+    def first_link():
+        return "https://x/first"
+
+    def second_link():
+        return "https://x/second"
+
+    first = Entity(first_link, context_link_or_func="https://x/c")
+    second = Entity(second_link, context_link_or_func="https://x/c")
+    results = {first_link: "https://x/first", second_link: "https://x/second"}
+    memo = {}
+    name = "schema_link_or_func"
+    assert _driven(_field(first, name, "w", memo), results) == (
+        "https://x/first",
+        [first_link],
+    )
+    # Kept: called once per build.
+    assert _driven(_field(first, name, "w", memo), results) == (
+        "https://x/first",
+        [],
+    )
+    # As if ``first`` were gone and ``second`` had its id.
+    memo[(id(second), name)] = memo.pop((id(first), name))
+    assert _driven(_field(second, name, "w", memo), results) == (
+        "https://x/second",
+        [second_link],
+    )

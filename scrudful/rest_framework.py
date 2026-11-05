@@ -3273,9 +3273,10 @@ class _Describing:
         self.failures = failures
         #: Names the method's entries in errors.
         self.name = f"{type(view).__name__} {method.upper()}"
-        #: The content of each source, by ``(id(source), media_type)``: its
+        #: The content of each source, by ``(id(source), media_type)``, with
+        #: the source (so its ``id`` isn't reused, and is checked): its
         #: callables are called once per method, however many entries it has.
-        self._contents: dict[tuple[int, str], dict[str, Any] | None] = {}
+        self._contents: dict[tuple[int, str], tuple[Any, dict[str, Any] | None]] = {}
 
     def value(self, value_or_func: Any) -> Any:
         """``value_or_func``, or what it returns when called as
@@ -3328,16 +3329,18 @@ class _Describing:
         if source is None:
             return None
         key = (id(source), media_type)
-        if key not in self._contents:
+        kept = self._contents.get(key)
+        if kept is None or kept[0] is not source:
             try:
-                self._contents[key] = self._content(source, media_type, where)
+                content = self._content(source, media_type, where)
             except _DataDependentError as exc:
                 if self.failures is None:
                     raise
                 if not any(seen.func is exc.func for seen in self.failures):
                     self.failures.append(exc)
-                self._contents[key] = None
-        return copy.deepcopy(self._contents[key])
+                content = None
+            kept = self._contents[key] = (source, content)
+        return copy.deepcopy(kept[1])
 
     def _content(
         self, source: ScrudfulViewFunc | Entity, media_type: str, where: str
