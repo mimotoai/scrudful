@@ -785,6 +785,10 @@ route with the API's own route in the root URLconf: a test gets
 an API the root URLconf doesn't include (or includes under parameters, or a
 namespace of its own), a ``TestClient`` request gets the route below the API's
 root, ``"items/<pk>"``. A router's own ``hsr_url`` gets its path, ``"/{pk}"``.
+DRF calls the setting's callable with a URL name instead
+(``"api:item-detail"``): a project using both adapters gives its routers
+``hsr_url=``, or its DRF views ``Meta.hsr_url``, so that one callable doesn't
+get both kinds.
 
 .. code-block:: python
 

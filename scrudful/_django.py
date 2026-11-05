@@ -92,7 +92,15 @@ class ScrudfulSettings(TypedDict, total=False):
     #: (:func:`setting_hsr_route`).
     HSR_ROUTE: bool
     #: Where the HTTP Schema Resources are served instead
-    #: (:func:`setting_hsr_url`); each adapter says what it is called with.
+    #: (:func:`setting_hsr_url`): the absolute URL of the HSR of the
+    #: request's route. Its one ``str`` argument names that route as the
+    #: adapter knows it: DRF passes the namespace-qualified URL name
+    #: (``request.resolver_match.view_name``, ``"api:item-detail"``),
+    #: django-ninja the route Django resolved, with every prefix
+    #: (``request.resolver_match.route``, ``"api/items/<pk>"``). A project
+    #: using both adapters gets both kinds from this one callable, with
+    #: nothing to tell them apart: set ``Meta.hsr_url`` (DRF) or a
+    #: ``ScrudfulRouter``'s ``hsr_url=`` (django-ninja) on one side.
     HSR_URL: Callable[[str], str]
 
 

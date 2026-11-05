@@ -201,8 +201,12 @@ The optional ``SCRUDFUL`` Django setting is a dict of these keys; a viewset's
      - ``Meta.hsr_url``
      - ``hsr_url(view_name)``: the absolute URL of the HSR of the route named
        ``view_name`` (namespace-qualified, as
-       ``request.resolver_match.view_name``), for a document served
-       elsewhere. The responses link to it as it returns it.
+       ``request.resolver_match.view_name``: ``"api:item-detail"``), for a
+       document served elsewhere. The responses link to it as it returns
+       it. django-ninja calls the setting's callable with a route instead
+       (``"api/items/<pk>"``): a project using both adapters sets
+       ``Meta.hsr_url`` here, or the ninja routers' ``hsr_url=``, so that
+       one callable doesn't get both kinds.
    * - ``"HSR_CACHE_CONTROL"``
      - ``Meta.hsr_cache_control``
      - The ``Cache-Control`` of the HSR route (default ``public,
