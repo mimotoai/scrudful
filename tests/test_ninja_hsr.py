@@ -2476,6 +2476,146 @@ def test_options_awaits_an_async_load():
     assert hsr_link_problems(dict(r.headers), PK_TARGET) == []
 
 
+def owner_router(asynchronous: bool, owned_status: int = 403, **put: Any) -> Any:
+    """GET loads any item; PUT loads it only for its owner (alice), raising
+    ``owned_status`` for anyone else. ``calls`` records each PUT load's
+    requester and method."""
+    store, calls = Store(), []
+
+    def owned(request, pk, **params):
+        calls.append((getattr(request, "auth", None), request.method))
+        if request.auth != ALICE:
+            raise HttpError(owned_status, "not yours")
+        return store.load(request, pk, **params)
+
+    async def async_owned(request, pk, **params):
+        return owned(request, pk, **params)
+
+    async def async_load(request, pk, **params):
+        return store.load(request, pk, **params)
+
+    router = ScrudfulRouter(base_url=BASE_URL)
+    get_load = async_load if asynchronous else store.load
+    put_load = async_owned if asynchronous else owned
+    if asynchronous:
+
+        @router.get("/{pk}", response=ItemOut)
+        @scrudful(load=get_load, etag_func=etag, **LINKS)
+        async def get_item(request, pk: int, obj):
+            return obj
+
+        @router.put("/{pk}", response=ItemOut, **put)
+        @scrudful(load=put_load, etag_func=etag, **LINKS)
+        async def put_item(request, pk: int, payload: ItemIn, obj):
+            return obj
+
+    else:
+
+        @router.get("/{pk}", response=ItemOut)
+        @scrudful(load=get_load, etag_func=etag, **LINKS)
+        def get_item(request, pk: int, obj):
+            return obj
+
+        @router.put("/{pk}", response=ItemOut, **put)
+        @scrudful(load=put_load, etag_func=etag, **LINKS)
+        def put_item(request, pk: int, payload: ItemIn, obj):
+            return obj
+
+    return mount(router, auth=KeyAuth()), calls
+
+
+def options_of(api: NinjaAPI, asynchronous: bool, path: str, **kwargs: Any) -> Any:
+    if asynchronous:
+        return async_options(api, path, **kwargs)
+    return options(TestClient(api), path, **kwargs)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("owned_status", [401, 403, 404])
+def test_options_runs_each_methods_own_load(asynchronous, owned_status):
+    """Authorization in a method's own ``load`` shapes ``Allow``: a refusal
+    (401, 403 or 404) of PUT's load leaves PUT out for that requester only,
+    and the OPTIONS is still a 204 (only the loader's 404 answers it)."""
+    api, calls = owner_router(asynchronous, owned_status)
+    bob = options_of(api, asynchronous, "/1", headers=BOB_KEY)
+    assert bob.status_code == 204 and bob.headers["Allow"] == "GET, OPTIONS"
+    assert calls == [(BOB, "PUT")]
+    alice = options_of(api, asynchronous, "/1", headers={"X-API-Key": ALICE})
+    assert alice.status_code == 204
+    assert alice.headers["Allow"] == "GET, PUT, OPTIONS"
+    assert calls[-1] == (ALICE, "PUT")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_options_loads_a_methods_own_object_only_once_it_passed(asynchronous):
+    """A method whose ``auth=`` refuses the requester never loads: nothing
+    loads for a method the requester may not use."""
+    api, calls = owner_router(asynchronous, auth=DenyAll())
+    bob = options_of(api, asynchronous, "/1", headers=BOB_KEY)
+    assert bob.headers["Allow"] == "GET, OPTIONS"
+    assert calls == []
+
+
+class DenyAll(APIKeyHeader):
+    param_name = "X-API-Key"
+
+    def authenticate(self, request, key):
+        return None
+
+
+def test_options_answers_the_loaders_404_before_any_methods_own_load():
+    api, calls = owner_router(False)
+    response = options(TestClient(api), "/99", headers=BOB_KEY)
+    assert response.status_code == 404
+    assert calls == []
+
+
+def test_options_shares_the_loaders_load():
+    """A method with the loader's own ``load`` doesn't load again."""
+    store, calls = Store(), []
+
+    def load(request, pk, **params):
+        calls.append(request.method)
+        return store.load(request, pk, **params)
+
+    api, _ = make_api(load=load)
+    response = options(TestClient(api), "/1")
+    assert response.headers["Allow"] == "GET, PUT, OPTIONS"
+    assert calls == ["GET"]
+
+
+def test_options_with_an_allowed_hook_runs_no_methods_own_load():
+    """An ``allowed`` hook alone decides: a method's own ``load`` doesn't
+    run, and the hook gets the loader's object."""
+    seen = []
+
+    def allowed(request, method, obj):
+        seen.append((method, obj is not None))
+        return True
+
+    store, calls = Store(), []
+
+    def owned(request, pk, **params):
+        calls.append(request.method)
+        raise HttpError(403, "not yours")
+
+    router = ScrudfulRouter(base_url=BASE_URL, allowed=allowed)
+
+    @router.get("/{pk}", response=ItemOut)
+    @scrudful(load=store.load, **LINKS)
+    def get_item(request, pk: int, obj):
+        return obj
+
+    @router.put("/{pk}", response=ItemOut)
+    @scrudful(load=owned, **LINKS)
+    def put_item(request, pk: int, payload: ItemIn, obj):
+        return obj
+
+    response = options(TestClient(mount(router)), "/1")
+    assert response.headers["Allow"] == "GET, PUT, OPTIONS"
+    assert calls == [] and seen == [("GET", True), ("PUT", True)]
+
+
 @pytest.mark.parametrize("hook", ["before", "after_throttles"])
 def test_options_never_runs_after_throttles(hook):
     """``after_throttles`` (a quota, an audit log) never runs for OPTIONS, nor

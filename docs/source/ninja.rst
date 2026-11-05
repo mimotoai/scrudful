@@ -962,7 +962,9 @@ for a preflight too. In this order:
    a method passes its object-free checks). An ``HttpError`` or ``Http404`` it raises (the 404 of a missing
    or hidden object) is the answer, by the API's exception handler, with
    ``add_error_links``'s Links and the HSR link: return ``None`` for a 204 on
-   a missing object (a PUT that may create, say).
+   a missing object (a PUT that may create, say). Another ``@scrudful``
+   operation whose ``load`` differs runs it too, in step 4, as a check of its
+   own method only.
 4. **Each method is checked**, on a copy of the request with that method:
 
    * with an ``allowed`` hook (the operation's ``allowed=``, else the
@@ -971,8 +973,14 @@ for a preflight too. In this order:
      authenticated by the operation's ``auth=`` callbacks when they
      authenticate the requester (``request.auth``), and as it came otherwise;
    * without one, the method is allowed when the operation's ``auth=``
-     callbacks authenticate the requester and its ``before`` (if any) returns
-     ``None``.
+     callbacks authenticate the requester, its ``before`` (if any) returns
+     ``None``, and then, for a ``@scrudful`` operation whose ``load`` differs
+     from step 3's, that ``load`` (called as in step 3, on the copy) returns,
+     whatever it returns. So a ``load`` that authorizes (an owner-only PUT
+     raising ``HttpError(403)`` for anyone else) leaves its method out of
+     that requester's ``Allow``, the OPTIONS still answering 204, and it
+     never runs for a method whose ``auth=`` or ``before`` refused the
+     requester. A ``load`` shared with step 3's runs once.
 
    A raised ``HttpError`` with status 401, 403 or 404 (as ninja's
    ``AuthenticationError`` and ``AuthorizationError`` are), ``Http404`` or

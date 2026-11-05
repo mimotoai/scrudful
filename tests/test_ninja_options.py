@@ -1168,7 +1168,8 @@ def test_options_async_operation_with_async_request_entity(store):
     assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
     assert sorted(calls) == [("async", None), ("sync", None)]
     assert store.calls == {}
-    # OPTIONS of the async path: the GET's (sync) load, run off the loop.
+    # OPTIONS of the async path: the GET's (sync) load, run off the loop,
+    # then the PUT's own (async) load, awaited, for PUT's Allow.
     response = async_to_sync(client.request)("OPTIONS", "/items/1")
     allow = {"GET", "PUT", "OPTIONS"}
     assert (
@@ -1177,7 +1178,7 @@ def test_options_async_operation_with_async_request_entity(store):
         )
         == []
     )
-    assert store.calls == {"load": 1}
+    assert store.calls == {"load": 2}
 
 
 # --- the implementer's own OPTIONS -------------------------------------------

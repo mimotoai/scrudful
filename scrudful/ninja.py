@@ -382,7 +382,10 @@ OPTIONS
        raises (the 404 of a missing or hidden object) is the answer, that
        status by the API's exception handler, with the Links of
        :func:`add_error_links` and the HSR link (for a 204 on a missing
-       object, return ``None``).
+       object, return ``None``). Another :func:`scrudful` operation of the
+       path whose ``load`` differs loads with it too, as a check of its own
+       method (step 4), and only for its method: its refusal is not the
+       answer.
     4. Each method the path serves is checked for this requester, on a copy
        of the request with that method. With an ``allowed`` hook (the
        operation's ``allowed=``, else the router's), what
@@ -390,8 +393,13 @@ OPTIONS
        ``TypeError``; the copy is authenticated by the operation's ``auth=``
        callbacks when they authenticate the requester, and as it came
        otherwise. Without one, the method is allowed when the operation's
-       ``auth=`` callbacks authenticate the requester and its ``before`` (if
-       any) returns ``None``. A raised ``HttpError`` with status 401, 403 or
+       ``auth=`` callbacks authenticate the requester, its ``before`` (if
+       any) returns ``None``, and then, for a :func:`scrudful` operation
+       whose ``load`` differs from the one of step 3, that ``load`` (called
+       as in step 3, on the copy) returns, whatever it returns: so
+       authorization in a method's own ``load`` shapes ``Allow``, and
+       nothing loads for a method its ``auth=`` or ``before`` refused. A
+       raised ``HttpError`` with status 401, 403 or
        404 (as ninja's ``AuthenticationError`` and ``AuthorizationError``
        are), ``Http404`` or ``PermissionDenied`` refuses the method, except
        a 404 (``HttpError`` or ``Http404``) an ``allowed`` hook raises, which
@@ -5674,8 +5682,9 @@ def _options_answer(
        ``Http404`` the loader raises is answered by the API's exception
        handler;
     4. each method of the path is checked for this requester
-       (:func:`_may_use`), with the operations of the mount the request came
-       through (:func:`_served_operations`), ninja's clones of the template's;
+       (:func:`_may_use`, with its own ``load`` when it differs from the
+       loader's), with the operations of the mount the request came through
+       (:func:`_served_operations`), ninja's clones of the template's;
     5. the answer is a 204 with no content and no ``Content-Type``, and the
        ``Allow`` of the methods allowed (:func:`scrudful._hsr.allow_value`).
 
@@ -5701,13 +5710,15 @@ def _options_answer(
         match = getattr(request, "resolver_match", None)
         url_params = dict(match.kwargs) if match is not None else {}
         try:
-            obj = _options_object(request, api, served, url_params)
+            obj, loader = _options_object(request, api, served, url_params)
         except (HttpError, Http404) as exc:
             return api.on_exception(request, exc)  # type: ignore[no-any-return]
         allowed = [
             method
             for method, template, bound in served
-            if _may_use(request, router, method, template, bound, obj, url_params)
+            if _may_use(
+                request, router, method, template, bound, obj, url_params, api, loader
+            )
         ]
     except Exception as exc:
         return api.on_exception(request, exc)  # type: ignore[no-any-return]
@@ -5929,8 +5940,10 @@ def _options_object(
     api: NinjaAPI,
     served: list[tuple[str, Any, Any]],
     url_params: dict[str, Any],
-) -> Any:
-    """The object of OPTIONS: what the loading operation's ``load`` returns.
+) -> tuple[Any, Callable[..., Any] | None]:
+    """The object of OPTIONS: what the loading operation's ``load`` returns,
+    and that ``load`` (``None`` without a loading operation), whether it ran
+    or not.
 
     The loading operation is the GET operation, if it has a ``load``, else
     the first item operation (:func:`scrudful`) with one; ``None`` (no
@@ -5961,15 +5974,15 @@ def _options_object(
             loading = method, config, bound
             break
     if loading is None:
-        return None
+        return None, None
     method, config, bound = loading
     requester, authenticated = _authenticated(request, bound, method)
     if not authenticated or not _before_allows(config, bound, requester, url_params):
-        return None
+        return None, config.load
     values = _path_values(requester, api, bound, url_params)
     if values is None:
-        return None
-    return _settled(config.load(requester, **values))
+        return None, config.load
+    return _settled(config.load(requester, **values)), config.load
 
 
 def _path_values(
@@ -6122,20 +6135,24 @@ def _may_use(
     bound: Any,
     obj: Any,
     url_params: dict[str, Any],
+    api: NinjaAPI,
+    loader: Callable[..., Any] | None,
 ) -> bool:
     """Whether the requester of the OPTIONS ``request`` may use ``method``,
     which the template operation ``template`` serves (``bound`` is its clone
-    serving the request), on ``obj``.
+    serving the request), on ``obj``, which ``loader`` loaded (see
+    :func:`_options_object`).
 
     With an ``allowed`` hook (the operation's, else ``router``'s), what it
     returns, on a copy of the request with ``method``, authenticated by the
     operation's ``auth`` callbacks when they authenticate it (else as is:
     the hook alone decides); a denial it raises (:func:`_is_hook_denial`)
     is not allowed, and anything else it raises (a 404 included)
-    propagates. Otherwise, whether those callbacks authenticate it and the
+    propagates. Otherwise, whether those callbacks authenticate it, the
     operation's ``before`` allows it (see :func:`_authenticated` and
-    :func:`_before_allows`). Neither throttles, ``after_throttles`` nor
-    ``load`` run.
+    :func:`_before_allows`) and then its own ``load`` does
+    (:func:`_own_load_allows`). Neither throttles nor ``after_throttles``
+    run.
 
     Raises
     ------
@@ -6159,7 +6176,49 @@ def _may_use(
                 f"allowed returned {result!r} for {method}: it must return a bool"
             )
         return result
-    return authenticated and _before_allows(config, bound, requester, url_params)
+    return (
+        authenticated
+        and _before_allows(config, bound, requester, url_params)
+        and _own_load_allows(config, api, bound, requester, url_params, loader)
+    )
+
+
+def _own_load_allows(
+    config: _Config | None,
+    api: NinjaAPI,
+    operation: Any,
+    requester: HttpRequest,
+    url_params: dict[str, Any],
+    loader: Callable[..., Any] | None,
+) -> bool:
+    """Whether the item operation's own ``load`` lets ``requester`` (a copy of
+    the OPTIONS request with the method, authenticated and allowed by
+    ``before``) use the method: it is called as the operation calls it, when
+    it differs from ``loader`` (the one :func:`_options_object` loads with,
+    whose answer is the OPTIONS'), and a denial it raises (a 401, 403 or 404
+    ``HttpError``, ``Http404`` or ``PermissionDenied``: :func:`_is_denial`)
+    refuses that method only. What it returns, ``None`` included, allows
+    it: the method's own flow answers that. An ``async def`` load is awaited.
+    With path parameters the operation would refuse (a 422), nothing loads,
+    as for the loader. Anything else it raises propagates.
+    """
+    if (
+        config is None
+        or config.kind != "item"
+        or config.load is None
+        or config.load == loader
+    ):
+        return True
+    values = _path_values(requester, api, operation, url_params)
+    if values is None:
+        return True
+    try:
+        _settled(config.load(requester, **values))
+    except Exception as exc:
+        if _is_denial(exc):
+            return False
+        raise
+    return True
 
 
 #: The description of each method's ``default`` response entry: the errors.
