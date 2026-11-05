@@ -753,6 +753,19 @@ API-wide error entity is :func:`~scrudful.ninja.add_error_links`'s): another
 value, or an unknown key, raises ``ImproperlyConfigured``. A ``base_url`` that
 isn't absolute is a ``ConfigError``.
 
+**A nested router inherits none of them.** A ``ScrudfulRouter`` added to
+another with ``add_router`` keeps its own ``base_url``, ``hsr_route``,
+``hsr_url``, ``hsr_cache_control`` and ``allowed``: those not given fall back
+to ``SCRUDFUL``, not to the parent's. Pass them to each router (a shared
+``dict`` of keyword arguments, say):
+
+.. code-block:: python
+
+    options = {"base_url": "https://api.example.com/", "allowed": allowed}
+    orgs = ScrudfulRouter(**options)
+    members = ScrudfulRouter(**options)  # not inherited from orgs
+    orgs.add_router("/{org}/members", members)
+
 The document
 ~~~~~~~~~~~~
 

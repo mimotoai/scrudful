@@ -41,6 +41,18 @@ Behaviour change (all adapters)
   loading operation's own ``auth=`` and ``before`` allow the requester, hook
   or not (else the hook gets ``obj=None``). A 404 the loader raises is the OPTIONS's
   answer, with the error Links and the HSR link; ``None`` is no object.
+* A denial an ``Allow`` hook raises refuses that method, in every adapter:
+  DRF's ``PermissionDenied`` or ``NotAuthenticated`` (or Django's
+  ``PermissionDenied``) from ``allowed_func``; ninja's ``HttpError`` 401 or
+  403 (``AuthenticationError``, ``AuthorizationError``) or ``PermissionDenied``
+  from ``allowed``; FastAPI's ``HTTPException`` 401 or 403 from
+  ``add_options(allowed=)`` (ninja and FastAPI failed the whole OPTIONS). A
+  404 a hook raises is the OPTIONS's answer; anything else propagates.
+* The HSR route and views are public under Django's
+  ``LoginRequiredMiddleware`` (Django 5.1+): DRF's ``hsr_urls()`` view and
+  ``http_schema_resource_view``, ninja's HSR routes and
+  ``http_schema_resource_view``, and the ``handler404`` / ``handler500`` views
+  are ``login_required = False`` (they redirected to the login page).
 * A CORS preflight (an OPTIONS with ``Origin`` and
   ``Access-Control-Request-Method``) that reaches scrudful is answered 204
   without content or Links, before any authentication, throttle, hook,
@@ -79,6 +91,8 @@ Behaviour change (all adapters)
   view returns, and the errors the framework answers through scrudful's error
   helpers; after the other Links. A Link the view sets with that relation
   replaces it. A preflight, and an error for a URL no route serves, get none.
+* A link URL with a scheme but no authority (``urn:``, ``tag:``) is absolute
+  in the HSR, as RFC 3986 has it: it needs no base URL.
 * The Link headers resolve relative URLs against the base URL when one is set
   (were always resolved against the request), so they agree with the HSR on
   every ``Host``.
@@ -162,8 +176,19 @@ Behaviour change (DRF)
   scrudful view, not only an OPTIONS, raises ``ImproperlyConfigured`` without
   it (or ``SCRUDFUL["HSR_URL"]``, or ``Meta.hsr_url``). So does a routed
   request of a scrudful view whose route has no URL name; two scrudful views
-  sharing a URL name make every ``/_hsr/`` request raise it. A view called
-  without URL resolution (``APIRequestFactory``) gets no HSR link.
+  sharing a URL name make a GET of that name's ``/_hsr/`` raise it. Each
+  breaks only its own requests: the HSRs of the other names are served. A
+  view called without URL resolution (``APIRequestFactory``) gets no HSR link.
+* ``manage.py check`` reports those misconfigurations before any request, as
+  errors of Django's URL system check: ``scrudful.E001`` (an unnamed route of
+  a scrudful view), ``E002`` (one URL name for two scrudful views), ``E003``
+  (no ``hsr_urls()`` include where a view needs it), ``E004`` (a route turned
+  off without ``hsr_url``), ``E005`` (an HSR that can't be built: a relative
+  link without a base URL, a schema without a context, a link callable failing
+  as ``func(view, None)``) and ``E006`` (an invalid ``SCRUDFUL`` setting). The
+  ``hsr_urls()`` pattern runs the check in Django's URL check; ``E003`` needs
+  ``scrudful.rest_framework`` imported before the checks start, which
+  registers the check (an ``AppConfig.ready()``).
 * OPTIONS is no longer gated by the view's permissions (DRF's ``initial()``
   checked them for OPTIONS too); authentication and throttles still run. Its
   ``Allow`` runs each method's ``check_permissions`` and, with the object,
