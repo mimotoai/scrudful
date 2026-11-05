@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
+from starlette.convertors import Convertor, register_url_convertor
 from starlette.routing import Mount, Route, Router
 
 from scrudful._hsr import (
@@ -2016,6 +2017,41 @@ def test_router_resource_the_hooks_miss_is_announced(make_client):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert hsr_link_problems(client.get("/things/1").headers, target) == []
+
+
+class _BuggyConvertor(Convertor):
+    """Matches any rest of the path; its ``convert`` has a bug for a value
+    without a ``/``."""
+
+    regex = ".+"
+
+    def convert(self, value: str) -> str:
+        if "/" not in value:
+            raise RuntimeError("convertor bug")
+        return value
+
+    def to_string(self, value: str) -> str:  # pragma: no cover
+        return value
+
+
+def test_a_convertor_s_unexpected_error_propagates(make_client):
+    """Finding the prefix a router came through converts the parameters each
+    candidate gives: a convertor refusing one (``ValueError``) rules the
+    candidate out, but another exception is a bug, not hidden behind
+    another prefix."""
+    register_url_convertor("scrudful_test_buggy", _BuggyConvertor())
+    router = APIRouter()
+
+    @router.get("/a/{rest:scrudful_test_buggy}")
+    @scrudful(**NOTE_LINKS)
+    async def read(rest: str):
+        return {}
+
+    add_options(router, base_url=BASE)
+    app = FastAPI()
+    app.include_router(router)
+    with pytest.raises(RuntimeError, match="convertor bug"):
+        make_client(app).get("/a/a/b")
 
 
 def test_target_needs_a_request_to_a_url_of_the_path(make_client):

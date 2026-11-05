@@ -399,6 +399,10 @@ Behaviour change (FastAPI)
   wraps those methods on the routers. A route appended to the router's
   ``routes`` still gets none until ``add_options`` is called again, and a
   ``RuntimeWarning`` now names it.
+* A custom path convertor whose ``convert`` raises something other than
+  ``ValueError`` or ``TypeError`` while the HSR link of a router's resource is
+  built makes the request fail with it (it was taken as a refusal, and the
+  link could point under another prefix).
 
 New
 ---

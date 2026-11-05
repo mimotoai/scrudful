@@ -3610,13 +3610,15 @@ def _same_parameters(
 ) -> bool:
     """Whether the parameters of a template's ``match`` that the request's
     path parameters ``known`` have are those, once ``convertors`` convert
-    them."""
+    them. A convertor refusing a value (``ValueError``, as Starlette's do,
+    or ``TypeError``) means they aren't; anything else it raises is a bug,
+    which propagates rather than make another prefix the HSR link's."""
     for name, value in match.groupdict().items():
         if name not in known:
             continue
         try:
             converted = convertors[name].convert(value)
-        except Exception:  # a custom convertor refusing it
+        except (ValueError, TypeError):  # the convertor refuses the value
             return False
         if converted != known[name]:
             return False
