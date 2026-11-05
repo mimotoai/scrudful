@@ -899,8 +899,11 @@ for a preflight too. In this order:
    A raised ``HttpError`` with status 401, 403 or 404 (as ninja's
    ``AuthenticationError`` and ``AuthorizationError`` are), ``Http404`` or
    ``PermissionDenied`` refuses the method: a ``before`` that signals denial
-   with a 404 refuses it, it doesn't answer the OPTIONS. Anything else raised
-   is answered by the API's exception handler. Throttles, ``after_throttles``
+   with a 404 refuses it, it doesn't answer the OPTIONS. An ``allowed`` hook's
+   401, 403 or ``PermissionDenied`` refuses the method too (as DRF's
+   ``allowed_func`` and FastAPI's ``allowed`` do), but a 404 it raises is the
+   OPTIONS's answer, as ``load``'s is. Anything else raised is answered by the
+   API's exception handler. Throttles, ``after_throttles``
    and the handlers never run, so computing ``Allow`` uses no throttle quota;
    the CSRF check of a cookie ``auth`` is skipped (the request using the
    method is checked).

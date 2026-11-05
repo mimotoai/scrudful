@@ -311,7 +311,10 @@ With ``ScrudfulMetadata`` installed, OPTIONS is answered in this order:
 ``Meta.allowed_func`` for every handler of a viewset), when given, alone decides
 its method: ``request`` is a request of ``method``, ``obj`` the loaded object
 or ``None``. It returns a ``bool`` (``TypeError`` otherwise), and may raise
-``PermissionDenied`` or ``NotAuthenticated`` for ``False``. Use it for
+DRF's ``PermissionDenied`` or ``NotAuthenticated`` (or Django's
+``PermissionDenied``) for ``False``, as ninja's and FastAPI's hooks may raise
+their 401 and 403; an ``Http404`` (or ``NotFound``) it raises is the OPTIONS's
+404, anything else propagates. Use it for
 authorization the permission classes don't hold (a policy checked in the
 view's code, say). A method with an ``allowed_func`` passes step 3 for every
 requester, since the hook has no object-free check: on such a view the object

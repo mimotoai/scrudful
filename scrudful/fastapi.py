@@ -1255,7 +1255,8 @@ def add_options(
         for every requester, after ``load`` (see step 3 above for what that
         reveals). A ``def`` runs in the threadpool, an ``async def`` (or an
         awaitable result) is awaited. Anything but a ``bool`` returned is a
-        ``TypeError``.
+        ``TypeError``. An ``HTTPException`` 401 or 403 it raises refuses the
+        method; another (a 404) is the OPTIONS's answer.
     load : callable, optional
         ``load(request, **path_params)``: the object at the URL, for
         ``allowed``, or ``None`` for none (a collection, a missing object);
@@ -2265,6 +2266,9 @@ def _leaf_routes(routes: Sequence[Any]) -> Iterator[Any]:
 #: The statuses of an ``HTTPException`` a per-method check of OPTIONS raises
 #: that mean "not allowed".
 _DENIAL_STATUSES = frozenset({401, 403, 404})
+#: Those an ``allowed`` hook raises that do (a 404 is the OPTIONS's answer,
+#: as ``load``'s is).
+_HOOK_DENIAL_STATUSES = frozenset({401, 403})
 
 
 async def _options_answer(
@@ -2295,9 +2299,9 @@ async def _options_answer(
        the HSR link (:func:`_hsr_target`) and the exposed headers.
 
     An ``HTTPException`` raised by ``load``, the hook or a check (but a
-    check's 401, 403 or 404) is answered by the app's exception handlers,
-    with the HSR link (:func:`_options_error`). Anything else raised
-    propagates.
+    check's 401, 403 or 404, and the hook's 401 or 403, which refuse the
+    method) is answered by the app's exception handlers, with the HSR link
+    (:func:`_options_error`). Anything else raised propagates.
     """
     if is_preflight(request.method, request.headers.get):
         return Response(status_code=204)
@@ -2358,7 +2362,10 @@ async def _hooked(
 ) -> bool:
     """``allowed(clone, method, obj)``, with ``clone`` a copy of ``request``
     whose method is ``method`` (sync hooks run in the threadpool, an
-    awaitable result is awaited).
+    awaitable result is awaited). An ``HTTPException`` 401 or 403 it raises
+    means not allowed (R30, as DRF's and ninja's hooks); anything else it
+    raises propagates (an ``HTTPException``, a 404 included, is then the
+    OPTIONS's answer).
 
     Raises
     ------
@@ -2366,7 +2373,12 @@ async def _hooked(
         If it returns something other than a ``bool``.
     """
     clone = Request({**request.scope, "method": method}, request.receive)
-    result = await _call(functools.partial(allowed, clone, method, obj), {})
+    try:
+        result = await _call(functools.partial(allowed, clone, method, obj), {})
+    except HTTPException as exc:
+        if exc.status_code in _HOOK_DENIAL_STATUSES:
+            return False
+        raise
     if not isinstance(result, bool):
         raise TypeError(
             f"allowed returned {result!r} for {method}: it must return a bool"

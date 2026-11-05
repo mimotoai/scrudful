@@ -18,7 +18,12 @@ from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.http import Http404, HttpResponseForbidden
 from django.test import Client
 from ninja import NinjaAPI, Router
-from ninja.errors import AuthenticationError, ConfigError, HttpError
+from ninja.errors import (
+    AuthenticationError,
+    AuthorizationError,
+    ConfigError,
+    HttpError,
+)
 from ninja.renderers import JSONRenderer
 from ninja.security import APIKeyHeader, django_auth
 from ninja.throttling import AnonRateThrottle
@@ -1416,6 +1421,60 @@ def test_denials_of_a_check(error, where):
     else:
         api, _ = make_api(auth=check)
     assert options(TestClient(api), "/1").headers["Allow"] == "GET, OPTIONS"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        HttpError(401, "no"),
+        HttpError(403, "no"),
+        AuthenticationError(),
+        AuthorizationError(),
+        PermissionDenied("no"),
+    ],
+    ids=["401", "403", "AuthenticationError", "AuthorizationError", "PermissionDenied"],
+)
+def test_a_denial_an_allowed_hook_raises_means_not_allowed(error):
+    """R30: as DRF's allowed_func and FastAPI's allowed= do."""
+
+    def allowed(request, method, obj):
+        if method == "PUT":
+            raise error
+        return True
+
+    api, _ = make_api(allowed=allowed)
+    r = options(TestClient(api), "/1")
+    assert r.status_code == 204
+    assert r.headers["Allow"] == "GET, OPTIONS"
+
+
+@pytest.mark.parametrize(
+    "error", [HttpError(404, "gone"), Http404("gone")], ids=["404", "Http404"]
+)
+def test_a_404_an_allowed_hook_raises_is_the_answer(error):
+    def allowed(request, method, obj):
+        raise error
+
+    api, _ = make_api(allowed=allowed)
+    assert options(TestClient(api), "/1").status_code == 404
+
+
+def test_another_error_an_allowed_hook_raises_propagates():
+    def allowed(request, method, obj):
+        if method == "PUT":
+            raise HttpError(409, "conflict")
+        return True
+
+    api, _ = make_api(allowed=allowed)
+    r = options(TestClient(api), "/1")
+    assert r.status_code == 409 and r.json() == {"detail": "conflict"}
+
+    def broken(request, method, obj):
+        raise LookupError("broken")
+
+    api, _ = make_api(allowed=broken)
+    with pytest.raises(LookupError, match="broken"):
+        options(TestClient(api), "/1")
 
 
 @pytest.mark.parametrize(

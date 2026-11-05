@@ -244,13 +244,15 @@ OPTIONS``, not a 401), in this order:
    existing object alike.
 4. **With** ``allowed``, ``allowed(request, method, obj)`` alone decides each
    method (``request`` a copy with that method; a ``bool``, else
-   ``TypeError``).
+   ``TypeError``). An ``HTTPException`` 401 or 403 it raises refuses the
+   method, as DRF's ``allowed_func`` and ninja's ``allowed`` do.
 5. **The answer** is a 204 without content or ``Content-Type``, with ``Allow``
    (the allowed methods and ``OPTIONS``; ``HEAD`` only when a route serves it),
    one HSR link and ``Access-Control-Expose-Headers``.
 
 An ``HTTPException`` raised by ``load`` or ``allowed`` (the 404 of a missing
-object), or by a check with another status than 401, 403 and 404 (a 429), is
+object; for ``allowed``, another status than 401 and 403), or by a check with
+another status than 401, 403 and 404 (a 429), is
 answered by the app's exception handlers, with the HSR link; anything else
 raised propagates (a 500). A 405 is Starlette's, with its ``Allow``: the
 methods of the first route whose path matches, which may be fewer than the

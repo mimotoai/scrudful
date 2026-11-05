@@ -17,12 +17,15 @@ from django.contrib.auth.models import Group, User
 from django.core import checks
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
+from django.http import Http404
 from django.test import Client, RequestFactory
 from django.urls import ResolverMatch, include, path, resolve, reverse
 from rest_framework import viewsets
 from rest_framework.authentication import BasicAuthentication
 from rest_framework.decorators import action
-from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import NotAuthenticated, NotFound
+from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
 from rest_framework.metadata import BaseMetadata
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
@@ -1803,3 +1806,64 @@ def test_another_exception_of_a_check_propagates(settings, client):
     settings.ROOT_URLCONF = CheckURLconf
     with pytest.raises(ValueError, match="broken"):
         client.options("/broken/1/")
+
+
+#: What the ``raising/<case>/`` views' ``allowed_func`` raises for PUT.
+HOOK_RAISES = {
+    "drf-denied": DRFPermissionDenied(),
+    "not-authenticated": NotAuthenticated(),
+    "django-denied": DjangoPermissionDenied(),
+    "http404": Http404(),
+    "not-found": NotFound(),
+    "broken": LookupError("broken"),
+}
+
+
+def raising_hook(view, request, method, obj):
+    if method == "PUT":
+        raise HOOK_RAISES[view.kwargs["case"]]
+    return True
+
+
+@scrudful_viewset
+class RaisingHookViewSet(drf_hsr_urls.ItemViewSetBase):
+    class Meta:
+        allowed_func = raising_hook
+
+    def retrieve(self, request, case):
+        return Response({"case": case})
+
+    def update(self, request, case):
+        return Response({"case": case})
+
+
+class RaisingHookURLconf:
+    urlpatterns = [
+        path(
+            "raising/<str:case>/",
+            RaisingHookViewSet.as_view({"get": "retrieve", "put": "update"}),
+            name="raising",
+        ),
+        path("", include(hsr_urls())),
+    ]
+
+
+@pytest.mark.parametrize("case", ["drf-denied", "not-authenticated", "django-denied"])
+def test_a_denial_an_allowed_func_raises_means_not_allowed(settings, client, case):
+    """R30: as ninja's allowed= and FastAPI's allowed= do."""
+    settings.ROOT_URLCONF = RaisingHookURLconf
+    response = client.options(f"/raising/{case}/")
+    assert response.status_code == 204
+    assert response["Allow"] == "GET, OPTIONS, HEAD"
+
+
+@pytest.mark.parametrize("case", ["http404", "not-found"])
+def test_a_404_an_allowed_func_raises_is_the_answer(settings, client, case):
+    settings.ROOT_URLCONF = RaisingHookURLconf
+    assert client.options(f"/raising/{case}/").status_code == 404
+
+
+def test_another_exception_an_allowed_func_raises_propagates(settings, client):
+    settings.ROOT_URLCONF = RaisingHookURLconf
+    with pytest.raises(LookupError, match="broken"):
+        client.options("/raising/broken/")

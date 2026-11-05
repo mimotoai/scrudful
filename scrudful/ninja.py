@@ -376,9 +376,11 @@ OPTIONS
        ``auth=`` callbacks authenticate the requester and its ``before`` (if
        any) returns ``None``. A raised ``HttpError`` with status 401, 403 or
        404 (as ninja's ``AuthenticationError`` and ``AuthorizationError``
-       are), ``Http404`` or ``PermissionDenied`` refuses the method; anything
-       else raised is answered by the API's exception handler, as ninja
-       answers what an operation raises (re-raised without a handler).
+       are), ``Http404`` or ``PermissionDenied`` refuses the method, but a
+       hook's 404 (``HttpError`` or ``Http404``), which is the OPTIONS's
+       answer, as ``load``'s is; anything else raised is answered by the
+       API's exception handler, as ninja answers what an operation raises
+       (re-raised without a handler).
        What an ``async def`` callback returns is awaited
        (``asgiref.sync.async_to_sync``), never taken for an answer; an
        awaitable returned by the ``before`` of a sync operation, which the
@@ -1128,6 +1130,9 @@ def scrudful(
         the router's ``allowed``, and alone decides: without either, the
         operation's ``auth=`` callbacks and ``before`` decide. It may be
         ``async def`` whatever the handler is, and must return a ``bool``.
+        A 401 or 403 ``HttpError`` (``AuthenticationError``,
+        ``AuthorizationError``) or ``PermissionDenied`` it raises refuses the
+        method; a 404 it raises is the OPTIONS's answer.
 
     Raises
     ------
@@ -5205,6 +5210,16 @@ def _is_denial(exc: Exception) -> bool:
     return isinstance(exc, (Http404, PermissionDenied))
 
 
+def _is_hook_denial(exc: Exception) -> bool:
+    """Whether ``exc``, raised by an ``allowed`` hook, means "not allowed"
+    (R30): a 401 or 403 ``HttpError`` (as ninja's ``AuthenticationError`` and
+    ``AuthorizationError`` are) or ``PermissionDenied``. A 404 (``HttpError``
+    or ``Http404``) is the hook's answer to the OPTIONS, as ``load``'s is."""
+    if isinstance(exc, HttpError):
+        return exc.status_code in (401, 403)
+    return isinstance(exc, PermissionDenied)
+
+
 def _settled(result: Any) -> Any:
     """``result``, awaited (``async_to_sync``) when it is awaitable: an
     ``async def`` check's coroutine is truthy, never its answer."""
@@ -5514,9 +5529,11 @@ def _may_use(
     With an ``allowed`` hook (the operation's, else ``router``'s), what it
     returns, on a copy of the request with ``method``, authenticated by the
     operation's ``auth`` callbacks when they authenticate it (else as is:
-    the hook alone decides). Otherwise, whether those callbacks authenticate
-    it and the operation's ``before`` allows it (see :func:`_authenticated`
-    and :func:`_before_allows`). Neither throttles, ``after_throttles`` nor
+    the hook alone decides); a denial it raises (:func:`_is_hook_denial`)
+    is not allowed, and anything else it raises (a 404 included)
+    propagates. Otherwise, whether those callbacks authenticate it and the
+    operation's ``before`` allows it (see :func:`_authenticated` and
+    :func:`_before_allows`). Neither throttles, ``after_throttles`` nor
     ``load`` run.
 
     Raises
@@ -5530,7 +5547,12 @@ def _may_use(
         hook = router.allowed
     requester, authenticated = _authenticated(request, bound, method)
     if hook is not None:
-        result = _settled(hook(requester, method, obj))
+        try:
+            result = _settled(hook(requester, method, obj))
+        except Exception as exc:
+            if _is_hook_denial(exc):
+                return False
+            raise
         if not isinstance(result, bool):
             raise TypeError(
                 f"allowed returned {result!r} for {method}: it must return a bool"

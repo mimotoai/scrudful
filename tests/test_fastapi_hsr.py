@@ -2137,17 +2137,46 @@ def test_load_http_exception_through_a_custom_handler(make_client):
     assert hsr_link_problems(dict(response.headers), NOTE_TARGET) == []
 
 
-def test_allowed_hook_http_exception_is_answered(make_client):
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_denial_an_allowed_hook_raises_means_not_allowed(make_client, status):
+    """R30: an ``HTTPException`` 401 or 403 from the hook refuses the method,
+    as DRF's allowed_func and ninja's allowed= do."""
+
     def allowed(request: Request, method: str, obj: Any) -> bool:
-        raise HTTPException(status_code=403, detail="No")
+        if method == "PUT":
+            raise HTTPException(status_code=status, detail="No")
+        return True
 
     response = make_client(note_app(allowed=allowed, error=APP_ERROR)).options(
         "/notes/1"
     )
-    assert response.status_code == 403
+    assert response.status_code == 204
+    assert response.headers["allow"] == "GET, OPTIONS, HEAD"
+
+
+@pytest.mark.parametrize("status", [404, 409])
+def test_another_allowed_hook_http_exception_is_answered(make_client, status):
+    """A 404 (R16) or another status the hook raises is the OPTIONS's
+    answer, by the app's handlers."""
+
+    def allowed(request: Request, method: str, obj: Any) -> bool:
+        raise HTTPException(status_code=status, detail="No")
+
+    response = make_client(note_app(allowed=allowed, error=APP_ERROR)).options(
+        "/notes/1"
+    )
+    assert response.status_code == status
     assert response.json() == {"detail": "No"}
     assert hsr_link_problems(dict(response.headers), NOTE_TARGET) == []
-    assert link_problems("OPTIONS", 403, dict(response.headers), True) == []
+    assert link_problems("OPTIONS", status, dict(response.headers), True) == []
+
+
+def test_another_exception_an_allowed_hook_raises_propagates(make_client):
+    def allowed(request: Request, method: str, obj: Any) -> bool:
+        raise LookupError("broken")
+
+    with pytest.raises(LookupError, match="broken"):
+        make_client(note_app(allowed=allowed)).options("/notes/1")
 
 
 def test_a_check_setting_request_state_leaves_the_others_alone(make_client):
