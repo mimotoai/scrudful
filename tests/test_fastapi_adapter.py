@@ -2906,7 +2906,8 @@ def test_add_options_on_a_router_groups_differently_named_parameters(make_client
         return {}
 
     add_options(router, base_url=TEST_BASE_URL)
-    automatic = [route for route in router.routes if "OPTIONS" in route.methods]
+    # The HSR route (methods=None, every method) isn't an OPTIONS route.
+    automatic = [r for r in router.routes if r.methods and "OPTIONS" in r.methods]
     assert [route.path for route in automatic] == [
         "/items/{id}",
         "/things/{n:int}",

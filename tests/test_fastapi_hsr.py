@@ -3,24 +3,34 @@
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any
 
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response
 from fastapi.testclient import TestClient
-from starlette.routing import Mount, Router
+from starlette.routing import Mount, Route, Router
 
-from scrudful._hsr import HsrConfigError, options_operation
+from scrudful._hsr import (
+    HsrConfigError,
+    hsr_etag,
+    hsr_response_links,
+    options_operation,
+    serialize_hsr,
+)
 from scrudful.fastapi import (
     CONDITIONAL_READ_RESPONSES,
     Entity,
+    _hsr_target,
     add_error_links,
     add_options,
     http_schema_resource,
+    http_schema_resource_endpoint,
     scrudful,
 )
 from tests.semantic_http import (
+    hsr_get_problems,
     link_problems,
     parse_links,
     validate_http_schema_resource,
@@ -256,7 +266,8 @@ def test_parameter_names_are_one_resource_convertors_are_distinct(make_client):
     app = FastAPI()
     app.include_router(reads)
     app.include_router(writes)
-    add_options(app, base_url=BASE)
+    # /items/{id} and /items/{id:int} would both have the route items.id.
+    add_options(app, base_url=BASE, hsr_route=False, hsr_url=str)
     hsr = http_schema_resource(app, "/items/{id}")
     assert list(hsr) == ["get", "put", "options", "patch"]
     assert http_schema_resource(app, "/items/{item_id}") == hsr
@@ -1016,3 +1027,456 @@ def test_the_hsr_is_a_deep_copy():
     pristine = copy.deepcopy(hsr)
     hsr["get"]["responses"]["200"]["content"]["application/json"]["schema"] = {}
     assert http_schema_resource(app, "/users/{id}") == pristine
+
+
+# --- the HSR GET route --------------------------------------------------------------
+
+
+def exposed(headers: Any) -> set[str]:
+    return {n.strip() for n in headers["access-control-expose-headers"].split(",")}
+
+
+def require_token(authorization: str | None = Header(None)) -> str:
+    """An app-level dependency: every APIRoute needs ``Bearer <token>``."""
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token needed")
+    return authorization.removeprefix("Bearer ")
+
+
+def token_app() -> FastAPI:
+    """``/users/{id}`` (GET) behind an app-level ``Depends(require_token)``."""
+    app = FastAPI(dependencies=[Depends(require_token)])
+
+    @app.get("/users/{id}")
+    @scrudful(etag_func=lambda **kwargs: '"v1"', **USER_LINKS)
+    async def get_user(id: int):
+        return {"id": id}
+
+    add_error_links(app, APP_ERROR)
+    add_options(app, base_url=BASE)
+    return app
+
+
+def hsr_problems(response: Any) -> list[str]:
+    return hsr_get_problems(
+        response.status_code, dict(response.headers), response.content
+    )
+
+
+def test_hsr_route_serves_document(make_client):
+    app = make_app()
+    client = make_client(app)
+    for name, path in (("users.id", "/users/{id}"), ("users", "/users")):
+        response = client.get(f"/_hsr/{name}")
+        assert hsr_problems(response) == []
+        assert response.content == serialize_hsr(http_schema_resource(app, path))
+        assert response.headers["etag"] == hsr_etag(response.content)
+    response = client.get("/_hsr/users.id")
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["cache-control"] == "public, max-age=300"
+    assert response.headers["link"] == hsr_response_links()
+    assert {"Link", "Allow", "ETag"} <= exposed(response.headers)
+    etag = response.headers["etag"]
+    for if_none_match in (etag, "W/" + etag, f'"other", {etag}', "*"):
+        not_modified = client.get(
+            "/_hsr/users.id", headers={"If-None-Match": if_none_match}
+        )
+        assert not_modified.status_code == 304
+        assert not_modified.content == b""
+        assert not_modified.headers["etag"] == etag
+        assert not_modified.headers["cache-control"] == "public, max-age=300"
+        assert "content-type" not in not_modified.headers
+    other = client.get("/_hsr/users.id", headers={"If-None-Match": '"other"'})
+    assert other.status_code == 200
+    head = client.head("/_hsr/users.id")
+    assert head.status_code == 200
+    assert head.content == b""
+    assert head.headers["etag"] == etag
+    assert head.headers["content-type"] == "application/json"
+    head_304 = client.head("/_hsr/users.id", headers={"If-None-Match": etag})
+    assert head_304.status_code == 304
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+def test_hsr_route_answers_other_methods_405(make_client, method):
+    response = make_client(make_app()).request(method, "/_hsr/users.id")
+    assert response.status_code == 405
+    assert response.headers["allow"] == "GET, HEAD"
+    assert response.content == b""
+    assert "content-type" not in response.headers
+    assert {"Link", "Allow"} <= exposed(response.headers)
+
+
+def test_hsr_route_unknown_name_is_a_json_404(make_client):
+    client = make_client(make_app())
+    for url in ("/_hsr/people.id", "/_hsr/users.name", "/_hsr/_root"):
+        response = client.get(url)
+        assert response.status_code == 404
+        assert response.headers["content-type"] == "application/json"
+        assert response.json() == {"detail": "Not Found"}
+
+
+def test_hsr_route_has_no_dependencies(make_client):
+    """An app's, a router's and an ``include_router`` call's dependencies
+    apply to their APIRoutes, not to the HSR route."""
+    from fastapi.routing import APIRoute
+
+    app = token_app()
+    client = make_client(app)
+    assert client.get("/users/1").status_code == 401
+    authorized = client.get("/users/1", headers={"Authorization": "Bearer a"})
+    assert authorized.json() == {"id": 1}
+    assert hsr_problems(client.get("/_hsr/users.id")) == []
+    route = app.router.routes[0]
+    assert type(route) is Route and not isinstance(route, APIRoute)
+    assert route.include_in_schema is False
+    assert not any("_hsr" in path for path in app.openapi()["paths"])
+
+    router = APIRouter(dependencies=[Depends(require_token)])
+
+    @router.get("/items/{id}")
+    @scrudful(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    async def get_item(id: int):
+        return {}
+
+    add_options(router, base_url=BASE)
+    other = FastAPI(dependencies=[Depends(require_token)])
+    other.include_router(router, prefix="/v1", dependencies=[Depends(require_token)])
+    client = make_client(other)
+    assert client.get("/v1/items/1").status_code == 401
+    response = client.get("/v1/_hsr/items.id")
+    assert hsr_problems(response) == []
+    assert response.json() == http_schema_resource(router, "/items/{id}")
+
+
+def test_hsr_bytes_identical_across_hosts_and_tokens(make_client):
+    """Two apps (each builds its own document), two Hosts, two tokens: the
+    same bytes and ETag, while the resources themselves need the token."""
+    responses = []
+    for host, token in (("a.example", "alice"), ("b.example", "bob")):
+        client = make_client(token_app(), base_url=f"http://{host}")
+        auth = {"Authorization": f"Bearer {token}", "Host": host}
+        assert client.get("/users/1", headers=auth).status_code == 200
+        responses.append(client.get("/_hsr/users.id", headers=auth))
+    first, second = responses
+    assert first.status_code == second.status_code == 200
+    assert first.content == second.content
+    assert first.headers["etag"] == second.headers["etag"]
+    assert b"a.example" not in first.content
+    assert first.content == serialize_hsr(
+        http_schema_resource(token_app(), "/users/{id}")
+    )
+
+
+def test_hsr_route_resolves_before_every_path(make_client):
+    """Wildcard paths, added before or after ``add_options``, would match
+    ``/_hsr/<name>`` if they came first."""
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    app = FastAPI()
+
+    @app.get("/{kind}/{id}")
+    @scrudful(**links)
+    async def pair(kind: str, id: str):
+        return {"pair": [kind, id]}
+
+    add_options(app, base_url=BASE)
+
+    @app.get("/{id}")
+    @scrudful(**links)
+    async def item(id: str):
+        return {"id": id}
+
+    client = make_client(app)
+    for name, path in (("kind.id", "/{kind}/{id}"), ("id", "/{id}")):
+        response = client.get(f"/_hsr/{name}")
+        assert response.headers["content-type"] == "application/json"
+        assert response.json() == http_schema_resource(app, path)
+    assert client.get("/a/b").json() == {"pair": ["a", "b"]}
+    assert client.get("/_hsr").json() == {"id": "_hsr"}  # only /_hsr/ is taken
+
+
+def test_hsr_route_serves_routes_added_later_and_mounted(make_client):
+    from fastapi.routing import APIRoute
+
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    app = FastAPI()
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    assert client.get("/_hsr/items.id").status_code == 404
+
+    @app.get("/items/{id}")
+    @scrudful(**links)
+    async def get_item(id: int):
+        return {}
+
+    app.router.routes.append(
+        Mount("/m", routes=[APIRoute("/things/{id}", get_item, methods=["GET"])])
+    )
+    for name, path in (("items.id", "/items/{id}"), ("m.things.id", "/m/things/{id}")):
+        response = client.get(f"/_hsr/{name}")
+        assert response.status_code == 200
+        assert response.json() == http_schema_resource(app, path)
+    # The display template is the first route's, parameter names and all.
+    assert client.get("/_hsr/items.item_id").status_code == 404
+
+
+def test_hsr_route_in_router_mode(make_client):
+    """On an ``APIRouter``, the route is the router's: the prefix it is
+    included under applies, parameters and all."""
+    router = APIRouter()
+
+    @router.get("/items/{id}")
+    @scrudful(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    async def get_item(id: int):
+        return {}
+
+    add_options(router, base_url="https://router.example/")
+    app = FastAPI()
+    app.include_router(router, prefix="/orgs/{org}")
+    client = make_client(app)
+    response = client.get("/orgs/acme/_hsr/items.id")
+    assert hsr_problems(response) == []
+    assert response.json() == http_schema_resource(router, "/items/{id}")
+    assert client.get("/_hsr/items.id").status_code == 404  # not on the app
+    assert client.post("/orgs/acme/_hsr/items.id").status_code == 405
+    assert client.get("/orgs/acme/_hsr/orgs.org.items.id").status_code == 404
+
+
+def test_hsr_cache_control_option(make_client):
+    client = make_client(make_app(hsr_cache_control="public, max-age=60"))
+    response = client.get("/_hsr/users.id")
+    assert response.headers["cache-control"] == "public, max-age=60"
+    etag = response.headers["etag"]
+    not_modified = client.get("/_hsr/users.id", headers={"If-None-Match": etag})
+    assert not_modified.headers["cache-control"] == "public, max-age=60"
+
+
+def test_calling_add_options_again_adds_no_route(make_client):
+    app = make_app()
+    count = len(app.router.routes)
+    add_options(app, base_url=BASE)
+    assert len(app.router.routes) == count
+    client = make_client(app)
+    assert client.get("/_hsr/users.id").status_code == 200
+    add_options(app, base_url=BASE, hsr_route=False, hsr_url=lambda p: "/x")
+    assert client.get("/_hsr/users.id").status_code == 404  # turned off
+    add_options(app, base_url=BASE)
+    assert len(app.router.routes) == count
+    assert client.get("/_hsr/users.id").status_code == 200
+
+
+def test_reserved_segment(make_client):
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    for owner in (FastAPI(), APIRouter()):
+
+        @owner.get("/_hsr/x")
+        @scrudful(**links)
+        async def reserved():
+            return {}
+
+        with pytest.raises(ValueError, match=r"'/_hsr/x'.*reserved"):
+            add_options(owner, base_url=BASE)
+        with pytest.raises(ValueError, match="reserved"):
+            add_options(owner, base_url=BASE, hsr_route=False, hsr_url=str)
+    # A path added after add_options raises on the first request.
+    app = FastAPI()
+    add_options(app, base_url=BASE)
+
+    @app.get("/_hsr/{name}/x")
+    @scrudful(**links)
+    async def later(name: str):
+        return {}
+
+    with pytest.raises(ValueError, match=r"'/_hsr/\{name\}/x'.*reserved"):
+        make_client(app).get("/_hsr/anything")
+
+
+def test_hsr_route_name_leaves_out_convertors(make_client):
+    app = FastAPI()
+
+    @app.get("/items/{id:int}/{rest:path}")
+    @scrudful(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    async def get_item(id: int, rest: str):
+        return {}
+
+    add_options(app, base_url=BASE)
+    response = make_client(app).get("/_hsr/items.id.rest")
+    assert response.json() == http_schema_resource(app, "/items/{n:int}/{p:path}")
+
+
+def test_hsr_route_name_clash(make_client):
+    """``/items/{id}`` and ``/items/{id:int}`` are two resources with one
+    route name, ``items.id``."""
+    links = dict(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+
+    def clashing() -> FastAPI:
+        app = FastAPI()
+
+        @app.get("/items/{id}")
+        @scrudful(**links)
+        async def by_name(id: str):
+            return {}
+
+        @app.get("/items/{id:int}")
+        @scrudful(**links)
+        async def by_number(id: int):
+            return {}
+
+        return app
+
+    clash = r"'/items/\{id\}' and '/items/\{id:int\}'.*'items\.id'"
+    with pytest.raises(ValueError, match=clash):
+        add_options(clashing(), base_url=BASE)
+    # With the route off there is no route name to clash.
+    add_options(clashing(), base_url=BASE, hsr_route=False, hsr_url=str)
+    # Added after add_options: the first request raises.
+    app = FastAPI()
+
+    @app.get("/items/{id}")
+    @scrudful(**links)
+    async def by_name(id: str):
+        return {}
+
+    add_options(app, base_url=BASE)
+
+    @app.get("/items/{id:int}")
+    @scrudful(**links)
+    async def by_number(id: int):
+        return {}
+
+    with pytest.raises(ValueError, match=clash):
+        make_client(app).get("/_hsr/items.id")
+
+
+def test_hsr_route_false_needs_hsr_url(make_client):
+    with pytest.raises(ValueError, match=re.escape("hsr_route=False needs hsr_url=")):
+        make_app(hsr_route=False)
+    with pytest.raises(ValueError, match=re.escape("hsr_route=False needs hsr_url=")):
+        add_options(APIRouter(), hsr_route=False)
+    app = make_app(hsr_route=False, hsr_url=lambda p: f"https://docs.example/hsr{p}")
+    assert not any(
+        "_hsr" in str(getattr(route, "path", "")) for route in app.router.routes
+    )
+    assert make_client(app).get("/_hsr/users.id").status_code == 404
+
+
+def test_http_schema_resource_endpoint_for_mounting(make_client):
+    app = make_app(hsr_route=False, hsr_url=lambda p: f"https://docs.example/hsr{p}")
+    endpoint = http_schema_resource_endpoint(app, "/users/{id}")
+    docs = FastAPI(dependencies=[Depends(require_token)])
+    docs.add_route(
+        "/hsr/users", endpoint, methods=["GET", "POST"], include_in_schema=False
+    )
+    client = make_client(docs)
+    response = client.get("/hsr/users")
+    assert hsr_problems(response) == []
+    assert response.content == serialize_hsr(http_schema_resource(app, "/users/{id}"))
+    assert response.headers["cache-control"] == "public, max-age=300"
+    etag = response.headers["etag"]
+    assert client.get("/hsr/users", headers={"If-None-Match": etag}).status_code == 304
+    assert client.head("/hsr/users").status_code == 200
+    not_allowed = client.post("/hsr/users")
+    assert not_allowed.status_code == 405
+    assert not_allowed.headers["allow"] == "GET, HEAD"
+    assert "content-type" not in not_allowed.headers
+    with pytest.raises(TypeError, match="FastAPI application or an APIRouter"):
+        http_schema_resource_endpoint(object(), "/users/{id}")  # type: ignore[arg-type]
+    unknown = http_schema_resource_endpoint(app, "/people/{id}")
+    docs.add_route("/hsr/people", unknown)
+    with pytest.raises(ValueError, match=r"'/people/\{id\}'"):
+        client.get("/hsr/people")
+
+
+# --- the HSR link target ------------------------------------------------------------
+
+
+def target_app(**options: Any) -> FastAPI:
+    """``make_app`` with ``/users/{user_id}/target`` answering
+    ``_hsr_target(request, ...)`` for ``/users/{id}``, by key and by template."""
+    app = make_app(**options)
+
+    @app.get("/users/{user_id}/target")
+    async def target(user_id: int, request: Request):
+        return {
+            "key": _hsr_target(request, "/users/{}"),
+            "template": _hsr_target(request, "/users/{user_id}"),
+        }
+
+    return app
+
+
+def test_target_is_the_route_url_against_the_base_url(make_client):
+    client = make_client(target_app(), base_url="http://elsewhere.example")
+    assert client.get("/users/1/target").json() == {
+        "key": "https://api.example/_hsr/users.id",
+        "template": "https://api.example/_hsr/users.id",
+    }
+
+
+def test_target_without_base_url_is_against_the_request(make_client):
+    app = FastAPI()
+
+    @app.get("/items/{id}")
+    @scrudful(
+        schema_link_or_func="https://s.example/s.json",
+        context_link_or_func="https://s.example/c.jsonld",
+    )
+    async def get_item(id: int, request: Request):
+        return {"target": _hsr_target(request, "/items/{id}")}
+
+    add_options(app)
+    outer = FastAPI()
+    outer.mount("/api", app)
+    client = make_client(outer, base_url="http://here.example")
+    target = client.get("/api/items/1").json()["target"]
+    assert target == "http://here.example/api/_hsr/items.id"
+    response = client.get("/api/_hsr/items.id")
+    assert response.json() == http_schema_resource(app, "/items/{id}")
+
+
+def test_target_is_hsr_url_when_given(make_client):
+    app = target_app(hsr_url=lambda p: f"https://docs.example/hsr{p}")
+    assert make_client(app).get("/users/1/target").json() == {
+        "key": "https://docs.example/hsr/users/{id}",
+        "template": "https://docs.example/hsr/users/{id}",
+    }
+    app = target_app(hsr_route=False, hsr_url=lambda p: f"https://docs.example/off{p}")
+    assert make_client(app).get("/users/1/target").json()["key"] == (
+        "https://docs.example/off/users/{id}"
+    )
+
+
+def test_target_in_router_mode_fills_the_prefix(make_client):
+    router = APIRouter()
+
+    @router.get("/items/{id}")
+    @scrudful(schema_link_or_func="/s.json", context_link_or_func="/c.jsonld")
+    async def get_item(id: int, request: Request):
+        return {
+            "target": _hsr_target(request, "/items/{id}"),
+            "explicit": _hsr_target(request, "/items/{}", owner=router),
+        }
+
+    add_options(router)
+    app = FastAPI()
+    app.include_router(router, prefix="/orgs/{org}")
+    client = make_client(app)
+    assert client.get("/orgs/acme/items/1").json() == {
+        "target": "http://testserver/orgs/acme/_hsr/items.id",
+        "explicit": "http://testserver/orgs/acme/_hsr/items.id",
+    }
+    add_options(router, base_url="https://router.example/v1/")
+    assert client.get("/orgs/acme/items/1").json()["target"] == (
+        "https://router.example/orgs/acme/_hsr/items.id"
+    )
+
+
+def test_target_of_an_unknown_path_raises(make_client):
+    app = target_app()
+
+    @app.get("/elsewhere")
+    async def elsewhere(request: Request):
+        return {"target": _hsr_target(request, "/people/{id}")}
+
+    with pytest.raises(ValueError, match=r"'/people/\{id\}'"):
+        make_client(app).get("/elsewhere")

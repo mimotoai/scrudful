@@ -12,10 +12,18 @@ import contextlib
 import copy
 import functools
 import inspect
+import itertools
 import re
 import types
 import weakref
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Generator,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from typing import Annotated, Any, TypeVar, get_args, get_origin
 from urllib.parse import urlsplit
@@ -68,9 +76,14 @@ from scrudful._adapter import DEFAULT_CONTEXT_REL  # noqa: F401  (re-exported)
 from scrudful._adapter import DEFAULT_CONTEXT_TYPE  # noqa: F401
 from scrudful._hsr import (
     DEFAULT_HSR_CACHE_CONTROL,
+    HSR_ROUTE_SEGMENT,
     HsrConfigError,
     absolute_for_hsr,
+    hsr_etag,
+    hsr_response_links,
+    hsr_route_name,
     options_operation,
+    serialize_hsr,
 )
 from scrudful.conditional import (
     ConditionalResult,
@@ -93,6 +106,7 @@ __all__ = [
     "add_error_links",
     "add_options",
     "http_schema_resource",
+    "http_schema_resource_endpoint",
     "scrudful",
 ]
 
@@ -735,6 +749,8 @@ _RANGE_TEXT = {
 _STATUS_KEY = re.compile(r"[1-5](?:[0-9]{2}|XX)")
 #: A path parameter of a route template, ``{name}`` or ``{name:convertor}``.
 _TEMPLATE_PARAMETER = re.compile(r"\{[^{}:]*(?::([^{}]*))?\}")
+#: The same, capturing the name.
+_TEMPLATE_NAME = re.compile(r"\{([^{}:]*)(?::[^{}]*)?\}")
 #: The segments of a Mount's key that match any one segment (``str``), or
 #: any rest of the path (``path``); a segment of another convertor (``int``,
 #: ``uuid``, a custom one) matches only some, so it shadows only itself.
@@ -790,6 +806,11 @@ class _HsrOptions:
     #: the routes of the path (compared by identity) and the error entity of
     #: :func:`add_error_links`.
     built: dict[str, tuple[tuple[Any, ...], Entity | None, dict[str, Any]]] = field(
+        default_factory=dict
+    )
+    #: Each served document's bytes and ETag, by path template, with the
+    #: document they serialize (compared by identity).
+    serialized: dict[str, tuple[dict[str, Any], bytes, str]] = field(
         default_factory=dict
     )
 
@@ -854,6 +875,33 @@ def add_options(
     with the router's document of it (keyed by the router's own templates);
     call it before including the router (older FastAPI versions copy a
     router's routes when it is included). Prefer calling it on the app.
+
+    With ``hsr_route`` (the default), it also serves each resource's
+    document by GET and HEAD at ``/_hsr/<name>``, where ``name`` is the
+    :func:`~scrudful._hsr.hsr_route_name` of the resource's template (that
+    of its first route, without convertors): ``/_hsr/users.id`` for
+    ``/users/{id}``, ``/_hsr/_root`` for ``/``. One route, ``/_hsr/{name}``,
+    resolves the name on each request, so the paths added later are served
+    too. It is a Starlette ``Route``, not an ``APIRoute``, so no app, router
+    or ``include_router`` dependency applies to it (it needs no
+    credentials), and it is not in the OpenAPI document; it is put before
+    every other route, ahead of a path such as ``"/{id}"``. It answers
+    ``application/json``, the compact JSON of the document
+    (:func:`~scrudful._hsr.serialize_hsr`), the Links of the HTTP Schema
+    Resource's own schema and context, a strong ``ETag``, ``Cache-Control``
+    (``hsr_cache_control``) and ``Access-Control-Expose-Headers``; a 304 to
+    a matching ``If-None-Match`` (weak comparison); a JSON 404,
+    ``{"detail": "Not Found"}``, to a name no resource has; and a 405 with
+    ``Allow: GET, HEAD``, and no content, to any other method. The bytes are
+    the same for every requester. Its CORS headers are your middleware's:
+    have it cover ``/_hsr/`` with the resources' origins. Given an
+    ``APIRouter``, the route is the router's (call this before including
+    the router), so the prefix it is included under applies:
+    ``/v1/_hsr/items.id`` for its ``/items/{id}`` included with
+    ``prefix="/v1"``. Paths under ``/_hsr/`` are reserved, and two resources
+    can't have one name (``/items/{id}`` beside ``/items/{id:int}``): this
+    raises ``ValueError`` for the paths there are, and the HSR route raises
+    it on a request for paths added since.
 
     A mounted Starlette or FastAPI app, a ``Mount`` with ``middleware`` and
     a ``Router`` with ``middleware`` are left alone: answering for them from
@@ -935,10 +983,13 @@ def add_options(
         paths covered. Without it, a relative URL in the document raises
         ``ValueError`` when the document is built.
     hsr_route : bool, optional
-        Whether to serve each path's document by GET (default ``True``).
+        Whether to serve each path's document by GET at ``/_hsr/<name>``
+        (default ``True``). Turning it off needs ``hsr_url``.
     hsr_url : callable, optional
-        ``hsr_url(path)``: the URL the document of ``path`` is served at,
-        when it is mounted elsewhere.
+        ``hsr_url(path)``: the URL the document of ``path`` (the resource's
+        template, its first route's) is served at, when it is mounted
+        elsewhere (see :func:`http_schema_resource_endpoint`). The
+        resources link to it, as it returns it, instead of the HSR route.
     hsr_cache_control : str, optional
         The ``Cache-Control`` of the document's GET response (default
         ``"public, max-age=300"``).
@@ -955,7 +1006,9 @@ def add_options(
         If ``app`` is neither a ``FastAPI`` application nor an ``APIRouter``,
         or an option has the wrong type.
     ValueError
-        If ``base_url`` is not an absolute URL, or a link callable of a
+        If ``base_url`` is not an absolute URL; ``hsr_route`` is off without
+        ``hsr_url``; a scrudful path is under ``/_hsr/``; two resources have
+        one HSR route name (with ``hsr_route``); or a link callable of a
         scrudful endpoint (or of its ``error``) can't be called with no
         arguments.
     """
@@ -965,13 +1018,19 @@ def add_options(
     )
     routes = app.router.routes if isinstance(app, FastAPI) else app.routes
     _check_options_callables(routes)
+    paths = _scrudful_paths(app)
+    _check_reserved(paths)
+    if options.hsr_route:
+        _hsr_names(paths)
     setattr(app, _OPTIONS_ATTRIBUTE, options)
     if isinstance(app, FastAPI):
         if not any(isinstance(route, _OptionsRoute) for route in routes):
             # First, so that it sees every OPTIONS request, including those
             # under a Mount; it matches only those it answers.
             routes.insert(0, _OptionsRoute(app))
-    else:
+    if options.hsr_route:
+        _add_hsr_route(app, routes)
+    if not isinstance(app, FastAPI):
         _add_path_options(app)
         for endpoint, _, _ in _endpoints(routes, for_options=True):
             with contextlib.suppress(TypeError):  # not weakly referenceable
@@ -1005,6 +1064,12 @@ def _check_hsr_options(
                 f"base_url must be an absolute URL (with a scheme and a host), "
                 f"not {base_url!r}"
             )
+    if not hsr_route and hsr_url is None:
+        raise ValueError(
+            "hsr_route=False needs hsr_url=, hsr_url(path): the URL each "
+            "path's HTTP Schema Resource is served at (see "
+            "http_schema_resource_endpoint), which every resource links to"
+        )
     return _HsrOptions(
         base_url=base_url,
         hsr_route=hsr_route,
@@ -1060,6 +1125,46 @@ def http_schema_resource(app: FastAPI | APIRouter, path: str) -> dict[str, Any]:
     return copy.deepcopy(_run_describing(_hsr_flow(app, path)))
 
 
+def http_schema_resource_endpoint(
+    app: FastAPI | APIRouter, path: str
+) -> Callable[[Request], Awaitable[Response]]:
+    """A Starlette endpoint serving the HTTP Schema Resource of ``path``.
+
+    It answers GET and HEAD as :func:`add_options`'s HSR route does (the
+    document, its Links, a strong ``ETag``, ``Cache-Control`` and a 304 for
+    a matching ``If-None-Match``), and any other method it is routed with
+    405 (``Allow: GET, HEAD``, no content). It is for serving the document
+    elsewhere, e.g. with ``hsr_route=False`` and an ``hsr_url`` naming where
+    it is mounted::
+
+        add_options(app, hsr_route=False, hsr_url=lambda path: ...)
+        docs.add_route(
+            "/schemas/items", http_schema_resource_endpoint(app, "/items/{id}")
+        )
+
+    Add it with ``add_route`` (a Starlette route, as the HSR route is), so it
+    has no dependencies. ``path`` is any template of the resource, as
+    :func:`http_schema_resource` takes it; it is checked on the first
+    request (a ``ValueError`` if no scrudful endpoint serves it).
+
+    Raises
+    ------
+    TypeError
+        If ``app`` is neither a ``FastAPI`` application nor an ``APIRouter``,
+        or ``path`` isn't a str.
+    """
+    _check_owner(app)
+    if not isinstance(path, str):
+        raise TypeError(f"path must be a str, not {type(path).__name__}")
+
+    async def scrudful_hsr_endpoint(request: Request) -> Response:
+        if request.method not in ("GET", "HEAD"):
+            return _hsr_not_allowed()
+        return await _hsr_get(request, app, path)
+
+    return scrudful_hsr_endpoint
+
+
 def _check_owner(app: Any) -> None:
     if not isinstance(app, (FastAPI, APIRouter)):
         raise TypeError(
@@ -1073,20 +1178,20 @@ def _check_owner(app: Any) -> None:
 _Flow = Generator[tuple[Callable[[], Any], str], Any, T]
 
 
-def _hsr_flow(owner: FastAPI | APIRouter, path: str) -> _Flow[dict[str, Any]]:
+def _hsr_flow(
+    owner: FastAPI | APIRouter,
+    path: str,
+    paths: Mapping[str, _Resource] | None = None,
+) -> _Flow[dict[str, Any]]:
     """The HTTP Schema Resource of ``path`` on ``owner`` (not a copy): the
-    one built, unless the routes of ``path`` or the error entity changed."""
+    one built, unless the routes of ``path`` or the error entity changed.
+    ``paths`` is ``owner``'s :func:`_scrudful_paths`, when the caller has
+    them."""
     options = _hsr_options(owner)
-    paths = _scrudful_paths(owner)
+    if paths is None:
+        paths = _scrudful_paths(owner)
     key = _template_key(path)
-    resource = paths.get(key)
-    if resource is None:
-        templates = sorted(resource.template for resource in paths.values())
-        raise ValueError(
-            f"{path!r} is not the path of a scrudful endpoint of this "
-            f"{type(owner).__name__} (its paths are {templates}): give the "
-            "route's full path string"
-        )
+    resource = _resource(owner, paths, path)
     routes = resource.routes
     api_error = _api_error(owner)
     originals = tuple(getattr(route, "original_route", route) for route in routes)
@@ -1101,6 +1206,28 @@ def _hsr_flow(owner: FastAPI | APIRouter, path: str) -> _Flow[dict[str, Any]]:
     document = yield from _describe_path(routes, options.base_url, api_error)
     options.built[key] = (originals, api_error, document)
     return document
+
+
+def _resource(
+    owner: FastAPI | APIRouter, paths: Mapping[str, _Resource], path: str
+) -> _Resource:
+    """The resource of ``path`` (a resource key, or any template of it)
+    among ``owner``'s ``paths``.
+
+    Raises
+    ------
+    ValueError
+        If no scrudful endpoint serves ``path``.
+    """
+    resource = paths.get(_template_key(path))
+    if resource is None:
+        templates = sorted(resource.template for resource in paths.values())
+        raise ValueError(
+            f"{path!r} is not the path of a scrudful endpoint of this "
+            f"{type(owner).__name__} (its paths are {templates}): give the "
+            "route's full path string"
+        )
+    return resource
 
 
 def _run_describing(flow: _Flow[T]) -> T:
@@ -1712,6 +1839,281 @@ def _options_response(body: dict[str, Any]) -> Response:
     response.headers["Allow"] = allow_header(body)
     expose_headers(response.headers)
     return response
+
+
+# --- The HSR route -----------------------------------------------------------------
+
+#: The path parameter of the HSR route: the route name of the resource
+#: (:func:`scrudful._hsr.hsr_route_name`). Named so that it can't clash with
+#: a parameter of the prefix of a router it is on (``"/users/{name}"``).
+_HSR_PARAMETER = "scrudful_hsr_name"
+#: The path of the HSR route, on the app or router :func:`add_options` covers.
+_HSR_PATH = f"/{HSR_ROUTE_SEGMENT}/{{{_HSR_PARAMETER}}}"
+#: The attribute of an app or router holding its HSR route.
+_HSR_ROUTE_ATTRIBUTE = "_scrudful_hsr_route"
+#: Numbers the HSR routes' names: each is unique, so that :func:`_hsr_target`
+#: reverses the route of its own app or router, wherever it is included.
+_HSR_SERIAL = itertools.count(1)
+
+
+class _HsrApp:
+    """The ASGI app of the HSR route of ``owner`` (an app or router).
+
+    An ASGI app, not a function, so that Starlette routes every method to it
+    (``methods=None``), also in the copy ``include_router`` makes of a
+    router's route (``methods=[]``, which matches every method too): it
+    answers GET and HEAD, and others with its own 405 (see
+    :func:`_hsr_not_allowed`), rather than Starlette's JSON one.
+    """
+
+    def __init__(self, owner: FastAPI | APIRouter) -> None:
+        self.owner = owner
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        request = Request(scope, receive)
+        response = await _hsr_route_response(request, self.owner)
+        await response(scope, receive, send)
+
+
+def _add_hsr_route(owner: FastAPI | APIRouter, routes: list[Any]) -> None:
+    """Add ``owner``'s HSR route, ``/_hsr/{name}``, before its ``routes``
+    (unless it has one): a Starlette ``Route``, so it has no dependencies,
+    and not in the OpenAPI document. It resolves the name on each request,
+    so the paths added later are served too."""
+    if getattr(owner, _HSR_ROUTE_ATTRIBUTE, None) is not None:
+        return
+    route = Route(
+        _HSR_PATH,
+        _HsrApp(owner),
+        name=f"scrudful_hsr_{next(_HSR_SERIAL)}",
+        include_in_schema=False,
+    )
+    # First, ahead of a path such as "/{kind}/{id}" that matches it too.
+    routes.insert(0, route)
+    setattr(owner, _HSR_ROUTE_ATTRIBUTE, route)
+
+
+def _hsr_route_name(template: str) -> str:
+    """The HSR route name of the Starlette route template ``template``:
+    :func:`~scrudful._hsr.hsr_route_name` of it with each ``{name:convertor}``
+    as ``{name}`` (that function reads Django's and ninja's
+    ``{convertor:name}``), so ``/items/{id:int}`` is ``items.id``."""
+    return hsr_route_name(_TEMPLATE_NAME.sub(r"{\1}", template))
+
+
+def _check_reserved(paths: Mapping[str, _Resource]) -> None:
+    """Raise ``ValueError`` if a scrudful path is under ``/_hsr/``."""
+    for resource in paths.values():
+        if resource.template.startswith(f"/{HSR_ROUTE_SEGMENT}/"):
+            raise ValueError(
+                f"{resource.template!r} is under '/{HSR_ROUTE_SEGMENT}/', which "
+                "is reserved for scrudful's HTTP Schema Resource routes"
+            )
+
+
+def _hsr_names(paths: Mapping[str, _Resource]) -> dict[str, str]:
+    """The resource key of each HSR route name (the
+    :func:`~scrudful._hsr.hsr_route_name` of the resource's template) of
+    ``paths``.
+
+    Raises
+    ------
+    ValueError
+        If a path is under ``/_hsr/``, or two resources have one name (such
+        as ``/items/{id}`` and ``/items/{id:int}``).
+    """
+    _check_reserved(paths)
+    names: dict[str, str] = {}
+    for key, resource in paths.items():
+        name = _hsr_route_name(resource.template)
+        other = names.get(name)
+        if other is not None:
+            raise ValueError(
+                f"{paths[other].template!r} and {resource.template!r} have the "
+                f"same HTTP Schema Resource route name {name!r} "
+                f"('/{HSR_ROUTE_SEGMENT}/{name}'): rename a path parameter, or "
+                "turn the route off (hsr_route=False) and give hsr_url="
+            )
+        names[name] = key
+    return names
+
+
+async def _hsr_route_response(request: Request, owner: FastAPI | APIRouter) -> Response:
+    """The HSR route's answer: the document of the resource the route name
+    names, a JSON 404 for a name no resource has (or with the route turned
+    off since), and a 405 to a method but GET and HEAD."""
+    if request.method not in ("GET", "HEAD"):
+        return _hsr_not_allowed()
+    if not _hsr_options(owner).hsr_route:
+        return _hsr_not_found()
+    paths = _scrudful_paths(owner)
+    key = _hsr_names(paths).get(request.path_params.get(_HSR_PARAMETER, ""))
+    if key is None:
+        return _hsr_not_found()
+    return await _hsr_get(request, owner, key, paths)
+
+
+async def _hsr_get(
+    request: Request,
+    owner: FastAPI | APIRouter,
+    path: str,
+    paths: Mapping[str, _Resource] | None = None,
+) -> Response:
+    """The answer to a GET or HEAD of ``path``'s HTTP Schema Resource on
+    ``owner``, with ``owner``'s ``Cache-Control`` (see :func:`_hsr_response`)."""
+    document = await _run_describing_async(_hsr_flow(owner, path, paths))
+    options = _hsr_options(owner)
+    key = _template_key(path)
+    serialized = options.serialized.get(key)
+    if serialized is None or serialized[0] is not document:
+        body = serialize_hsr(document)
+        serialized = (document, body, hsr_etag(body))
+        options.serialized[key] = serialized
+    _, body, etag = serialized
+    return _hsr_response(request, body, etag, options.hsr_cache_control)
+
+
+def _hsr_response(
+    request: Request, body: bytes, etag: str, cache_control: str
+) -> Response:
+    """The answer to a GET or HEAD of an HTTP Schema Resource whose
+    serialization is ``body`` (:func:`~scrudful._hsr.serialize_hsr`) and
+    ``ETag`` ``etag`` (:func:`~scrudful._hsr.hsr_etag`), as the Django
+    adapters' (``scrudful._django.hsr_response``).
+
+    A 200, ``application/json``, with the HSR's own Links and
+    ``cache_control`` as ``Cache-Control``; or, for an ``If-None-Match``
+    matching the ``ETag`` (weak comparison), a 304 with the ``ETag`` and
+    ``Cache-Control``. The same for every requester.
+    """
+    result = evaluate_preconditions(
+        request.method,
+        precondition_headers(request.headers.getlist),
+        etag=etag,
+        last_modified=None,
+        require_precondition=False,
+    )
+    if result is not None:
+        early = _conditional_response(result, Headers())
+        if result.status == 304:
+            early.headers["Cache-Control"] = cache_control
+        return early
+    response = Response(body, media_type="application/json")
+    response.headers["Link"] = hsr_response_links()
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = cache_control
+    expose_headers(response.headers)
+    return response
+
+
+def _hsr_not_allowed() -> Response:
+    """The 405 of an HSR route or endpoint to a method but GET and HEAD:
+    ``Allow: GET, HEAD``, the expose headers, and neither content nor
+    ``Content-Type`` (as the Django adapters' ``hsr_not_allowed``)."""
+    response = Response(status_code=405, headers={"Allow": "GET, HEAD"})
+    expose_headers(response.headers)
+    return response
+
+
+def _hsr_not_found() -> Response:
+    """The HSR route's 404, with FastAPI's own 404 body."""
+    return JSONResponse({"detail": "Not Found"}, status_code=404)
+
+
+def _hsr_target(
+    request: Request, path: str, owner: FastAPI | APIRouter | None = None
+) -> str:
+    """The URL of the HTTP Schema Resource of ``path``: the target of the HSR
+    link of the responses (and OPTIONS) of ``path``.
+
+    ``owner`` is the app or router whose :func:`add_options` covers the
+    request (by default as :func:`_live_base` finds it: the app's, else that
+    of the router whose scrudful endpoint serves it), and ``path`` a
+    resource key (:func:`_template_key`) or any template of a resource of
+    ``owner``'s (a router's own templates, for a router). Resolved in this
+    order:
+
+    1. ``hsr_url(template)``, with ``template`` the resource's (its first
+       route's), as it returns it;
+    2. else (with ``hsr_route=False``, which :func:`add_options` refuses
+       without ``hsr_url``) a ``ValueError``;
+    3. else the URL of ``owner``'s HSR route for the resource, reversed by its
+       unique name with ``request.url_for``: through the Mounts of the app
+       serving the request, and for a router, under the prefix the request
+       came through (its parameters are the request's); made absolute
+       against ``owner``'s ``base_url`` (an absolute path, so the base URL's
+       own path is replaced) when it has one, else against the request.
+
+    Raises
+    ------
+    ValueError
+        If no :func:`add_options` covers the request; no scrudful endpoint
+        of ``owner`` serves ``path``; the route is off and there is no
+        ``hsr_url``; two resources have one route name, or a path is under
+        ``/_hsr/``; or the route can't be reversed from the request (it
+        wasn't routed through ``owner``, or a named Mount is in the way).
+    """
+    if owner is None:
+        owner = _hsr_owner(request)
+    options = _hsr_options(owner)
+    paths = _scrudful_paths(owner)
+    resource = _resource(owner, paths, path)
+    if options.hsr_url is not None:
+        return options.hsr_url(resource.template)
+    route = getattr(owner, _HSR_ROUTE_ATTRIBUTE, None)
+    if not options.hsr_route or route is None:
+        raise ValueError(
+            "hsr_route=False needs hsr_url= (and the HSR route needs "
+            f"add_options on this {type(owner).__name__})"
+        )
+    _hsr_names(paths)
+    params: dict[str, Any] = {_HSR_PARAMETER: _hsr_route_name(resource.template)}
+    if isinstance(owner, APIRouter):
+        # The prefix's parameters: the request's but the resource's own.
+        own = set().union(*(_path_param_names(r) for r in resource.routes))
+        params.update(
+            (name, value)
+            for name, value in request.path_params.items()
+            if name not in own and name != _HSR_PARAMETER
+        )
+    try:
+        url = request.url_for(route.name, **params)
+    except NoMatchFound:
+        raise ValueError(
+            f"the HTTP Schema Resource route of {resource.template!r} can't be "
+            f"reversed from a request to {request.url.path!r}: it wasn't routed "
+            f"through this {type(owner).__name__}'s routes, or a named Mount "
+            "is in the way; give add_options hsr_url="
+        ) from None
+    if options.base_url:
+        return resolve_uri(url.path, options.base_url)
+    return str(url)
+
+
+def _hsr_owner(request: Request) -> FastAPI | APIRouter:
+    """The app or router whose :func:`add_options` covers ``request``: the
+    app's, else that of the router whose scrudful endpoint serves it.
+
+    Raises
+    ------
+    ValueError
+        If there is none.
+    """
+    app = request.scope.get("app")
+    options = getattr(app, _OPTIONS_ATTRIBUTE, None)
+    if isinstance(app, FastAPI) and isinstance(options, _HsrOptions):
+        if options.explicit:
+            return app
+    router_ref = None
+    with contextlib.suppress(TypeError):  # not weakly referenceable
+        router_ref = _ROUTER_ENDPOINTS.get(request.scope.get("endpoint"))
+    router = None if router_ref is None else router_ref()
+    if router is None:
+        raise ValueError(
+            "no add_options covers this request: call add_options on the app, "
+            "or on the router of the endpoint serving it"
+        )
+    return router
 
 
 def _has_validators(config: _EndpointConfig) -> bool:
