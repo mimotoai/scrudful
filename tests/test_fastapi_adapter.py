@@ -2240,12 +2240,6 @@ OK = {"responses": {"200": {"description": "OK"}, "default": DEFAULT}}
 ITEM_LINKS = dict(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
 
 
-def with_default(operation, content=None):
-    """``operation`` with the ``default`` error entry (``content`` its)."""
-    default = dict(DEFAULT, content=content) if content else DEFAULT
-    return {**operation, "responses": {**operation["responses"], "default": default}}
-
-
 def hsr_target(name, prefix=""):
     """The HSR link target of the resource whose HSR route name is ``name``."""
     return f"http://testserver{prefix}/_hsr/{name}"

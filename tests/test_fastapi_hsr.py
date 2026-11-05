@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import re
 import warnings
 from typing import Any
@@ -23,7 +24,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 from starlette.convertors import Convertor, register_url_convertor
-from starlette.routing import Mount, Route, Router
+from starlette.routing import Host, Mount, Route, Router
 
 from scrudful._hsr import (
     HsrConfigError,
@@ -2817,6 +2818,146 @@ def test_a_route_added_later_whose_security_needs_the_body_is_announced(
     with pytest.warns(RuntimeWarning, match=r"PUT '/notes/\{id\}'"):
         options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
     options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
+
+
+def test_a_check_s_404_refuses_only_its_method(make_client):
+    """A security dependency raising 404 for this requester refuses its
+    method; it doesn't answer the OPTIONS (as ninja's ``auth=`` and
+    ``before``; DRF answers the OPTIONS with a permission check's 404).
+    ``load`` runs only once a method passed."""
+    loaded = []
+
+    def hidden(
+        credentials: HTTPAuthorizationCredentials | None = Security(bearer),
+    ) -> None:
+        raise HTTPException(status_code=404)
+
+    app = FastAPI()
+
+    @app.get("/notes/{id}", dependencies=[Security(hidden)])
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {}
+
+    @app.put("/notes/{id}", dependencies=[Security(require_role("writer"))])
+    @scrudful(**NOTE_LINKS)
+    async def write(id: int):
+        return {}
+
+    add_options(app, base_url=BASE, load=lambda request, **p: loaded.append(p))
+    client = make_client(app)
+    options_204(client, "/notes/1", "OPTIONS", NOTE_TARGET)
+    assert loaded == []
+    options_204(client, "/notes/1", "PUT, OPTIONS", NOTE_TARGET, headers=ADMIN)
+    assert loaded == [{"id": "1"}]
+
+
+def test_a_check_whose_yield_dependency_swallows_its_error_refuses(make_client):
+    """A check raising 403 inside a dependency with ``yield`` that catches
+    it resolves nothing: the method is not allowed, rather than listed."""
+    events = []
+
+    def session() -> Any:
+        try:
+            yield "session"
+        except HTTPException as exc:
+            events.append(exc.status_code)
+
+    def deny(
+        db: str = Depends(session),
+        credentials: HTTPAuthorizationCredentials | None = Security(bearer),
+    ) -> None:
+        raise HTTPException(status_code=403)
+
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {}
+
+    @app.put("/notes/{id}", dependencies=[Security(deny)])
+    @scrudful(**NOTE_LINKS)
+    async def write(id: int):
+        return {}
+
+    add_options(app, base_url=BASE)
+    options_204(make_client(app), "/notes/1", "GET, OPTIONS", NOTE_TARGET)
+    assert events == [403]
+
+
+def test_a_method_not_routed_at_the_url_is_left_out(make_client):
+    """A method of the resource that no route serves at this URL (its route
+    is under a ``Host`` the request isn't for) isn't listed, and isn't
+    checked; for the Host's requests it is."""
+    from fastapi.routing import APIRoute
+
+    async def write(id: int):
+        return {}
+
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {}
+
+    app.router.routes.append(
+        Host(
+            "admin.example",
+            app=Router(
+                routes=[
+                    APIRoute(
+                        "/notes/{id}",
+                        scrudful(**NOTE_LINKS)(write),
+                        methods=["PUT"],
+                        dependencies=[Security(require_role("writer"))],
+                    )
+                ]
+            ),
+        )
+    )
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    options_204(client, "/notes/1", "GET, OPTIONS", NOTE_TARGET, headers=ADMIN)
+    admin = make_client(app, base_url="http://admin.example")
+    options_204(admin, "/notes/1", "GET, OPTIONS", NOTE_TARGET)
+    options_204(admin, "/notes/1", "GET, PUT, OPTIONS", NOTE_TARGET, headers=ADMIN)
+
+
+def test_a_rebuilt_hsr_is_served_with_its_new_bytes_and_etag(make_client):
+    """The HSR route serves the document built now: after a route is added to
+    the path, its new bytes, with their ETag, and the old ETag no longer
+    matches (a 200, not a 304)."""
+
+    def etag_of(body: bytes) -> str:
+        return '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
+
+    app = FastAPI()
+
+    @app.get("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def read(id: int):
+        return {}
+
+    add_options(app, base_url=BASE)
+    client = make_client(app)
+    first = client.get("/_hsr/notes.id")
+    assert list(first.json()) == ["get", "options"]
+    assert first.headers["etag"] == etag_of(first.content)
+    stale = {"If-None-Match": first.headers["etag"]}
+    assert client.get("/_hsr/notes.id", headers=stale).status_code == 304
+
+    @app.put("/notes/{id}")
+    @scrudful(**NOTE_LINKS)
+    async def write(id: int):
+        return {}
+
+    second = client.get("/_hsr/notes.id", headers=stale)
+    assert second.status_code == 200
+    assert list(second.json()) == ["get", "put", "options"]
+    assert second.headers["etag"] == etag_of(second.content)
+    assert second.headers["etag"] != first.headers["etag"]
 
 
 def test_a_yield_dependency_is_cleaned_up(make_client):

@@ -239,7 +239,10 @@ OPTIONS``, not a 401), in this order:
    or the app). They are resolved by FastAPI on a copy of the request whose
    method is the method checked, without its body. An ``HTTPException`` with
    401, 403 or 404, or a parameter of theirs failing validation, means not
-   allowed.
+   allowed. **A 404 from a check refuses only its method**, as ninja's
+   ``auth=`` and ``before`` do; it doesn't answer the OPTIONS, as a DRF
+   permission check's 404 does. A 404 from ``load`` or ``allowed`` is the
+   OPTIONS's answer.
 3. **When a method passed and the URL has path parameters**, the object is
    loaded: ``load(request, **path_params)``, with all the matched URL's path
    parameters (a ``Mount``'s and a router prefix's too), as Starlette converts
