@@ -3662,7 +3662,8 @@ def test_dependencies_that_are_not_functions_are_read_in_their_globals(
         pytest.skip(f"this FastAPI can't evaluate these annotations: {exc}")
     client = make_client(app)
     assert client.put("/notes/1").status_code == 403
-    assert client.put("/notes/1", headers=security_annotations.WRITER).status_code
+    writer = security_annotations.WRITER
+    assert client.put("/notes/1", headers=writer).status_code == 200
     options_204(client, "/notes/1", "GET, DELETE, OPTIONS", NOTE_TARGET)
     options_204(
         client,
