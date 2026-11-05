@@ -6,13 +6,19 @@ this module only adapts it to FastAPI's request/response handling.
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import contextlib
 import copy
 import functools
 import inspect
+import re
 import types
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+import weakref
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Annotated, Any, TypeVar, get_args, get_origin
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi import routing as fastapi_routing
@@ -31,8 +37,6 @@ from starlette.types import Receive, Scope, Send
 from scrudful import _adapter
 from scrudful._adapter import (
     BODY_HEADERS,
-    DEFAULT_CONTEXT_REL,
-    DEFAULT_CONTEXT_TYPE,
     DEFAULT_SCHEMA_REL,
     DEFAULT_SCHEMA_TYPE,
     METHOD_KEYS,
@@ -44,21 +48,31 @@ from scrudful._adapter import (
     context_defaults,
     context_link_type,
     describe_content,
-    describe_options,
     describe_read,
     describe_write,
+    essence,
     evaluated_signature,
     evaluates_preconditions,
     expose_headers,
     has_default_entity,
     is_json,
+    media_type_key,
     merge_links,
     options_links,
     precondition_headers,
+    reason_phrase,
     resolve_annotation,
     set_validator_headers,
     validator_policy,
     with_error_body,
+)
+from scrudful._adapter import DEFAULT_CONTEXT_REL  # noqa: F401  (re-exported)
+from scrudful._adapter import DEFAULT_CONTEXT_TYPE  # noqa: F401
+from scrudful._hsr import (
+    DEFAULT_HSR_CACHE_CONTROL,
+    HsrConfigError,
+    absolute_for_hsr,
+    options_operation,
 )
 from scrudful.conditional import (
     ConditionalResult,
@@ -80,6 +94,7 @@ __all__ = [
     "Entity",
     "add_error_links",
     "add_options",
+    "http_schema_resource",
     "scrudful",
 ]
 
@@ -99,6 +114,7 @@ CONDITIONAL_WRITE_RESPONSES: dict[int | str, dict[str, Any]] = (
 )
 
 Endpoint = TypeVar("Endpoint", bound=Callable[..., Any])
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -123,6 +139,14 @@ class _EndpointConfig:
     #: The names of the endpoint's own parameters: the keyword arguments its
     #: callables get inside it, of which a path parameter is passed outside.
     param_names: frozenset[str]
+    #: The ``entity=`` given, whose link fields are the ones above; ``None``
+    #: for the link options (an ``application/json`` entity).
+    entity: Entity | None = None
+
+    @property
+    def media_type(self) -> str:
+        """The media type of the endpoint's success content (its entity's)."""
+        return _ENDPOINT_MEDIA_TYPE if self.entity is None else self.entity.media_type
 
 
 def scrudful(
@@ -135,6 +159,7 @@ def scrudful(
     context_link_or_func: Any = None,
     context_rel_or_func: Any = None,
     context_type_or_func: Any = None,
+    entity: Entity | None = None,
     error: Entity | None = None,
     error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
 ) -> Callable[[Endpoint], Endpoint]:
@@ -160,25 +185,33 @@ def scrudful(
         ``*_or_func`` callable (of the endpoint and of its ``error``) is
         called with the keyword arguments FastAPI resolved for the endpoint:
         path, query, body and dependency values, plus the endpoint's own
-        ``Request`` / ``Response`` parameters if it declares any (so a link
-        callback can use ``request.url_for``). Accept ``**kwargs`` to ignore
+        ``Request`` / ``Response`` parameters if it declares any (a link
+        callback must not depend on them, see below). Accept ``**kwargs`` to ignore
         the ones you don't need. Callbacks may be ``def`` (run in the
         threadpool) or ``async def``; an awaitable result is awaited.
 
         Outside the endpoint, the link callables (schema and context URL and
-        type) are also called by :func:`add_options` for the OPTIONS body,
-        and those of ``error`` by :func:`add_options` and by
-        :func:`add_error_links`'s exception handlers. There they get only the
-        URL's path parameters that the endpoint takes (not those of an
-        ``include_router`` prefix it doesn't declare, which FastAPI doesn't
-        pass it either) as Starlette matched them (strings, unless the path
-        uses a convertor such as ``{id:int}``), plus the request under
-        the name of the endpoint's ``Request`` parameter when it declares
-        one: no body, query or dependency values. Both helpers check, when
-        they are called, that each such callable can be called that way, and
-        raise ``TypeError`` otherwise. To use one callable in both places,
-        accept ``**kwargs`` or give the parameters only the endpoint gets
-        defaults, e.g. ``def schema(item_id, **kwargs)``.
+        type, of the endpoint and of its ``error``) are also called in
+        *describe* mode, ``func()`` with no arguments, to build the path's
+        HTTP Schema Resource (see :func:`add_options`), which is the same
+        for every requester. They must return the same target in both
+        modes, or the description disagrees with the responses: a link
+        depending on the request or a path parameter can't be described.
+        :func:`add_options` checks, when it is called, that each can be
+        called with no arguments, and raises ``ValueError`` otherwise; give
+        the parameters it takes inside the endpoint defaults, or accept only
+        ``**kwargs``.
+
+        Those of ``error`` are also called by :func:`add_error_links`'s
+        exception handlers. There they get only the URL's path parameters
+        that the endpoint takes (not those of an ``include_router`` prefix
+        it doesn't declare, which FastAPI doesn't pass it either) as
+        Starlette matched them (strings, unless the path uses a convertor
+        such as ``{id:int}``), plus the request under the name of the
+        endpoint's ``Request`` parameter when it declares one: no body,
+        query or dependency values. :func:`add_error_links` checks, when it
+        is called, that each can be called that way, and raises
+        ``TypeError`` otherwise.
 
         The validator callbacks run before the endpoint, so before any lookup
         or authorization check its body makes: they must apply the same
@@ -237,8 +270,10 @@ def scrudful(
     (``describedby`` by default) replaces that link, and one with either
     context relation (JSON-LD or ``rdf-context``, one slot) the context link
     (see :func:`scrudful._adapter.merge_links`). Link
-    URLs are resolved against the request's URL (``str(request.url)``), so
-    a relative value such as ``"/schemas/item"`` is sent absolute.
+    URLs are resolved against the ``base_url`` of the :func:`add_options`
+    call covering the endpoint, as in its HTTP Schema Resource, else against
+    the request's URL (``str(request.url)``), so a relative value such as
+    ``"/schemas/item"`` is sent absolute.
     ``Access-Control-Expose-Headers`` is extended with whichever of
     ``ETag``, ``Link`` and ``Location`` the response carries. Starlette's
     ``CORSMiddleware`` replaces that header on cross-origin requests, so if
@@ -286,6 +321,15 @@ def scrudful(
         ``"http://www.w3.org/ns/json-ld#context"``.
     context_type_or_func : str or callable, optional
         ``type`` of the context link. Defaults to ``"application/ld+json"``.
+    entity : Entity, optional
+        The schema and context of the success content, and its media type,
+        in place of the link options above (giving both is a
+        ``TypeError``). The context link's defaults then follow its media
+        type (e.g. the ``rdf-context`` relation for ``text/csv``), and the
+        HTTP Schema Resource describes the content under that media type.
+        It is declarative: the endpoint must serve that media type (e.g.
+        return ``Response(..., media_type="text/csv")``). Without it, the
+        content is ``application/json`` with the link options' links.
     error : Entity, optional
         The schema and context of scrudful's own 400, 412 and 428 bodies.
         Its link callables get the endpoint's keyword arguments, like the
@@ -293,7 +337,7 @@ def scrudful(
         (``application/json`` or ``+json``, e.g.
         ``application/problem+json``), since those bodies are JSON objects.
         With :func:`add_error_links`, the errors the app's exception handlers
-        answer for this endpoint get it too, and :func:`add_options`
+        answer for this endpoint get it too, and the HTTP Schema Resource
         describes it; its link callables are then called outside the
         endpoint (see "Callbacks").
     error_body_func : callable, optional
@@ -311,15 +355,33 @@ def scrudful(
     Raises
     ------
     TypeError
-        If a validator callback isn't callable or ``error`` isn't an
-        :class:`Entity`.
+        If a validator callback isn't callable, ``entity`` or ``error`` isn't
+        an :class:`Entity`, or ``entity`` is given with a link option.
     ValueError
         If ``error``'s media type is not JSON content.
     """
     check_validators(etag_func, last_modified_func)
+    links_given = dict(
+        schema_link_or_func=schema_link_or_func,
+        schema_rel_or_func=schema_rel_or_func,
+        schema_type_or_func=schema_type_or_func,
+        context_link_or_func=context_link_or_func,
+        context_rel_or_func=context_rel_or_func,
+        context_type_or_func=context_type_or_func,
+    )
+    _check_entity(entity, links_given)
     _check_error(error)
     check_error_body_func(error_body_func)
     has_validators = etag_func is not None or last_modified_func is not None
+    # The endpoint's links: those of ``entity``, else the link options (an
+    # ``application/json`` entity).
+    link_fields = (
+        links_given
+        if entity is None
+        else {name: getattr(entity, name) for name in links_given}
+    )
+    source = types.SimpleNamespace(**link_fields)
+    media_type = _ENDPOINT_MEDIA_TYPE if entity is None else entity.media_type
 
     async def validators(kwargs: Mapping[str, Any]) -> tuple[str | None, int | None]:
         funcs = [f for f in (etag_func, last_modified_func) if f is not None]
@@ -335,19 +397,7 @@ def scrudful(
     async def links(
         kwargs: Mapping[str, Any], base: str
     ) -> tuple[str | None, str | None]:
-        schema = await _link(
-            kwargs,
-            (schema_link_or_func, schema_rel_or_func, schema_type_or_func),
-            (DEFAULT_SCHEMA_REL, DEFAULT_SCHEMA_TYPE),
-            base,
-        )
-        context = await _link(
-            kwargs,
-            (context_link_or_func, context_rel_or_func, context_type_or_func),
-            (DEFAULT_CONTEXT_REL, DEFAULT_CONTEXT_TYPE),
-            base,
-        )
-        return schema, context
+        return await _source_links(source, media_type, kwargs, base)
 
     async def early_response(
         request: Request,
@@ -373,15 +423,11 @@ def scrudful(
         config = _EndpointConfig(
             etag_func=etag_func,
             last_modified_func=last_modified_func,
-            schema_link_or_func=schema_link_or_func,
-            schema_rel_or_func=schema_rel_or_func,
-            schema_type_or_func=schema_type_or_func,
-            context_link_or_func=context_link_or_func,
-            context_rel_or_func=context_rel_or_func,
-            context_type_or_func=context_type_or_func,
+            **link_fields,
             error=error,
             request_name=request_name if pass_request else None,
             param_names=_param_names(endpoint),
+            entity=entity,
         )
 
         @functools.wraps(endpoint)
@@ -393,7 +439,7 @@ def scrudful(
                 kwargs[response_name] if pass_response else kwargs.pop(response_name)
             )
             method = request.method.upper()
-            base = str(request.url)
+            base = _live_base(request, wrapper)
 
             if has_validators and evaluates_preconditions(method):
                 etag, last_modified = await validators(kwargs)
@@ -463,7 +509,7 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
     :func:`scrudful._adapter.merge_links`), and serves it as
     ``error.media_type``. Responses without content (e.g. a 304) or with
     other content are left unchanged. Link URLs are resolved against the
-    request's URL.
+    ``base_url`` of :func:`add_options`, else the request's URL.
 
     The media type is relabelled whatever the handler chose: a custom
     handler's JSON response (``application/json``, or another ``+json``
@@ -474,10 +520,11 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
     :func:`scrudful` endpoint with an ``error`` of its own that serves the
     request's method: then the errors raised for it (by the endpoint, its
     dependencies or FastAPI's request validation) get that endpoint's
-    ``error``, the entity :func:`add_options` describes, so that the Links
-    of an error the endpoint raises with one of scrudful's statuses (e.g.
-    ``HTTPException(400)``) agree with the OPTIONS body. A 405, which no
-    endpoint serves, gets ``error``.
+    ``error``, so that the Links of an error the endpoint raises (e.g.
+    ``HTTPException(400)``, a dependency's 401, request validation's 422)
+    agree with the ``default`` entry of the HTTP Schema Resource. A 405,
+    which no endpoint serves, gets ``error``. The HTTP Schema Resources
+    describe ``error`` as the content of those errors.
 
     So a custom handler registered before the call is kept, and calling this
     again replaces the entity of the earlier call: no Link is added twice. A
@@ -496,11 +543,12 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
         The schema and context of the error bodies. Its link callables are
         called with ``request=<Request>`` only; they may be ``def`` (run in
         the threadpool) or ``async def``. An endpoint's own ``error`` is
-        called outside the endpoint, as in :func:`add_options`: with the
-        URL's path parameters it takes, plus the request under the name of
-        the endpoint's ``Request`` parameter if it declares one (see
-        "Callbacks" in :func:`scrudful`). Both are checked when this is
-        called, against the endpoints the app has then: those of included
+        called outside the endpoint: with the URL's path parameters it
+        takes, plus the request under the name of the endpoint's ``Request``
+        parameter if it declares one (see "Callbacks" in :func:`scrudful`).
+        In the HTTP Schema Resource, both are called as ``func()`` (see
+        :func:`add_options`). Both are checked for the handlers' call when
+        this is called, against the endpoints the app has then: those of included
         routers and under any ``Mount`` or ``Host``, with or without
         middleware, since this app's handlers serve them, but not those of a
         mounted Starlette or FastAPI app, which has its own handlers: call
@@ -531,6 +579,8 @@ def add_error_links(app: FastAPI, error: Entity) -> None:
             "middleware stack, which holds the exception handlers, is already built"
         )
     _check_error_callables(app.router.routes, error)
+    # For the default error entries of the HTTP Schema Resources.
+    _APP_ERRORS[app] = error
     handlers = app.exception_handlers
     keys: list[Any] = [
         key
@@ -566,7 +616,8 @@ def _error_handler(
         ):
             return response
         headers = response.headers
-        base = str(request.url)
+        route = request.scope.get("route")
+        base = _live_base(request, getattr(route, "endpoint", None))
         entity, kwargs = _raised_entity(request, error)
         link = merge_links(
             ", ".join(headers.getlist("link")),
@@ -583,14 +634,34 @@ def _error_handler(
     return scrudful_handler
 
 
+def _live_base(request: Request, endpoint: Any = None) -> str:
+    """The URL the relative link URLs of a response resolve against.
+
+    The ``base_url`` of the :func:`add_options` call covering the request: the
+    app's, else that of the router whose ``endpoint`` serves it; else the
+    request's URL.
+    """
+    options = getattr(request.scope.get("app"), _OPTIONS_ATTRIBUTE, None)
+    if not isinstance(options, _HsrOptions) or not options.explicit:
+        router_ref = None
+        if endpoint is not None:
+            with contextlib.suppress(TypeError):  # not weakly referenceable
+                router_ref = _ROUTER_ENDPOINTS.get(endpoint)
+        router = None if router_ref is None else router_ref()
+        options = getattr(router, _OPTIONS_ATTRIBUTE, None)
+    if isinstance(options, _HsrOptions) and options.explicit and options.base_url:
+        return options.base_url
+    return str(request.url)
+
+
 def _raised_entity(request: Request, error: Entity) -> tuple[Entity, dict[str, Any]]:
     """The entity of an error the app's handlers answer, and its callables' kwargs.
 
     The ``error`` of the :func:`scrudful` endpoint the request was routed to,
     when it has one and serves the request's method (Starlette records a
-    route matched by path alone, whose 405 it raises, too), called as in
-    :func:`add_options`; else the app-wide ``error``, called with the
-    request only.
+    route matched by path alone, whose 405 it raises, too), called with the
+    path parameters (see :func:`_description_kwargs`); else the app-wide
+    ``error``, called with the request only.
     """
     route = request.scope.get("route")
     config = getattr(getattr(route, "endpoint", None), "_scrudful", None)
@@ -630,19 +701,20 @@ def _has_json_content(response: Response) -> bool:
     return getattr(response, "body", None) != b""
 
 
-# --- OPTIONS -------------------------------------------------------------------
+# --- OPTIONS and the HTTP Schema Resource ---------------------------------------
 
-#: The media type the OPTIONS body gives an endpoint's own content (DRF's).
+#: The media type of an endpoint's own content without ``entity=`` (DRF's).
 _ENDPOINT_MEDIA_TYPE = "application/json"
-#: The fields of an endpoint or entity whose callables an OPTIONS body calls
-#: (the rels are not needed there).
+#: The fields of an endpoint or entity whose callables the HTTP Schema Resource
+#: calls (the rels are not needed there).
 _LINK_FIELDS = (
     "schema_link_or_func",
     "schema_type_or_func",
     "context_link_or_func",
     "context_type_or_func",
 )
-#: What an endpoint's callables get outside the endpoint.
+#: What an endpoint's callables get outside the endpoint, in
+#: :func:`add_error_links`'s handlers.
 _OUTSIDE = (
     "the URL's path parameters the endpoint takes, and the request under the "
     "name of the endpoint's Request parameter if it declares one"
@@ -650,8 +722,19 @@ _OUTSIDE = (
 #: The fields of an entity whose callables :func:`add_error_links`'s handlers
 #: call (via :func:`_entity_links`).
 _ERROR_LINK_FIELDS = (*_LINK_FIELDS, "schema_rel_or_func", "context_rel_or_func")
-#: Where the OPTIONS route keeps the routes it resolved, in the request scope.
+#: Where the OPTIONS route keeps the path template it matched, in the scope.
 _SERVED_KEY = "scrudful.options"
+#: The description of each method's ``default`` response entry.
+_DEFAULT_ERROR = "Error."
+#: The descriptions of the status ranges a route's ``responses=`` may declare.
+_RANGE_TEXT = {
+    "1": "Informational",
+    "2": "Success",
+    "3": "Redirection",
+    "4": "Client Error",
+    "5": "Server Error",
+}
+_STATUS_KEY = re.compile(r"[1-5](?:[0-9]{2}|XX)")
 
 #: FastAPI's flattening of included routers into their routes, as its OpenAPI
 #: generation walks them (FastAPI versions that include routers lazily); older
@@ -659,147 +742,756 @@ _SERVED_KEY = "scrudful.options"
 _iter_route_contexts = getattr(fastapi_routing, "iter_route_contexts", None)
 
 
-def add_options(app: FastAPI | APIRouter) -> None:
-    """Answer OPTIONS on ``app``'s scrudful paths with an HTTP Schema Resource.
+@dataclass
+class _HsrOptions:
+    """The :func:`add_options` options of an app or router, and its built
+    HTTP Schema Resources."""
 
-    An OPTIONS request to a URL that a :func:`scrudful` endpoint serves with
-    some method, and that no other route serves OPTIONS for, is answered with
-    200 and the URL's HTTP Schema Resource (Semantic HTTP 0.1) as
-    ``application/json``, the Links of that resource's published JSON Schema
-    and JSON-LD context (:func:`scrudful._adapter.options_links`), an
-    ``Allow`` listing the body's methods and
-    ``Access-Control-Expose-Headers``. Other OPTIONS requests are routed as
-    before (e.g. a 405, or your own OPTIONS route). The OPTIONS answer has no
-    dependencies (neither the app's, a router's nor an ``include_router``
-    call's), so it needs no credentials, and is not in the OpenAPI document.
+    base_url: str | None = None
+    hsr_route: bool = True
+    hsr_url: Callable[[str], str] | None = None
+    hsr_cache_control: str = DEFAULT_HSR_CACHE_CONTROL
+    #: ``allowed(request, method, obj)`` (Task 16).
+    allowed: Callable[..., Any] | None = None
+    #: ``load(request, **path_params)`` (Task 16).
+    load: Callable[..., Any] | None = None
+    #: Whether :func:`add_options` gave them (else they are the defaults, for
+    #: :func:`http_schema_resource` on an app without it).
+    explicit: bool = False
+    #: Each built document, by path template, with what it was built from:
+    #: the routes of the path (compared by identity) and the error entity of
+    #: :func:`add_error_links`.
+    built: dict[str, tuple[tuple[Any, ...], Entity | None, dict[str, Any]]] = field(
+        default_factory=dict
+    )
 
-    Given a ``FastAPI`` app, the body describes, for each method, the
-    endpoint the app routes that method of the URL to, found the way
-    Starlette routes it: by matching the request against the app's routes,
-    those of the routers included in it, and the routes of a
-    ``Mount(routes=...)`` the URL is under. So a path served by several
-    routers, by the app and a router, or under differently named path
-    parameters (``/items/{id}`` and ``/items/{item_id}``), is described as a
-    whole, and ``Allow`` lists every method. Given an ``APIRouter``, it adds
-    an OPTIONS route to each of the router's own paths that has a scrudful
-    route, describing the routes on that path; call it before including the
-    router (older FastAPI versions copy a router's routes when it is
-    included). Prefer calling it on the app.
+
+#: The attribute of an app or router holding its :class:`_HsrOptions` (an
+#: ``APIRouter`` is not hashable on every FastAPI version).
+_OPTIONS_ATTRIBUTE = "_scrudful_hsr_options"
+#: The entity :func:`add_error_links` gave each app.
+_APP_ERRORS: weakref.WeakKeyDictionary[FastAPI, Entity] = weakref.WeakKeyDictionary()
+#: The router whose :func:`add_options` covers each scrudful endpoint of it,
+#: for the base URL of the endpoint's live Links (see :func:`_live_base`).
+_ROUTER_ENDPOINTS: weakref.WeakKeyDictionary[Any, weakref.ref[APIRouter]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def add_options(
+    app: FastAPI | APIRouter,
+    *,
+    base_url: str | None = None,
+    hsr_route: bool = True,
+    hsr_url: Callable[[str], str] | None = None,
+    hsr_cache_control: str | None = None,
+    allowed: Callable[..., Any] | None = None,
+    load: Callable[..., Any] | None = None,
+) -> None:
+    """Answer OPTIONS on ``app``'s scrudful paths with their HTTP Schema Resource.
+
+    Each path template (the route's path string, e.g. ``"/items/{item_id}"``)
+    that a :func:`scrudful` endpoint serves with some method has an HTTP
+    Schema Resource (Semantic HTTP 0.1, an OpenAPI 3.1 Path Item), the same
+    for every requester: :func:`http_schema_resource` returns it. An OPTIONS
+    request to a URL of such a path, which no other route serves OPTIONS
+    for, is answered with 200 and that document as ``application/json``, the
+    Links of its published JSON Schema and JSON-LD context
+    (:func:`scrudful._adapter.options_links`), an ``Allow`` listing the
+    document's methods and ``Access-Control-Expose-Headers``. Other OPTIONS
+    requests are routed as before (e.g. a 405, or your own OPTIONS route).
+    The OPTIONS answer has no dependencies (neither the app's, a router's
+    nor an ``include_router`` call's), so it needs no credentials, and is not
+    in the OpenAPI document.
+
+    Given a ``FastAPI`` app, the paths are the full path strings of its
+    routes: those of the routers included in it (with their prefixes) and
+    those under a ``Mount(routes=...)`` (with the Mount's path). A URL is
+    answered with the document of the first route whose path matches it, as
+    Starlette routes it. Routes with the same path string, on the app or on
+    several routers, are one resource: its document describes, for each
+    method, the first of them that serves it. Overlapping templates are
+    separate resources: ``/items/new`` beside ``/items/{id}``, and
+    ``/items/{id}`` beside ``/items/{item_id}`` (on another router), each
+    have their own document and OPTIONS answer. Given an ``APIRouter``, it
+    adds an OPTIONS route to each of the router's own paths that has a
+    scrudful route, answered with the router's document of that path (keyed
+    by the router's path strings); call it before including the router
+    (older FastAPI versions copy a router's routes when it is included).
+    Prefer calling it on the app.
 
     A mounted Starlette or FastAPI app, a ``Mount`` with ``middleware`` and
     a ``Router`` with ``middleware`` are left alone: answering for them from
     the outer app would skip their middleware (e.g. a ``CORSMiddleware``).
     Call this on a mounted app itself, whose OPTIONS answer then runs inside
-    its middleware; the paths under a middleware-wrapped ``Mount`` or
-    ``Router`` get no automatic OPTIONS.
+    its middleware (its paths are those of the mounted app); the paths under
+    a middleware-wrapped ``Mount`` or ``Router`` get no automatic OPTIONS.
 
-    The body lists the methods in the order ``get``, ``put``, ``post``,
+    The document lists the methods in the order ``get``, ``put``, ``post``,
     ``delete``, ``options``, ``head``, ``patch``, ``trace``:
 
-    - a scrudful GET: its success status (``route.status_code``, else 200)
-      with the content of the endpoint's links (``application/json``, a
-      ``schema`` ``$ref`` and an ``x-rdf-context``), and, when it has
-      validator callbacks, scrudful's 304, 400 and 412, the 400 and 412 with
-      the content of its ``error``;
+    - a scrudful GET: its success status (``status_code=``, else the
+      response class's default, 200 for JSON) with the content of the
+      endpoint's ``entity`` (by default ``application/json``, from the link
+      options: a ``schema`` ``$ref`` and an ``x-rdf-context``), and, when it
+      has validator callbacks, scrudful's 304, 400 and 412, the 400 and 412
+      with the content of its ``error``;
     - a scrudful HEAD: the same responses, without content;
     - a scrudful TRACE: its success status, without content: a TRACE's
       content is the echoed request, which the endpoint's links don't
       describe, and it gets none of them;
-    - a scrudful PUT, PATCH, DELETE or POST: the request body (the content
-      of the endpoint's links, when the endpoint takes a body; DELETE has
-      none), the success status with that content (but a 204), and, when
+    - a scrudful PUT, PATCH, DELETE or POST: the request body (the
+      endpoint's content, when the endpoint takes a body; DELETE has none),
+      the success status with that content (but a 204), and, when
       conditional, scrudful's 400, 412 and (but for POST) 428 with the
       ``error`` content and the precondition header parameters;
-    - ``options``: this response;
-    - a method served by a route that isn't scrudful: ``{"responses":
-      {"200": {"description": "OK"}}}``, without content or a request body.
+    - ``options``: ``{"responses": {"204": {"description": "No Content"}}}``;
+    - a method served by a route that isn't scrudful: its success status,
+      without content or a request body.
 
-    Only the error statuses scrudful itself answers are listed: an
-    ``HTTPException`` the endpoint raises is not, but when it has one of
-    those statuses, :func:`add_error_links` gives it the same entity.
+    Each method also lists the statuses its route declares in
+    ``responses=`` (a status code, or a range such as ``"4XX"``), with the
+    declared ``description`` (else the reason phrase): a success status
+    (2xx but 204) with the endpoint's content, under its media type and
+    every other media type the declared ``content`` lists (described by the
+    same schema and context), an error status (4xx, 5xx) with the content
+    of the error entity its raised errors get (below), any other status
+    without content. A status scrudful describes itself (the success status,
+    and scrudful's 304, 400, 412 and 428 when conditional) keeps scrudful's
+    entry. A status set only at run time (``response.status_code = 201``)
+    can't be known: declare it with ``status_code=`` or ``responses=``.
 
-    Callables are called outside the endpoint here: the endpoints' link
-    callables (schema and context URL and type), and their ``error``'s when
-    they are conditional, get only the path parameters of the URL that the
-    endpoint takes (as inside it: not an ``include_router`` prefix's that it
-    doesn't declare), as Starlette matched them (strings, unless the path
-    uses a convertor such as ``{id:int}``), plus the request under the name
-    of the endpoint's ``Request`` parameter when it declares one: not the
-    values FastAPI resolves for the endpoint (body, query, dependencies).
-    Each is checked when this is called, and one that can't be called that
-    way raises ``TypeError``; accept ``**kwargs`` or give the other
-    parameters defaults to use one both inside the endpoint and here.
-    Validator callbacks are not called. Every URL is resolved against the
-    request's URL, as the Links are.
+    Every method has a ``default`` entry ("Error.") with the content of the
+    entity of the errors raised for it: those :func:`add_error_links`
+    answers, with the endpoint's ``error`` when it has one, else the app's
+    entity. FastAPI's own errors for a routed request (a dependency's 401
+    or 403, a raised 404, request validation's 422) go through those
+    handlers with that same entity, so ``default`` describes them. Without
+    :func:`add_error_links`, the raised errors carry no Links, and
+    ``default`` has no content.
+
+    The document is built without a request, the first time it is needed
+    (an OPTIONS request, or :func:`http_schema_resource`), and kept: it is
+    built again only when the routes of its path or the app's
+    :func:`add_error_links` entity change. Link callables are called in
+    *describe* mode, ``func()``, with no arguments, even those that take the
+    endpoint's keyword arguments inside it: give such parameters defaults
+    (or accept ``**kwargs``). A callable must return the same target in both
+    modes, or the document disagrees with the responses it describes. Async
+    callables are awaited. Validator callbacks are not called. Relative URLs
+    are resolved against ``base_url``; the live Links of the responses
+    resolve against it too (else against the request's URL).
 
     Call it once the routes are added (the endpoints added later are
     described, but their callables are not checked); calling it again adds
-    nothing. CORS preflight requests are meant to be answered by
-    ``CORSMiddleware`` before routing; one that reaches this answer gets the
-    description like any other OPTIONS.
+    no route, and replaces the options. CORS preflight requests are meant to
+    be answered by ``CORSMiddleware`` before routing; one that reaches this
+    answer gets the description like any other OPTIONS.
 
     Parameters
     ----------
     app : FastAPI or APIRouter
         The application or router whose scrudful paths answer OPTIONS.
+    base_url : str, optional
+        The absolute URL relative link URLs resolve against, in the HTTP
+        Schema Resource and on the Link headers of the responses of the
+        paths covered. Without it, a relative URL in the document raises
+        ``ValueError`` when the document is built.
+    hsr_route : bool, optional
+        Whether to serve each path's document by GET (default ``True``).
+    hsr_url : callable, optional
+        ``hsr_url(path)``: the URL the document of ``path`` is served at,
+        when it is mounted elsewhere.
+    hsr_cache_control : str, optional
+        The ``Cache-Control`` of the document's GET response (default
+        ``"public, max-age=300"``).
+    allowed : callable, optional
+        ``allowed(request, method, obj)``: whether the requester may use
+        ``method``, for ``Allow``.
+    load : callable, optional
+        ``load(request, **path_params)``: the object at the URL, for
+        ``allowed``.
 
     Raises
     ------
     TypeError
         If ``app`` is neither a ``FastAPI`` application nor an ``APIRouter``,
-        or a callable the OPTIONS body would call can't be called with the
-        path parameters and the request alone.
+        or an option has the wrong type.
+    ValueError
+        If ``base_url`` is not an absolute URL, or a link callable of a
+        scrudful endpoint (or of its ``error``) can't be called with no
+        arguments.
     """
+    _check_owner(app)
+    options = _check_hsr_options(
+        base_url, hsr_route, hsr_url, hsr_cache_control, allowed, load
+    )
+    routes = app.router.routes if isinstance(app, FastAPI) else app.routes
+    _check_options_callables(routes)
+    setattr(app, _OPTIONS_ATTRIBUTE, options)
     if isinstance(app, FastAPI):
-        _check_options_callables(app.router.routes)
-        routes = app.router.routes
         if not any(isinstance(route, _OptionsRoute) for route in routes):
             # First, so that it sees every OPTIONS request, including those
             # under a Mount; it matches only those it answers.
-            routes.insert(0, _OptionsRoute(app.router))
-    elif isinstance(app, APIRouter):
-        _check_options_callables(app.routes)
-        _add_path_options(app)
+            routes.insert(0, _OptionsRoute(app))
     else:
+        _add_path_options(app)
+        for endpoint, _, _ in _endpoints(routes, for_options=True):
+            with contextlib.suppress(TypeError):  # not weakly referenceable
+                _ROUTER_ENDPOINTS[endpoint] = weakref.ref(app)
+
+
+def _check_hsr_options(
+    base_url: Any,
+    hsr_route: Any,
+    hsr_url: Any,
+    hsr_cache_control: Any,
+    allowed: Any,
+    load: Any,
+) -> _HsrOptions:
+    """The :func:`add_options` options, checked."""
+    for name, value, kind in (
+        ("base_url", base_url, str),
+        ("hsr_cache_control", hsr_cache_control, str),
+    ):
+        if value is not None and not isinstance(value, kind):
+            raise TypeError(f"{name} must be a str, not {type(value).__name__}")
+    if not isinstance(hsr_route, bool):
+        raise TypeError(f"hsr_route must be a bool, not {type(hsr_route).__name__}")
+    for name, value in (("hsr_url", hsr_url), ("allowed", allowed), ("load", load)):
+        if value is not None and not callable(value):
+            raise TypeError(f"{name} must be callable, not {type(value).__name__}")
+    if base_url is not None:
+        parts = urlsplit(base_url)
+        if not (parts.scheme and parts.netloc):
+            raise ValueError(
+                f"base_url must be an absolute URL (with a scheme and a host), "
+                f"not {base_url!r}"
+            )
+    return _HsrOptions(
+        base_url=base_url,
+        hsr_route=hsr_route,
+        hsr_url=hsr_url,
+        hsr_cache_control=(
+            hsr_cache_control
+            if hsr_cache_control is not None
+            else DEFAULT_HSR_CACHE_CONTROL
+        ),
+        allowed=allowed,
+        load=load,
+        explicit=True,
+    )
+
+
+def _hsr_options(owner: FastAPI | APIRouter) -> _HsrOptions:
+    """The :func:`add_options` options of ``owner``, else (kept) defaults."""
+    options = getattr(owner, _OPTIONS_ATTRIBUTE, None)
+    if not isinstance(options, _HsrOptions):
+        options = _HsrOptions()
+        setattr(owner, _OPTIONS_ATTRIBUTE, options)
+    return options
+
+
+def http_schema_resource(app: FastAPI | APIRouter, path: str) -> dict[str, Any]:
+    """The HTTP Schema Resource (an OpenAPI 3.1 Path Item) of ``path``.
+
+    ``path`` is the full path string of the routes, as :func:`add_options`
+    keys them (e.g. ``"/v1/items/{item_id}"`` for a router included with
+    ``prefix="/v1"``; for an ``APIRouter``, the router's own path). The
+    document is the same for every requester: it is built without a
+    request, once (see :func:`add_options`, which describes its content and
+    whose ``base_url`` it uses), and a copy is returned.
+
+    Link callables are called in *describe* mode, ``func()``: with no
+    arguments. They must return the same target as on the responses they
+    describe, or the description disagrees with the responses. An async
+    one is awaited (in a worker thread when this is called inside a running
+    event loop).
+
+    Raises
+    ------
+    TypeError
+        If ``app`` is neither a ``FastAPI`` application nor an ``APIRouter``.
+    ValueError
+        If no scrudful endpoint serves ``path``; a link URL is relative and
+        there is no base URL; a link callable raises when called as
+        ``func()``; or a router is included in apps that
+        :func:`add_error_links` gave different entities.
+    """
+    _check_owner(app)
+    return copy.deepcopy(_run_describing(_hsr_flow(app, path)))
+
+
+def _check_owner(app: Any) -> None:
+    if not isinstance(app, (FastAPI, APIRouter)):
         raise TypeError(
             "app must be a FastAPI application or an APIRouter, "
             f"not {type(app).__name__}"
         )
 
 
+#: A describe-mode build: it yields each link callable to call (with the
+#: entry it is for), and is sent back what it returns.
+_Flow = Generator[tuple[Callable[[], Any], str], Any, T]
+
+
+def _hsr_flow(owner: FastAPI | APIRouter, path: str) -> _Flow[dict[str, Any]]:
+    """The HTTP Schema Resource of ``path`` on ``owner`` (not a copy): the
+    one built, unless the routes of ``path`` or the error entity changed."""
+    options = _hsr_options(owner)
+    paths = _scrudful_paths(owner)
+    routes = paths.get(path)
+    if routes is None:
+        raise ValueError(
+            f"{path!r} is not the path of a scrudful endpoint of this "
+            f"{type(owner).__name__} (its paths are {sorted(paths)}): give the "
+            "route's full path string"
+        )
+    api_error = _api_error(owner)
+    originals = tuple(getattr(route, "original_route", route) for route in routes)
+    built = options.built.get(path)
+    if (
+        built is not None
+        and len(built[0]) == len(originals)
+        and all(old is new for old, new in zip(built[0], originals))
+        and built[1] == api_error
+    ):
+        return built[2]
+    document = yield from _describe_path(routes, options.base_url, api_error)
+    options.built[path] = (originals, api_error, document)
+    return document
+
+
+def _run_describing(flow: _Flow[T]) -> T:
+    """Run a describe-mode ``flow`` here: each callable is called, and an
+    awaitable it returns awaited (see :func:`_await`)."""
+    result = None
+    while True:
+        try:
+            func, where = flow.send(result)
+        except StopIteration as stop:
+            return stop.value
+        except HsrConfigError as exc:
+            raise ValueError(str(exc)) from exc
+        try:
+            result = func()
+            if inspect.isawaitable(result):
+                result = _await(result)
+        except Exception as exc:
+            raise _describing_error(func, where, exc) from exc
+
+
+async def _run_describing_async(flow: _Flow[T]) -> T:
+    """:func:`_run_describing` in the event loop (sync callables in the
+    threadpool)."""
+    result = None
+    while True:
+        try:
+            func, where = flow.send(result)
+        except StopIteration as stop:
+            return stop.value
+        except HsrConfigError as exc:
+            raise ValueError(str(exc)) from exc
+        try:
+            result = await _call(func, {})
+        except Exception as exc:
+            raise _describing_error(func, where, exc) from exc
+
+
+def _await(awaitable: Any) -> Any:
+    """The result of ``awaitable``, from sync code: in a new event loop, in
+    a worker thread when this thread runs one."""
+
+    async def wait() -> Any:
+        return await awaitable
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(wait())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, wait()).result()
+
+
+def _describing_error(func: Any, where: str, exc: Exception) -> ValueError:
+    name = getattr(func, "__qualname__", None) or repr(func)
+    return ValueError(
+        f"{name}, a link callable of {where}, must work without a request when "
+        f"the HTTP Schema Resource is built (called as func()): {exc!r}"
+    )
+
+
+def _scrudful_paths(owner: FastAPI | APIRouter) -> dict[str, list[Any]]:
+    """The routes of each path template of ``owner`` that a scrudful endpoint
+    serves, in routing order (see :func:`add_options`)."""
+    paths: dict[str, list[Any]] = {}
+    routes = owner.router.routes if isinstance(owner, FastAPI) else owner.routes
+    _collect_paths(routes, "", paths)
+    return {
+        path: served
+        for path, served in paths.items()
+        if any(_endpoint_config(getattr(route, "endpoint", None)) for route in served)
+    }
+
+
+def _collect_paths(
+    routes: Sequence[Any], prefix: str, paths: dict[str, list[Any]]
+) -> None:
+    """Add the HTTP routes under ``routes`` to ``paths``, by full path.
+
+    Into the ``Mount``\\ s and ``Host``\\ s :func:`_contents` looks into; the
+    automatic OPTIONS routes are skipped.
+    """
+    for route in _flat(routes):
+        if _is_automatic(route):
+            continue
+        contents = _contents(route)
+        if contents is _OPAQUE:
+            continue
+        if contents is not None:
+            _collect_paths(contents, prefix + _mount_path(route), paths)
+        elif isinstance(getattr(route, "original_route", route), Route):
+            paths.setdefault(prefix + route.path, []).append(route)
+
+
+def _mount_path(route: Any) -> str:
+    """The path a ``Mount`` adds to its routes' (a ``Host`` adds none)."""
+    original = getattr(route, "original_route", route)
+    return str(original.path) if isinstance(original, Mount) else ""
+
+
+def _api_error(owner: FastAPI | APIRouter) -> Entity | None:
+    """The entity :func:`add_error_links` gave the app serving ``owner``'s
+    routes: the app's own, or for a router, that of the apps including it.
+
+    Raises
+    ------
+    ValueError
+        If apps including the router were given different entities: its HTTP
+        Schema Resources would differ between them.
+    """
+    if isinstance(owner, FastAPI):
+        return _APP_ERRORS.get(owner)
+    endpoints = [
+        endpoint for endpoint, _, _ in _endpoints(owner.routes, for_options=True)
+    ]
+    errors: list[Entity] = []
+    for app, error in list(_APP_ERRORS.items()):
+        if error not in errors and any(
+            any(endpoint is ours for ours in endpoints)
+            for endpoint, _, _ in _endpoints(app.router.routes, for_options=False)
+        ):
+            errors.append(error)
+    if len(errors) > 1:
+        raise ValueError(
+            "an APIRouter is included in apps that add_error_links gave "
+            "different error entities, so its HTTP Schema Resources would "
+            "differ between them: give them the same entity, or call "
+            "add_options on each app"
+        )
+    return errors[0] if errors else None
+
+
+def _describe_path(
+    routes: Sequence[Any], base_url: str | None, api_error: Entity | None
+) -> _Flow[dict[str, Any]]:
+    """The HTTP Schema Resource of a path served by ``routes``: each method,
+    described as the first route serving it, and ``options``."""
+    memo: dict[tuple[int, str], Any] = {}
+    body: dict[str, Any] = {}
+    for method in METHOD_KEYS:
+        if method == "options":
+            body[method] = options_operation()
+            continue
+        route = next((route for route in routes if _serves(route, method)), None)
+        if route is not None:
+            body[method] = yield from _describe_route(
+                method, route, base_url, api_error, memo
+            )
+    return body
+
+
+def _serves(route: Any, method: str) -> bool:
+    methods = getattr(route, "methods", None)
+    return methods is None or method.upper() in methods
+
+
+def _describe_route(
+    method: str,
+    route: Any,
+    base_url: str | None,
+    api_error: Entity | None,
+    memo: dict[tuple[int, str], Any],
+) -> _Flow[dict[str, Any]]:
+    """Describe ``route`` as the operation of ``method`` (see :func:`add_options`).
+
+    ``api_error`` is the entity of :func:`add_error_links` (``None``
+    without it); ``memo`` keeps the values of the link callables called.
+    """
+    endpoint = getattr(route, "endpoint", None)
+    config = _endpoint_config(endpoint)
+    name = f"{_endpoint_name(endpoint)}()"
+    status = _route_status(route)
+    conditional = config is not None and _is_conditional(config, method)
+    with_content = method != "head"
+    # The entity of the errors raised for the method, which add_error_links'
+    # handlers answer (see _raised_entity).
+    raised = None
+    if api_error is not None:
+        raised = api_error
+        if config is not None and config.error is not None:
+            raised = config.error
+
+    def media(source: Any, media_type: str, key: str) -> _Flow[Any]:
+        return _media(source, media_type, base_url, f"{name}'s {key} response", memo)
+
+    content = error_content = None
+    if config is not None and with_content and method != "trace":
+        content = yield from media(config, config.media_type, str(status))
+    if conditional and with_content and config.error is not None:
+        # scrudful's own 400, 412 and 428
+        error_content = yield from media(config.error, config.error.media_type, "400")
+    if method in ("get", "head", "trace"):
+        description = describe_read(None, conditional, [status], error_content)
+        if content and has_default_entity(method, status):
+            description["responses"][str(status)]["content"] = copy.deepcopy(content)
+    else:
+        takes_body = getattr(route, "body_field", None) is not None
+        description = describe_write(
+            method,
+            content if takes_body else None,
+            conditional,
+            config is not None and config.etag_func is not None,
+            config is not None and config.last_modified_func is not None,
+            [status],
+            response_content=content if has_default_entity(method, status) else None,
+            error_content=error_content,
+        )
+    responses = description["responses"]
+    for key, declared in _declared_responses(route):
+        entry = responses.get(key)
+        fresh = entry is None
+        if entry is None:
+            entry = responses[key] = {"description": _declared_text(key, declared)}
+        if not with_content:
+            continue
+        kind = _status_kind(method, key)
+        if kind == "success" and content:
+            described = entry.setdefault("content", copy.deepcopy(content))
+            known = {essence(media_type) for media_type in described}
+            for media_type in declared.get("content") or ():
+                if essence(media_type_key(media_type)) not in known:
+                    more = yield from media(config, media_type, key)
+                    described.update(more or {})
+                    known.add(essence(media_type))
+        elif kind == "error" and fresh and raised is not None:
+            more = yield from media(raised, raised.media_type, key)
+            if more:
+                entry["content"] = more
+    default: dict[str, Any] = {"description": _DEFAULT_ERROR}
+    if with_content and raised is not None:
+        more = yield from media(raised, raised.media_type, "default")
+        if more:
+            default["content"] = more
+    responses["default"] = default
+    return description
+
+
+def _route_status(route: Any) -> int:
+    """The success status of ``route``: its ``status_code``, else its
+    response class's default (FastAPI's choice), 200 for a Starlette route."""
+    status = getattr(route, "status_code", None)
+    if status:
+        return int(status)
+    response_class = getattr(route, "response_class", None)
+    if isinstance(response_class, DefaultPlaceholder):
+        response_class = response_class.value
+    return _default_status(response_class)
+
+
+def _declared_responses(route: Any) -> list[tuple[str, Mapping[str, Any]]]:
+    """The statuses ``route`` declares in ``responses=``, as response keys
+    (``"404"``, ``"4XX"``), with their declared responses. ``"default"`` and
+    keys that are no status are left out."""
+    declared = []
+    for key, response in (getattr(route, "responses", None) or {}).items():
+        if isinstance(key, bool):
+            continue
+        text = str(key).strip().upper()
+        if _STATUS_KEY.fullmatch(text):
+            declared.append((text, response if isinstance(response, Mapping) else {}))
+    return declared
+
+
+def _declared_text(key: str, declared: Mapping[str, Any]) -> str:
+    description = declared.get("description")
+    if isinstance(description, str) and description:
+        return description
+    if key.endswith("XX"):
+        return _RANGE_TEXT[key[0]]
+    return reason_phrase(int(key))
+
+
+def _status_kind(method: str, key: str) -> str | None:
+    """``"success"`` for a status with the endpoint's content (see
+    :func:`scrudful._adapter.has_default_entity`), ``"error"`` for a 4xx or
+    5xx, else ``None``."""
+    status = int(key[0]) * 100 if key.endswith("XX") else int(key)
+    if has_default_entity(method, status):
+        return "success"
+    return "error" if status >= 400 else None
+
+
+def _media(
+    source: Any,
+    media_type: str,
+    base_url: str | None,
+    where: str,
+    memo: dict[tuple[int, str], Any],
+) -> _Flow[dict[str, Any] | None]:
+    """The ``content`` of ``source``'s links: its Media Type Object, or ``None``.
+
+    Built by :func:`scrudful._adapter.describe_content` from the schema and
+    context URLs and types of ``source`` (an endpoint's options or an
+    :class:`Entity`), evaluated in describe mode (the context only when
+    ``media_type`` takes one), with relative URLs resolved against
+    ``base_url`` (:func:`scrudful._hsr.absolute_for_hsr`), as the Links of
+    the responses it describes are (see :func:`_live_base`). ``None``
+    without a schema URL. ``where`` names the entry, for errors.
+
+    Raises
+    ------
+    HsrConfigError
+        If a URL is relative and there is no ``base_url``, or a schema has
+        no RDF context.
+    """
+    schema = yield from _field(source, "schema_link_or_func", where, memo)
+    if not schema:
+        return None
+    schema_type = yield from _field(source, "schema_type_or_func", where, memo)
+    context = context_type = None
+    rel, default_type = context_defaults(media_type)
+    if rel is not None:  # not in-band RDF
+        context = yield from _field(source, "context_link_or_func", where, memo)
+    if context:
+        context_type = (
+            yield from _field(source, "context_type_or_func", where, memo)
+        ) or default_type
+    schema_url = absolute_for_hsr(str(schema), base_url, f"{where} schema link")
+    context_url = (
+        absolute_for_hsr(str(context), base_url, f"{where} context link")
+        if context
+        else None
+    )
+    try:
+        return describe_content(
+            media_type,
+            schema_url,
+            str(schema_type or SCHEMA_TYPE),
+            context_url,
+            None if context_type is None else str(context_type),
+        )
+    except HsrConfigError as exc:
+        raise HsrConfigError(f"{where}: {exc}") from exc
+
+
+def _field(
+    source: Any, name: str, where: str, memo: dict[tuple[int, str], Any]
+) -> _Flow[Any]:
+    """The value of ``source``'s field ``name``: a callable's result, called
+    once per build (``memo``)."""
+    value = getattr(source, name)
+    if not callable(value):
+        return value
+    key = (id(source), name)
+    if key not in memo:
+        memo[key] = yield value, where
+    return memo[key]
+
+
 class _OptionsRoute(BaseRoute):
-    """Answers OPTIONS where a scrudful endpoint of ``router`` serves the URL.
+    """Answers OPTIONS where a scrudful endpoint of ``app`` serves the URL.
 
     It matches an OPTIONS request only when no other route serves OPTIONS for
-    its URL and a scrudful endpoint serves another method (see
-    :func:`_resolve`); every other request goes on to the other routes.
+    its URL and the first route whose path matches it is on a scrudful path
+    (see :func:`_options_path`); every other request goes on to the other
+    routes.
     """
 
     name = "scrudful_options"
     path = ""
     include_in_schema = False
 
-    def __init__(self, router: Router) -> None:
-        self.router = router
+    def __init__(self, app: FastAPI) -> None:
+        self.owner = app
 
     def matches(self, scope: Scope) -> tuple[Match, Scope]:
         if scope.get("type") != "http" or scope.get("method") != "OPTIONS":
             return Match.NONE, {}
-        served = _resolve(self.router.routes, scope)
-        if served is None:
+        path = _options_path(self.owner, scope)
+        if path is None:
             return Match.NONE, {}
-        return Match.FULL, {_SERVED_KEY: served}
+        return Match.FULL, {_SERVED_KEY: path}
 
     def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
         raise NoMatchFound(name, path_params)
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
-        served = scope.get(_SERVED_KEY)
-        if served is None:
-            served = _resolve(self.router.routes, scope) or {}
-        request = Request(scope, receive)
-        response = _options_response(await _describe(request, served))
-        await response(scope, receive, send)
+        path = scope.get(_SERVED_KEY) or _options_path(self.owner, scope)
+        if path is None:
+            raise HTTPException(status_code=404)
+        body = await _run_describing_async(_hsr_flow(self.owner, path))
+        await _options_response(body)(scope, receive, send)
+
+
+def _options_path(app: FastAPI, scope: Scope) -> str | None:
+    """The path template whose document answers the OPTIONS ``scope``.
+
+    That of the first route whose path matches the URL (see
+    :func:`_match_path`), when it is a scrudful path; ``None`` when another
+    route (or a mounted app) serves OPTIONS for the URL, or that path has no
+    scrudful endpoint.
+    """
+    routes = app.router.routes
+    if _match(routes, {**scope, "method": "OPTIONS"}) is not None:
+        return None
+    path = _match_path(routes, scope)
+    if path is None or path not in _scrudful_paths(app):
+        return None
+    return path
+
+
+def _match_path(routes: Sequence[Any], scope: Scope, prefix: str = "") -> str | None:
+    """The full path of the route Starlette routes ``scope`` to, by path.
+
+    As Starlette routes: a ``Mount`` or ``Host`` that fully matches is gone
+    into (``None`` for an app :func:`_contents` doesn't look into), else the
+    first route whose path matches (a partial match: its methods aren't
+    the request's). The automatic OPTIONS routes are skipped.
+    """
+    partial = None
+    for route in _flat(routes):
+        if _is_automatic(route):
+            continue
+        match, child_scope = route.matches(scope)
+        if match == Match.NONE:
+            continue
+        contents = _contents(route)
+        if contents is None:
+            path = getattr(route, "path", None)
+            if path is None:
+                continue
+            if match == Match.FULL:
+                return prefix + path
+            if partial is None:
+                partial = prefix + path
+        elif match == Match.FULL:
+            if contents is _OPAQUE:
+                return None
+            return _match_path(
+                contents, {**scope, **child_scope}, prefix + _mount_path(route)
+            )
+    return partial
 
 
 def _flat(routes: Sequence[Any]) -> list[Any]:
@@ -890,32 +1582,6 @@ def _match(routes: Sequence[Any], scope: Scope) -> tuple[Any, Scope] | None:
     return None
 
 
-def _resolve(
-    routes: Sequence[Any], scope: Scope
-) -> dict[str, tuple[Any, Any, Scope]] | None:
-    """The ``(route, endpoint, scope)`` serving each method of the URL.
-
-    The scope is the one the route would get for that method (its
-    ``path_params``, ``route`` and ``endpoint``). ``None`` when another route
-    (or a mounted app) serves OPTIONS for the URL, or no scrudful endpoint
-    serves any of its methods.
-    """
-    served = {}
-    for method in METHOD_KEYS:
-        found = _match(routes, {**scope, "method": method.upper()})
-        if method == "options":
-            if found is not None:
-                return None
-            continue
-        if found is not None:
-            route, routed = found
-            endpoint = routed.get("endpoint", getattr(route, "endpoint", None))
-            served[method] = (route, endpoint, routed)
-    if not any(_endpoint_config(endpoint) for _, endpoint, _ in served.values()):
-        return None
-    return served
-
-
 def _add_path_options(router: APIRouter) -> None:
     """:func:`add_options` for an ``APIRouter``: an OPTIONS route per path."""
     paths: dict[str, list[Route]] = {}
@@ -936,35 +1602,13 @@ def _add_path_options(router: APIRouter) -> None:
 
 
 def _options_endpoint(router: APIRouter, path: str) -> Callable[[Request], Any]:
-    """The endpoint of the OPTIONS route of ``path`` on ``router``.
-
-    It reads ``router``'s routes when a request comes, so that routes added
-    later are described, and through whichever app or prefix the router is
-    included.
-    """
+    """The endpoint of the OPTIONS route of ``path`` on ``router``: the
+    router's document of ``path``, whichever app or prefix the router is
+    included through (routes added to the path later are described)."""
 
     async def scrudful_options(request: Request) -> Response:
-        routes = [
-            route
-            for route in router.routes
-            if isinstance(route, Route) and route.path == path
-        ]
-        served = {}
-        for method in METHOD_KEYS:
-            # The first route serving a method describes it, as Starlette
-            # routes it.
-            route = next(
-                (
-                    route
-                    for route in routes
-                    if route.methods is None or method.upper() in route.methods
-                ),
-                None,
-            )
-            if route is not None and method != "options":
-                routed = {**request.scope, "route": route, "endpoint": route.endpoint}
-                served[method] = (route, route.endpoint, routed)
-        return _options_response(await _describe(request, served))
+        body = await _run_describing_async(_hsr_flow(router, path))
+        return _options_response(body)
 
     scrudful_options._scrudful_options = True  # type: ignore[attr-defined]
     return scrudful_options
@@ -977,74 +1621,6 @@ def _options_response(body: dict[str, Any]) -> Response:
     response.headers["Allow"] = allow_header(body)
     expose_headers(response.headers)
     return response
-
-
-async def _describe(
-    request: Request, served: Mapping[str, tuple[Any, Any, Scope]]
-) -> dict[str, Any]:
-    """The HTTP Schema Resource of the methods ``served``, and ``options``."""
-    body: dict[str, Any] = {}
-    for method in METHOD_KEYS:
-        if method == "options":
-            body[method] = describe_options()
-        elif method in served:
-            route, endpoint, routed = served[method]
-            body[method] = await _describe_route(
-                method, route, endpoint, routed, request
-            )
-    return body
-
-
-async def _describe_route(
-    method: str,
-    route: Any,
-    endpoint: Any,
-    routed: Scope,
-    request: Request,
-) -> Any:
-    """Describe ``route`` as the operation of ``method`` (see :func:`add_options`).
-
-    The callables get a ``Request`` of the OPTIONS request with the scope
-    ``routed``, the route's (its ``path_params``, ``route`` and ``endpoint``).
-    """
-    config = _endpoint_config(endpoint)
-    if config is None:
-        return {"responses": {"200": {"description": "OK"}}}
-    routed_request = Request({**routed, "method": request.method}, request.receive)
-    kwargs = _description_kwargs(config, routed_request)
-    base = str(request.url)
-    status = int(getattr(route, "status_code", None) or 200)
-    conditional = _is_conditional(config, method)
-    if method == "head":
-        return describe_read(None, conditional, [status])
-    if method == "trace":
-        # Neither a read nor a write: its status, without content (and, never
-        # conditional, without early responses), as django-ninja's.
-        return describe_read(None, conditional, [status])
-    content = await _media(config, _ENDPOINT_MEDIA_TYPE, kwargs, base)
-    error_content = None
-    if conditional and config.error is not None:  # scrudful's 400, 412, 428
-        error_content = await _media(
-            config.error, config.error.media_type, kwargs, base
-        )
-    if method == "get":
-        description = describe_read(content, conditional, [status], error_content)
-        if content and has_default_entity(method, status):
-            # describe_read puts the content on a 200 only.
-            success = description["responses"][str(status)]
-            success.setdefault("content", copy.deepcopy(content))
-        return description
-    takes_body = getattr(route, "body_field", None) is not None
-    return describe_write(
-        method,
-        content if takes_body else None,
-        conditional,
-        config.etag_func is not None,
-        config.last_modified_func is not None,
-        [status],
-        response_content=content if has_default_entity(method, status) else None,
-        error_content=error_content,
-    )
 
 
 def _has_validators(config: _EndpointConfig) -> bool:
@@ -1067,7 +1643,8 @@ def _endpoint_config(endpoint: Any) -> _EndpointConfig | None:
 
 
 def _description_kwargs(config: _EndpointConfig, request: Request) -> dict[str, Any]:
-    """The kwargs of an endpoint's callables outside the endpoint.
+    """The kwargs of an endpoint's callables outside the endpoint, in
+    :func:`add_error_links`'s handlers.
 
     The request's path parameters that the endpoint takes, under the names
     it takes them by, as FastAPI passes them inside it (see
@@ -1134,13 +1711,37 @@ def _endpoints(
 
 
 def _check_options_callables(routes: Sequence[Any]) -> None:
-    """Check the callables an OPTIONS body calls (see :func:`add_options`)."""
-    for endpoint, config, names in _endpoints(routes, for_options=True):
+    """Check the link callables the HTTP Schema Resource calls, as ``func()``
+    (see :func:`add_options`): an endpoint's, and its ``error``'s."""
+    for endpoint, config, _ in _endpoints(routes, for_options=True):
         where = f"endpoint {_endpoint_name(endpoint)}"
-        _check_call(config, "", where, names, "in OPTIONS")
-        # Called for the conditional methods: checked whichever it serves.
-        if config.error is not None and _has_validators(config):
-            _check_call(config.error, "error.", where, names, "in OPTIONS")
+        _check_describe_call(config, "", where)
+        if config.error is not None:
+            _check_describe_call(config.error, "error.", where)
+
+
+def _check_describe_call(
+    source: _EndpointConfig | Entity, prefix: str, where: str
+) -> None:
+    """Raise ``ValueError`` unless each link callable of ``source`` can be
+    called with no arguments."""
+    for name in _LINK_FIELDS:
+        func = getattr(source, name)
+        if not callable(func):
+            continue
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):  # e.g. some builtins: can't tell
+            continue
+        try:
+            signature.bind()
+        except TypeError as exc:
+            raise ValueError(
+                f"{prefix}{name} of {where} ({func!r}) is called as func(), with "
+                "no arguments, when the HTTP Schema Resource is built, but "
+                f"{exc}; give the parameters it takes inside the endpoint "
+                "defaults, or accept **kwargs"
+            ) from exc
 
 
 def _check_error_callables(routes: Sequence[Any], error: Entity) -> None:
@@ -1204,8 +1805,8 @@ def _check_call(
 ) -> None:
     """Raise ``TypeError`` unless each callable of ``source``'s ``fields`` can
     be called with the keyword arguments ``names`` alone (``meaning``)."""
-    for field in fields:
-        func = getattr(source, field)
+    for name in fields:
+        func = getattr(source, name)
         if not callable(func):
             continue
         try:
@@ -1216,7 +1817,7 @@ def _check_call(
             signature.bind(**dict.fromkeys(names))
         except TypeError as exc:
             raise TypeError(
-                f"{prefix}{field} of {where} ({func!r}) is called {purpose} with "
+                f"{prefix}{name} of {where} ({func!r}) is called {purpose} with "
                 f"the keyword arguments {sorted(names)} only ({meaning}), but "
                 f"{exc}; accept **kwargs or give its other parameters defaults"
             ) from None
@@ -1224,40 +1825,6 @@ def _check_call(
 
 def _endpoint_name(endpoint: Any) -> str:
     return getattr(endpoint, "__qualname__", None) or repr(endpoint)
-
-
-async def _media(
-    source: _EndpointConfig | Entity,
-    media_type: str,
-    kwargs: Mapping[str, Any],
-    base: str,
-) -> dict[str, Any] | None:
-    """The ``content`` of ``source``'s links: its Media Type Object, or ``None``.
-
-    Built by :func:`scrudful._adapter.describe_content` from the schema and
-    context URLs and types of ``source`` (an endpoint's options or an
-    :class:`Entity`), which are evaluated as for its Links (the context only
-    when ``media_type`` takes one), and with the URLs resolved against
-    ``base`` the same way, so that the entry agrees with the Links of the
-    responses it describes. ``None`` without a schema URL.
-    """
-    schema = await _value(source.schema_link_or_func, kwargs)
-    if not schema:
-        return None
-    schema_type = await _value(source.schema_type_or_func, kwargs)
-    context = context_type = None
-    rel, default_type = context_defaults(media_type)
-    if rel is not None:  # not in-band RDF
-        context = await _value(source.context_link_or_func, kwargs)
-    if context:
-        context_type = await _value(source.context_type_or_func, kwargs) or default_type
-    return describe_content(
-        media_type,
-        resolve_uri(schema, base),
-        str(schema_type or SCHEMA_TYPE),
-        resolve_uri(context, base) if context else None,
-        None if context_type is None else str(context_type),
-    )
 
 
 async def _call(func: Callable[..., Any], kwargs: Mapping[str, Any]) -> Any:
@@ -1345,6 +1912,15 @@ async def _entity_links(
     The context link's defaults come from ``entity.media_type``; in-band RDF
     has none.
     """
+    return await _source_links(entity, entity.media_type, kwargs, base)
+
+
+async def _source_links(
+    entity: Any, media_type: str, kwargs: Mapping[str, Any], base: str
+) -> tuple[str | None, str | None]:
+    """:func:`_entity_links` of the link fields of ``entity`` (an
+    :class:`Entity`, or an endpoint's link options) describing ``media_type``
+    content."""
     schema = await _link(
         kwargs,
         (
@@ -1356,7 +1932,7 @@ async def _entity_links(
         base,
     )
     context = None
-    defaults = context_defaults(entity.media_type)
+    defaults = context_defaults(media_type)
     if defaults != (None, None):
         context = await _link(
             kwargs,
@@ -1367,9 +1943,23 @@ async def _entity_links(
             ),
             defaults,
             base,
-            context_of=entity.media_type,
+            context_of=media_type,
         )
     return schema, context
+
+
+def _check_entity(entity: Any, links: Mapping[str, Any]) -> None:
+    """Check an ``entity`` argument: ``None``, or an :class:`Entity` given
+    without any of the link options ``links``, which it replaces."""
+    if entity is None:
+        return
+    if not isinstance(entity, Entity):
+        raise TypeError(f"entity must be an Entity, not {type(entity).__name__}")
+    given = [name for name, value in links.items() if value is not None]
+    if given:
+        raise TypeError(
+            f"entity replaces {', '.join(given)}: give the links in the Entity"
+        )
 
 
 def _check_error(error: Any) -> None:

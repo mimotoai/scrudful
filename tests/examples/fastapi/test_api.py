@@ -9,7 +9,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from examples.fastapi import api
-from scrudful._adapter import allow_header, options_links
+from scrudful._adapter import allow_header, describe_options, options_links
+from scrudful._hsr import options_operation
+from scrudful.fastapi import add_options
 from tests.semantic_http import (
     link_problems,
     parse_links,
@@ -42,6 +44,14 @@ JOHN = {
 }
 
 
+@pytest.fixture(autouse=True, scope="module")
+def test_base_url():
+    """The test client's URL as the base URL (the example's is localhost:8000)."""
+    add_options(api.app, base_url=f"{BASE}/")
+    yield
+    add_options(api.app, base_url=api.BASE_URL)
+
+
 @pytest.fixture(autouse=True)
 def fresh_data():
     api.reset_data()
@@ -53,6 +63,13 @@ def fresh_data():
 def client():
     with TestClient(api.app) as client:
         yield client
+
+
+def answered_hsr(body):
+    """``body`` with the ``options`` entry of the 200 OPTIONS response that
+    returned it, for agreement checks of that response: until OPTIONS answers
+    204, the HTTP Schema Resource's own entry (a 204) doesn't describe it."""
+    return {**body, "options": describe_options()}
 
 
 def assert_unchanged(client, user_id=2):
@@ -436,6 +453,7 @@ def test_options_user(client):
             },
         }
     }
+    assert body["options"] == options_operation()
     users = client.options("/users")
     assert users.headers["allow"] == "POST, OPTIONS"
     validate_http_schema_resource(users.json())
@@ -484,11 +502,12 @@ CONFORMANCE = [
     ("get", USERS, {}, 405),
     ("get", "/nowhere", {}, 404),
 ]
-# Statuses with nothing in the OPTIONS bodies to agree with: the 404 the
-# endpoints and Starlette raise, the 405 and FastAPI's 422 are not listed, and a
-# 304 (a HEAD's too) has no content, hence no entry. Their Links are still
-# checked by the rules that don't need the body.
-NO_ENTRY = {304, 404, 405, 422}
+# Statuses with nothing in the OPTIONS bodies to agree with: the 405 (of a
+# method the path doesn't serve) and a 304 (a HEAD's too), which has no
+# content, hence no entry. Their Links are still checked by the rules that
+# don't need the body. The 404 the endpoints raise and FastAPI's 422 agree with
+# the ``default`` entry (Starlette's 404 for an unknown path has no body).
+NO_ENTRY = {304, 405}
 
 
 @pytest.mark.parametrize(
@@ -501,6 +520,8 @@ def test_example_links_everywhere(client, method, path, arguments, status):
     and agrees with the OPTIONS body of its path."""
     options = client.options(path)
     hsr = options.json() if options.status_code == 200 else None
+    if hsr is not None and method == "options":
+        hsr = answered_hsr(hsr)
     response = client.request(method.upper(), path, **arguments)
     assert response.status_code == status
     content = method != "head" and bool(response.content)
