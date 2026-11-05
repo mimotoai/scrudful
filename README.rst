@@ -1018,9 +1018,11 @@ this release, also need the 0.9.0 changes in the changelog):
    makes OPTIONS load the object for every requester, so ``get_object()``
    (DRF) or ``load`` (FastAPI) must hide, with a 404 or ``None``, the objects
    a requester may not see. A denial the hook raises (a 401 or 403) refuses
-   the method; a 404 it raises answers the OPTIONS. Without a hook, the
-   permission classes (DRF), ``auth=`` and ``before=`` (ninja) or the security
-   dependencies (FastAPI) decide.
+   the method; a 404 it raises answers the OPTIONS (DRF: the first loaded
+   method's; another method's 404 leaves out only that method). Without a
+   hook, the permission classes (DRF), ``auth=``, ``before=`` and each item
+   operation's own ``load`` (ninja) or the security dependencies (FastAPI)
+   decide.
 6. **Update the tests that assert the 200 OPTIONS body.** OPTIONS is now a 204
    without content, ``Allow`` depends on the requester, and the document is
    at the target of the response's HTTP Schema Resource link: GET it there. It
@@ -1067,7 +1069,9 @@ this release, also need the 0.9.0 changes in the changelog):
      not filled yet) when called as ``func(view, None)``, or returning
      nothing for a context link or its type. Anything else a callable raises
      (a ``NoReverseMatch``, a ``TypeError`` of its signature) is ``E005``.
-     Run ``manage.py check`` before deploying;
+     Without the ``hsr_urls()`` include, the checks run only when
+     ``scrudful.rest_framework`` was imported before they started (import it
+     in an ``AppConfig.ready()``). Run ``manage.py check`` before deploying;
    * DRF: ``Meta.hsr_route = False`` without ``Meta.hsr_url`` or
      ``SCRUDFUL["HSR_URL"]`` raises ``ImproperlyConfigured`` when the class
      is decorated;
@@ -1083,7 +1087,14 @@ this release, also need the 0.9.0 changes in the changelog):
      operation (``ConfigError``). The ninja internals OPTIONS relies on are
      checked when a path gets its OPTIONS, at startup (``ConfigError`` for
      an unsupported ninja); where ninja's source isn't installed, a
-     ``RuntimeWarning`` says the check is weaker, once;
+     ``RuntimeWarning`` says the check is weaker, once. The ``ninja`` extra
+     now allows django-ninja 1.7.0 to 1.7.3 only (``<1.7.4``), the releases
+     scrudful verified;
+   * django-ninja: building the API's URL patterns (``api.urls``) raises
+     ``ConfigError`` when a path of a router added to the API before a
+     ``ScrudfulRouter``, or of the API itself, would shadow one of its HSR
+     routes (``"/{kind}/{pk}"`` beside its ``"/{pk}"``): add the
+     ``ScrudfulRouter`` first, or use ``hsr_route=False`` and ``hsr_url=``;
    * FastAPI: ``add_options`` raises ``RuntimeError`` on a FastAPI whose
      internals differ from those scrudful supports, when a route has
      security dependencies to check (no ``allowed=``), and ``ValueError``
@@ -1093,7 +1104,11 @@ this release, also need the 0.9.0 changes in the changelog):
      form or file parameter, at any depth) can't run on OPTIONS: its method
      is left out of ``Allow`` for every requester, and ``add_options`` warns
      (``RuntimeWarning``, which fails a test suite run with warnings as
-     errors). Give ``allowed=`` to decide such a method.
+     errors). Give ``allowed=`` to decide such a method. So is a method one
+     of whose parameters has an annotation that can't be evaluated (a name
+     imported only under ``TYPE_CHECKING``, with ``from __future__ import
+     annotations``) naming ``Security(`` or ``Depends(``, or whose signature
+     can't be read, with a ``RuntimeWarning`` naming the route.
 
 10. **Check what now behaves differently:**
 
@@ -1105,7 +1120,15 @@ this release, also need the 0.9.0 changes in the changelog):
     * DRF: OPTIONS loads the object as the first method that passed its
       view-level checks loads it (GET, when it did): with a request of that
       method and, on a viewset, its action (``retrieve``), so a
-      ``get_queryset`` scoped by ``self.action`` scopes it as a GET does. A
+      ``get_queryset`` scoped by ``self.action`` scopes it as a GET does.
+      That load's 404 is the OPTIONS's answer. It then loads once more for
+      each other distinct action of the methods that passed (on a view that
+      isn't a viewset, for each other method that passed, so a
+      ``get_queryset`` scoped by ``self.request.method`` is checked per
+      method): a 401, 403 or 404 that load raises, or a 404 from that
+      method's object permissions or ``allowed_func``, leaves out only that
+      method. An item OPTIONS of a ``ModelViewSet`` may so call
+      ``get_object()`` four times: keep it free of side effects. A
       ``get_object`` of the view's own is called on a viewset's item action,
       and on a generic view's route with a URL kwarg other than ``format``,
       whatever the kwarg is named: it must handle each route it serves
@@ -1122,12 +1145,20 @@ this release, also need the 0.9.0 changes in the changelog):
       the router's path (``"/{pk}"``). Pass ``api=`` to
       ``http_schema_resource`` and ``http_schema_resource_view`` for a router
       mounted on several APIs;
-    * django-ninja, with ``add_error_links``: a 401 or 403 of a scrudful
-      operation (ninja's authentication's, ``before=``'s,
-      ``after_throttles=``'s or one it raises) carries the API-wide entity,
-      not the operation's ``error``, unless the operation declares that
-      status in ``responses=``: a declared error status has its own HSR entry
-      and its entity wins, on every response with that status;
+    * django-ninja: OPTIONS runs, besides the loading operation's ``load``,
+      each other item operation's own ``load`` (when it differs) as a check
+      of that method, once its ``auth=`` and ``before=`` pass: any
+      ``HttpError``, ``Http404`` or ``PermissionDenied`` it raises leaves out
+      only that method. Keep every ``load`` free of side effects;
+    * django-ninja, with ``add_error_links``: a 401, 403, 422 or 429 of a
+      scrudful operation (ninja's own, or one the operation, its ``load``,
+      ``before=`` or ``after_throttles=`` raises) carries the API-wide
+      entity, not the operation's ``error``, unless the operation declares
+      that status in ``responses=``: a declared error status has its own HSR
+      entry and its entity wins, on every response with that status.
+      Without ``add_error_links``, ninja's own 401, 403, 422 and 429 for an
+      operation with an ``error`` carry that ``error``'s Links (they carried
+      none);
     * all adapters: scrudful's 400, 412 and 428 of an operation without
       ``error=`` carry the Links and media type of the API-wide error entity
       (``add_error_links``, DRF's ``SCRUDFUL["ERROR"]``), on the wire and in
@@ -1139,7 +1170,11 @@ this release, also need the 0.9.0 changes in the changelog):
       next route added, or another ``add_options`` call, and a
       ``RuntimeWarning`` names it. A ``copy.copy`` of such a router shares
       the wrapped methods (a route added to the copy goes to the original),
-      and ``copy.deepcopy`` fails: copy a router before ``add_options``.
+      and ``copy.deepcopy`` fails: copy a router before ``add_options``;
+    * FastAPI: an app's HSR route removed from (or replaced in)
+      ``app.router.routes`` after ``add_options(app)`` leaves its resources
+      without the HSR link until ``add_options`` is called again, and a
+      ``RuntimeWarning`` says so on the next request.
 
 The changelog lists every change.
 
