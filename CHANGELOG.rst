@@ -157,9 +157,10 @@ Behaviour change (all adapters)
   ``HSR_ROUTE``, ``HSR_URL``, ``HSR_CACHE_CONTROL`` and ``ERROR``: another
   value, or an unknown key, raises ``ImproperlyConfigured``. A base URL that
   isn't absolute is a configuration error (``ConfigError`` for ninja,
-  ``ImproperlyConfigured`` for DRF and the 404 and 500 handlers,
-  ``ValueError`` for FastAPI). A ``base_url`` that isn't a ``str`` is refused
-  the same way.
+  ``ImproperlyConfigured`` for DRF, ``ValueError`` for FastAPI). A
+  ``base_url`` that isn't a ``str`` is refused the same way. The 404 and 500
+  handlers don't raise for it: they log it and serve the error without the
+  entity's Links.
 * A ``hsr_url`` callable must return an absolute URL (a non-empty ``str`` with
   a scheme): ``None``, an empty string or a relative URL is a configuration
   error, raised when the link is built. ``hsr_cache_control`` (and
@@ -227,9 +228,9 @@ Behaviour change (ninja)
   while it runs (for other path values, say), or after its operation's run
   ended (from a task or thread it left running) raises ``RuntimeError``
   (naming the handler, and the calling operation): its hooks didn't run for
-  that call. Move the shared code into a plain function instead. (Since
-  0.7.1, such a call ran, without its hooks running for it, whenever the
-  hooks of the operation running had allowed the request.)
+  that call. Move the shared code into a plain function instead. (In 0.9,
+  such a call ran, without its hooks running for it, whenever the hooks of
+  the operation running had allowed the request.)
 * OPTIONS is answered by an ``Operation.run`` decorator, so the API's and
   routers' ``add_decorator(mode="operation")`` decorators no longer gate it
   (they did in 0.9); ``mode="view"`` ones still run first. A non-preflight

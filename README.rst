@@ -1086,8 +1086,9 @@ this release, also need the 0.9.0 changes in the changelog):
      snippet had a schema only);
    * a base URL that isn't an absolute URL, a ``str`` (bytes, say) included,
      raises the adapter's configuration error: ``ConfigError`` (ninja),
-     ``ImproperlyConfigured`` (DRF, the 404 and 500 handlers) or
-     ``HsrConfigError``, a ``ValueError`` (FastAPI);
+     ``ImproperlyConfigured`` (DRF) or ``HsrConfigError``, a ``ValueError``
+     (FastAPI). The 404 and 500 handlers log it instead, and serve the error
+     without the entity's Links;
    * DRF: ``manage.py check``, and so ``runserver``, ``migrate`` and Django's
      test runner, which run it, now fail with the errors ``scrudful.E001``
      to ``E007``: an unnamed route of a scrudful view, a URL name shared by
