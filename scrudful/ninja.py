@@ -376,11 +376,11 @@ OPTIONS
        ``auth=`` callbacks authenticate the requester and its ``before`` (if
        any) returns ``None``. A raised ``HttpError`` with status 401, 403 or
        404 (as ninja's ``AuthenticationError`` and ``AuthorizationError``
-       are), ``Http404`` or ``PermissionDenied`` refuses the method, but a
-       hook's 404 (``HttpError`` or ``Http404``), which is the OPTIONS's
-       answer, as ``load``'s is; anything else raised is answered by the
-       API's exception handler, as ninja answers what an operation raises
-       (re-raised without a handler).
+       are), ``Http404`` or ``PermissionDenied`` refuses the method, except
+       a 404 (``HttpError`` or ``Http404``) an ``allowed`` hook raises, which
+       answers the OPTIONS, as ``load``'s does; anything else raised is
+       answered by the API's exception handler, as ninja answers what an
+       operation raises (re-raised without a handler).
        What an ``async def`` callback returns is awaited
        (``asgiref.sync.async_to_sync``), never taken for an answer; an
        awaitable returned by the ``before`` of a sync operation, which the

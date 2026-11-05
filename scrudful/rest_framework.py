@@ -2145,7 +2145,7 @@ def hsr_urls() -> list[URLPattern]:
     other name is served. Django's system checks (``manage.py check``, and
     ``runserver`` and ``migrate`` before they start) report both, and a
     missing include, before any request (``scrudful.E001`` to
-    ``scrudful.E005``, see "System checks" in the module docstring).
+    ``scrudful.E006``, see "System checks" in the module docstring).
 
     Raises
     ------
