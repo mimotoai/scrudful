@@ -269,7 +269,9 @@ Behaviour change (DRF)
   ``django.core.exceptions.ObjectDoesNotExist`` (subclasses included) when
   called as ``func(view, None)``, or returning nothing for a context link or
   its type, so that ``migrate`` runs on a fresh database whose tables a
-  callable reads, and on one whose tables are still empty. Any other
+  callable reads, and on one whose tables are still empty. There is one
+  ``W001`` for each callable that fails so, and the check goes on past it,
+  so a ``W001`` hides no ``E005`` of the same view. Any other
   exception a callable raises (``NoReverseMatch``, a signature's
   ``TypeError``) is ``E005``. The errors fail ``manage.py check`` and the
   commands that run it (``runserver``, ``migrate``, Django's test runner).

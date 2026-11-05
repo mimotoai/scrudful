@@ -87,7 +87,9 @@ and, as a warning:
   model's ``DoesNotExist``), subclasses included, when called as
   ``func(view, None)``, or returns nothing for a context link (beside a
   schema link) or for its type. The warning names the route, the callable or
-  entry, and the error.
+  entry, and the error. There is one for each callable that fails so, and
+  the check goes on past it (describing that entry without content), so a
+  warning hides no ``scrudful.E005`` of the same view.
 
 These are only a warning because ``migrate`` runs the checks before it
 migrates: a callable that reads the database fails on a database not migrated

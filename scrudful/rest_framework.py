@@ -250,9 +250,12 @@ System checks
       database not migrated yet, or on a table not filled yet (a
       ``get_list_or_404`` or a ``.get()``), and must not stop ``migrate``.
       The document is built again, the callables called again, when it is
-      first served; if it fails then, that request fails. Any other
-      exception a callable raises (a ``NoReverseMatch``, a ``TypeError`` of
-      its signature, an ``AttributeError``) is ``scrudful.E005``.
+      first served; if it fails then, that request fails. One warning for
+      each callable that fails so; the check goes on past it (describing
+      that entry without content), so it hides no ``scrudful.E005`` of the
+      same view. Any other exception a callable raises (a
+      ``NoReverseMatch``, a ``TypeError`` of its signature, an
+      ``AttributeError``) is ``scrudful.E005``.
 
     Each would otherwise fail on a request. The check builds each document
     as :func:`http_schema_resource` does (no request, no database access by
@@ -2753,35 +2756,40 @@ def _hsr_build_messages(
     ``migrate`` runs this check first; one reading a row raises a 404 or a
     ``DoesNotExist``, or returns nothing, while the table is empty), and the
     document is built again when
-    it is first served. Any other failure (whatever else a callable raises,
-    such as a ``NoReverseMatch`` or a ``TypeError`` of its signature;
-    scrudful's configuration errors; whatever else the build raises) is the
-    error ``scrudful.E005``, so that one view never stops the check of the
-    others.
+    it is first served. There is one for each callable that fails so, and
+    the build goes on past it (the entry it fails without content), so that
+    it hides no error of the rest of the view. Any other failure (whatever
+    else a callable raises, such as a ``NoReverseMatch`` or a ``TypeError``
+    of its signature; scrudful's configuration errors; whatever else the
+    build raises) stops the build, and is the error ``scrudful.E005``, so
+    that one view never stops the check of the others.
     """
     where = f"the HTTP Schema Resource of the route {view_name!r} can't be built"
+    failures: list[_DataDependentError] = []
+    messages: list[checks.CheckMessage] = []
     try:
-        _describe_view(_describe_mode_view(view_func))
-    except _DataDependentError as exc:
-        return [
-            checks.Warning(
-                f"{where} now: {exc}",
-                hint=(
-                    "It is built when it is first served, calling the link "
-                    "callables again: if it fails then too, that request "
-                    "fails."
-                ),
-                obj=view_func.cls,
-                id="scrudful.W001",
-            )
-        ]
+        _describe_view(_describe_mode_view(view_func), failures)
     except ImproperlyConfigured as exc:
-        return [checks.Error(f"{where}: {exc}", obj=view_func.cls, id="scrudful.E005")]
+        messages.append(
+            checks.Error(f"{where}: {exc}", obj=view_func.cls, id="scrudful.E005")
+        )
     except Exception as exc:
-        return [
+        messages.append(
             checks.Error(f"{where}: {exc!r}", obj=view_func.cls, id="scrudful.E005")
-        ]
-    return []
+        )
+    warnings = [
+        checks.Warning(
+            f"{where} now: {failure}",
+            hint=(
+                "It is built when it is first served, calling the link "
+                "callables again: if it fails then too, that request fails."
+            ),
+            obj=view_func.cls,
+            id="scrudful.W001",
+        )
+        for failure in failures
+    ]
+    return warnings + messages
 
 
 def _join_route(prefix: str, route: str) -> str:
@@ -3095,8 +3103,15 @@ def _describe_mode_copy(view: APIView) -> APIView:
     return copied
 
 
-def _describe_view(view: APIView) -> dict[str, Any]:
-    """The HTTP Schema Resource of the describe-mode ``view``."""
+def _describe_view(
+    view: APIView, failures: list[_DataDependentError] | None = None
+) -> dict[str, Any]:
+    """The HTTP Schema Resource of the describe-mode ``view``.
+
+    With ``failures`` (the system check's), a failure that may be the
+    data's (:class:`_DataDependentError`) doesn't stop the build: it is
+    appended to ``failures``, once for each callable, and the entry it
+    fails is described without content. Without, it propagates."""
     action_map = getattr(view, "action_map", None)
     allowed = {method.lower() for method in view.allowed_methods}
     api_error = setting_error() if _is_scrudful_view(view) else None
@@ -3110,7 +3125,7 @@ def _describe_view(view: APIView) -> dict[str, Any]:
             continue
         if action_map is not None:
             view.action = action_map.get(method)
-        body[method] = _describe_method(view, method, api_error, error_links)
+        body[method] = _describe_method(view, method, api_error, error_links, failures)
     return body
 
 
@@ -3128,15 +3143,30 @@ class _DataDependentError(ImproperlyConfigured):
     or returned nothing for a context link (beside a schema link) or for its
     type, as one reading a row may while the table is empty. The system
     check reports it as a warning (see :func:`_hsr_build_messages`); any
-    other error of a callable is a plain ``ImproperlyConfigured``."""
+    other error of a callable is a plain ``ImproperlyConfigured``.
+
+    ``func`` is the link callable that failed."""
+
+    def __init__(self, message: str, func: Callable[..., Any]) -> None:
+        super().__init__(message)
+        self.func = func
 
 
 class _Describing:
     """Evaluates link values in describe mode, for one method of a view."""
 
-    def __init__(self, view: APIView, method: str, base_url: str | None) -> None:
+    def __init__(
+        self,
+        view: APIView,
+        method: str,
+        base_url: str | None,
+        failures: list[_DataDependentError] | None = None,
+    ) -> None:
         self.view = view
         self.base_url = base_url
+        #: Where a failure that may be the data's goes, instead of being
+        #: raised (see :func:`_describe_view`).
+        self.failures = failures
         #: Names the method's entries in errors.
         self.name = f"{type(view).__name__} {method.upper()}"
         #: The content of each source, by ``(id(source), media_type)``: its
@@ -3161,16 +3191,14 @@ class _Describing:
             return value_or_func(self.view, None)
         except Exception as exc:
             func = getattr(value_or_func, "__qualname__", repr(value_or_func))
-            error = (
-                _DataDependentError
-                if isinstance(exc, _DATA_DEPENDENT)
-                else ImproperlyConfigured
-            )
-            raise error(
+            message = (
                 f"{func}, a link callable of {self.name}, must work without a "
                 "request when the HTTP Schema Resource is built (called as "
                 f"func(view, None)): {exc!r}"
-            ) from exc
+            )
+            if isinstance(exc, _DATA_DEPENDENT):
+                raise _DataDependentError(message, value_or_func) from exc
+            raise ImproperlyConfigured(message) from exc
 
     def content(
         self, source: ScrudfulViewFunc | Entity | None, media_type: str, where: str
@@ -3197,7 +3225,14 @@ class _Describing:
             return None
         key = (id(source), media_type)
         if key not in self._contents:
-            self._contents[key] = self._content(source, media_type, where)
+            try:
+                self._contents[key] = self._content(source, media_type, where)
+            except _DataDependentError as exc:
+                if self.failures is None:
+                    raise
+                if not any(seen.func is exc.func for seen in self.failures):
+                    self.failures.append(exc)
+                self._contents[key] = None
         return copy.deepcopy(self._contents[key])
 
     def _content(
@@ -3220,9 +3255,11 @@ class _Describing:
         # type: describe_content's refusal of that may depend on the data,
         # and not happen later (see _DataDependentError). A relative URL
         # needs a base URL, which is configuration.
-        returned_nothing = (not context and callable(source.context_link_or_func)) or (
-            bool(context) and not given_type and callable(source.context_type_or_func)
-        )
+        returned_nothing: Callable[..., Any] | None = None
+        if not context and callable(source.context_link_or_func):
+            returned_nothing = source.context_link_or_func
+        elif context and not given_type and callable(source.context_type_or_func):
+            returned_nothing = source.context_type_or_func
         describing = False
         try:
             schema_url = absolute_for_hsr(
@@ -3248,19 +3285,24 @@ class _Describing:
                 # content): either is this entry's configuration error.
                 raise HsrConfigError(f"{where}: {exc}") from exc
         except HsrConfigError as exc:
-            data = describing and returned_nothing
-            error = _DataDependentError if data else ImproperlyConfigured
-            raise error(str(exc)) from exc
+            if describing and returned_nothing is not None:
+                raise _DataDependentError(str(exc), returned_nothing) from exc
+            raise ImproperlyConfigured(str(exc)) from exc
 
 
 def _describe_method(
-    view: APIView, method: str, api_error: Entity | None, error_links: bool
+    view: APIView,
+    method: str,
+    api_error: Entity | None,
+    error_links: bool,
+    failures: list[_DataDependentError] | None = None,
 ) -> dict[str, Any]:
     """Describe ``method`` (lowercase, not ``options``) of the describe-mode
-    ``view`` (see :func:`http_schema_resource`)."""
+    ``view`` (see :func:`http_schema_resource`; ``failures`` as for
+    :func:`_describe_view`)."""
     handler = _handler(view, method)
     scrudful_handler = handler if isinstance(handler, ScrudfulViewFunc) else None
-    describing = _Describing(view, method, _handler_base_url(view, handler))
+    describing = _Describing(view, method, _handler_base_url(view, handler), failures)
     statuses = _statuses(view, scrudful_handler, method)
     conditional = _is_conditional(handler, method)
     content = None

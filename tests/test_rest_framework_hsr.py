@@ -24,7 +24,7 @@ from django.db import DatabaseError, OperationalError, ProgrammingError
 from django.urls import NoReverseMatch
 from django.http import Http404
 from django.shortcuts import get_list_or_404
-from django.test import Client, RequestFactory
+from django.test import Client, RequestFactory, override_settings
 from django.urls import ResolverMatch, include, path, resolve, reverse
 from rest_framework import viewsets
 from rest_framework.authentication import BasicAuthentication
@@ -1625,6 +1625,15 @@ class MissingType(Http404):
         ({"schema_link_or_func": returning("/relative")}, None, "E005"),
         ({"context_link_or_func": returning("/relative")}, None, "E005"),
         ({"schema_link_or_func": "/relative"}, None, "E005"),
+        # Both: the relative URL is refused first, so it is the error.
+        (
+            {
+                "schema_link_or_func": "/relative",
+                "context_link_or_func": returning(None),
+            },
+            None,
+            "E005",
+        ),
         (
             {
                 "schema_link_or_func": returning("https://x/s"),
@@ -1661,6 +1670,84 @@ def test_what_a_link_callable_does_decides_warning_or_error(
     assert message.id == f"scrudful.{expected}"
     assert type(message) is (checks.Warning if expected == "W001" else checks.Error)
     assert "'l'" in message.msg
+
+
+def missing_row(view, request, **kwargs):
+    raise ObjectDoesNotExist("no row yet")
+
+
+def missing_table(view, request, **kwargs):
+    raise OperationalError("no such table: schemas")
+
+
+def check_messages_of(meta):
+    """The ``scrudful.*`` check messages of an item viewset with ``meta``,
+    routed for GET and PUT."""
+    view = scrudful_viewset(type("Checked", (ItemViewSetBase,), {"Meta": meta}))
+
+    class URLconf:
+        urlpatterns = [
+            path(
+                "checked/<str:pk>/",
+                view.as_view({"get": "retrieve", "put": "update"}),
+                name="checked",
+            ),
+            path("", include(hsr_urls())),
+        ]
+
+    with override_settings(ROOT_URLCONF=URLconf, SCRUDFUL=None):
+        return scrudful_check_errors()
+
+
+def test_a_warning_hides_no_configuration_error_of_the_same_view():
+    """A link callable whose failure may be the data's doesn't stop the
+    view's build: a configuration error of another entry of the same view
+    is still the error E005, beside the warning W001."""
+
+    class Meta:
+        schema_link_or_func = missing_row
+        context_link_or_func = "https://x/c"
+        # Relative links, and no base URL anywhere: a configuration error.
+        error = Entity("/errors/schema", context_link_or_func="/errors/context")
+
+    messages = check_messages_of(Meta)
+    assert sorted(message.id for message in messages) == [
+        "scrudful.E005",
+        "scrudful.W001",
+    ]
+    [warning] = [message for message in messages if message.id == "scrudful.W001"]
+    assert "missing_row" in warning.msg
+    [error] = [message for message in messages if message.id == "scrudful.E005"]
+    assert "default response" in error.msg and "relative" in error.msg
+
+
+def test_one_warning_for_each_failing_link_callable():
+    """Each callable whose failure may be the data's is one W001, however
+    many methods and entries call it; the build goes on past each."""
+
+    class Meta:
+        schema_link_or_func = missing_row
+        context_link_or_func = "https://x/c"
+        error = Entity(missing_table, context_link_or_func="https://x/ec")
+
+    messages = check_messages_of(Meta)
+    assert [message.id for message in messages] == ["scrudful.W001"] * 2
+    assert "missing_row" in messages[0].msg
+    assert "missing_table" in messages[1].msg
+    assert all(type(message) is checks.Warning for message in messages)
+
+
+def test_a_build_with_a_warning_still_fails_when_served():
+    """Only the check goes on past a failure that may be the data's: the
+    HTTP Schema Resource built when it is served fails as before."""
+
+    class Meta:
+        schema_link_or_func = missing_row
+        context_link_or_func = "https://x/c"
+
+    view = scrudful_viewset(type("Served", (ItemViewSetBase,), {"Meta": Meta}))
+    with pytest.raises(ImproperlyConfigured, match="missing_row"):
+        http_schema_resource(view.as_view({"get": "retrieve"}))
 
 
 def test_manage_py_check_passes_a_link_callable_raising(settings):
