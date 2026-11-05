@@ -1,5 +1,6 @@
 import importlib
 import json
+import pathlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -254,6 +255,28 @@ def test_setting_keys_are_the_typed_dicts():
     keys = {"BASE_URL", "ERROR", "HSR_CACHE_CONTROL", "HSR_ROUTE", "HSR_URL"}
     assert _django.SETTING_KEYS == keys
     assert set(_django.ScrudfulSettings.__annotations__) == keys
+
+
+def test_each_setting_key_has_one_accessor():
+    """Every key the setting accepts has the accessor the system check runs,
+    and the mapping can't be changed from outside."""
+    assert _django.SETTING_ACCESSORS.keys() == _django.SETTING_KEYS
+    with pytest.raises(TypeError):
+        _django.SETTING_ACCESSORS["BASE_URL"] = lambda: None
+
+
+def test_a_setting_key_without_an_accessor_fails_the_import():
+    """A key added to ``ScrudfulSettings`` without an accessor is caught when
+    the module is imported, not left unchecked by the system check."""
+    source = pathlib.Path(_django.__file__).read_text()
+    source = source.replace(
+        "    HSR_URL: Callable[[str], str]\n",
+        "    HSR_URL: Callable[[str], str]\n    NEW_KEY: str\n",
+        1,
+    )
+    assert "NEW_KEY" in source
+    with pytest.raises(AssertionError, match="NEW_KEY"):
+        exec(compile(source, _django.__file__, "exec"), {"__name__": "copy_of"})
 
 
 def test_setting_accessors_give_the_defaults(settings):

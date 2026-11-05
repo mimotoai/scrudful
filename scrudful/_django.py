@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import types
 import warnings
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -98,7 +99,9 @@ class ScrudfulSettings(TypedDict, total=False):
 logger = logging.getLogger(__name__)
 
 #: The keys of the ``SCRUDFUL`` setting.
-SETTING_KEYS = frozenset(ScrudfulSettings.__annotations__)
+SETTING_KEYS = frozenset(
+    ScrudfulSettings.__required_keys__ | ScrudfulSettings.__optional_keys__
+)
 
 
 def scrudful_setting(name: str, default: Any) -> Any:
@@ -218,14 +221,24 @@ def setting_error() -> Entity | None:
     return value
 
 
-#: The accessor of each key of the ``SCRUDFUL`` setting.
-SETTING_ACCESSORS: Mapping[str, Callable[[], Any]] = {
-    "BASE_URL": setting_base_url,
-    "ERROR": setting_error,
-    "HSR_CACHE_CONTROL": setting_hsr_cache_control,
-    "HSR_ROUTE": setting_hsr_route,
-    "HSR_URL": setting_hsr_url,
-}
+#: The accessor of each key of the ``SCRUDFUL`` setting (read-only): the
+#: system check validates each key by calling its accessor.
+SETTING_ACCESSORS: Mapping[str, Callable[[], Any]] = types.MappingProxyType(
+    {
+        "BASE_URL": setting_base_url,
+        "ERROR": setting_error,
+        "HSR_CACHE_CONTROL": setting_hsr_cache_control,
+        "HSR_ROUTE": setting_hsr_route,
+        "HSR_URL": setting_hsr_url,
+    }
+)
+# A key without an accessor would be accepted but never checked: fail the
+# import instead (not an assert, which -O removes).
+if SETTING_ACCESSORS.keys() != SETTING_KEYS:
+    raise AssertionError(
+        "SETTING_ACCESSORS and ScrudfulSettings differ: "
+        f"{sorted(SETTING_ACCESSORS.keys() ^ SETTING_KEYS)}"
+    )
 
 
 def precondition_headers(request: HttpRequest) -> dict[str, str]:
