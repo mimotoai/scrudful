@@ -2176,8 +2176,18 @@ def test_hsr_meta_options_are_checked(name, value, match):
         scrudful_viewset(type("V", (drf_hsr_urls.ItemViewSetBase,), {"Meta": meta}))
 
 
-@pytest.mark.parametrize("value", ["", "  "])
-def test_empty_hsr_cache_control_is_rejected(urls, client, settings, value):
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "  ",
+        "public\r\nX-Injected: 1",
+        "no-cache\n",
+        "public\x00",
+        "max-age=300 \u2713",
+    ],
+)
+def test_an_unusable_hsr_cache_control_is_rejected(urls, client, settings, value):
     meta = type("Meta", (), {"hsr_cache_control": value})
     with pytest.raises(ImproperlyConfigured, match="hsr_cache_control"):
         scrudful_viewset(type("V", (drf_hsr_urls.ItemViewSetBase,), {"Meta": meta}))

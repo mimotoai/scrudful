@@ -153,6 +153,24 @@ def test_check_hsr_cache_control_rejects_empty_and_non_str(value):
         check_hsr_cache_control(value, "hsr_cache_control")
 
 
+@pytest.mark.parametrize(
+    "value, why",
+    [
+        ("public\r\nX-Injected: 1", "control"),
+        ("no-cache\n", "control"),
+        ("public,\tmax-age=60", "control"),
+        ("public\x00", "control"),
+        ("public\x7f", "control"),
+        ("public, max-age=300 \u2713", "Latin-1"),
+    ],
+)
+def test_check_hsr_cache_control_rejects_what_a_field_cant_carry(value, why):
+    """A value no HTTP field can carry (a CR or LF would split the
+    response's headers) fails when given, not on each HSR response."""
+    with pytest.raises(HsrConfigError, match=f"hsr_cache_control.*{why}"):
+        check_hsr_cache_control(value, "hsr_cache_control")
+
+
 def test_hsr_config_error_is_public():
     from scrudful import entity
 

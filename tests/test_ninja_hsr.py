@@ -901,8 +901,18 @@ def test_relative_base_url_is_rejected(settings):
         http_schema_resource(router, "/{pk}")
 
 
-@pytest.mark.parametrize("value", ["", "  "])
-def test_empty_hsr_cache_control_is_rejected(settings, value):
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "  ",
+        "public\r\nX-Injected: 1",
+        "no-cache\n",
+        "public\x00",
+        "max-age=300 \u2713",
+    ],
+)
+def test_an_unusable_hsr_cache_control_is_rejected(settings, value):
     with pytest.raises(ConfigError, match="hsr_cache_control"):
         ScrudfulRouter(hsr_cache_control=value)
     settings.SCRUDFUL = {"HSR_CACHE_CONTROL": value}

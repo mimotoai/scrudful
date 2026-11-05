@@ -1165,8 +1165,18 @@ def test_add_options_checks_its_options(name, value):
         add_options(FastAPI(), **{name: value})
 
 
-@pytest.mark.parametrize("value", ["", "  "])
-def test_add_options_rejects_an_empty_hsr_cache_control(value):
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "  ",
+        "public\r\nX-Injected: 1",
+        "no-cache\n",
+        "public\x00",
+        "max-age=300 \u2713",
+    ],
+)
+def test_add_options_rejects_an_unusable_hsr_cache_control(value):
     with pytest.raises(ValueError, match="hsr_cache_control"):
         add_options(FastAPI(), hsr_cache_control=value)
 

@@ -171,9 +171,11 @@ Behaviour change (all adapters)
 * A ``hsr_url`` callable must return an absolute URL (a non-empty ``str`` with
   a scheme): ``None``, an empty string or a relative URL is a configuration
   error, raised when the link is built. ``hsr_cache_control`` (and
-  ``SCRUDFUL["HSR_CACHE_CONTROL"]``) must not be empty: an empty one is
-  refused with the same error types (``ImproperlyConfigured`` for DRF's
-  ``Meta.hsr_cache_control``). A base URL that doesn't make a relative link
+  ``SCRUDFUL["HSR_CACHE_CONTROL"]``) must not be empty, nor have control
+  characters (CR, LF, tab ...) or characters outside Latin-1, which no field
+  can carry: such a value is refused when given, with the same error types
+  (``ImproperlyConfigured`` for DRF's ``Meta.hsr_cache_control``), rather
+  than fail every HSR response. A base URL that doesn't make a relative link
   absolute is refused too.
 * ``scrudful.entity.HsrConfigError`` is the public name of the error the
   shared HSR code raises.

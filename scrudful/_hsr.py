@@ -26,7 +26,7 @@ from scrudful._adapter import (
     SCHEMA_TYPE,
     HsrConfigError,
 )
-from scrudful.utils import link_content, resolve_uri
+from scrudful.utils import _CTL_RE, _NON_LATIN1_RE, link_content, resolve_uri
 
 __all__ = [
     "DEFAULT_HSR_CACHE_CONTROL",
@@ -213,15 +213,24 @@ def check_hsr_url_result(value: Any, what: str) -> str:
 def check_hsr_cache_control(value: Any, what: str) -> str:
     """``value``, a ``Cache-Control`` value for the HTTP Schema Resource.
 
+    Checked once, when given, as the Link rels and types are
+    (:func:`scrudful.utils.link_content`): a value no field can carry would
+    fail, or split the headers (a CR or LF), on every HSR response.
+
     Raises
     ------
     HsrConfigError
-        If ``value`` is not a ``str``, or is empty (an empty ``Cache-Control``
-        field says nothing).
+        If ``value`` is not a ``str``, is empty (an empty ``Cache-Control``
+        field says nothing), or has characters a field can't carry: control
+        characters (CR, LF, tab, ...), or characters outside Latin-1.
     """
     if not isinstance(value, str) or not value.strip():
         raise HsrConfigError(
             f"{what} must be a non-empty str of Cache-Control directives, "
             f"not {value!r}"
         )
+    if _CTL_RE.search(value):
+        raise HsrConfigError(f"{what} {value!r} contains control characters")
+    if _NON_LATIN1_RE.search(value):
+        raise HsrConfigError(f"{what} {value!r} contains characters outside Latin-1")
     return value
