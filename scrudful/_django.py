@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
+import traceback
 import types
 import warnings
 from collections.abc import Callable, Mapping
@@ -28,6 +30,7 @@ from django.http import (
     JsonResponse,
     QueryDict,
 )
+from django.urls import NoReverseMatch
 from django.utils import timezone
 from django.utils.cache import patch_vary_headers
 from django.views import defaults
@@ -364,22 +367,37 @@ def _plain_links(entity: Entity, request: HttpRequest | None) -> str | None:
     as the adapters' Links and HTTP Schema Resources do, else against the
     request (``build_absolute_uri()``, called only then: an absolute link
     needs no host of the request's). Without a ``request``, each URL is a
-    fixed placeholder (a lazy URL, such as ``reverse_lazy``'s, is not
-    evaluated) and the settings are unread: a check of the rels and types.
+    fixed placeholder, once a plain one is parsed (a lazy URL, such as
+    ``reverse_lazy``'s, is not evaluated), and the settings are unread: a
+    check of the URLs, rels and types that depend on neither.
 
     Raises
     ------
     ImproperlyConfigured
-        If ``SCRUDFUL["BASE_URL"]`` is not an absolute URL.
+        If ``SCRUDFUL["BASE_URL"]`` is not an absolute URL; without a
+        ``request``, if a plain URL can't be parsed (``urlsplit``'s
+        ``ValueError``).
     django.core.exceptions.DisallowedHost
         If a relative link needs the request's host and ``ALLOWED_HOSTS``
         refuses it.
+    django.urls.NoReverseMatch
+        If a lazy URL (``reverse_lazy``) doesn't reverse.
+    ValueError
+        If a lazy URL evaluates to one that can't be parsed.
     """
     base = setting_base_url() if request is not None else None
 
     def resolve(url: Any) -> str:
         nonlocal base
         if request is None:
+            if isinstance(url, str):  # a lazy URL is not evaluated
+                try:
+                    urlsplit(url)
+                except ValueError as exc:
+                    raise ImproperlyConfigured(
+                        f"the error entity's link {url!r} can't be parsed as a "
+                        f"URL ({exc})"
+                    ) from exc
             return "about:blank"
         if base is None:
             if urlsplit(str(url)).scheme:
@@ -439,16 +457,21 @@ def error_handler(
 
     ``error`` is checked here, when the handler is made: an
     :class:`~scrudful.entity.Entity` of a JSON media type (its bodies are
-    JSON), with plain link values whose rels and types a Link can carry.
+    JSON), with plain link values whose URLs can be parsed and whose rels and
+    types a Link can carry. A lazy URL (``reverse_lazy``) is evaluated only
+    when the handler answers.
 
-    It doesn't raise for a Link that depends on the settings or the request:
-    Django logs the error it answers only once the handler returns, so a
-    Link it can't build for one of those (an invalid ``SCRUDFUL["BASE_URL"]``;
-    a relative link without a base URL, on a request whose host
-    ``ALLOWED_HOSTS`` refuses) is logged, on the ``scrudful._django`` logger
-    with the exception and the request's path, and the error is served
-    without the entity's Links. Anything else raised building them
-    propagates, to Django's own handling of an error handler that fails.
+    It doesn't raise for a Link that depends on the settings, the request or
+    the URLconf: Django logs the error it answers only once the handler
+    returns, so a Link it can't build for one of those (an invalid
+    ``SCRUDFUL["BASE_URL"]``; a relative link without a base URL, on a
+    request whose host ``ALLOWED_HOSTS`` refuses; a lazy URL that doesn't
+    reverse, or that can't be parsed) is logged, on the ``scrudful._django``
+    logger with the exception and the request's path, and the error is
+    served without the entity's Links. Anything else raised building them
+    propagates, to Django's own handling of an error handler that fails;
+    a ``handler500`` first logs, on the same logger, the error it was
+    answering, which Django then doesn't log.
 
     Raises
     ------
@@ -459,6 +482,8 @@ def error_handler(
         If ``error``'s media type is not JSON (``application/json`` or a
         ``+json`` type), or a rel or type of its links has characters a
         Link can't carry (control characters, or outside Latin-1).
+    ImproperlyConfigured
+        If a plain link URL of ``error`` can't be parsed.
     """
     if not isinstance(error, Entity):
         raise TypeError(f"error must be an Entity, not {type(error).__name__}")
@@ -475,11 +500,33 @@ def error_handler(
         )
     ):
         raise TypeError("handler404/handler500 need an Entity with plain link values")
-    # Each Link with a URL of the same form: what depends on neither the
-    # settings nor the request fails now.
+    # Each plain URL parsed, then each Link with a URL of the same form:
+    # what depends on neither the settings, the request nor the URLconf
+    # fails now.
     _plain_links(error, None)
 
     def view(request: HttpRequest, exception: Exception | None = None) -> HttpResponse:
+        # A handler500 is called while Django handles the error it answers,
+        # which Django logs only once the handler returns. Django calls it
+        # again at each middleware layer, then answering what this view
+        # raised: logged once, at the first.
+        answering = sys.exc_info()[1] if status == 500 else None
+        try:
+            return answer(request, exception)
+        except Exception:
+            if answering is not None and not any(
+                frame.f_code is view.__code__
+                for frame, _ in traceback.walk_tb(answering.__traceback__)
+            ):
+                logger.error(
+                    "scrudful handler500 failed answering the error of %s; the "
+                    "error it was answering",
+                    request.path,
+                    exc_info=answering,
+                )
+            raise
+
+    def answer(request: HttpRequest, exception: Exception | None) -> HttpResponse:
         if _adapter.prefers_html(request.headers.get("Accept"), error.media_type):
             if status == 404:
                 response = defaults.page_not_found(
@@ -495,9 +542,10 @@ def error_handler(
             response = json_response(body, status, error.media_type)
             try:
                 link = _plain_links(error, request)
-            except (ImproperlyConfigured, DisallowedHost, HsrConfigError):
+            except (ImproperlyConfigured, DisallowedHost, NoReverseMatch, ValueError):
                 # Serve the error, and keep Django's own log of what it is
-                # answering, rather than fail inside the error handler.
+                # answering, rather than fail inside the error handler. The
+                # settings' errors are HsrConfigError, a ValueError, too.
                 logger.exception(
                     "scrudful handler%s: the error entity's Links can't be "
                     "built for %s; answering without them",

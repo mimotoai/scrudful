@@ -445,6 +445,8 @@ def handler404(error: Entity) -> Callable[..., HttpResponseBase]:
     ValueError
         If ``error``'s media type is not JSON, or a rel or type of its links
         has characters a Link can't carry.
+    ImproperlyConfigured
+        If a plain link URL of ``error`` can't be parsed.
     """
     return error_handler(404, error)
 
@@ -462,6 +464,8 @@ def handler500(error: Entity) -> Callable[..., HttpResponseBase]:
     ValueError
         If ``error``'s media type is not JSON, or a rel or type of its links
         has characters a Link can't carry.
+    ImproperlyConfigured
+        If a plain link URL of ``error`` can't be parsed.
     """
     return error_handler(500, error)
 

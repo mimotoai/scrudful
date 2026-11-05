@@ -8,6 +8,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.http import Http404
 from django.test import RequestFactory
 from django.urls import path, reverse_lazy
+from django.utils.functional import lazy
 
 from scrudful import _django
 from scrudful._adapter import prefers_html
@@ -270,6 +271,142 @@ def test_handler_serves_an_unparsable_base_url_without_links(rf, settings, caplo
     assert response.status_code == 404 and "Link" not in response
     [record] = caplog.records
     assert isinstance(record.exc_info[1], ImproperlyConfigured)
+
+
+@pytest.mark.parametrize("link", ["schema", "context"])
+def test_handler_rejects_a_link_url_it_cant_parse_when_made(link):
+    """A plain link URL that can't be parsed fails when the handler is made
+    (in ``urls.py``), not on each error it answers."""
+    urls = {"schema": "https://x/s", "context": "https://x/c"}
+    urls[link] = "http://[::1/errors"
+    with pytest.raises(ImproperlyConfigured, match=r"http://\[::1/errors"):
+        error_handler(404, Entity(urls["schema"], context_link_or_func=urls["context"]))
+
+
+def _unparsable_url() -> str:
+    return "http://[::1/errors/schema"
+
+
+@pytest.mark.parametrize(
+    "url, error",
+    [
+        (reverse_lazy("no-such-url-name"), "NoReverseMatch"),
+        (lazy(_unparsable_url, str)(), "ValueError"),
+    ],
+    ids=["doesnt-reverse", "unparsable"],
+)
+@pytest.mark.parametrize("status", [404, 500])
+def test_handler_serves_its_error_without_a_lazy_link_it_cant_resolve(
+    rf, settings, caplog, status, url, error
+):
+    """A lazy link URL is evaluated only when the handler answers: one whose
+    name doesn't reverse, or whose URL can't be parsed, is logged with the
+    request's path, and the error served without the entity's Links."""
+    settings.SCRUDFUL = None
+    view = error_handler(status, Entity(url, context_link_or_func="https://x/c"))
+    request = rf.get("/some/where", HTTP_ACCEPT="application/json")
+    with caplog.at_level("ERROR", logger="scrudful"):
+        response = view(request, Http404()) if status == 404 else view(request)
+    assert response.status_code == status
+    assert "Link" not in response
+    [record] = caplog.records
+    assert record.name == "scrudful._django" and record.levelname == "ERROR"
+    assert f"handler{status}" in record.getMessage()
+    assert "/some/where" in record.getMessage()
+    assert type(record.exc_info[1]).__name__ == error
+
+
+def _original_bug(request):
+    raise RuntimeError("original bug")
+
+
+class BrokenErrorLinkURLconf:
+    """A ``urls.py`` whose error handlers' schema link names no URL."""
+
+    urlpatterns = [path("boom", _original_bug)]
+    handler404 = error_handler(
+        404,
+        Entity(reverse_lazy("no-such-url-name"), context_link_or_func="https://x/c"),
+    )
+    handler500 = error_handler(
+        500,
+        Entity(reverse_lazy("no-such-url-name"), context_link_or_func="https://x/c"),
+    )
+
+
+@pytest.mark.parametrize("url, status", [("/boom", 500), ("/missing", 404)])
+def test_django_answers_and_logs_an_error_whose_handler_cant_link(
+    client, db, settings, caplog, url, status
+):
+    """Through Django's own error handling: the handler answers the error,
+    so Django logs it (``django.request``, which it does only once the
+    handler returned)."""
+    settings.ROOT_URLCONF = BrokenErrorLinkURLconf
+    settings.SCRUDFUL = None
+    client.raise_request_exception = False
+    with caplog.at_level("WARNING"):
+        response = client.get(url, HTTP_ACCEPT="application/json")
+    assert response.status_code == status and "Link" not in response
+    [logged] = [r for r in caplog.records if r.name == "django.request"]
+    assert logged.getMessage().endswith(url)
+    if status == 500:
+        assert isinstance(logged.exc_info[1], RuntimeError)
+    [scrudful_log] = [r for r in caplog.records if r.name == "scrudful._django"]
+    assert type(scrudful_log.exc_info[1]).__name__ == "NoReverseMatch"
+
+
+class FailingHandler500URLconf:
+    urlpatterns = [path("boom", _original_bug)]
+    handler500 = error_handler(
+        500, Entity("https://x/s", context_link_or_func="https://x/c")
+    )
+
+
+def test_a_failing_handler500_logs_the_error_it_was_answering(
+    client, db, settings, caplog, monkeypatch
+):
+    """Django logs the error a ``handler500`` answers only once it returns,
+    and nothing past it catches what it raises: when it fails for a reason
+    it doesn't serve around (a bug), it logs the error it was answering
+    first, which would otherwise reach no log but as the context of its own
+    exception."""
+    settings.ROOT_URLCONF = FailingHandler500URLconf
+    settings.SCRUDFUL = None
+
+    def broken(*args):
+        raise KeyError("bug")
+
+    monkeypatch.setattr(_django, "link_content", broken)
+    client.raise_request_exception = False
+    with caplog.at_level("ERROR"), pytest.raises(KeyError, match="bug"):
+        client.get("/boom", HTTP_ACCEPT="application/json")
+    # Django's own log of it never ran.
+    assert not [r for r in caplog.records if r.name == "django.request"]
+    [record] = [r for r in caplog.records if r.name == "scrudful._django"]
+    assert record.levelname == "ERROR"
+    assert "handler500" in record.getMessage() and "/boom" in record.getMessage()
+    assert isinstance(record.exc_info[1], RuntimeError)
+    assert str(record.exc_info[1]) == "original bug"
+
+
+def test_a_failing_handler404_logs_nothing_of_its_own(
+    rf, settings, caplog, monkeypatch
+):
+    """A ``handler404`` that fails is Django's to answer, with its
+    ``handler500``: only that one logs the error it was answering."""
+    settings.SCRUDFUL = None
+
+    def broken(*args):
+        raise KeyError("bug")
+
+    view = error_handler(404, Entity("https://x/s", context_link_or_func="https://x/c"))
+    monkeypatch.setattr(_django, "link_content", broken)
+    with caplog.at_level("ERROR"), pytest.raises(KeyError):
+        try:
+            raise Http404("missing")
+        except Http404 as exc:
+            view(rf.get("/x", HTTP_ACCEPT="application/json"), exc)
+    assert not caplog.records
 
 
 def test_handler_rejects_a_link_value_it_cant_write():
