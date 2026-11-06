@@ -368,6 +368,7 @@ from scrudful._adapter import (
 from scrudful._django import (
     SETTING_ACCESSORS,
     aware,
+    check_page,
     error_handler,
     hsr_not_allowed,
     hsr_response,
@@ -379,7 +380,6 @@ from scrudful._django import (
     setting_hsr_cache_control,
     setting_hsr_route,
     setting_hsr_url,
-    check_page,
     slice_page,
 )
 from scrudful._django import conditional_response as django_conditional_response
@@ -1386,11 +1386,12 @@ def scrudful_viewset(cls: type) -> type:
     list_etag_func, list_last_modified_func : callable, optional
         Validators of the ``list`` response, against which the preconditions
         of ``create`` are evaluated too (a 400 or 412, never a 428; see
-        :class:`ScrudfulViewFunc`). A GET's or HEAD's preconditions are
-        evaluated once the requested page is known to be valid: with a
-        paginator having ``check_page`` (:class:`ScrudfulPagination`), bad
-        page parameters are its 400 and a page past the last its 404, the
-        preconditions ignored (RFC 9110 §13.2.1).
+        :class:`ScrudfulViewFunc`). For a GET or HEAD carrying a
+        precondition, a paginator with ``check_page``
+        (:class:`ScrudfulPagination`) answers bad page parameters with its
+        400 and a page past the last with its 404, the preconditions ignored
+        (RFC 9110 §13.2.1); another paginator's page errors still lose to a
+        304 or 412.
     list_schema_link_or_func, list_schema_rel_or_func, list_schema_type_or_func
         Schema link of the ``list`` response.
     list_context_link_or_func, list_context_rel_or_func, list_context_type_or_func
@@ -3560,9 +3561,20 @@ def _check_list_page(view: Any, request: Request) -> None:
     first."""
     if not django_precondition_headers(request):
         return
-    check = getattr(getattr(view, "paginator", None), "check_page", None)
-    if check is not None:
-        check(lambda: view.filter_queryset(view.get_queryset()), request, view)
+    paginator = getattr(view, "paginator", None)
+    check = getattr(paginator, "check_page", None)
+    if check is None:
+        return
+    if isinstance(paginator, ScrudfulPagination):
+        cls = type(paginator)
+        if (
+            cls.paginate_queryset is not ScrudfulPagination.paginate_queryset
+            and cls.check_page is ScrudfulPagination.check_page
+        ):
+            # Its own pagination decides what a page is: check_page, which
+            # knows scrudful's, can't tell (override it too to be asked).
+            return
+    check(lambda: view.filter_queryset(view.get_queryset()), request, view)
 
 
 def _check_list_validators(
@@ -4170,16 +4182,18 @@ class ScrudfulPagination(BasePagination):
         return self.objects
 
     def check_page(self, queryset: Any, request: Request, view: Any = None) -> None:
-        """Raise what :meth:`paginate_queryset` would for the request's page:
-        ``ValidationError`` (400) for bad ``page`` / ``page_size`` parameters,
-        ``NotFound`` (404) for a page past the last. ``queryset`` may be a
-        callable returning it, called (and counted) only for a page after the
-        first, which always exists.
+        """Raise the page errors :meth:`paginate_queryset` would for the
+        request: ``ValidationError`` (400) for bad ``page`` / ``page_size``
+        parameters, ``NotFound`` (404) for a page past the last. ``queryset``
+        may be a callable returning it, called (and counted) only for a page
+        after the first (page 1 always exists).
 
-        :func:`scrudful_viewset`'s ``list`` calls it before evaluating a
-        GET's or HEAD's preconditions, so a request whose page is an error
-        is answered with it, its preconditions ignored (RFC 9110 §13.2.1),
-        never a 304 or 412.
+        :func:`scrudful_viewset`'s ``list`` calls it before evaluating the
+        preconditions of a GET or HEAD carrying one, so a request whose page
+        is an error is answered with it, its preconditions ignored (RFC 9110
+        §13.2.1), never a 304 or 412. A subclass overriding
+        ``paginate_queryset`` (its own idea of a page) is not called unless
+        it overrides this too.
         """
         number, size = self._page_parameters(request)
         if number > 1:

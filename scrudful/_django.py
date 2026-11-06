@@ -54,6 +54,7 @@ __all__ = [
     "SETTING_ACCESSORS",
     "ScrudfulSettings",
     "aware",
+    "check_page",
     "conditional_response",
     "error_handler",
     "hsr_not_allowed",
@@ -68,7 +69,6 @@ __all__ = [
     "setting_hsr_cache_control",
     "setting_hsr_route",
     "setting_hsr_url",
-    "check_page",
     "slice_page",
 ]
 
