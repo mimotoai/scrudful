@@ -252,22 +252,38 @@ def test_ninja_list_error_body_func():
     assert response.json()["custom"] == 400
 
 
-def test_ninja_create_takes_no_error_body_func():
-    with pytest.raises(TypeError):
-        sf_ninja.scrudful_create(
-            location_func=lambda r, o: "/x", error_body_func=body_func
-        )
+def test_ninja_create_error_body_func():
+    router = Router()
+
+    @router.post("/items", response={201: int})
+    @sf_ninja.scrudful_create(
+        location_func=lambda request, item: f"/items/{item}",
+        list_load=lambda request, **params: [1, 2],
+        list_etag_func=lambda items: f"n{len(items)}",
+        error_body_func=body_func,
+    )
+    def create_item(request):
+        return 3
+
+    api = NinjaAPI(urls_namespace=f"api-{uuid.uuid4().hex}")
+    api.add_router("", router)
+    response = NinjaClient(api).post("/items", headers={"If-Match": '"n1"'})
+    assert response.status_code == 412
+    assert response.json()["custom"] == 412
 
 
 def test_drf_viewset_meta_error_body_func():
     from rest_framework import viewsets
+
+    def list_body_func(request, result):
+        return {"list": result.status}
 
     @sf_drf.scrudful_viewset
     class V(viewsets.ViewSet):
         class Meta:
             etag_func = staticmethod(lambda view, request, pk: "v1")
             error_body_func = staticmethod(body_func)
-            list_error_body_func = staticmethod(body_func)
+            list_error_body_func = staticmethod(list_body_func)
 
         def update(self, request, pk):
             return Response({})
@@ -275,6 +291,10 @@ def test_drf_viewset_meta_error_body_func():
         def list(self, request):
             return Response([])
 
-    assert V.update.error_body_func is not None
-    assert V.list.error_body_func is not None
-    assert V.update.error_body_func is V.list.error_body_func
+        def create(self, request):
+            return Response({}, status=201)
+
+    assert V.update.error_body_func is body_func
+    assert V.list.error_body_func is list_body_func
+    # A create's 400/412 carry the item error entity: the item's body.
+    assert V.create.error_body_func is body_func

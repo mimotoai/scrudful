@@ -28,7 +28,10 @@ Validators
     means the target resource has no current representation; when both
     validators are ``None`` the preconditions are skipped (except for PUT,
     which may create the resource) and the view decides, e.g. by answering
-    404.
+    404. A create's list validators are the exception (see
+    ``list_etag_func`` on :class:`ScrudfulViewFunc`): the collection always
+    has a representation, so raise ``Http404`` in the callback to answer a
+    POST to a missing one.
 
     When either validator callback is configured, PUT, PATCH and DELETE on an
     existing resource must be conditional: a request without If-Match (or a
@@ -58,7 +61,11 @@ Concurrency
     applied outside the decorator). For strict lost-update protection, lock the
     row in the validator callback on unsafe methods
     (``Model.objects.select_for_update().filter(pk=pk)``), or make the write
-    itself conditional (``UPDATE ... WHERE version = <expected>``).
+    itself conditional (``UPDATE ... WHERE version = <expected>``). A create's
+    preconditions are the collection's (``list_etag_func``, see
+    :class:`ScrudfulViewFunc`): lock a row per collection in a list validator
+    callback (for a POST only), in a request-wide transaction, and take the
+    same lock in every other write that changes the collection's validators.
 
 Headers
     The Link header is added to the responses whose content the view's links
@@ -131,6 +138,7 @@ from scrudful._adapter import (
     DEFAULT_SCHEMA_TYPE,
     METHOD_KEYS,
     allow_header,
+    check_callables,
     check_error_body_func,
     check_error_media_type,
     check_validators,
@@ -141,6 +149,7 @@ from scrudful._adapter import (
     describe_options,
     describe_read,
     describe_write,
+    evaluates_create_preconditions,
     evaluates_preconditions,
     expose_headers,
     has_default_entity,
@@ -197,15 +206,33 @@ _LINK_OPTIONS = (
     "context_type_or_func",
 )
 _VALIDATOR_OPTIONS = ("etag_func", "last_modified_func")
+_LIST_VALIDATOR_OPTIONS = ("list_etag_func", "list_last_modified_func")
 _OBJECT_OPTIONS = ("object_validators",)
 # The object a create saved (see ``object_validators``).
 _CREATED_ATTR = "_scrudful_created"
 # The object ``get_object()`` returned for the request (see ``object_validators``).
 _OBJECT_ATTR = "_scrudful_object"
 _ERROR_OPTIONS = ("error",)
-# What the 400/412/428 bodies are built with; a create never evaluates
-# preconditions, so it has none.
+# What the 400/412/428 bodies are built with (paired with ``error``).
 _ERROR_BODY_OPTIONS = ("error_body_func",)
+# Handler names that never answer a POST: list validators there would never be
+# evaluated (see ``ScrudfulViewFunc.__set_name__``).
+_NEVER_CREATES = frozenset(
+    {
+        "get",
+        "head",
+        "put",
+        "patch",
+        "delete",
+        "options",
+        "trace",
+        "list",
+        "retrieve",
+        "update",
+        "partial_update",
+        "destroy",
+    }
+)
 #: The media type of the content a view's own links describe.
 _VIEW_MEDIA_TYPE = "application/json"
 
@@ -296,7 +323,8 @@ class ScrudfulViewFunc:
 
         On a *create* (``creates=True``; :func:`scrudful_viewset` sets it for
         ``create``) the validators describe the new resource instead:
-        no precondition is evaluated, and a 201 gets ``ETag`` and
+        they are not used for the preconditions (``list_etag_func`` and
+        ``list_last_modified_func`` are), and a 201 gets ``ETag`` and
         ``Last-Modified`` from the saved instance (``serializer.instance``
         after ``perform_create``), never replacing a header the view set. A
         ``many=True`` create saves several objects and gets neither.
@@ -308,13 +336,60 @@ class ScrudfulViewFunc:
         request, obj)`` returns the ``Location`` of the new object ``obj``
         (passed through ``iri_to_uri(str(...))``); a 201 without a
         ``Location`` gets it. ``None`` sends none.
+    list_etag_func, list_last_modified_func : callable, optional
+        For a create (a POST to a collection): the validators of the
+        collection, its target, called as ``func(view, request,
+        **url_kwargs)`` (``func(request, **url_kwargs)`` on a function view),
+        with ``object_validators`` too; :func:`scrudful_viewset` passes the
+        list's, so they return what a GET of the list computes for the same
+        request. A POST's preconditions are evaluated against
+        them before the view, with the rules of the other methods: If-Match
+        is a strong comparison (``*`` passes; a weak list entity-tag never
+        matches), If-Unmodified-Since applies only without If-Match,
+        If-None-Match is a weak comparison (``*`` fails: the collection
+        always has a representation, even empty), and If-Modified-Since is
+        ignored. Unlike a GET of the list, callbacks returning ``None`` don't
+        make the collection missing (If-Match with an entity-tag fails,
+        ``*`` passes): to answer a POST to a missing collection, e.g. a
+        nested route whose parent doesn't exist, with 404, raise ``Http404``
+        in the callback. A failed precondition is a 412 and a malformed If-Match or
+        If-None-Match a 400, with ``error``'s Links and ``error_body_func``'s
+        body, without calling the view. The callbacks are called only for a
+        POST carrying If-Match, If-None-Match or If-Unmodified-Since: a
+        create without one proceeds (never a 428). On a function view other
+        methods ignore them, as does any other handler that doesn't answer a
+        POST (e.g. a GET ``@action``), but a class-body handler named after
+        a standard non-POST handler rejects them (see Raises). With ``etag_func`` or
+        ``last_modified_func``, they need ``creates=True`` (the target's
+        validators would be ambiguous otherwise).
+
+        The check and the create are atomic only if the application
+        serializes every write that changes the collection's validators with
+        conditional creates: lock a row per collection
+        (``select_for_update()``) in a list validator callback, with a
+        transaction spanning the whole request (``ATOMIC_REQUESTS = True``,
+        or ``transaction.atomic`` applied outside the decorator) so that the
+        lock is held until the create commits, and take the same lock in the
+        other writes. Otherwise two requests carrying the same If-Match can
+        both create, or an item PUT can change the collection between the
+        check and the create. Unconditional creates call no list callback,
+        so they must take the lock themselves (e.g. in ``perform_create``).
+        :func:`scrudful_viewset` gives the same callbacks to ``list``: lock
+        only when ``request.method == "POST"``, or every GET of the list
+        takes the lock too.
 
     Raises
     ------
     TypeError
         If a validator callback isn't callable, ``error`` isn't an
-        :class:`Entity`, the view is ``async def``, or ``object_validators``
-        is set without a validator callback.
+        :class:`Entity`, the view is ``async def``, ``object_validators``
+        is set without a validator callback, or a list validator callback
+        is set with a validator callback but without ``creates``. When the
+        class is created, if a list validator callback is set on a
+        class-body handler named after a standard non-POST handler (``get``,
+        ``head``, ``put``, ``patch``, ``delete``, ``options``, ``trace``,
+        ``list``, ``retrieve``, ``update``, ``partial_update`` or
+        ``destroy``).
     ValueError
         If ``error``'s media type is not JSON content.
     """
@@ -338,8 +413,17 @@ class ScrudfulViewFunc:
         object_validators: bool = False,
         location_func: Callable[..., Any] | None = None,
         creates: bool = False,
+        list_etag_func: Callable[..., Any] | None = None,
+        list_last_modified_func: Callable[..., Any] | None = None,
     ) -> None:
         check_validators(etag_func, last_modified_func)
+        _check_list_validators(
+            etag_func,
+            last_modified_func,
+            list_etag_func,
+            list_last_modified_func,
+            creates,
+        )
         _check_error(error)
         check_error_body_func(error_body_func)
         _check_sync(view_method)
@@ -371,6 +455,8 @@ class ScrudfulViewFunc:
         if location_func is not None and not creates:
             raise TypeError("location_func needs creates=True")
         self.creates = bool(creates)
+        self.list_etag_func = list_etag_func
+        self.list_last_modified_func = list_last_modified_func
         self._from_viewset = False
 
     def __get__(self, obj: Any, objtype: type | None = None) -> Any:
@@ -388,6 +474,13 @@ class ScrudfulViewFunc:
         each ``APIView`` subclassing it gets its OPTIONS the same way when it
         is created (see :func:`_install_metadata_on_views`).
         """
+        if self.has_list_validators and name in _NEVER_CREATES:
+            raise TypeError(
+                f"{owner.__qualname__}.{name}: list_etag_func and "
+                "list_last_modified_func are evaluated for a create (a POST) "
+                "only, and this handler never answers one. Move them to the "
+                "post or create handler."
+            )
         if issubclass(owner, APIView):
             _install_metadata(owner)
         else:
@@ -397,6 +490,13 @@ class ScrudfulViewFunc:
     def has_validators(self) -> bool:
         """Whether a validator callback is configured."""
         return self.etag_func is not None or self.last_modified_func is not None
+
+    @property
+    def has_list_validators(self) -> bool:
+        """Whether a list validator callback (of the collection created in) is set."""
+        return (
+            self.list_etag_func is not None or self.list_last_modified_func is not None
+        )
 
     def __call__(self, *args: Any, **kwargs: Any) -> HttpResponseBase:
         index = _request_index(args)
@@ -424,7 +524,31 @@ class ScrudfulViewFunc:
         view = args[0] if index > 0 else None
         if self.creates and view is not None:
             _record_created(view)
-        if self.has_validators and not self.creates and evaluates_preconditions(method):
+        if self.has_list_validators:
+            headers = django_precondition_headers(request)
+            # Only a POST carrying a precondition: the callbacks aren't called
+            # for one without (nothing to evaluate, never a 428).
+            if evaluates_create_preconditions(method, headers):
+                list_etag, list_last_modified = _compute_validators(
+                    self.list_etag_func,
+                    self.list_last_modified_func,
+                    cb_args,
+                    cb_kwargs,
+                )
+                result = evaluate_preconditions(
+                    method,
+                    headers,
+                    etag=list_etag,
+                    last_modified=list_last_modified,
+                    # The collection always has a representation.
+                    exists=True,
+                    require_precondition=False,
+                )
+                if result is not None:
+                    return self._early_response(result, request, cb_args, cb_kwargs)
+        elif (
+            self.has_validators and not self.creates and evaluates_preconditions(method)
+        ):
             exists = None
             if self.object_validators:
                 # Authorization comes first: an exception propagates as the
@@ -525,15 +649,9 @@ class ScrudfulViewFunc:
     def _validators(
         self, args: Sequence[Any], kwargs: Mapping[str, Any]
     ) -> tuple[str | None, int | None]:
-        etag = None
-        if self.etag_func is not None:
-            value = self.etag_func(*args, **kwargs)
-            etag = None if value is None else quote_etag(value)
-        last_modified = None
-        if self.last_modified_func is not None:
-            value = self.last_modified_func(*args, **kwargs)
-            last_modified = http_timestamp(aware(value))
-        return etag, last_modified
+        return _compute_validators(
+            self.etag_func, self.last_modified_func, args, kwargs
+        )
 
     def add_expose_headers(self, response: HttpResponseBase) -> None:
         """Add the ETag/Link/Location headers present to the expose header."""
@@ -603,6 +721,8 @@ def scrudful(
     object_validators: bool = False,
     location_func: Callable[..., Any] | None = None,
     creates: bool = False,
+    list_etag_func: Callable[..., Any] | None = None,
+    list_last_modified_func: Callable[..., Any] | None = None,
 ) -> Callable[[Callable[..., Any]], ScrudfulViewFunc]:
     """Decorate a view method or function view to make it SCRUDful.
 
@@ -645,8 +765,13 @@ def scrudful(
         "object_validators": object_validators,
         "location_func": location_func,
         "creates": creates,
+        "list_etag_func": list_etag_func,
+        "list_last_modified_func": list_last_modified_func,
     }
     check_validators(etag_func, last_modified_func)
+    _check_list_validators(
+        etag_func, last_modified_func, list_etag_func, list_last_modified_func, creates
+    )
     _check_error(error)
     check_error_body_func(error_body_func)
     if object_validators and etag_func is None and last_modified_func is None:
@@ -751,11 +876,18 @@ def scrudful_viewset(cls: type) -> type:
     inherited). ``retrieve``, ``update``, ``partial_update`` and ``destroy``
     are wrapped with the item configuration below, ``list`` with the
     ``list_*`` configuration, and ``create`` with the item *link*
-    configuration (and ``error``) only: its target is the collection, so the
-    item validators do not apply to it. Methods the class doesn't have are not
-    added, and methods decorated with :func:`scrudful` explicitly are left
-    alone. OPTIONS is answered by :class:`ScrudfulMetadata` only when the
-    class's ``metadata_class`` is DRF's default ``SimpleMetadata``; any other
+    configuration, ``error`` and ``error_body_func``, and the list
+    validators: its target is the collection, so its preconditions are
+    evaluated against the list's validators (see ``list_etag_func`` on
+    :class:`ScrudfulViewFunc`), and the item validators describe only the
+    object it saves (with ``object_validators``). Methods
+    the class doesn't have are not added, and methods decorated with
+    :func:`scrudful` explicitly are left alone: an explicit ``create`` must
+    then be given list validators of its own when ``Meta`` sets
+    ``list_etag_func`` or ``list_last_modified_func`` (``TypeError``
+    otherwise), so that its preconditions are never silently unevaluated.
+    OPTIONS is answered by :class:`ScrudfulMetadata` only when the class's
+    ``metadata_class`` is DRF's default ``SimpleMetadata``; any other
     value (``None``, or a class set on the viewset, a base class or
     ``DEFAULT_METADATA_CLASS``) is kept, so subclass or mix in
     :class:`ScrudfulMetadata` to combine it with a custom metadata class. With
@@ -813,7 +945,9 @@ def scrudful_viewset(cls: type) -> type:
         Schema and context of the item routes' (and the create's) 400, 412
         and 428 bodies (see :class:`ScrudfulViewFunc`).
     list_etag_func, list_last_modified_func : callable, optional
-        Validators of the ``list`` response.
+        Validators of the ``list`` response, against which the preconditions
+        of ``create`` are evaluated too (a 400 or 412, never a 428; see
+        :class:`ScrudfulViewFunc`).
     list_schema_link_or_func, list_schema_rel_or_func, list_schema_type_or_func
         Schema link of the ``list`` response.
     list_context_link_or_func, list_context_rel_or_func, list_context_type_or_func
@@ -821,7 +955,8 @@ def scrudful_viewset(cls: type) -> type:
     list_error : Entity, optional
         Schema and context of the ``list`` response's 400 and 412 bodies.
     error_body_func : callable, optional
-        As for :class:`ScrudfulViewFunc`, for the item routes (not the create).
+        As for :class:`ScrudfulViewFunc`, for the item routes and the create
+        (whose 400 and 412 carry ``error``).
     list_error_body_func : callable, optional
         As ``error_body_func``, for the ``list`` response's 400 and 412.
     href_func : callable, optional
@@ -842,7 +977,12 @@ def scrudful_viewset(cls: type) -> type:
         + _ERROR_BODY_OPTIONS
         + _OBJECT_OPTIONS,
     )
-    create = options("", _LINK_OPTIONS + _ERROR_OPTIONS)
+    # Its preconditions are evaluated against the collection's validators;
+    # its 400/412 carry the item ``error``, so they get its body too.
+    create = options(
+        "",
+        _LINK_OPTIONS + _ERROR_OPTIONS + _ERROR_BODY_OPTIONS + _LIST_VALIDATOR_OPTIONS,
+    )
     if item["object_validators"]:
         if not callable(getattr(cls, "get_object", None)):
             raise TypeError("object_validators needs a view with get_object()")
@@ -872,6 +1012,7 @@ def scrudful_viewset(cls: type) -> type:
             continue
         if isinstance(method, ScrudfulViewFunc):
             if not method._from_viewset:
+                _check_explicit_create(cls, name, method, config)
                 continue
             method = method.view_method
         if name == "partial_update" and method is _STOCK_PARTIAL_UPDATE:
@@ -885,6 +1026,23 @@ def scrudful_viewset(cls: type) -> type:
         setattr(cls, name, wrapper)
     _install_metadata(cls)
     return cls
+
+
+def _check_explicit_create(
+    cls: type, name: str, method: ScrudfulViewFunc, config: dict[str, Any]
+) -> None:
+    """Raise ``TypeError`` if an explicit ``create`` would drop ``Meta``'s
+    list validators, leaving its preconditions unevaluated."""
+    if name != "create" or method.has_list_validators:
+        return
+    dropped = [key for key in _LIST_VALIDATOR_OPTIONS if config[key] is not None]
+    if dropped:
+        raise TypeError(
+            f"{cls.__qualname__}.create is decorated with @scrudful, so "
+            f"Meta.{' and Meta.'.join(dropped)} don't apply to it and its "
+            "preconditions would never be evaluated: pass "
+            f"{', '.join(f'{key}=' for key in dropped)} to its @scrudful."
+        )
 
 
 def _memoize_get_object(cls: type) -> None:
@@ -1190,6 +1348,44 @@ def _check_sync(view: Callable[..., Any]) -> None:
         raise TypeError(f"@scrudful does not support async views ({name})")
 
 
+def _check_list_validators(
+    etag_func: Any,
+    last_modified_func: Any,
+    list_etag_func: Any,
+    list_last_modified_func: Any,
+    creates: bool,
+) -> None:
+    check_callables(
+        list_etag_func=list_etag_func, list_last_modified_func=list_last_modified_func
+    )
+    has_list = list_etag_func is not None or list_last_modified_func is not None
+    has_own = etag_func is not None or last_modified_func is not None
+    if has_list and has_own and not creates:
+        # Both would describe the target: only a create's describe the new object.
+        raise TypeError(
+            "list_etag_func and list_last_modified_func with etag_func or "
+            "last_modified_func need creates=True"
+        )
+
+
+def _compute_validators(
+    etag_func: Callable[..., Any] | None,
+    last_modified_func: Callable[..., Any] | None,
+    args: Sequence[Any],
+    kwargs: Mapping[str, Any],
+) -> tuple[str | None, int | None]:
+    """The quoted entity-tag and epoch timestamp the callbacks return."""
+    etag = None
+    if etag_func is not None:
+        value = etag_func(*args, **kwargs)
+        etag = None if value is None else quote_etag(value)
+    last_modified = None
+    if last_modified_func is not None:
+        value = last_modified_func(*args, **kwargs)
+        last_modified = http_timestamp(aware(value))
+    return etag, last_modified
+
+
 def _evaluate(
     value_or_func: Any, args: Sequence[Any], kwargs: Mapping[str, Any]
 ) -> Any:
@@ -1381,11 +1577,19 @@ def _has_validators(handler: Any) -> bool:
 def _is_conditional(handler: Any, method: str) -> bool:
     """Whether ``handler`` evaluates the If-* headers for ``method`` (lower-case).
 
-    With validators, for a method :func:`scrudful._adapter.evaluates_preconditions`
-    accepts (not TRACE).
+    With list validators, for POST only (a create's target is the
+    collection); a create without them, never; otherwise, with validators,
+    for a method :func:`scrudful._adapter.evaluates_preconditions` accepts
+    (not CONNECT, OPTIONS or TRACE).
     """
-    if isinstance(handler, ScrudfulViewFunc) and handler.creates:
-        return False  # it describes the object it saved, and checks nothing
+    if not isinstance(handler, ScrudfulViewFunc):
+        return False
+    if handler.has_list_validators:
+        # A create's target is the collection: its POST is checked against
+        # the list validators.
+        return method == "post"
+    if handler.creates:
+        return False  # without list validators: nothing to check against
     return _has_validators(handler) and evaluates_preconditions(method.upper())
 
 

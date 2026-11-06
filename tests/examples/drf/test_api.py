@@ -390,9 +390,7 @@ def test_scoped_viewset_serves_visible_items(client):
 
 
 def test_create_exposes_location_and_sends_no_validators(client):
-    response = client.post(
-        "/items/", {"name": "New"}, format="json", headers={"If-Match": '"x"'}
-    )
+    response = client.post("/items/", {"name": "New"}, format="json")
     assert response.status_code == 201
     item = Item.objects.get(name="New")
     assert response["Location"] == f"{BASE}/items/{item.pk}/"
@@ -400,6 +398,24 @@ def test_create_exposes_location_and_sends_no_validators(client):
     assert "Last-Modified" not in response
     assert response["Link"] == LINKS
     assert response["Access-Control-Expose-Headers"] == "Link, Location"
+
+
+def test_create_checks_the_preconditions_of_the_collection(client, item):
+    etag = client.get("/items/")["ETag"]
+    stale = client.post(
+        "/items/", {"name": "New"}, format="json", headers={"If-Match": '"x"'}
+    )
+    assert stale.status_code == 412
+    assert stale.json() == PRECONDITION_FAILED
+    # The create's error entity, though the viewset has no object_validators.
+    assert stale["Content-Type"] == "application/json"
+    assert f'<{BASE}/schemas/error.json>; rel="describedby"' in stale["Link"]
+    assert f"<{BASE}/contexts/error.jsonld>" in stale["Link"]
+    assert not Item.objects.filter(name="New").exists()
+    current = client.post(
+        "/items/", {"name": "New"}, format="json", headers={"If-Match": etag}
+    )
+    assert current.status_code == 201
 
 
 def test_list_has_a_collection_etag(client, item):
@@ -508,7 +524,8 @@ def test_options_describes_the_list_route(client):
     assert metadata["post"]["requestBody"]["description"] == (
         "The content for the resource to be created."
     )
-    assert set(metadata["post"]["responses"]) == {"201", "400"}
+    # Its preconditions are evaluated against the list's ETag, never required.
+    assert set(metadata["post"]["responses"]) == {"201", "400", "412"}
     assert "parameters" not in metadata["post"]
     assert set(metadata["get"]["responses"]) == {"200", "304", "400", "412"}
 

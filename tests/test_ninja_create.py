@@ -700,9 +700,10 @@ def test_create_config():
     # The request body is an item, as for DRF's create.
     assert config.request == config.entity
     assert dict(config.responses) == {400: ERROR}
-    # A create produces no 400, 412 or 428 of its own: no error entity.
+    # Without list validators it evaluates no precondition (see
+    # test_ninja_create_preconditions.py for those with them).
     assert config.error is None
-    assert "error" not in inspect.signature(scrudful_create).parameters
+    assert not config.evaluates_preconditions
     assert config.has_etag
     assert not config.has_last_modified
 
