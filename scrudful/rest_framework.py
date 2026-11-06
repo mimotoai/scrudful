@@ -1390,8 +1390,12 @@ def scrudful_viewset(cls: type) -> type:
         precondition, a paginator with ``check_page``
         (:class:`ScrudfulPagination`) answers bad page parameters with its
         400 and a page past the last with its 404, the preconditions ignored
-        (RFC 9110 §13.2.1); another paginator's page errors still lose to a
-        304 or 412.
+        (RFC 9110 §13.2.1), unless a subclass overrides ``paginate_queryset``
+        without ``check_page``; another paginator's page errors still lose to
+        a 304 or 412. The check assumes ``list`` pages
+        ``filter_queryset(get_queryset())`` with ``view.paginator``, as
+        DRF's does: a ``list`` paging another queryset should paginate with a
+        paginator whose ``check_page`` agrees (or none).
     list_schema_link_or_func, list_schema_rel_or_func, list_schema_type_or_func
         Schema link of the ``list`` response.
     list_context_link_or_func, list_context_rel_or_func, list_context_type_or_func
@@ -3557,8 +3561,10 @@ def _check_list_page(view: Any, request: Request) -> None:
     page would (the paginator's ``check_page``, as :class:`ScrudfulPagination`
     has: 400, 404), so that a request whose page is an error ignores them (RFC
     9110 §13.2.1). Only for a request carrying a precondition, and a paginator
-    with ``check_page``; the queryset is filtered only for a page after the
-    first."""
+    with ``check_page`` (not a ``ScrudfulPagination`` subclass overriding
+    ``paginate_queryset`` without it); the queryset, assumed to be what
+    ``list`` pages (``filter_queryset(get_queryset())``), is filtered only for
+    a page after the first."""
     if not django_precondition_headers(request):
         return
     paginator = getattr(view, "paginator", None)

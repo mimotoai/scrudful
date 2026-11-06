@@ -7,10 +7,12 @@ Changelog
 
 A list's GET or HEAD preconditions are evaluated once its requested page is
 known to exist (RFC 9110 §13.2.1: preconditions are ignored when the request
-without them would not be a 2xx or 412). A page past the last was a 304 with
-``If-None-Match``, or a 412 with a failed ``If-Match``, where it is the 404
-``Invalid page.``; with DRF, bad ``page`` / ``page_size`` parameters were a 304
-or 412 too, where they are the 400.
+without them would not be a 2xx or 412). A page past the last was the
+precondition's answer (a 304 for ``If-None-Match`` or ``If-Modified-Since``, a
+412 for a failed ``If-Match`` or ``If-Unmodified-Since``, a 400 for a malformed
+one), where it is the 404 ``Invalid page.``; with DRF, bad ``page`` /
+``page_size`` parameters were the precondition's answer too, where they are the
+400.
 
 Behaviour change (ninja)
 ------------------------
@@ -31,7 +33,10 @@ Behaviour change (DRF)
   filtered only for a page after the first. A request without a precondition,
   a paginator without ``check_page``, a ``ScrudfulPagination`` subclass that
   overrides ``paginate_queryset`` without overriding ``check_page``, and an
-  explicit ``@scrudful`` list handler are unchanged.
+  explicit ``@scrudful`` list handler are unchanged. The check assumes the
+  viewset's ``list`` pages ``filter_queryset(get_queryset())`` with its
+  paginator, as DRF's does: a ``list`` of its own paging another queryset
+  should use a paginator whose ``check_page`` agrees.
 
 New
 ---

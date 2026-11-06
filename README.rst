@@ -513,8 +513,7 @@ DRF's ``IntegerField`` codes (``invalid``, ``min_value``, ``max_value``) on the
 errors, and a page past the last one is a 404, whatever the request's
 preconditions on a ``scrudful_viewset`` list with list validators (the page is
 checked first, ``ScrudfulPagination.check_page``: RFC 9110 §13.2.1). An
-integer is what django-ninja's
-``scrudful_list`` accepts (pydantic's lax ``int``: ``2.0`` is 2, a non-ASCII
+integer is what django-ninja's ``scrudful_list`` accepts (pydantic's lax ``int``: ``2.0`` is 2, a non-ASCII
 digit is not an integer), so both front ends answer the same values alike. Give the view an ordered
 queryset: an unordered one warns, as with Django's ``Paginator``.
 

@@ -223,6 +223,16 @@ class OwnPagesViewSet(ListValidatedViewSet):
     pagination_class = OwnPagesPagination
 
 
+class LastPageListViewSet(ListValidatedViewSet):
+    """Parsing of its own (``page=last``), scrudful's idea of a page."""
+
+    pagination_class = LastPagePagination
+
+
+class LastPageParseListViewSet(ListValidatedViewSet):
+    pagination_class = LastPageParsePagination
+
+
 def listed_modified(view, request):
     return max(item.updated_at for item in Item.objects.all())
 
@@ -242,6 +252,8 @@ router.register("listed", ListValidatedViewSet, basename="listed")
 router.register("filtered", FilteredListViewSet, basename="filtered")
 router.register("other-pages", OtherPaginatorViewSet, basename="other-pages")
 router.register("own-pages", OwnPagesViewSet, basename="own-pages")
+router.register("last-list", LastPageListViewSet, basename="last-list")
+router.register("last-parse-list", LastPageParseListViewSet, basename="last-parse-list")
 router.register("modified-only", LastModifiedOnlyViewSet, basename="modified-only")
 router.register("items", ItemViewSet, basename="item")
 router.register("bare", BareViewSet, basename="bare")
@@ -645,3 +657,18 @@ def test_an_unconditional_list_checks_no_page():
         return len(captured.captured_queries)
 
     assert queries("/drf/listed/?page=2") == queries("/drf/listed/")
+
+
+@pytest.mark.parametrize("prefix", ["last-list", "last-parse-list"])
+@pytest.mark.parametrize("query, status", [("?page=last", 304), ("?page=99", 404)])
+def test_a_paginator_parsing_its_own_way_still_checks_its_page(prefix, query, status):
+    # Overriding _integer or _parse_parameter (not paginate_queryset): asked,
+    # with its own parsing.
+    for name in "abc":
+        Item.objects.create(name=name)
+
+    response = APIClient().get(
+        f"/drf/{prefix}/{query}", headers={"If-None-Match": '"n3"'}
+    )
+
+    assert response.status_code == status
