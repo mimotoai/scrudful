@@ -9,11 +9,12 @@ from ninja import Router
 from ninja.errors import ConfigError
 from ninja.testing import TestAsyncClient, TestClient
 
+from scrudful._hsr import hsr_link
 from scrudful.ninja import Entity, ScrudfulRouter, scrudful_create
 from scrudful.problem import PROBLEM_JSON, problem_details
-from tests.test_ninja_adapter import ItemIn, ItemOut, Store, etag
+from tests.test_ninja_adapter import TEST_BASE_URL, ItemIn, ItemOut, Store, etag
 from tests.test_ninja_entities import ERROR, ERROR_LINK
-from tests.test_ninja_options import options
+from tests.test_ninja_options import hsr_get
 
 LIST_MODIFIED = datetime(2026, 1, 1, tzinfo=timezone.utc)
 BEFORE = "Wed, 31 Dec 2025 00:00:00 GMT"
@@ -35,7 +36,7 @@ def collection_modified(items: list[Any]) -> datetime:
 
 def create_router(store: Store, router: Router | None = None, **options: Any) -> Router:
     """``POST /items`` whose collection is ``store.items`` (two rows: ``"n2"``)."""
-    router = router or ScrudfulRouter()
+    router = router or ScrudfulRouter(base_url=TEST_BASE_URL)
 
     def items(request: Any, **params: Any) -> list[Any]:
         store.calls["list_load"] += 1
@@ -155,11 +156,18 @@ def test_the_412_has_the_error_links_and_body(store):
     response = post(
         store,
         {"If-Match": '"nope"'},
-        error=Entity("/schemas/error", media_type=PROBLEM_JSON),
+        error=Entity(
+            "/schemas/error",
+            context_link_or_func="/contexts/error",
+            media_type=PROBLEM_JSON,
+        ),
         error_body_func=problem_details,
     )
     assert response.status_code == 412
-    assert response.headers["Link"] == ERROR_LINK
+    # The error entity's Links, then the HTTP Schema Resource link.
+    assert response.headers["Link"] == (
+        f"{ERROR_LINK}, {hsr_link('http://testlocation/_hsr/items')}"
+    )
     assert response.headers["Content-Type"].startswith(PROBLEM_JSON)
     assert response.json()["status"] == 412
 
@@ -174,7 +182,7 @@ def test_error_link_callables_get_the_collection(store):
     response = post(
         store,
         {"If-Match": '"nope"'},
-        error=Entity(schema),
+        error=Entity(schema, context_link_or_func="/contexts/error"),
     )
     assert response.status_code == 412
     assert seen == [list(store.items.values())]
@@ -194,18 +202,24 @@ def test_without_list_validators_preconditions_are_ignored(store):
 
 def test_options_describes_the_412(store):
     client = TestClient(create_router(store, error=ERROR))
-    described = options(client, "/items").json()["post"]
+    described = hsr_get(client, "/items")["post"]
     assert {"201", "400", "412"} <= set(described["responses"])
     assert "428" not in described["responses"]
     assert "parameters" not in described
     assert described["responses"]["412"]["content"] == {
-        "application/json": {"schema": {"$ref": "http://testlocation/schemas/error"}}
+        "application/json": {
+            "schema": {"$ref": "http://testlocation/schemas/error"},
+            "x-rdf-context": {
+                "href": "http://testlocation/contexts/error",
+                "type": "application/ld+json",
+            },
+        }
     }
     assert store.calls == {}
 
 
 def test_async_create_with_async_list_load(store):
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     async def items(request: Any, **params: Any) -> list[Any]:
         return list(store.items.values())
@@ -270,7 +284,7 @@ def test_sync_handler_rejects_async_list_load():
 
 @pytest.mark.parametrize("method", ["put", "patch"])
 def test_list_validators_on_an_operation_without_post_are_rejected(method):
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     decorate = scrudful_create(
         location_func=lambda request, item: "/x",
         list_load=lambda request, **params: [],
@@ -284,7 +298,7 @@ def test_list_validators_on_an_operation_without_post_are_rejected(method):
 
 
 def test_list_validators_on_an_operation_with_post_are_accepted():
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
 
     @router.api_operation(["POST", "PUT"], "/items", response={201: ItemOut})
     @scrudful_create(

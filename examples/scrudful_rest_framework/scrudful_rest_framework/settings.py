@@ -3,6 +3,7 @@
 Development settings only: the secret key is public and DEBUG is on.
 """
 
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -12,6 +13,11 @@ SECRET_KEY = "django-insecure-scrudful-example-not-for-production"
 DEBUG = True
 
 ALLOWED_HOSTS = ["localhost", "127.0.0.1", "testserver"]
+
+# The absolute URL the API is served at. scrudful resolves the relative link
+# URLs against it, in the HTTP Schema Resources (which don't depend on the
+# request) and in the Link headers.
+SCRUDFUL = {"BASE_URL": os.environ.get("SCRUDFUL_BASE_URL", "http://localhost:8000/")}
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -67,10 +73,12 @@ REST_FRAMEWORK = {
     # Gives the errors DRF itself raises (a serializer's 400, a 404, a 405 ...)
     # the Links of the views' error entity.
     "EXCEPTION_HANDLER": "scrudful.rest_framework.exception_handler",
-    # Semantic HTTP 0.1: every response's content is described by its Links,
-    # and OPTIONS lists every request body media type. Only JSON is: the
-    # browsable API's HTML carries the Links of the JSON content, and form
-    # data has no lifting to RDF, so neither is served nor accepted.
+    # Semantic HTTP 0.1: the HTTP Schema Resource describes JSON content only.
+    # The browsable API would be allowed for a client asking for text/html
+    # (scrudful sends Vary: Accept), but DRF also serves its HTML for
+    # ?format=api without Accept, which is undescribed: it is left out. Form
+    # bodies would be allowed (a resource MAY accept undescribed request
+    # media types), but have no lifting to RDF: only JSON is accepted.
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
     "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
 }

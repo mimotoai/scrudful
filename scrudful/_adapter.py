@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import http
 import inspect
 import re
@@ -17,9 +18,8 @@ from typing import Any, Protocol
 
 from scrudful.conditional import SAFE_METHODS, ConditionalResult, validator_headers
 from scrudful.utils import (
-    EXPOSABLE_HEADERS,
+    EXPOSE_HEADERS,
     join_links,
-    link_content,
     link_relations,
     merge_expose_headers,
 )
@@ -34,6 +34,9 @@ HSR_SCHEMA_URL = "https://w3id.org/semantic-http/0.1/http-schema-resource.schema
 HSR_CONTEXT_URL = (
     "https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld"
 )
+#: The relation and media type of the Link to an HTTP Schema Resource.
+HSR_LINK_REL = "https://w3id.org/semantic-http/ns#http-schema-resource-document"
+HSR_LINK_TYPE = "application/json"
 #: Media types that carry their RDF in-band, so need no context link.
 IN_BAND_MEDIA_TYPES = frozenset(
     {
@@ -47,6 +50,21 @@ IN_BAND_MEDIA_TYPES = frozenset(
 )
 #: The keys of an HTTP Schema Resource that are methods (the others are ``x-``).
 METHOD_KEYS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
+
+
+class HsrConfigError(ValueError):
+    """A configuration the HTTP Schema Resource cannot be built from.
+
+    The adapters re-raise it as their framework's configuration error.
+    """
+
+
+#: The message of the schema-without-context error (:class:`HsrConfigError`).
+SCHEMA_WITHOUT_CONTEXT = (
+    "{media_type} content has a schema link but no RDF context link; the HTTP "
+    "Schema Resource's x-rdf-context would be missing. Give the context link "
+    "(context_link_or_func)"
+)
 
 DEFAULT_SCHEMA_REL = SCHEMA_REL
 DEFAULT_SCHEMA_TYPE = SCHEMA_TYPE
@@ -109,11 +127,11 @@ BODY_HEADERS = frozenset(
     }
 )
 
-#: :data:`READ_DESCRIPTIONS` as OPTIONS responses (string status keys).
+#: :data:`READ_DESCRIPTIONS` as HTTP Schema Resource responses (string status keys).
 READ_RESPONSES = {
     str(status): {"description": text} for status, text in READ_DESCRIPTIONS.items()
 }
-#: :data:`WRITE_DESCRIPTIONS` as OPTIONS responses (string status keys).
+#: :data:`WRITE_DESCRIPTIONS` as HTTP Schema Resource responses (string status keys).
 WRITE_RESPONSES = {
     str(status): {"description": text} for status, text in WRITE_DESCRIPTIONS.items()
 }
@@ -185,8 +203,8 @@ def evaluates_preconditions(method: str) -> bool:
     Not for CONNECT, OPTIONS and TRACE (:data:`NO_PRECONDITION_METHODS`),
     whose response is no representation of the target resource: the
     resource's validators don't describe it, so a server ignores the
-    conditional headers (RFC 9110 §13.2.1). Their OPTIONS description lists
-    neither scrudful's early responses nor the precondition headers.
+    conditional headers (RFC 9110 §13.2.1). Their HTTP Schema Resource entries
+    list neither scrudful's early responses nor the precondition headers.
     """
     return method not in NO_PRECONDITION_METHODS
 
@@ -212,13 +230,21 @@ def set_validator_headers(
             headers[name] = value
 
 
+_ALWAYS_EXPOSED = frozenset({"Link", "Allow"})
+
+
 def expose_headers(headers: Headers) -> None:
-    """Add the exposable headers present to Access-Control-Expose-Headers."""
-    names = [name for name in EXPOSABLE_HEADERS if name in headers]
-    if names:
-        headers["Access-Control-Expose-Headers"] = merge_expose_headers(
-            headers.get("Access-Control-Expose-Headers"), names
-        )
+    """Merge the exposed headers into Access-Control-Expose-Headers.
+
+    ``Link`` and ``Allow`` are always exposed; ``ETag`` and ``Location`` only
+    when present.
+    """
+    names = [
+        name for name in EXPOSE_HEADERS if name in _ALWAYS_EXPOSED or name in headers
+    ]
+    headers["Access-Control-Expose-Headers"] = merge_expose_headers(
+        headers.get("Access-Control-Expose-Headers"), names
+    )
 
 
 def evaluated_signature(func: Callable[..., Any]) -> inspect.Signature:
@@ -252,18 +278,30 @@ def resolved_signature(func: Callable[..., Any]) -> inspect.Signature:
     For endpoints written with ``from __future__ import annotations``, as
     :func:`evaluated_signature`, but each annotation is evaluated on its own:
     one that can't be (e.g. a name imported only under ``TYPE_CHECKING``) is
-    left as it is, and the others are still evaluated.
+    left as it is, and the others are still evaluated. When all can be, this
+    is ``inspect.signature(func, eval_str=True)``; else each is evaluated in
+    the globals that would have used (:func:`annotation_globals`), so a
+    callable instance, a ``functools.partial`` or a class is read as a
+    function is.
     """
     try:
-        signature = inspect.signature(func)
-    except NameError:
-        # Python 3.14+, see evaluated_signature.
-        if sys.version_info < (3, 14):
-            raise
-        from annotationlib import Format
+        signature = inspect.signature(func, eval_str=True)
+    except Exception:
+        # One annotation can't be evaluated (a NameError, or an
+        # AttributeError, SyntaxError or TypeError, as for
+        # ``module.Missing``): each is evaluated on its own below.
+        try:
+            signature = inspect.signature(func)
+        except NameError:
+            # Python 3.14+, see evaluated_signature.
+            if sys.version_info < (3, 14):
+                raise
+            from annotationlib import Format
 
-        signature = inspect.signature(func, annotation_format=Format.FORWARDREF)
-    globalns = getattr(inspect.unwrap(func), "__globals__", {})
+            signature = inspect.signature(func, annotation_format=Format.FORWARDREF)
+    # Also for a signature eval_str leaves as it is (a ``__signature__``,
+    # such as a wrapper's, which may hold strings).
+    globalns = annotation_globals(func)
 
     def resolve(annotation: Any) -> Any:
         if isinstance(annotation, str):
@@ -280,6 +318,41 @@ def resolved_signature(func: Callable[..., Any]) -> inspect.Signature:
         ],
         return_annotation=resolve(signature.return_annotation),
     )
+
+
+def annotation_globals(func: Any) -> dict[str, Any]:
+    """The globals ``func``'s string annotations are evaluated in, as
+    ``inspect.signature(func, eval_str=True)`` picks them: through
+    ``__wrapped__`` and ``functools.partial``, those of the function the
+    signature comes from (a bound method's function, a class's ``__init__``
+    or ``__new__``, a callable instance's ``__call__``), else those of the
+    object's module."""
+    seen: set[int] = set()
+    obj = func
+    while id(obj) not in seen:
+        seen.add(id(obj))
+        unwrapped = inspect.unwrap(obj)
+        if unwrapped is not obj:
+            obj = unwrapped
+        elif isinstance(obj, functools.partial):
+            obj = obj.func
+        elif inspect.ismethod(obj):
+            obj = obj.__func__
+        elif inspect.isfunction(obj):
+            return obj.__globals__  # type: ignore[no-any-return]
+        elif inspect.isclass(obj):
+            for name in ("__init__", "__new__"):
+                method = getattr(obj, name, None)
+                if inspect.isfunction(method):
+                    return method.__globals__  # type: ignore[no-any-return]
+            break
+        else:
+            call = getattr(type(obj), "__call__", None)
+            if not inspect.isfunction(call):
+                break
+            obj = call
+    module = sys.modules.get(getattr(obj, "__module__", None) or "")
+    return vars(module) if module is not None else {}
 
 
 def resolve_annotation(annotation: Any, globalns: dict[str, Any]) -> Any:
@@ -483,7 +556,7 @@ def context_link_type(media_type: str, value: Any) -> str:
 
     ``value``, the evaluated ``context_type_or_func``, unless it is empty;
     else the default of :func:`context_defaults` (JSON-LD, for JSON content).
-    The Link header and the OPTIONS body both take the type from here, so
+    The Link header and the HTTP Schema Resource both take the type from here, so
     they agree, and fail alike.
 
     Raises
@@ -532,9 +605,13 @@ _CONTEXT_RELS = frozenset({JSON_LD_CONTEXT_REL, RDF_CONTEXT_REL})
 
 
 def merge_links(
-    existing: str | None, schema: str | None, context: str | None
+    existing: str | None,
+    schema: str | None,
+    context: str | None,
+    hsr: str | None = None,
 ) -> str | None:
-    """Join the view's Link ``existing`` with the ``schema`` and ``context`` links.
+    """Join the view's Link ``existing`` with the ``schema``, ``context`` and
+    ``hsr`` links.
 
     A link of ``existing`` with a relation that scrudful's ``schema``
     (``context``) link-value has replaces that link: with the defaults, a
@@ -546,9 +623,12 @@ def merge_links(
     replaces it. An overridden context relation is matched exactly.
     Relation types are compared case-insensitively, every one of a ``rel``
     holding several (RFC 8288 §2.1.1, §3.3). A link of another relation
-    replaces nothing.
+    replaces nothing. A link of ``existing`` with the HTTP Schema Resource
+    relation replaces scrudful's ``hsr`` link.
     """
     relations = link_relations(existing)
+    if HSR_LINK_REL.lower() in relations:
+        hsr = None
     if relations & link_relations(schema):
         schema = None
     context_rels = link_relations(context)
@@ -556,22 +636,14 @@ def merge_links(
         context_rels |= _CONTEXT_RELS
     if relations & context_rels:
         context = None
-    return join_links(existing, schema, context)
+    return join_links(existing, schema, context, hsr)
 
 
-def options_links() -> str:
-    """The Link field value of an OPTIONS response: the HTTP Schema Resource's
-    own schema and context."""
-    schema = link_content(HSR_SCHEMA_URL, SCHEMA_REL, SCHEMA_TYPE)
-    context = link_content(HSR_CONTEXT_URL, JSON_LD_CONTEXT_REL, CONTEXT_TYPE)
-    return f"{schema}, {context}"
-
-
-# --- OPTIONS descriptions ----------------------------------------------------
+# --- HTTP Schema Resource descriptions ---------------------------------------
 #
-# The operations of an OPTIONS body (an HTTP Schema Resource: an OpenAPI Path
-# Item), shared by the DRF and django-ninja adapters. ``content`` is a Media
-# Type map as built by :func:`describe_content`; falsy means none.
+# The operations of an HTTP Schema Resource (an OpenAPI Path Item), shared by
+# the three adapters. ``content`` is a Media Type map as built by
+# :func:`describe_content`; falsy means none.
 # ``conditional``: whether the method's preconditions are evaluated.
 
 
@@ -594,10 +666,15 @@ def describe_content(
     ValueError
         If ``media_type`` is malformed, or a context is given for non-JSON
         content without ``context_type``.
+    HsrConfigError
+        If ``media_type`` is not in-band and a ``schema`` is given without a
+        ``context``.
     """
     key = media_type_key(media_type)
     if not schema:
         return None
+    if not context and not is_in_band(media_type):
+        raise HsrConfigError(SCHEMA_WITHOUT_CONTEXT.format(media_type=key))
     if essence(schema_type) == SCHEMA_TYPE:
         entry: dict[str, Any] = {"schema": {"$ref": schema}}
     else:
@@ -606,29 +683,6 @@ def describe_content(
         context_type = context_link_type(media_type, context_type)
         entry["x-rdf-context"] = {"href": context, "type": context_type}
     return {key: entry}
-
-
-def describe_options() -> dict[str, Any]:
-    """The ``options`` operation: a 200 whose content is the HTTP Schema Resource."""
-    return {
-        "responses": {
-            "200": {
-                "description": "OK",
-                "content": describe_content(
-                    "application/json",
-                    HSR_SCHEMA_URL,
-                    SCHEMA_TYPE,
-                    HSR_CONTEXT_URL,
-                    CONTEXT_TYPE,
-                ),
-            }
-        }
-    }
-
-
-def allow_header(body: Mapping[str, Any]) -> str:
-    """The ``Allow`` value for an HTTP Schema Resource ``body``: its methods."""
-    return ", ".join(key.upper() for key in body if key in METHOD_KEYS)
 
 
 def check_error_body_func(func: Any) -> None:
@@ -659,6 +713,67 @@ def with_error_body(
             f"error_body_func must return a dict, not {type(body).__name__}"
         )
     return dataclasses.replace(result, body=body)
+
+
+def _accept_ranges(accept: str) -> list[tuple[str, float]]:
+    """The ``(type/subtype range, q)`` pairs of an Accept field value."""
+    ranges = []
+    for item in accept.split(","):
+        pieces = [piece.strip() for piece in item.split(";")]
+        media_range = pieces[0].lower()
+        if "/" not in media_range:
+            continue
+        weight = 1.0
+        for parameter in pieces[1:]:
+            name, _, value = parameter.partition("=")
+            if name.strip().lower() == "q":
+                try:
+                    weight = min(max(float(value.strip()), 0.0), 1.0)
+                except ValueError:
+                    weight = 0.0
+                break
+        ranges.append((media_range, weight))
+    return ranges
+
+
+def _accept_rank(ranges: list[tuple[str, float]], media_type: str) -> tuple[float, int]:
+    """``(q, specificity)`` of ``media_type`` for the Accept ``ranges``.
+
+    The most specific matching range decides (RFC 9110 section 12.5.1);
+    ``(0.0, -1)`` when none matches.
+    """
+    kind = media_type.partition("/")[0]
+    best = -1
+    weight = 0.0
+    for media_range, q in ranges:
+        if media_range == media_type:
+            specificity = 2
+        elif media_range == f"{kind}/*":
+            specificity = 1
+        elif media_range == "*/*":
+            specificity = 0
+        else:
+            continue
+        if specificity > best:
+            best, weight = specificity, q
+    return weight, best
+
+
+def prefers_html(accept: str | None, media_type: str) -> bool:
+    """Whether an Accept field value prefers ``text/html`` to ``media_type``.
+
+    True iff ``text/html`` is acceptable (a quality above 0) and ranks above
+    ``media_type``'s essence: by quality first, then, at equal quality, by the
+    specificity of the range that matches it (RFC 9110 section 12.5.1). So
+    ``text/html,*/*;q=0.8`` and ``text/html, application/*`` prefer HTML, and
+    ``*/*`` does not. An absent or empty ``accept`` prefers nothing.
+    """
+    if not accept or not accept.strip():
+        return False
+    ranges = _accept_ranges(accept)
+    html = _accept_rank(ranges, "text/html")
+    other = _accept_rank(ranges, essence(media_type))
+    return html[0] > 0 and html > other
 
 
 def reason_phrase(status: int) -> str:

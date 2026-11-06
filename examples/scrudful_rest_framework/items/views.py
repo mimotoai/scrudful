@@ -116,8 +116,11 @@ def collection_etag(view, request, **kwargs):
     return hashlib.sha256(repr(rows).encode()).hexdigest()[:32]
 
 
-# Django's ``reverse`` gives a path, which scrudful resolves against the
-# request. DRF's ``reverse(..., request=request)`` would keep the request's
+# Link callables get ``(view, request, **url_kwargs)`` on a response, and
+# ``(view, None)`` when the HTTP Schema Resource is built, so they must return
+# the same target without the request. Django's ``reverse`` gives a path,
+# which scrudful resolves against ``SCRUDFUL["BASE_URL"]`` (settings.py).
+# DRF's ``reverse(..., request=request)`` would need the request, and keep its
 # ``?format=`` in the link targets, which then answer 404.
 def item_schema_url(view, request, **kwargs):
     return reverse("item-schema")

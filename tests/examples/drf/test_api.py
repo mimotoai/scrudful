@@ -7,18 +7,25 @@ settings are the pytest-django settings, so these tests drive the real router,
 
 from datetime import datetime, timezone
 
+import django.test
 import pytest
 from django.db import connection
-from django.urls import include, path
+from django.urls import include, path, resolve
 from items import views
 from items.models import Item
 from rest_framework.routers import SimpleRouter
 from rest_framework.test import APIClient
 
-from scrudful._adapter import allow_header, describe_options, options_links
+from scrudful._hsr import allow_value, hsr_link, options_operation
+from scrudful.rest_framework import hsr_urls, http_schema_resource
+from tests import test_wire_drf as wire
 from tests.semantic_http import (
+    hsr_get_problems,
+    hsr_link_problems,
     link_problems,
+    options_204_problems,
     parse_links,
+    undescribed_problems,
     validate_http_schema_resource,
 )
 
@@ -54,6 +61,55 @@ ITEM_CONTENT = {
 }
 
 
+ERROR_CONTENT = {
+    "application/json": {
+        "schema": {"$ref": f"{BASE}/schemas/error.json"},
+        "x-rdf-context": {
+            "href": f"{BASE}/contexts/error.jsonld",
+            "type": "application/ld+json",
+        },
+    }
+}
+
+
+@pytest.fixture(autouse=True)
+def base_url(settings):
+    """The example's ``SCRUDFUL["BASE_URL"]`` for APIClient's host (the
+    suite's settings, ``tests/settings.py``, have no ``SCRUDFUL``)."""
+    settings.SCRUDFUL = {"BASE_URL": f"{BASE}/"}
+
+
+def hsr_of(client, path):
+    """The HTTP Schema Resource of the route of ``path``, as the example's
+    ``hsr_urls()`` route serves it (the target of its OPTIONS's HSR link)."""
+    response = client.get(hsr_path(path))
+    assert response.status_code == 200, response.content
+    return response.json()
+
+
+def hsr_path(path):
+    """The path of the HTTP Schema Resource of the route of ``path``."""
+    return f"/_hsr/{resolve(path).view_name}"
+
+
+def with_hsr(links, path):
+    """``links`` and the HTTP Schema Resource link that every response of the
+    route of ``path`` carries."""
+    return f"{links}, {hsr_link(BASE + hsr_path(path))}"
+
+
+def options_problems(response, path, allow=None):
+    """How the OPTIONS ``response`` of ``path`` breaks the rules: a 204
+    without content, with ``Allow`` (listing the methods of ``allow``, an
+    ``Allow`` value, when given) and one HTTP Schema Resource link, to the
+    route of ``path``'s."""
+    headers = dict(response.items())
+    expected = None if allow is None else {m.strip() for m in allow.split(",")}
+    return options_204_problems(
+        response.status_code, headers, response.content, expected
+    ) + hsr_link_problems(headers, f"{BASE}{hsr_path(path)}")
+
+
 @pytest.fixture
 def client():
     return APIClient()
@@ -81,8 +137,8 @@ def test_retrieve_sends_validators_links_and_expose_headers(client, item):
     assert response.json()["name"] == "One"
     assert response["ETag"] == '"v1"'
     assert response["Last-Modified"] == MODIFIED_HTTP
-    assert response["Link"] == LINKS
-    assert response["Access-Control-Expose-Headers"] == "ETag, Link"
+    assert response["Link"] == with_hsr(LINKS, detail(item))
+    assert response["Access-Control-Expose-Headers"] == "ETag, Link, Allow"
 
 
 def test_echoed_etag_gives_304_with_validators(client, item):
@@ -92,7 +148,7 @@ def test_echoed_etag_gives_304_with_validators(client, item):
     assert response.content == b""
     assert response["ETag"] == '"v1"'
     assert response["Last-Modified"] == MODIFIED_HTTP
-    assert response["Access-Control-Expose-Headers"] == "ETag"
+    assert response["Access-Control-Expose-Headers"] == "ETag, Link, Allow"
 
 
 def test_echoed_last_modified_gives_304(client, item):
@@ -230,8 +286,8 @@ def test_write_response_carries_the_new_validators(client, item, method):
     assert response["ETag"] == after["ETag"]
     assert response["Last-Modified"] == after["Last-Modified"]
     assert response["Last-Modified"] != MODIFIED_HTTP
-    assert response["Link"] == LINKS
-    assert response["Access-Control-Expose-Headers"] == "ETag, Link"
+    assert response["Link"] == with_hsr(LINKS, detail(item))
+    assert response["Access-Control-Expose-Headers"] == "ETag, Link, Allow"
 
 
 def test_edit_loop_reuses_the_write_response_etag(client, item):
@@ -262,8 +318,9 @@ def test_delete_with_if_match(client, item):
     assert response.status_code == 204
     assert "ETag" not in response
     assert "Last-Modified" not in response
-    # A 204 has no content for the item's Links to describe.
-    assert "Link" not in response
+    # A 204 has no content for the item's Links to describe: only the link
+    # to its HTTP Schema Resource.
+    assert response["Link"] == hsr_link(BASE + hsr_path(detail(item)))
     assert not Item.objects.filter(pk=item.pk).exists()
 
 
@@ -344,7 +401,11 @@ class ScopedItemViewSet(views.ItemViewSet):
 
 scoped_router = SimpleRouter()
 scoped_router.register("scoped-items", ScopedItemViewSet, basename="scoped-item")
-urlpatterns = [path("", include("items.urls")), path("", include(scoped_router.urls))]
+urlpatterns = [
+    path("", include("items.urls")),
+    path("", include(scoped_router.urls)),
+    path("", include(hsr_urls())),
+]
 
 
 @pytest.mark.urls(__name__)
@@ -396,8 +457,8 @@ def test_create_exposes_location_and_sends_no_validators(client):
     assert response["Location"] == f"{BASE}/items/{item.pk}/"
     assert "ETag" not in response
     assert "Last-Modified" not in response
-    assert response["Link"] == LINKS
-    assert response["Access-Control-Expose-Headers"] == "Link, Location"
+    assert response["Link"] == with_hsr(LINKS, "/items/")
+    assert response["Access-Control-Expose-Headers"] == "Link, Location, Allow"
 
 
 def test_create_checks_the_preconditions_of_the_collection(client, item):
@@ -424,13 +485,14 @@ def test_list_has_a_collection_etag(client, item):
     assert [entry["name"] for entry in response.json()] == ["One"]
     etag = response["ETag"]
     assert "Last-Modified" not in response
-    assert response["Link"] == (
+    assert response["Link"] == with_hsr(
         f'<{BASE}/schemas/items.json>; rel="describedby"; '
         'type="application/schema+json", '
         f'<{BASE}/contexts/item.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; '
-        'type="application/ld+json"'
+        'type="application/ld+json"',
+        "/items/",
     )
-    assert response["Access-Control-Expose-Headers"] == "ETag, Link"
+    assert response["Access-Control-Expose-Headers"] == "ETag, Link, Allow"
     assert client.get("/items/", headers={"If-None-Match": etag}).status_code == 304
 
     client.post("/items/", {"name": "Two"}, format="json")
@@ -456,7 +518,7 @@ def test_readonly_viewset_reads(client, item):
     response = client.get(f"/readonly-items/{item.pk}/")
     assert response.status_code == 200
     assert response["ETag"] == '"v1"'
-    assert response["Link"] == LINKS
+    assert response["Link"] == with_hsr(LINKS, f"/readonly-items/{item.pk}/")
     etag = client.get("/readonly-items/")["ETag"]
     response = client.get("/readonly-items/", headers={"If-None-Match": etag})
     assert response.status_code == 304
@@ -480,9 +542,11 @@ def test_readonly_viewset_rejects_writes_with_405(client, item, method, path):
 
 def test_readonly_viewset_options_lists_only_get(client, item):
     for path_ in (f"/readonly-items/{item.pk}/", "/readonly-items/"):
-        body = client.options(path_).json()
+        body = hsr_of(client, path_)
         validate_http_schema_resource(body)
         assert list(body) == ["get", "options", "head"]
+        response = client.options(path_)
+        assert options_problems(response, path_, "GET, OPTIONS, HEAD") == []
 
 
 # --- OPTIONS metadata ---------------------------------------------------------
@@ -490,26 +554,39 @@ def test_readonly_viewset_options_lists_only_get(client, item):
 
 def test_options_describes_the_detail_route(client, item):
     response = client.options(detail(item))
-    assert response.status_code == 200
-    metadata = response.json()
+    assert options_problems(response, detail(item)) == []
+    metadata = hsr_of(client, detail(item))
     validate_http_schema_resource(metadata)
     assert list(metadata) == ["get", "put", "delete", "options", "head", "patch"]
     assert metadata["get"]["responses"]["200"] == {
         "description": "OK",
         "content": ITEM_CONTENT,
     }
-    assert set(metadata["get"]["responses"]) == {"200", "304", "400", "412"}
-    assert set(metadata["head"]["responses"]) == {"200", "304", "400", "412"}
+    read = {"200", "304", "400", "412", "default"}
+    assert set(metadata["get"]["responses"]) == read
+    assert set(metadata["head"]["responses"]) == read
+    write = {"200", "400", "412", "428", "default"}
     for method in ("put", "patch"):
         assert metadata[method]["requestBody"]["content"] == ITEM_CONTENT
-        assert set(metadata[method]["responses"]) == {"200", "400", "412", "428"}
+        assert set(metadata[method]["responses"]) == write
     assert metadata["put"]["requestBody"]["description"] == (
         "The new content of the resource."
     )
     assert metadata["patch"]["requestBody"]["description"] == (
         "The changes to apply to the resource."
     )
-    assert set(metadata["delete"]["responses"]) == {"204", "400", "412", "428"}
+    assert set(metadata["delete"]["responses"]) == {
+        "204",
+        "400",
+        "412",
+        "428",
+        "default",
+    }
+    # The errors the exception handler gives the error entity's Links.
+    assert metadata["get"]["responses"]["default"] == {
+        "description": "Error.",
+        "content": ERROR_CONTENT,
+    }
     for method in ("put", "patch", "delete"):
         names = [p["name"] for p in metadata[method]["parameters"]]
         assert names == ["If-Match", "If-Unmodified-Since"]
@@ -518,16 +595,16 @@ def test_options_describes_the_detail_route(client, item):
 
 
 def test_options_describes_the_list_route(client):
-    metadata = client.options("/items/").json()
+    metadata = hsr_of(client, "/items/")
     validate_http_schema_resource(metadata)
     assert list(metadata) == ["get", "post", "options", "head"]
     assert metadata["post"]["requestBody"]["description"] == (
         "The content for the resource to be created."
     )
     # Its preconditions are evaluated against the list's ETag, never required.
-    assert set(metadata["post"]["responses"]) == {"201", "400", "412"}
+    assert set(metadata["post"]["responses"]) == {"201", "400", "412", "default"}
     assert "parameters" not in metadata["post"]
-    assert set(metadata["get"]["responses"]) == {"200", "304", "400", "412"}
+    assert set(metadata["get"]["responses"]) == {"200", "304", "400", "412", "default"}
 
 
 @pytest.mark.parametrize(
@@ -537,26 +614,26 @@ def test_options_describes_the_list_route(client):
 def test_options_valid_0_1(client, item, path):
     path = path.format(pk=item.pk)
     response = client.options(path)
-    assert response.status_code == 200
-    assert response["Content-Type"] == "application/json"
-    body = response.json()
+    body = hsr_of(client, path)
     validate_http_schema_resource(body)
-    assert response["Link"] == options_links()
-    assert response["Allow"] == allow_header(body)
-    assert body["options"] == describe_options()
-    # The body lists exactly the methods the route serves, HEAD included.
+    # The example has no permission classes: every method the HSR
+    # describes is allowed to anyone.
+    assert options_problems(response, path, allow_value(body)) == []
+    assert response["Allow"] == allow_value(body)
+    assert body["options"] == options_operation()
+    # The HSR lists exactly the methods the route serves, HEAD included.
     assert ("head" in body) == (client.head(path).status_code != 405)
     assert "head" in body
-    assert link_problems("OPTIONS", 200, dict(response.items()), True, body) == []
+    assert "HEAD" in response["Allow"]
 
 
 def test_options_write_response_content(client, item):
-    metadata = client.options(detail(item)).json()
+    metadata = hsr_of(client, detail(item))
     validate_http_schema_resource(metadata)
     for method in ("put", "patch"):
         assert metadata[method]["requestBody"]["content"] == ITEM_CONTENT
         assert metadata[method]["responses"]["200"]["content"] == ITEM_CONTENT
-    listing = client.options("/items/").json()
+    listing = hsr_of(client, "/items/")
     validate_http_schema_resource(listing)
     assert listing["post"]["requestBody"]["content"] == ITEM_CONTENT
     assert listing["post"]["responses"]["201"]["content"] == ITEM_CONTENT
@@ -573,7 +650,7 @@ def test_stats_function_view(client, item):
     assert etag == client.get("/items/")["ETag"]
     assert client.get("/stats/", headers={"If-None-Match": etag}).status_code == 304
     assert client.post("/stats/").status_code == 405
-    body = client.options("/stats/").json()
+    body = hsr_of(client, "/stats/")
     validate_http_schema_resource(body)
     assert list(body) == ["get", "options", "head"]
 
@@ -611,7 +688,7 @@ CONFORMANCE = [
     ("delete", ITEM, {"headers": IF_MATCH}, 204),
     ("delete", ITEM, {}, 428),
     ("delete", ITEM, {"headers": IF_MATCH_STALE}, 412),
-    ("options", ITEM, {}, 200),
+    ("options", ITEM, {}, 204),
     ("get", "/items/999/", {}, 404),
     ("put", "/items/999/", {**BODY, "headers": IF_MATCH}, 412),
     ("post", ITEM, {}, 405),
@@ -622,32 +699,32 @@ CONFORMANCE = [
     ("head", LIST, {"headers": NOT_MODIFIED}, 304),
     ("post", LIST, {**BODY}, 201),
     ("post", LIST, {**INVALID}, 400),
-    ("options", LIST, {}, 200),
+    ("options", LIST, {}, 204),
     ("put", LIST, {}, 405),
     ("get", READONLY, {}, 200),
     ("get", READONLY, {"headers": NOT_MODIFIED}, 304),
     ("get", READONLY, {"headers": IF_MATCH_STALE}, 412),
     ("head", READONLY, {}, 200),
     ("head", READONLY, {"headers": NOT_MODIFIED}, 304),
-    ("options", READONLY, {}, 200),
+    ("options", READONLY, {}, 204),
     ("get", "/readonly-items/999/", {}, 404),
     ("post", READONLY, {}, 405),
     ("get", READONLY_LIST, {}, 200),
     ("get", READONLY_LIST, {"headers": NOT_MODIFIED}, 304),
     ("head", READONLY_LIST, {}, 200),
-    ("options", READONLY_LIST, {}, 200),
+    ("options", READONLY_LIST, {}, 204),
     ("post", READONLY_LIST, {**BODY}, 405),
     ("get", STATS, {}, 200),
     ("get", STATS, {"headers": NOT_MODIFIED}, 304),
     ("get", STATS, {"headers": IF_MATCH_STALE}, 412),
     ("head", STATS, {}, 200),
     ("head", STATS, {"headers": NOT_MODIFIED}, 304),
-    ("options", STATS, {}, 200),
+    ("options", STATS, {}, 204),
     ("post", STATS, {}, 405),
 ]
-# Statuses with nothing in the OPTIONS bodies to agree with: DRF's 404 and 405
-# are not listed, and a 304 (a HEAD's too) has no content, hence no entry. Their
-# Links are still checked by the rules that don't need the body.
+# Statuses with nothing in the HTTP Schema Resources to agree with: DRF's 404
+# and 405 are not listed, and a 304 (a HEAD's too) has no content, hence no
+# entry. Their Links are still checked by the rules that don't need the body.
 NO_ENTRY = {304, 404, 405}
 
 
@@ -658,13 +735,17 @@ NO_ENTRY = {304, 404, 405}
 )
 def test_example_links_everywhere(client, item, method, path, arguments, status):
     """Every response, a HEAD included, follows the Semantic HTTP 0.1 Link rules
-    and agrees with the OPTIONS body of its path."""
+    and agrees with the HTTP Schema Resource of its path; an OPTIONS is the
+    204 with the HSR link."""
     path = path.format(pk=item.pk)
-    hsr = client.options(path).json()
+    hsr = hsr_of(client, path)
     response = getattr(client, method)(path, **arguments)
     assert response.status_code == status
     content = method != "head" and bool(response.content)
     assert content == (status not in (204, 304) and method != "head")
+    if method == "options":
+        assert options_problems(response, path, allow_value(hsr)) == []
+        return
     problems = link_problems(
         method.upper(),
         status,
@@ -694,14 +775,14 @@ def test_example_links_are_served_with_the_documents(client, item, path):
 def test_format_suffix_routes(client, item):
     """The router's ``.json`` routes: the callables take DRF's ``format`` too."""
     for url in (f"/items/{item.pk}.json", "/items.json"):
-        hsr = client.options(url).json()
+        hsr = hsr_of(client, url)
         validate_http_schema_resource(hsr)
         response = client.get(url)
         assert response.status_code == 200, url
         assert "ETag" in response
         assert link_problems("GET", 200, dict(response.items()), True, hsr) == []
     response = client.get(f"/items/{item.pk}.json")
-    assert response["Link"] == LINKS
+    assert response["Link"] == with_hsr(LINKS, f"/items/{item.pk}.json")
     response = client.put(f"/items/{item.pk}.json", {"name": "Two"}, format="json")
     assert response.status_code == 428
 
@@ -710,7 +791,7 @@ def test_format_query_parameter_stays_out_of_the_links(client, item):
     """``?format=json`` is negotiation, not part of the linked documents' URLs."""
     response = client.get(detail(item) + "?format=json")
     assert response.status_code == 200
-    assert response["Link"] == LINKS
+    assert response["Link"] == with_hsr(LINKS, detail(item))
     response = client.put(detail(item) + "?format=json", {"name": "Two"}, format="json")
     assert response.status_code == 428
     for target, _ in parse_links(response["Link"]):
@@ -728,5 +809,119 @@ def test_only_json_is_served_and_accepted(client, item):
         "/items/", "name=Two", content_type="application/x-www-form-urlencoded"
     )
     assert response.status_code == 415
-    hsr = client.options("/items/").json()
+    hsr = hsr_of(client, "/items/")
     assert list(hsr["post"]["requestBody"]["content"]) == ["application/json"]
+
+
+@pytest.mark.parametrize(
+    "view_name, path",
+    [
+        ("item-detail", "/items/1/"),
+        ("item-list", "/items/"),
+        ("readonly-item-detail", "/readonly-items/1/"),
+        ("readonly-item-list", "/readonly-items/"),
+        ("item-stats", "/stats/"),
+    ],
+)
+def test_hsr_urls_serve_every_view(client, view_name, path):
+    """The example's URLconf includes ``hsr_urls()``."""
+    response = client.get(f"/_hsr/{view_name}")
+    headers = dict(response.items())
+    assert hsr_get_problems(response.status_code, headers, response.content) == []
+    assert response.json() == http_schema_resource(resolve(path).func)
+
+
+# --- The wire-conformance suite, on the example ----------------------------------
+#
+# The exchanges of tests/test_wire_drf.py with the example project, through the
+# example's own URLconf (its hsr_urls() include and handler404 / handler500),
+# with DEBUG off, checked as that suite checks them (tests/semantic_http.py).
+
+
+@pytest.fixture
+def wire_client(settings):
+    settings.DEBUG = False
+    return django.test.Client(raise_request_exception=False)
+
+
+@pytest.mark.parametrize("exchange", wire.example_exchanges(), ids=lambda e: e.id)
+def test_wire_exchanges(wire_client, exchange):
+    """Every response has its content Links and the HSR link of its route,
+    and agrees with its HSR entry."""
+    world = wire.World()
+    response = wire.send(wire_client, world, exchange)
+    headers = wire.headers_of(response)
+    content = wire.has_content(exchange, response)
+    hsr = None
+    if exchange.status not in (304, 405):
+        hsr = wire.hsr_of(wire_client, exchange.kind)
+    problems = link_problems(exchange.method, exchange.status, headers, content, hsr)
+    assert problems == []
+    assert hsr_link_problems(headers, wire.target(exchange.kind)) == []
+
+
+@pytest.mark.parametrize(
+    "kind, url, allow",
+    [
+        ("item", "/items/{one}/", wire.ITEM_METHODS),
+        ("items", "/items/", {"GET", "HEAD", "POST", "OPTIONS"}),
+        ("readonly", "/readonly-items/{one}/", wire.READ),
+        ("readonly-list", "/readonly-items/", wire.READ),
+        ("stats", "/stats/", wire.READ),
+    ],
+)
+def test_wire_options_and_hsr(wire_client, kind, url, allow):
+    """The OPTIONS 204 (its ``Allow`` and HSR link) and the HSR route."""
+    response = wire_client.options(wire.World().format(url))
+    headers = wire.headers_of(response)
+    problems = options_204_problems(
+        response.status_code, headers, response.content, allow
+    )
+    assert problems == []
+    assert hsr_link_problems(headers, wire.target(kind)) == []
+    document = wire_client.get(wire.HSR_ROUTES[kind])
+    headers = wire.headers_of(document)
+    assert hsr_get_problems(document.status_code, headers, document.content) == []
+
+
+@pytest.mark.parametrize("accept", [None, "application/json"], ids=["absent", "json"])
+@pytest.mark.parametrize(
+    "method, url",
+    [
+        ("GET", "/nope/"),
+        ("GET", "/items/abc/"),
+        ("GET", "/items/{missing}/"),
+        ("TRACE", "/items/{one}/"),
+        ("GET", "/_hsr/nope"),
+        ("POST", "/_hsr/item-detail"),
+    ],
+)
+def test_wire_no_undescribed_content(wire_client, accept, method, url):
+    """No error is content the HSR doesn't describe, for an absent ``Accept``
+    or ``Accept: application/json``: the example's handler404 answers a URL
+    no pattern matches with JSON. The HSR route's own 404, for a name that
+    is no scrudful route's, is ``{"detail": "Not found."}`` without Links:
+    it is no resource's, and its URL is no HSR link's target."""
+    hsr = wire.hsr_of(wire_client, "item")
+    headers = {} if accept is None else {"Accept": accept}
+    url = wire.World().format(url)
+    response = wire_client.generic(method, url, headers=headers)
+    assert response.status_code >= 400
+    response_headers = wire.headers_of(response)
+    assert undescribed_problems(accept, response_headers, hsr) == []
+    if url != "/_hsr/nope":
+        content = bool(response.content)
+        status = response.status_code
+        assert link_problems(method, status, response_headers, content) == []
+
+
+def test_wire_django_404_is_html_only_when_preferred(wire_client):
+    """The example's handler404: Django's HTML page for a browser, with
+    ``Vary: Accept``; JSON with the error Links otherwise."""
+    response = wire_client.get("/nope/", headers={"Accept": wire.BROWSER})
+    assert response["Content-Type"].startswith("text/html")
+    assert "Accept" in response["Vary"]
+    response = wire_client.get("/nope/")
+    assert response["Content-Type"] == "application/json"
+    assert "Accept" in response["Vary"]
+    assert link_problems("GET", 404, wire.headers_of(response), True) == []

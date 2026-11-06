@@ -1,7 +1,7 @@
 """``object_validators``: validators computed from ``get_object()``."""
 
 import pytest
-from django.urls import include, path
+from django.urls import include, path, resolve
 from rest_framework import generics, serializers, viewsets
 from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
@@ -13,6 +13,8 @@ from scrudful.problem import PROBLEM_JSON, problem_details
 from scrudful.rest_framework import (
     Entity,
     exception_handler,
+    hsr_urls,
+    http_schema_resource,
     scrudful,
     scrudful_api_view,
     scrudful_viewset,
@@ -22,6 +24,13 @@ pytestmark = [pytest.mark.urls(__name__), pytest.mark.django_db]
 
 calls: list = []
 object_checks: list = []
+
+
+@pytest.fixture(autouse=True)
+def base_url(settings):
+    """The HTTP Schema Resource resolves relative links against the base URL,
+    never the request: APIClient's host, so the URIs are those of 0.9."""
+    settings.SCRUDFUL = {"BASE_URL": "http://testserver/"}
 
 
 @pytest.fixture(autouse=True)
@@ -90,7 +99,9 @@ class ExplicitView(generics.RetrieveUpdateDestroyAPIView):
         return super().put(request, *args, **kwargs)
 
 
-ERROR = Entity(schema_link_or_func="/schemas/error")
+ERROR = Entity(
+    schema_link_or_func="/schemas/error", context_link_or_func="/contexts/error"
+)
 
 
 @scrudful_viewset
@@ -197,7 +208,11 @@ class ProblemViewSet(viewsets.ModelViewSet):
     class Meta:
         object_validators = True
         etag_func = object_etag
-        error = Entity(schema_link_or_func="/schemas/error", media_type=PROBLEM_JSON)
+        error = Entity(
+            schema_link_or_func="/schemas/error",
+            context_link_or_func="/contexts/error",
+            media_type=PROBLEM_JSON,
+        )
         error_body_func = problem_details
 
 
@@ -214,8 +229,10 @@ router.register("objects", ObjectViewSet, basename="object")
 router.register("legacy", LegacyViewSet, basename="legacy")
 urlpatterns = [
     path("", include(router.urls)),
-    path("explicit/<int:pk>/", ExplicitView.as_view()),
-    path("explicit-create/", ExplicitCreateView.as_view()),
+    path("explicit/<int:pk>/", ExplicitView.as_view(), name="explicit"),
+    path("explicit-create/", ExplicitCreateView.as_view(), name="explicit-create"),
+    # Every response of a scrudful view links its HTTP Schema Resource.
+    path("", include(hsr_urls())),
 ]
 
 
@@ -433,8 +450,8 @@ def test_create_without_object_validators_is_unchanged(client):
 def test_options_does_not_describe_201_validators(client):
     """As ninja's create: described with its 201 only (describe_write has no
     response-header description), never as a conditional write."""
-    post = client.options("/creates/").json()["post"]
-    assert list(post["responses"]) == ["201"]
+    post = http_schema_resource(resolve("/creates/").func)["post"]
+    assert list(post["responses"]) == ["201", "default"]
     assert "parameters" not in post
 
 
@@ -444,8 +461,8 @@ def test_create_without_location_func_sends_validators_only(client):
     created = Item.objects.get(name="new")
     assert response["ETag"] == f'"v{created.version}"'
     assert "Location" not in response
-    post = client.options("/nolocs/").json()["post"]
-    assert list(post["responses"]) == ["201"]
+    post = http_schema_resource(resolve("/nolocs/").func)["post"]
+    assert list(post["responses"]) == ["201", "default"]
     assert "parameters" not in post
 
 

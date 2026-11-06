@@ -2,31 +2,36 @@
 
 import dataclasses
 import inspect
+import logging
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Annotated
+from typing import Annotated, Any
 
 import pytest
 from fastapi import (
     APIRouter,
     Depends,
     FastAPI,
+    Header,
     HTTPException,
     Path,
     Query,
     Request,
     Response,
+    Security,
 )
 from fastapi.exception_handlers import (
     http_exception_handler,
     request_validation_exception_handler,
 )
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.testclient import TestClient
-from pydantic import BaseModel
+from jsonschema import Draft202012Validator
+from pydantic import BaseModel, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Mount, Router
 
@@ -39,18 +44,19 @@ from scrudful.fastapi import (
     _EndpointConfig,
     add_error_links,
     add_options,
+    http_schema_resource,
     scrudful,
 )
-from scrudful._adapter import (
-    allow_header,
-    describe_options,
-    describe_read,
-    describe_write,
-    options_links,
-)
+from scrudful._hsr import hsr_link
+from scrudful.problem import problem_from_errors
 from tests import fastapi_future_annotations as future_endpoints
 from tests.semantic_http import (
+    HSR_DOCUMENT_REL,
+    PROBLEM_DETAILS_SCHEMA,
+    hsr_get_problems,
+    hsr_link_problems,
     link_problems,
+    options_204_problems,
     parse_links,
     validate_http_schema_resource,
 )
@@ -63,6 +69,9 @@ EARLIER_HTTP = "Tue, 02 Jan 2024 03:04:04 GMT"
 IST = timezone(timedelta(hours=5, minutes=30))
 SCHEMA = "http://example.com/schema.json"
 CONTEXT = "http://example.com/context.jsonld"
+#: The base URL of the add_options calls: the test client's, so the relative
+#: links resolve as against its requests.
+TEST_BASE_URL = "http://testserver/"
 SCHEMA_LINK = f'<{SCHEMA}>; rel="describedby"; type="application/schema+json"'
 CONTEXT_LINK = (
     f'<{CONTEXT}>; rel="http://www.w3.org/ns/json-ld#context"; '
@@ -268,13 +277,17 @@ def test_future_annotations_are_evaluated_in_the_endpoint_module(make_client):
     assert response.headers["etag"] == '"v3"'
 
 
-def test_unresolvable_annotations_fall_back_to_the_unevaluated_signature():
+def test_an_unresolvable_annotation_stays_a_string_and_the_others_are_evaluated():
+    """Each annotation is evaluated on its own: one that can't be stays as
+    it is, and doesn't leave the others unevaluated (a FastAPI evaluating
+    them in the wrapper's globals would miss the endpoint's names)."""
+
     @scrudful()
     async def endpoint(item_id: "int", thing: "Undefined" = None):  # noqa: F821
         pass
 
     params = inspect.signature(endpoint).parameters
-    assert params["item_id"].annotation == "int"
+    assert params["item_id"].annotation is int
     assert params["thing"].annotation == "Undefined"
 
 
@@ -507,6 +520,7 @@ def test_returned_response_gets_the_headers(make_client, store):
         etag_func=store.etag,
         last_modified_func=store.last_modified,
         schema_link_or_func=SCHEMA,
+        context_link_or_func=CONTEXT,
     )
     async def get_items():
         return JSONResponse({"a": 1}, headers={"X-Own": "1"})
@@ -516,8 +530,8 @@ def test_returned_response_gets_the_headers(make_client, store):
     assert response.headers["x-own"] == "1"
     assert response.headers["etag"] == '"v1"'
     assert response.headers["last-modified"] == MODIFIED_HTTP
-    assert response.headers["link"] == SCHEMA_LINK
-    assert response.headers["access-control-expose-headers"] == "ETag, Link"
+    assert response.headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+    assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
 
 
 @pytest.mark.parametrize("returned", [True, False])
@@ -557,14 +571,16 @@ def test_route_status_code_decides_whether_validators_are_sent(make_client, stor
     response = client.get("/redirect", follow_redirects=False)
     assert response.status_code == 307
     assert "etag" not in response.headers
-    assert response.headers["access-control-expose-headers"] == "Location"
+    assert response.headers["access-control-expose-headers"] == "Link, Location, Allow"
 
 
 def test_http_exception_propagates_unchanged(make_client, store):
     app = FastAPI()
 
     @app.get("/items")
-    @scrudful(etag_func=store.etag, schema_link_or_func=SCHEMA)
+    @scrudful(
+        etag_func=store.etag, schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT
+    )
     async def get_items():
         raise HTTPException(status_code=409, detail="nope", headers={"X-A": "b"})
 
@@ -639,7 +655,9 @@ def test_headers_set_by_the_endpoint_are_kept_and_merged(make_client, store):
         '<http://example.com/1>; rel="prev", <http://example.com/3>; rel="next", '
         f"{SCHEMA_LINK}, {CONTEXT_LINK}"
     ]
-    assert response.headers["access-control-expose-headers"] == "X-Total, ETag, Link"
+    assert response.headers["access-control-expose-headers"] == (
+        "X-Total, ETag, Link, Allow"
+    )
 
 
 def test_cors_middleware_replaces_expose_headers_on_cross_origin_requests(
@@ -659,7 +677,9 @@ def test_cors_middleware_replaces_expose_headers_on_cross_origin_requests(
         return {}
 
     client = make_client(app)
-    assert client.get("/items").headers["access-control-expose-headers"] == "ETag"
+    assert client.get("/items").headers["access-control-expose-headers"] == (
+        "ETag, Link, Allow"
+    )
     cross_origin = client.get("/items", headers={"Origin": "http://other.example"})
     assert cross_origin.headers["access-control-expose-headers"] == (
         "ETag, Link, Location"
@@ -749,6 +769,7 @@ def test_link_defaults_and_custom_values(make_client):
         schema_link_or_func=SCHEMA,
         schema_rel_or_func=lambda **kwargs: None,
         schema_type_or_func=lambda **kwargs: "",
+        context_link_or_func=CONTEXT,
     )
     async def callable_defaults():
         return {}
@@ -756,14 +777,16 @@ def test_link_defaults_and_custom_values(make_client):
     client = make_client(app)
     response = client.get("/defaults")
     assert response.headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
-    assert response.headers["access-control-expose-headers"] == "Link"
+    assert response.headers["access-control-expose-headers"] == "Link, Allow"
     assert client.get("/custom").headers["link"] == (
         f'<{SCHEMA}>; rel="schema"; type="application/schema+json"'
     )
     response = client.get("/none")
     assert "link" not in response.headers
-    assert "access-control-expose-headers" not in response.headers
-    assert client.get("/callable-defaults").headers["link"] == SCHEMA_LINK
+    assert response.headers["access-control-expose-headers"] == "Link, Allow"
+    assert client.get("/callable-defaults").headers["link"] == (
+        f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+    )
 
 
 def test_link_values_are_escaped(make_client):
@@ -855,7 +878,7 @@ def test_get_returns_validators(client):
     assert response.headers["etag"] == '"v1"'
     assert response.headers["last-modified"] == MODIFIED_HTTP
     assert response.headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
-    assert response.headers["access-control-expose-headers"] == "ETag, Link"
+    assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
 
 
 @pytest.mark.parametrize(
@@ -868,7 +891,7 @@ def test_if_none_match_gives_304_with_validators(client, store, if_none_match):
     assert response.content == b""
     assert response.headers["etag"] == '"v1"'
     assert response.headers["last-modified"] == MODIFIED_HTTP
-    assert response.headers["access-control-expose-headers"] == "ETag"
+    assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
     assert "endpoint" not in store.calls
 
 
@@ -1003,7 +1026,7 @@ def test_conditional_write_gets_fresh_validators(client, store, method, headers)
     assert response.json() == {"version": 2, "method": method}
     assert response.headers["etag"] == '"v2"'
     assert response.headers["last-modified"] == "Tue, 02 Jan 2024 04:04:05 GMT"
-    assert response.headers["access-control-expose-headers"] == "ETag"
+    assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
     assert store.calls == ["etag", "last_modified", "endpoint"] + [
         "etag",
         "last_modified",
@@ -1079,7 +1102,7 @@ def test_no_preconditions_without_validator_callbacks(make_client):
     app = FastAPI()
 
     @app.api_route("/item", methods=["GET", "PUT", "DELETE"])
-    @scrudful(schema_link_or_func=SCHEMA)
+    @scrudful(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
     async def item():
         return {}
 
@@ -1088,7 +1111,7 @@ def test_no_preconditions_without_validator_callbacks(make_client):
         for headers in ({}, {"If-Match": "*"}, {"If-Match": "x"}):
             response = client.request(method, "/item", headers=headers)
             assert response.status_code == 200
-            assert response.headers["link"] == SCHEMA_LINK
+            assert response.headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
             assert "etag" not in response.headers
 
 
@@ -1218,7 +1241,9 @@ def test_304_carries_dependency_headers(make_client, store):
         "session=abc; Path=/; SameSite=lax",
         "raw=1",
     ]
-    assert response.headers["access-control-expose-headers"] == "X-Custom, ETag"
+    assert response.headers["access-control-expose-headers"] == (
+        "X-Custom, ETag, Link, Allow"
+    )
     assert "content-type" not in response.headers
     assert "content-encoding" not in response.headers
     assert response.content == b""
@@ -1237,7 +1262,7 @@ def test_412_carries_only_dependency_cookies(make_client, store):
     assert "cache-control" not in response.headers
     assert "vary" not in response.headers
     assert "etag" not in response.headers
-    assert response.headers["access-control-expose-headers"] == "X-Custom"
+    assert response.headers["access-control-expose-headers"] == "X-Custom, Link, Allow"
 
 
 # --- default status of the response class --------------------------------------
@@ -1495,10 +1520,10 @@ def test_empty_dependency_expose_header_on_early_responses(make_client, store):
     client = make_client(app)
     response = client.put("/item", headers={"If-Match": '"other"'})
     assert response.status_code == 412
-    assert "access-control-expose-headers" not in response.headers
+    assert response.headers["access-control-expose-headers"] == "Link, Allow"
     response = client.put("/item")
     assert response.status_code == 428
-    assert "access-control-expose-headers" not in response.headers
+    assert response.headers["access-control-expose-headers"] == "Link, Allow"
 
 
 def test_empty_if_match_is_absent(make_client, store):
@@ -1549,7 +1574,7 @@ def test_repeated_expose_header_lines_are_all_kept(make_client, store):
 
     response = make_client(app).get("/item")
     assert response.headers.get_list("access-control-expose-headers") == [
-        "X-One, X-Two, ETag"
+        "X-One, X-Two, ETag, Link, Allow"
     ]
 
 
@@ -1571,7 +1596,7 @@ def _error_app(store, error=ERROR):
     app = FastAPI()
 
     @app.api_route("/items/{item_id}", methods=["GET", "PUT"])
-    @scrudful(etag_func=store.etag, schema_link_or_func=SCHEMA, error=error)
+    @scrudful(etag_func=store.etag, **ITEM_LINKS, error=error)
     async def item(item_id: int):
         return {}
 
@@ -1617,6 +1642,60 @@ def test_early_responses_without_error_are_unchanged(make_client, store):
     assert response.status_code == 428
     assert "link" not in response.headers
     assert response.headers["content-type"] == "application/json"
+
+
+@pytest.mark.parametrize(
+    "method, headers, status",
+    [
+        ("PUT", {"If-Match": '"other"'}, 412),
+        ("PUT", {}, 428),
+        ("GET", {"If-None-Match": "v1"}, 400),
+    ],
+)
+def test_early_responses_without_error_get_the_app_s_error_entity(
+    make_client, store, method, headers, status
+):
+    """Without the endpoint's ``error``, scrudful's own 400, 412 and 428 are
+    described by the app's ``add_error_links`` entity, on the wire and in the
+    HSR, as the errors the app's handlers answer for it are. Its callables get
+    ``request=`` only, as in those handlers."""
+    seen = []
+
+    def schema(request=None):  # None in describe mode
+        seen.append(type(request).__name__)
+        return "/schemas/error"
+
+    app = _error_app(store, error=None)
+    add_error_links(
+        app,
+        Entity(
+            schema_link_or_func=schema,
+            context_link_or_func="http://example.com/error.jsonld",
+            media_type="application/problem+json",
+        ),
+    )
+    add_options(app, base_url="http://testserver/")
+    response = make_client(app).request(method, "/items/3", headers=headers)
+    assert response.status_code == status
+    assert response.headers["content-type"] == "application/problem+json"
+    hsr_link = (
+        '<http://testserver/_hsr/items.item_id>; rel="https://w3id.org/'
+        'semantic-http/ns#http-schema-resource-document"; type="application/json"'
+    )
+    assert response.headers["link"] == f"{ERROR_LINKS}, {hsr_link}"
+    assert "Request" in seen
+    hsr = http_schema_resource(app, "/items/{item_id}")
+    entry = hsr[method.lower()]["responses"][str(status)]
+    assert entry["content"] == {
+        "application/problem+json": {
+            "schema": {"$ref": "http://testserver/schemas/error"},
+            "x-rdf-context": {
+                "href": "http://example.com/error.jsonld",
+                "type": "application/ld+json",
+            },
+        }
+    }
+    assert link_problems(method, status, response.headers, True, hsr) == []
 
 
 def test_error_link_callables_get_the_endpoint_kwargs(make_client, store):
@@ -1665,39 +1744,90 @@ def _add_to_new_app(error):
     add_error_links(FastAPI(), error)
 
 
-def test_dependency_link_is_not_copied_onto_early_errors(make_client, store):
-    """A dependency's Link describes the success representation."""
+#: Links a dependency sets: the success representation's schema and context
+#: (relations in other cases, and the rdf-context one), and an author link.
+DEPENDENCY_SCHEMA_LINK = (
+    '<http://example.com/other>; rel="DescribedBy"; type="application/schema+json"'
+)
+DEPENDENCY_CONTEXT_LINKS = (
+    '<http://example.com/other.jsonld>; rel="http://www.w3.org/ns/JSON-LD#context"; '
+    'type="application/ld+json", <http://example.com/other.csvm>; '
+    'rel="https://w3id.org/semantic-http/ns#rdf-context"; type="application/csvm+json"'
+)
+AUTHOR_LINK = '<http://example.com/me>; rel="author"'
+
+
+def _dependency_links_app(store, error):
+    """``/items/{item_id}`` (GET, PUT), whose dependency sets the success
+    representation's schema and context links, an author link and a cookie."""
     app = FastAPI()
-    dependency_link = (
-        '<http://example.com/other>; rel="describedby"; type="application/schema+json"'
-    )
 
     def set_headers(response: Response):
-        response.headers["Link"] = dependency_link
+        response.headers.append("Link", DEPENDENCY_SCHEMA_LINK)
+        response.headers.append("Link", f"{DEPENDENCY_CONTEXT_LINKS}, {AUTHOR_LINK}")
         response.set_cookie("session", "abc")
 
-    for path, error in (("/with-error", ERROR), ("/without-error", None)):
+    @app.api_route(
+        "/items/{item_id}",
+        methods=["GET", "PUT"],
+        dependencies=[Depends(set_headers)],
+    )
+    @scrudful(etag_func=store.etag, error=error)
+    async def item(item_id: int):
+        return {}
 
-        @app.api_route(
-            path, methods=["GET", "PUT"], dependencies=[Depends(set_headers)]
-        )
-        @scrudful(etag_func=store.etag, error=error)
-        async def item():
-            return {}
+    add_options(app, base_url=TEST_BASE_URL)
+    return app
 
-    client = make_client(app)
-    response = client.put("/with-error", headers={"If-Match": '"other"'})
-    assert response.status_code == 412
-    assert response.headers["link"] == ERROR_LINKS
+
+EARLY_ERRORS = [
+    ("PUT", {"If-Match": '"other"'}, 412),
+    ("PUT", {}, 428),
+    ("GET", {"If-Match": "v1"}, 400),
+]
+
+
+@pytest.mark.parametrize("method, headers, status", EARLY_ERRORS)
+def test_dependency_content_links_are_dropped_on_early_errors(
+    make_client, store, method, headers, status
+):
+    """A dependency's ``describedby`` and RDF context links
+    describe the success representation, not the early error's body: they
+    are dropped from the 400/412/428, which carry the error entity's (and
+    agree with the HSR's entry). Its other Links and its cookies are kept."""
+    client = make_client(_dependency_links_app(store, ERROR))
+    hsr = options_hsr(client, "/items/1")
+    response = client.request(method, "/items/1", headers=headers)
+    assert response.status_code == status
+    assert response.headers["link"] == f"{AUTHOR_LINK}, {ERROR_LINKS}, {ITEMS_HSR_LINK}"
+    assert link_problems(method, status, response.headers, True, hsr) == []
     assert response.headers["set-cookie"] == "session=abc; Path=/; SameSite=lax"
-    response = client.put("/without-error", headers={"If-Match": '"other"'})
-    assert response.status_code == 412
-    assert "link" not in response.headers
-    assert response.headers["set-cookie"] == "session=abc; Path=/; SameSite=lax"
-    # A 304 keeps every dependency header, as a 200 would carry it.
-    response = client.get("/with-error", headers={"If-None-Match": '"v1"'})
+
+
+@pytest.mark.parametrize("method, headers, status", EARLY_ERRORS)
+def test_dependency_content_links_are_dropped_without_an_error_entity(
+    make_client, store, method, headers, status
+):
+    """Without ``error``, nothing describes the early error's body: no
+    ``describedby`` or context link at all, as in 0.9; the author link and
+    the HSR link stay."""
+    client = make_client(_dependency_links_app(store, None))
+    response = client.request(method, "/items/1", headers=headers)
+    assert response.status_code == status
+    assert response.headers["link"] == f"{AUTHOR_LINK}, {ITEMS_HSR_LINK}"
+
+
+def test_a_304_keeps_the_dependency_links(make_client, store):
+    """A 304 stands for the success representation: it keeps every
+    dependency header, its schema and context links included, as a 200
+    would carry them."""
+    client = make_client(_dependency_links_app(store, ERROR))
+    response = client.get("/items/1", headers={"If-None-Match": '"v1"'})
     assert response.status_code == 304
-    assert response.headers["link"] == dependency_link
+    assert response.headers["link"] == (
+        f"{DEPENDENCY_SCHEMA_LINK}, {DEPENDENCY_CONTEXT_LINKS}, {AUTHOR_LINK}, "
+        f"{ITEMS_HSR_LINK}"
+    )
 
 
 def test_relative_link_resolved(make_client):
@@ -1712,7 +1842,9 @@ def test_relative_link_resolved(make_client):
         return {}
 
     @app.get("/network-path")
-    @scrudful(schema_link_or_func="//cdn.example/schema.json")
+    @scrudful(
+        schema_link_or_func="//cdn.example/schema.json", context_link_or_func=CONTEXT
+    )
     async def network_path():
         return JSONResponse({})
 
@@ -1769,7 +1901,7 @@ def test_endpoint_config_is_attached():
     def etag(**kwargs):
         return "x"
 
-    @scrudful(etag_func=etag, schema_link_or_func=SCHEMA, error=ERROR)
+    @scrudful(etag_func=etag, **ITEM_LINKS, error=ERROR)
     async def get_item(item_id: int, req: Request):
         return {}
 
@@ -1780,12 +1912,7 @@ def test_endpoint_config_is_attached():
     assert get_item._scrudful == _EndpointConfig(
         etag_func=etag,
         last_modified_func=None,
-        schema_link_or_func=SCHEMA,
-        schema_rel_or_func=None,
-        schema_type_or_func=None,
-        context_link_or_func=None,
-        context_rel_or_func=None,
-        context_type_or_func=None,
+        entity=Entity(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT),
         error=ERROR,
         request_name="req",
         param_names=frozenset({"item_id", "req"}),
@@ -1822,7 +1949,13 @@ def test_add_error_links_http_and_validation(make_client, method, path, status):
     response = make_client(app).request(method, path)
     plain = make_client(_links_app()).request(method, path)
     assert response.status_code == plain.status_code == status
-    assert response.json() == plain.json()
+    if status == 422:
+        # ERROR is problem details: so is the validation 422.
+        assert response.json() == problem_from_errors(
+            422, plain.json()["detail"], "Request validation failed"
+        )
+    else:
+        assert response.json() == plain.json()
     assert response.headers.get("allow") == plain.headers.get("allow")
     assert response.headers["link"] == ERROR_LINKS
     assert response.headers["content-type"] == "application/problem+json"
@@ -1890,10 +2023,18 @@ def test_add_error_links_twice_does_not_double(make_client):
     # The latest call's entity replaces the earlier one.
     app = _links_app()
     add_error_links(app, ERROR)
-    add_error_links(app, Entity(schema_link_or_func="http://example.com/other"))
+    add_error_links(
+        app,
+        Entity(
+            schema_link_or_func="http://example.com/other",
+            context_link_or_func="http://example.com/other.jsonld",
+        ),
+    )
     response = make_client(app).get("/items/3")
     assert response.headers["link"] == (
-        '<http://example.com/other>; rel="describedby"; type="application/schema+json"'
+        '<http://example.com/other>; rel="describedby"; '
+        'type="application/schema+json", <http://example.com/other.jsonld>; '
+        'rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
     )
     assert response.headers["content-type"] == "application/json"
     handler = app.exception_handlers[StarletteHTTPException]
@@ -1986,7 +2127,7 @@ def _raising_app(store):
         raise HTTPException(status_code=400, detail="Bad item")
 
     add_error_links(app, APP_ERROR)
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     return app
 
 
@@ -1997,11 +2138,11 @@ def test_raised_error_gets_the_endpoint_error(make_client, store, method, header
     """An HTTPException the endpoint raises carries the endpoint's ``error``, as
     the OPTIONS body describes its 400, not the app-wide one."""
     client = make_client(_raising_app(store))
-    hsr = client.options("/items/3").json()
+    hsr = options_hsr(client, "/items/3")
     response = client.request(method, "/items/3", headers=headers)
     assert response.status_code == 400
     assert response.json() == {"detail": "Bad item"}
-    assert response.headers["link"] == ERROR_LINKS
+    assert response.headers["link"] == f"{ERROR_LINKS}, {ITEMS_HSR_LINK}"
     assert response.headers["content-type"] == "application/problem+json"
     assert link_problems(method, 400, response.headers, True, hsr) == []
 
@@ -2010,10 +2151,12 @@ def test_raised_error_without_endpoint_error_gets_the_app_error(make_client, sto
     client = make_client(_raising_app(store))
     response = client.get("/plain/3")
     assert response.status_code == 400
-    assert response.headers["link"] == APP_ERROR_LINKS
+    assert response.headers["link"] == (
+        f"{APP_ERROR_LINKS}, {hsr_link('http://testserver/_hsr/plain.item_id')}"
+    )
     assert response.headers["content-type"] == "application/json"
     # Not conditional: the OPTIONS body lists no 400 to agree with.
-    assert "400" not in client.options("/plain/3").json()["get"]["responses"]
+    assert "400" not in options_hsr(client, "/plain/3")["get"]["responses"]
     assert link_problems("GET", 400, response.headers, True) == []
 
 
@@ -2023,11 +2166,11 @@ def test_endpoint_error_applies_to_the_methods_it_serves(make_client, store):
     client = make_client(_raising_app(store))
     response = client.get("/items/x")
     assert response.status_code == 422
-    assert response.headers["link"] == ERROR_LINKS
+    assert response.headers["link"] == f"{ERROR_LINKS}, {ITEMS_HSR_LINK}"
     assert response.headers["content-type"] == "application/problem+json"
     response = client.post("/items/3")
     assert response.status_code == 405
-    assert response.headers["link"] == APP_ERROR_LINKS
+    assert response.headers["link"] == f"{APP_ERROR_LINKS}, {ITEMS_HSR_LINK}"
     assert response.headers["content-type"] == "application/json"
 
 
@@ -2089,8 +2232,52 @@ ERROR_CONTENT = {
         },
     }
 }
-OK = {"responses": {"200": {"description": "OK"}}}
+#: The ``default`` entry of a method whose raised errors carry no Links (no
+#: add_error_links).
+DEFAULT = {"description": "Error."}
+OK = {"responses": {"200": {"description": "OK"}, "default": DEFAULT}}
 ITEM_LINKS = dict(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+
+
+def hsr_target(name, prefix=""):
+    """The HSR link target of the resource whose HSR route name is ``name``."""
+    return f"http://testserver{prefix}/_hsr/{name}"
+
+
+def options_204(client, url, allow, target=None, **kwargs):
+    """The OPTIONS response of ``url``: a 204 without content, with ``Allow:
+    <allow>`` (exactly, in its order), one HSR link (to ``target``, unless
+    ``None``) and the exposed ``Link`` and ``Allow``."""
+    response = client.options(url, **kwargs)
+    headers = dict(response.headers)
+    expected = {method.strip() for method in allow.split(",")}
+    assert (
+        options_204_problems(response.status_code, headers, response.content, expected)
+        == []
+    ), (url, response.status_code, response.content)
+    assert response.headers["allow"] == allow, url
+    assert hsr_link_problems(headers, target) == [], url
+    assert {"Link", "Allow"} <= set(_exposed(response))
+    return response
+
+
+def options_hsr(client, url, **kwargs):
+    """The HTTP Schema Resource the OPTIONS of ``url`` links to: the 204's HSR
+    link, followed by a GET of the HSR route."""
+    response = client.options(url, **kwargs)
+    headers = dict(response.headers)
+    assert options_204_problems(response.status_code, headers, response.content) == []
+    (target,) = [
+        target
+        for target, params in parse_links(headers["link"])
+        if params.get("rel") == HSR_DOCUMENT_REL
+    ]
+    document = client.get(target)
+    assert (
+        hsr_get_problems(document.status_code, dict(document.headers), document.content)
+        == []
+    ), target
+    return document.json()
 
 
 class ItemIn(BaseModel):
@@ -2128,65 +2315,137 @@ def _options_app(store):
     async def act(item_id: int):
         return {"name": "one"}
 
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     return app
+
+
+#: The literal entries of :func:`_options_app`'s ``/items/{item_id}``: the
+#: expectations don't come from the functions that build them.
+NOT_MODIFIED = {
+    "description": (
+        "Not Modified: the representation matches the request's If-None-Match "
+        "or If-Modified-Since validators."
+    )
+}
+MALFORMED = "Malformed If-Match or If-None-Match header."
+FAILED = "Precondition Failed."
+REQUIRED = (
+    "Precondition Required: this request must be conditional (send If-Match or "
+    "If-Unmodified-Since)."
+)
+PRECONDITION_PARAMETERS = [
+    {
+        "in": "header",
+        "name": name,
+        "schema": {"type": "string"},
+        "required": False,
+        "description": (
+            f"The {what} of the current representation. Either If-Match or "
+            "If-Unmodified-Since is required."
+        ),
+    }
+    for name, what in (
+        ("If-Match", "entity-tag"),
+        ("If-Unmodified-Since", "Last-Modified date"),
+    )
+]
+
+
+def _write_entry(request: str | None, status: str) -> dict:
+    responses = {status: {"description": "OK" if status == "200" else "No Content"}}
+    if status == "200":
+        responses[status]["content"] = ITEM_CONTENT
+    responses.update(
+        {
+            "400": {"description": MALFORMED, "content": ERROR_CONTENT},
+            "412": {"description": FAILED, "content": ERROR_CONTENT},
+            "428": {"description": REQUIRED, "content": ERROR_CONTENT},
+            "default": {"description": "Error."},
+        }
+    )
+    entry: dict = {}
+    if request is not None:
+        entry["requestBody"] = {
+            "description": request,
+            "required": True,
+            "content": ITEM_CONTENT,
+        }
+    entry["responses"] = responses
+    entry["parameters"] = PRECONDITION_PARAMETERS
+    return entry
+
+
+ITEM_HSR = {
+    "get": {
+        "responses": {
+            "200": {"description": "OK", "content": ITEM_CONTENT},
+            "304": NOT_MODIFIED,
+            "400": {"description": MALFORMED, "content": ERROR_CONTENT},
+            "412": {"description": FAILED, "content": ERROR_CONTENT},
+            "default": {"description": "Error."},
+        }
+    },
+    "put": _write_entry("The new content of the resource.", "200"),
+    "delete": _write_entry(None, "204"),
+    "options": {"responses": {"204": {"description": "No Content"}}},
+    "head": {
+        "responses": {
+            "200": {"description": "OK"},
+            "304": NOT_MODIFIED,
+            "400": {"description": MALFORMED},
+            "412": {"description": FAILED},
+            "default": {"description": "Error."},
+        }
+    },
+    "patch": _write_entry("The changes to apply to the resource.", "200"),
+}
 
 
 def test_add_options_body_and_headers(make_client, store):
     client = make_client(_options_app(store))
-    response = client.options("/items/3")
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "application/json"
-    body = response.json()
+    response = options_204(
+        client,
+        "/items/3",
+        "GET, PUT, DELETE, OPTIONS, HEAD, PATCH",
+        hsr_target("items.item_id"),
+    )
+    assert response.headers["link"] == hsr_link(hsr_target("items.item_id"))
+    assert "content-type" not in response.headers
+    body = options_hsr(client, "/items/3")
+    assert body == http_schema_resource(client.app, "/items/{item_id}")
     validate_http_schema_resource(body)
     assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
-    assert response.headers["link"] == options_links()
-    assert response.headers["allow"] == allow_header(body)
-    assert response.headers["allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
-    assert "Link" in _exposed(response)
-    assert link_problems("OPTIONS", 200, response.headers, True, body) == []
-
-    assert body["get"] == describe_read(ITEM_CONTENT, True, [200], ERROR_CONTENT)
-    assert body["get"]["responses"]["412"]["content"] == ERROR_CONTENT
-    assert body["head"] == describe_read(None, True, [200])
-    for method in ("put", "patch"):
-        assert body[method] == describe_write(
-            method,
-            ITEM_CONTENT,
-            True,
-            True,
-            True,
-            [200],
-            response_content=ITEM_CONTENT,
-            error_content=ERROR_CONTENT,
-        )
-    assert body["put"]["responses"]["428"]["content"] == ERROR_CONTENT
-    assert body["delete"] == describe_write(
-        "delete", None, True, True, True, [204], error_content=ERROR_CONTENT
-    )
-    assert "content" not in body["delete"]["responses"]["204"]
-    assert body["options"] == describe_options()
+    assert body == ITEM_HSR
 
 
 def test_add_options_success_status_and_conditional_post(make_client, store):
     client = make_client(_options_app(store))
-    body = client.options("/items").json()
+    body = options_hsr(client, "/items")
     validate_http_schema_resource(body)
     assert list(body) == ["post", "options"]
-    assert body["post"] == describe_write(
-        "post", ITEM_CONTENT, False, False, False, [201], response_content=ITEM_CONTENT
-    )
+    assert body["post"] == {
+        "requestBody": {
+            "description": "The content for the resource to be created.",
+            "required": True,
+            "content": ITEM_CONTENT,
+        },
+        "responses": {
+            "201": {"description": "Created", "content": ITEM_CONTENT},
+            "default": {"description": "Error."},
+        },
+    }
     # A conditional POST: scrudful's 400 and 412, never a 428.
-    body = client.options("/items/3/actions").json()
+    body = options_hsr(client, "/items/3/actions")
     validate_http_schema_resource(body)
-    assert set(body["post"]["responses"]) == {"200", "400", "412"}
+    assert set(body["post"]["responses"]) == {"200", "400", "412", "default"}
     assert body["post"]["responses"]["400"]["content"] == ERROR_CONTENT
     # The endpoint takes no body: no requestBody.
     assert "requestBody" not in body["post"]
 
 
 def test_trace_gets_no_links(make_client):
-    """A TRACE's content is the echoed request: OPTIONS gives it none."""
+    """A TRACE's content is the echoed request: OPTIONS gives it none, and
+    it gets only the HSR link."""
     app = FastAPI()
 
     @app.api_route("/items/{item_id}", methods=["GET", "TRACE"])
@@ -2194,14 +2453,16 @@ def test_trace_gets_no_links(make_client):
     async def item(item_id: int):
         return {"id": item_id}
 
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    body = client.options("/items/3").json()
-    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    body = options_hsr(client, "/items/3")
+    assert body["trace"] == OK
     response = client.request("TRACE", "/items/3")
     assert response.status_code == 200
-    assert "link" not in response.headers
-    assert client.get("/items/3").headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+    assert response.headers["link"] == ITEMS_HSR_LINK
+    assert client.get("/items/3").headers["link"] == (
+        f"{SCHEMA_LINK}, {CONTEXT_LINK}, {ITEMS_HSR_LINK}"
+    )
 
 
 def test_trace_ignores_preconditions(make_client, store):
@@ -2213,7 +2474,7 @@ def test_trace_ignores_preconditions(make_client, store):
     async def item(item_id: int):
         return {"id": item_id}
 
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
     for headers in ({"If-Match": '"nope"'}, {"If-None-Match": '"v1"'}, {}):
         response = client.request("TRACE", "/items/3", headers=headers)
@@ -2223,8 +2484,8 @@ def test_trace_ignores_preconditions(make_client, store):
         assert "last-modified" not in response.headers
     assert store.calls == []
     assert client.get("/items/3", headers={"If-Match": '"nope"'}).status_code == 412
-    body = client.options("/items/3").json()
-    assert body["trace"] == {"responses": {"200": {"description": "OK"}}}
+    body = options_hsr(client, "/items/3")
+    assert body["trace"] == OK
     assert "412" in body["get"]["responses"]
 
 
@@ -2241,18 +2502,21 @@ def test_a_context_type_callable_returning_none_takes_the_default(make_client):
     async def get_item(item_id: int):
         return {}
 
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    body = client.options("/items/3").json()
+    body = options_hsr(client, "/items/3")
     content = body["get"]["responses"]["200"]["content"]["application/json"]
     assert content["x-rdf-context"] == {"href": CONTEXT, "type": "application/ld+json"}
     response = client.get("/items/3")
-    assert response.headers["link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+    assert response.headers["link"] == (
+        f"{SCHEMA_LINK}, {CONTEXT_LINK}, {ITEMS_HSR_LINK}"
+    )
     assert link_problems("GET", 200, response.headers, True, body) == []
 
 
 def test_add_options_success_content_only_on_a_2xx(make_client):
-    """A redirect gets no Links on the wire, and no content in OPTIONS."""
+    """A redirect gets no content Links on the wire (only the HSR link), and
+    no content in OPTIONS."""
     app = FastAPI()
     links = dict(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
 
@@ -2266,16 +2530,22 @@ def test_add_options_success_content_only_on_a_2xx(make_client):
     async def put_item(item_id: int, response: Response):
         response.headers["Location"] = "/elsewhere"
 
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    body = client.options("/items/3").json()
+    body = options_hsr(client, "/items/3")
     validate_http_schema_resource(body)
-    assert body["get"]["responses"] == {"307": {"description": "Temporary Redirect"}}
-    assert body["put"]["responses"] == {"303": {"description": "See Other"}}
+    assert body["get"]["responses"] == {
+        "307": {"description": "Temporary Redirect"},
+        "default": DEFAULT,
+    }
+    assert body["put"]["responses"] == {
+        "303": {"description": "See Other"},
+        "default": DEFAULT,
+    }
     for method in ("GET", "PUT"):
         response = client.request(method, "/items/3", follow_redirects=False)
         assert response.status_code in (303, 307)
-        assert "link" not in response.headers
+        assert response.headers["link"] == ITEMS_HSR_LINK
 
 
 @pytest.mark.parametrize(
@@ -2299,7 +2569,7 @@ def test_add_options_agrees_with_the_responses(
     make_client, store, method, path, headers, json, status
 ):
     client = make_client(_options_app(store))
-    hsr = client.options(path).json()
+    hsr = options_hsr(client, path)
     response = client.request(method, path, headers=headers, json=json)
     assert response.status_code == status
     content = method != "HEAD"
@@ -2328,22 +2598,23 @@ def test_add_options_skips_existing_options(make_client):
     async def others():
         return {}
 
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     routes = list(app.routes)
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     assert app.routes == routes  # a second call adds nothing
     client = make_client(app)
     assert client.options("/items/3").json() == {"own": True}
     assert client.options("/plain").status_code == 405
     assert client.options("/nowhere").status_code == 404
-    assert client.options("/others").status_code == 200
+    options_204(client, "/others", "GET, OPTIONS", hsr_target("others"))
     assert "options" not in app.openapi()["paths"]["/others"]
     assert app.url_path_for("get_item", item_id=3) == "/items/3"
 
 
 def test_add_options_mixed_path(make_client, store):
-    """Review Focus 5: a plain method on a scrudful path is described without
-    content or a request body, and ``Allow`` still follows the body."""
+    """A plain method on a scrudful path is described without
+    content or a request body, and ``Allow`` still lists the methods the
+    body describes (none of them has a check)."""
     app = FastAPI()
 
     @app.get("/items/{item_id}")
@@ -2359,18 +2630,22 @@ def test_add_options_mixed_path(make_client, store):
         return JSONResponse({})
 
     app.add_route("/items/{item_id}", starlette_patch, methods=["PATCH"])
-    add_options(app)
-    response = make_client(app).options("/items/3")
-    body = response.json()
+    add_options(app, base_url=TEST_BASE_URL)
+    client = make_client(app)
+    body = options_hsr(client, "/items/3")
     validate_http_schema_resource(body)
     assert body["put"] == OK
     assert body["patch"] == OK
-    assert response.headers["allow"] == allow_header(body)
-    assert response.headers["allow"] == "GET, PUT, OPTIONS, PATCH"
-    assert link_problems("OPTIONS", 200, response.headers, True, body) == []
+    assert list(body) == ["get", "put", "options", "patch"]
+    options_204(
+        client, "/items/3", "GET, PUT, OPTIONS, PATCH", hsr_target("items.item_id")
+    )
 
 
-def test_add_options_link_callable_gets_path_params_and_request(make_client, store):
+def test_add_options_link_callables_are_called_in_describe_mode(make_client, store):
+    """The HTTP Schema Resource calls the link callables as ``func()``, once
+    per path: with neither the path parameters nor the request, which they
+    get inside the endpoint. Relative URLs resolve against ``base_url``."""
     app = FastAPI()
     received = []
 
@@ -2401,15 +2676,15 @@ def test_add_options_link_callable_gets_path_params_and_request(make_client, sto
     async def get_other(other_id: int):
         return {}
 
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    body = client.options("/items/3?x=1").json()
+    body = options_hsr(client, "/items/3?x=1")
     validate_http_schema_resource(body)
     assert body["get"]["responses"]["200"]["content"] == {
         "application/json": {
             "schema": {"$ref": "http://testserver/schemas/item"},
             "x-rdf-context": {
-                "href": "http://testserver/items/context.jsonld",
+                "href": "http://testserver/context.jsonld",
                 "type": "application/ld+json",
             },
         }
@@ -2420,27 +2695,39 @@ def test_add_options_link_callable_gets_path_params_and_request(make_client, sto
             "x-rdf-context": {"href": CONTEXT, "type": "application/ld+json"},
         }
     }
-    assert sorted(name for name, _ in received) == ["context", "error", "schema"]
-    for _, kwargs in received:
-        assert sorted(kwargs) == ["item_id", "req"]
-        assert kwargs["item_id"] == "3"  # the raw path parameter
-        assert isinstance(kwargs["req"], Request)
-    # The Links of the GET agree with it.
+    assert received == [("schema", {}), ("context", {}), ("error", {})]
+    assert options_hsr(client, "/items/4") == body  # built once
+    assert len(received) == 3
+    # The Links of the GET agree with it: inside the endpoint the callables
+    # get its keyword arguments, and the URLs resolve against base_url too.
+    received.clear()
     response = client.get("/items/3")
     assert link_problems("GET", 200, response.headers, True, body) == []
+    assert sorted(name for name, _ in received) == ["context", "schema"]
+    for _, kwargs in received:
+        assert sorted(kwargs) == ["item_id", "req"]
+        assert kwargs["item_id"] == 3
 
     received.clear()
-    client.options("/others/7")
-    assert received == [("schema", {"other_id": "7"})]
+    options_hsr(client, "/others/7")
+    assert received == [("schema", {})]
 
 
-def test_add_options_needs_no_credentials(make_client):
+@pytest.mark.parametrize("security", [False, True])
+def test_add_options_needs_no_credentials(make_client, security):
+    """OPTIONS isn't gated by the app's, a router's or ``include_router``'s
+    dependencies, and the document it links to is served without
+    credentials. Its ``Allow`` runs only security dependencies: a
+    plain ``Depends(deny)`` isn't run, so GET is listed; a ``Security(deny)``
+    refuses everything but OPTIONS."""
+
     def deny():
         raise HTTPException(status_code=401)
 
+    declare = Security if security else Depends
     links = dict(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
-    app = FastAPI(dependencies=[Depends(deny)])
-    router = APIRouter(dependencies=[Depends(deny)])
+    app = FastAPI(dependencies=[declare(deny)])
+    router = APIRouter(dependencies=[declare(deny)])
 
     @router.get("/items/{item_id}")
     @scrudful(**links)
@@ -2452,15 +2739,15 @@ def test_add_options_needs_no_credentials(make_client):
     async def things():
         return {}
 
-    add_options(router)
-    app.include_router(router, prefix="/v1", dependencies=[Depends(deny)])
-    add_options(app)
+    add_options(router, base_url=TEST_BASE_URL)
+    app.include_router(router, prefix="/v1", dependencies=[declare(deny)])
+    add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    for path in ("/v1/items/3", "/things"):
+    allow = "OPTIONS" if security else "GET, OPTIONS"
+    for path, name in (("/v1/items/3", "v1.items.item_id"), ("/things", "things")):
         assert client.get(path).status_code == 401
-        response = client.options(path)
-        assert response.status_code == 200
-        assert response.headers["allow"] == "GET, OPTIONS"
+        options_204(client, path, allow, hsr_target(name))
+        assert list(options_hsr(client, path)) == ["get", "options"]
 
 
 def test_add_options_covers_included_routers(make_client):
@@ -2475,22 +2762,27 @@ def test_add_options_covers_included_routers(make_client):
     outer.include_router(inner, prefix="/inner")
     app = FastAPI()
     app.include_router(outer, prefix="/v1")
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    response = client.options("/v1/inner/items/3")
-    assert response.status_code == 200
-    body = response.json()
+    options_204(
+        client,
+        "/v1/inner/items/3",
+        "GET, OPTIONS",
+        hsr_target("v1.inner.items.item_id"),
+    )
+    body = options_hsr(client, "/v1/inner/items/3")
     assert body["get"]["responses"]["200"]["content"] == ITEM_CONTENT
     get = client.get("/v1/inner/items/3")
     assert link_problems("GET", 200, get.headers, True, body) == []
 
 
-def _prefixed_router():
-    """``GET /items/{item_id}``, whose schema callable takes ``item_id`` only."""
+def _prefixed_router(received):
+    """``GET /items/{item_id}``, whose schema callable records its kwargs."""
     router = APIRouter()
 
-    def schema(item_id):
-        return f"/schemas/item?id={item_id}"
+    def schema(**kwargs):
+        received.append(kwargs)
+        return "/schemas/item"
 
     @router.get("/items/{item_id}")
     @scrudful(schema_link_or_func=schema, context_link_or_func=CONTEXT)
@@ -2502,28 +2794,42 @@ def _prefixed_router():
 
 @pytest.mark.parametrize("on", ["router", "app"])
 def test_add_options_under_a_prefix_with_path_parameters(make_client, on):
-    """The callables get what the endpoint gets, not the prefix's parameters."""
-    router = _prefixed_router()
+    """The callables get neither the endpoint's nor the prefix's parameters
+    in the HTTP Schema Resource, keyed by the app's full path (or the
+    router's own)."""
+    received = []
+    router = _prefixed_router(received)
     app = FastAPI()
     if on == "router":
-        add_options(router)
+        add_options(router, base_url=TEST_BASE_URL)
     app.include_router(router, prefix="/users/{user_id}")
     if on == "app":
-        add_options(app)
+        add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
     get = client.get("/users/1/items/2")
     assert get.status_code == 200
-    response = client.options("/users/1/items/2")
-    assert response.status_code == 200
-    body = response.json()
+    assert received == [{"item_id": 2}]
+    target = (
+        hsr_target("items.item_id", "/users/1")
+        if on == "router"
+        else hsr_target("users.user_id.items.item_id")
+    )
+    options_204(client, "/users/1/items/2", "GET, OPTIONS", target)
+    body = options_hsr(client, "/users/1/items/2")
     assert body["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
-        "$ref": "http://testserver/schemas/item?id=2"
+        "$ref": "http://testserver/schemas/item"
     }
+    assert received[1:] == [{}]
+    if on == "router":
+        assert body == http_schema_resource(router, "/items/{item_id}")
+    else:
+        assert body == http_schema_resource(app, "/users/{user_id}/items/{item_id}")
     assert link_problems("GET", 200, get.headers, True, body) == []
 
 
-def test_add_options_still_rejects_a_parameter_the_endpoint_lacks():
-    """A callable needing a path parameter the endpoint doesn't take fails."""
+def test_add_options_rejects_a_callable_needing_path_parameters():
+    """A callable needing path parameters (the endpoint's or a prefix's)
+    can't be called as ``func()``: no description of the template."""
     router = APIRouter()
 
     @router.get("/items/{item_id}")
@@ -2533,12 +2839,15 @@ def test_add_options_still_rejects_a_parameter_the_endpoint_lacks():
 
     app = FastAPI()
     app.include_router(router, prefix="/users/{user_id}")
-    with pytest.raises(TypeError, match="user_id"):
-        add_options(app)
+    with pytest.raises(ValueError, match=r"func\(\)") as raised:
+        add_options(app, base_url=TEST_BASE_URL)
+    assert "schema_link_or_func" in str(raised.value)
+    assert "missing a required argument: 'item_id'" in str(raised.value)
 
 
 def test_outside_callables_get_an_aliased_parameter_by_its_name(make_client):
-    """As inside the endpoint: ``item``, not the URL's ``item_id``."""
+    """In add_error_links' handlers, as inside the endpoint: ``item``, not the
+    URL's ``item_id``."""
     received = []
 
     def schema(item, **kwargs):
@@ -2549,34 +2858,40 @@ def test_outside_callables_get_an_aliased_parameter_by_its_name(make_client):
         return user_id
 
     app = FastAPI()
+    error = Entity(schema_link_or_func=schema, context_link_or_func=CONTEXT)
 
     @app.get("/users/{user_id}/items/{item_id}")
-    @scrudful(schema_link_or_func=schema, context_link_or_func=CONTEXT)
+    @scrudful(schema_link_or_func=schema, context_link_or_func=CONTEXT, error=error)
     async def get_item(item: int = Path(alias="item_id"), who=Depends(owner)):
+        if item == 3:
+            raise HTTPException(status_code=404)
         return {}
 
-    add_options(app)
+    add_error_links(app, APP_ERROR)
     client = make_client(app)
-    get = client.get("/users/1/items/2")
-    body = client.options("/users/1/items/2").json()
+    client.get("/users/1/items/2")
+    response = client.get("/users/1/items/3")
+    assert response.status_code == 404
     # GET gets the endpoint's kwargs (``who``, not the dependency's
-    # ``user_id``); OPTIONS the path parameters among them.
-    assert received == [(2, {"who": 1}), ("2", {})]
-    assert body["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
-        "$ref": "http://testserver/schemas/item?id=2"
-    }
-    assert link_problems("GET", 200, get.headers, True, body) == []
+    # ``user_id``); the handler the path parameters among them.
+    assert received == [(2, {"who": 1}), ("3", {})]
+    assert parse_links(response.headers["link"])[0][0] == (
+        "http://testserver/schemas/item?id=3"
+    )
 
     # Checked by the same names: ``item_id`` is no keyword the callable gets.
     app = FastAPI()
+    error = Entity(
+        schema_link_or_func=lambda item_id: "/e.json", context_link_or_func=CONTEXT
+    )
 
     @app.get("/items/{item_id}")
-    @scrudful(schema_link_or_func=lambda item_id: "/s.json")
+    @scrudful(error=error)
     async def aliased(item: int = Path(alias="item_id")):
         return {}
 
     with pytest.raises(TypeError, match=r"\['item'\]"):
-        add_options(app)
+        add_error_links(app, APP_ERROR)
 
 
 def test_add_options_after_the_app_started(make_client):
@@ -2584,8 +2899,9 @@ def test_add_options_after_the_app_started(make_client):
     app = _links_app()
     client = make_client(app)
     assert client.options("/items/3").status_code == 405
-    add_options(app)
-    assert client.options("/items/3").status_code == 200
+    add_options(app, base_url=TEST_BASE_URL)
+    options_204(client, "/items/3", "GET, OPTIONS", hsr_target("items.item_id"))
+    assert list(options_hsr(client, "/items/3")) == ["get", "options"]
 
 
 def test_add_options_needs_an_app_or_router():
@@ -2611,10 +2927,11 @@ def test_add_options_skips_the_error_of_an_unconditional_endpoint(make_client):
     async def put_item(item_id: int, item: ItemIn):
         return {}
 
-    add_options(app)
-    body = make_client(app).options("/items/3").json()
+    add_options(app, base_url=TEST_BASE_URL)
+    body = options_hsr(make_client(app), "/items/3")
     validate_http_schema_resource(body)
-    assert set(body["put"]["responses"]) == {"200"}
+    assert set(body["put"]["responses"]) == {"200", "default"}
+    assert body["put"]["responses"]["default"] == DEFAULT
     assert body["put"]["requestBody"]["content"] == ITEM_CONTENT
     assert calls == []
 
@@ -2648,9 +2965,10 @@ def _probe_app():
 
 
 def test_add_options_rejects_callables_needing_endpoint_arguments():
-    with pytest.raises(TypeError, match="put_item") as raised:
-        add_options(_probe_app())
+    with pytest.raises(ValueError, match="put_item") as raised:
+        add_options(_probe_app(), base_url=TEST_BASE_URL)
     assert "schema_link_or_func" in str(raised.value)
+    assert "func()" in str(raised.value)
     assert "item_id" in str(raised.value)
 
 
@@ -2669,15 +2987,21 @@ def test_add_error_links_rejects_app_error_callables_needing_more_than_request()
 
 
 def test_outside_callables_with_kwargs_or_defaults_pass(make_client, store):
+    """Callables whose parameters have defaults (or ``**kwargs``) are called
+    as ``func()`` in the HTTP Schema Resource, with the path parameters in
+    add_error_links' handlers and with the resolved arguments inside the
+    endpoint."""
     app = FastAPI()
     received = []
+    errors = []
 
-    def schema(item_id, item=None, **kwargs):
+    def schema(item_id=None, item=None, **kwargs):
         received.append((item_id, item))
         return "/s.json"
 
-    def error_schema(**kwargs):
-        return f"/errors/{kwargs['item_id']}"
+    def error_schema(item_id=None, **kwargs):
+        errors.append(item_id)
+        return "/errors/item"
 
     @app.put("/items/{item_id}")
     @scrudful(
@@ -2692,14 +3016,19 @@ def test_outside_callables_with_kwargs_or_defaults_pass(make_client, store):
         return {}
 
     add_error_links(app, APP_ERROR)
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    body = client.options("/items/3").json()
+    body = options_hsr(client, "/items/3")
     validate_http_schema_resource(body)
-    assert received == [("3", None)]  # the raw path parameter, no body
+    assert received == [(None, None)]  # describe mode: func()
+    assert errors == [None]
     response = client.put("/items/4", json={"name": "x"}, headers={"If-Match": '"v1"'})
     assert response.status_code == 404
-    assert parse_links(response.headers["link"])[0][0] == "http://testserver/errors/4"
+    assert (
+        parse_links(response.headers["link"])[0][0] == "http://testserver/errors/item"
+    )
+    assert errors[-1] == "4"  # the raw path parameter, in the handler
+    assert link_problems("PUT", 404, response.headers, True, body) == []
     response = client.put("/items/3", json={"name": "x"}, headers={"If-Match": '"v1"'})
     assert response.status_code == 200
     assert received[-1] == (3, ItemIn(name="x"))  # inside the endpoint: resolved
@@ -2731,13 +3060,14 @@ def test_add_options_path_split_across_routers(make_client):
     async def remove(i: int):
         return {}
 
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    options = client.options("/v1/items/1")
-    body = options.json()
+    options_204(
+        client, "/v1/items/1", "GET, PUT, DELETE, OPTIONS", hsr_target("v1.items.i")
+    )
+    body = options_hsr(client, "/v1/items/1")
     validate_http_schema_resource(body)
-    assert options.headers["allow"] == "GET, PUT, DELETE, OPTIONS"
-    assert options.headers["allow"] == allow_header(body)
+    assert list(body) == ["get", "put", "delete", "options"]
     for method in ("GET", "PUT", "DELETE"):
         response = client.request(method, "/v1/items/1")
         assert response.status_code == 200
@@ -2745,6 +3075,9 @@ def test_add_options_path_split_across_routers(make_client):
 
 
 def test_add_options_differently_named_parameters(make_client):
+    """Starlette routes ``/items/5`` GET to ``/items/{id}`` and PUT to
+    ``/items/{item_id}``: one resource, whose document has both, under
+    either template, and whose ``Allow`` lists both."""
     received = []
 
     def schema(**kwargs):
@@ -2767,10 +3100,59 @@ def test_add_options_differently_named_parameters(make_client):
     app = FastAPI()
     app.include_router(reads)
     app.include_router(writes)
-    add_options(app)
-    response = make_client(app).options("/items/5")
-    assert response.headers["allow"] == "GET, PUT, OPTIONS"
-    assert received == [{"id": "5"}, {"item_id": "5"}]
+    add_options(app, base_url=TEST_BASE_URL)
+    client = make_client(app)
+    options_204(client, "/items/5", "GET, PUT, OPTIONS", hsr_target("items.id"))
+    body = options_hsr(client, "/items/5")
+    assert list(body) == ["get", "put", "options"]
+    assert body == http_schema_resource(app, "/items/{id}")
+    assert body == http_schema_resource(app, "/items/{item_id}")
+    assert received == [{}, {}]  # each endpoint's callable, once
+
+
+def test_add_options_on_a_router_groups_differently_named_parameters(make_client):
+    """Router mode: one OPTIONS route for the resource, not one per template."""
+    links = dict(schema_link_or_func=SCHEMA, context_link_or_func=CONTEXT)
+    router = APIRouter()
+
+    @router.get("/items/{id}")
+    @scrudful(**links)
+    async def read(id: int):
+        return {}
+
+    @router.put("/items/{item_id}")
+    @scrudful(**links)
+    async def write(item_id: int):
+        return {}
+
+    # Another convertor matches other URLs: another resource.
+    @router.delete("/things/{n:int}", status_code=204)
+    @scrudful()
+    async def remove(n: int):
+        return None
+
+    @router.get("/things/{name}")
+    @scrudful(**links)
+    async def thing(name: str):
+        return {}
+
+    add_options(router, base_url=TEST_BASE_URL)
+    # The HSR route (methods=None, every method) isn't an OPTIONS route.
+    automatic = [r for r in router.routes if r.methods and "OPTIONS" in r.methods]
+    assert [route.path for route in automatic] == [
+        "/items/{id}",
+        "/things/{n:int}",
+        "/things/{name}",
+    ]
+    app = FastAPI()
+    app.include_router(router)
+    client = make_client(app)
+    options_204(client, "/items/5", "GET, PUT, OPTIONS", hsr_target("items.id"))
+    assert options_hsr(client, "/items/5") == http_schema_resource(
+        router, "/items/{item_id}"
+    )
+    options_204(client, "/things/5", "DELETE, OPTIONS", hsr_target("things.n-int"))
+    options_204(client, "/things/abc", "GET, OPTIONS", hsr_target("things.name"))
 
 
 def test_add_options_mount(make_client):
@@ -2787,17 +3169,16 @@ def test_add_options_mount(make_client):
     app.router.routes.append(
         Mount("/n", routes=[APIRoute("/items/{item_id}", endpoint, methods=["PUT"])])
     )
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
-    for path, allow, method in [
-        ("/m/items/1", "GET, OPTIONS", "GET"),
-        ("/n/items/1", "PUT, OPTIONS", "PUT"),
+    for path, allow, method, name in [
+        ("/m/items/1", "GET, OPTIONS", "GET", "m.items.item_id"),
+        ("/n/items/1", "PUT, OPTIONS", "PUT", "n.items.item_id"),
     ]:
-        options = client.options(path)
-        assert options.status_code == 200
-        assert options.headers["allow"] == allow
+        options_204(client, path, allow, hsr_target(name))
+        hsr = options_hsr(client, path)
         response = client.request(method, path)
-        assert link_problems(method, 200, response.headers, True, options.json()) == []
+        assert link_problems(method, 200, response.headers, True, hsr) == []
 
 
 def test_add_options_mounted_fastapi_app(make_client):
@@ -2815,16 +3196,18 @@ def test_add_options_mounted_fastapi_app(make_client):
 
     app = FastAPI()
     app.mount("/sub", sub)
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
     preflight = {"Origin": "https://a.example", "Access-Control-Request-Method": "GET"}
     assert client.options("/sub/items/1").status_code == 405
     response = client.options("/sub/items/1", headers=preflight)
     assert response.headers["access-control-allow-origin"] == "https://a.example"
-    add_options(sub)
-    options = client.options("/sub/items/1")
-    assert options.status_code == 200
-    assert options.json()["get"]["responses"]["200"]["content"] == ITEM_CONTENT
+    add_options(sub, base_url=TEST_BASE_URL)
+    # The sub-app's own HSR route, where the sub-app is mounted.
+    target = hsr_target("items.item_id", "/sub")
+    options_204(client, "/sub/items/1", "GET, OPTIONS", target)
+    hsr = options_hsr(client, "/sub/items/1")
+    assert hsr["get"]["responses"]["200"]["content"] == ITEM_CONTENT
     response = client.options("/sub/items/1", headers=preflight)
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "https://a.example"
@@ -2849,7 +3232,7 @@ def test_add_error_links_rejects_rel_callables_needing_arguments():
     async def get_item(item_id: int, who: str = Depends(user)):
         raise HTTPException(status_code=404)
 
-    add_options(app)  # the rels are not called in OPTIONS
+    add_options(app, base_url=TEST_BASE_URL)  # the rels are not called in OPTIONS
     with pytest.raises(TypeError, match="error.schema_rel_or_func"):
         add_error_links(app, APP_ERROR)
     app_error = Entity(
@@ -2862,7 +3245,9 @@ def test_add_error_links_rejects_rel_callables_needing_arguments():
 
 
 def test_mount_callables_get_the_path_parameters_that_reach_them(make_client):
-    """A Mount's own ``{path:path}`` is not a path parameter of its routes."""
+    """A Mount's own ``{path:path}`` is not a path parameter of its routes:
+    add_error_links' handlers pass only ``item_id``. Callables needing it
+    can't describe the template, so add_options rejects them."""
     from fastapi.routing import APIRoute
 
     def schema(item_id):
@@ -2886,32 +3271,23 @@ def test_mount_callables_get_the_path_parameters_that_reach_them(make_client):
         Mount("/n", routes=[APIRoute("/items/{item_id}", endpoint, methods=["GET"])])
     )
     add_error_links(app, APP_ERROR)
-    add_options(app)
-    client = make_client(app)
-    body = client.options("/n/items/1").json()
-    assert body["get"]["responses"]["200"]["content"] == {
-        "application/json": {
-            "schema": {"$ref": "http://testserver/s/1.json"},
-            "x-rdf-context": {"href": CONTEXT, "type": "application/ld+json"},
-        }
-    }
-    assert body["get"]["responses"]["400"]["content"]["application/json"]["schema"] == {
-        "$ref": "http://testserver/e/1"
-    }
-    response = client.get("/n/items/1")
+    with pytest.raises(ValueError, match=r"func\(\)"):
+        add_options(app, base_url=TEST_BASE_URL)
+    response = make_client(app).get("/n/items/1")
     assert response.status_code == 404
     assert parse_links(response.headers["link"])[0][0] == "http://testserver/e/1"
 
 
 @pytest.mark.parametrize("mode", ["app", "router"])
-def test_options_request_carries_the_matched_route(make_client, mode):
+def test_options_answers_the_matched_path(make_client, mode):
+    """The app's or the router's OPTIONS answer links to the document of the
+    path matched, built without the request: the callables get no
+    arguments."""
     seen = []
 
-    def schema(req, **kwargs):
-        seen.append(
-            (dict(req.path_params), req.scope.get("route"), req.scope.get("endpoint"))
-        )
-        return f"/s/{req.path_params['item_id']}.json"
+    def schema(*args, **kwargs):
+        seen.append((args, kwargs))
+        return "/s/item.json"
 
     router = APIRouter()
 
@@ -2922,22 +3298,20 @@ def test_options_request_carries_the_matched_route(make_client, mode):
 
     app = FastAPI()
     if mode == "router":
-        add_options(router)
+        add_options(router, base_url=TEST_BASE_URL)
     app.include_router(router)
     if mode == "app":
-        add_options(app)
-    response = make_client(app).options("/items/7")
-    assert response.status_code == 200
-    content = response.json()["get"]["responses"]["200"]["content"]
+        add_options(app, base_url=TEST_BASE_URL)
+    client = make_client(app)
+    options_204(client, "/items/7", "GET, OPTIONS", hsr_target("items.item_id"))
+    hsr = options_hsr(client, "/items/7")
+    content = hsr["get"]["responses"]["200"]["content"]
     assert content["application/json"]["schema"] == {
-        "$ref": "http://testserver/s/7.json"
+        "$ref": "http://testserver/s/item.json"
     }
-    [(path_params, route, endpoint)] = seen
-    assert path_params == {"item_id": "7"}
-    # The router's route, or the app's copy of it (FastAPI < 0.134 copies).
-    assert route.endpoint is get_item
-    assert route.path == "/items/{item_id}"
-    assert endpoint is get_item
+    owner = router if mode == "router" else app
+    assert hsr == http_schema_resource(owner, "/items/{item_id}")
+    assert seen == [((), {})]
 
 
 class _Tag:
@@ -3008,7 +3382,7 @@ def test_add_options_leaves_middleware_mounts_alone(make_client):
         CORSMiddleware, allow_origins=["https://a.example"], allow_methods=["*"]
     )
     app.router.routes.append(Mount("/n", routes=[_mounted_item()], middleware=[cors]))
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     client = make_client(app)
     preflight = {"Origin": "https://a.example", "Access-Control-Request-Method": "GET"}
     response = client.options("/n/items/1", headers=preflight)
@@ -3028,7 +3402,559 @@ def test_add_options_leaves_middleware_routers_alone(make_client):
     app = FastAPI()
     inner = Router(routes=[_mounted_item()], middleware=[Middleware(_Tag)])
     app.router.routes.append(Mount("/r", app=inner))
-    add_options(app)
+    add_options(app, base_url=TEST_BASE_URL)
     # Routed into the inner Router (through its middleware), which has no
     # OPTIONS route: its 405, not an answer from outside it.
     assert make_client(app).options("/r/items/1").status_code == 405
+
+
+# --- The HSR link on every response, kept dependency Links, JSON 500, 422 -------
+
+#: The HSR route URL of ``/items/{item_id}`` (add_options' base URL is the
+#: test client's).
+ITEMS_HSR = "http://testserver/_hsr/items.item_id"
+ITEMS_HSR_LINK = hsr_link(ITEMS_HSR)
+SERVER_ERROR = problem_from_errors(500, None)
+
+
+def _key(x_key: str | None = Header(default=None)) -> str | None:
+    """The requester: ``X-Key``; ``bad`` is refused (401)."""
+    if x_key == "bad":
+        raise HTTPException(401, "Bad key", headers={"WWW-Authenticate": "Key"})
+    return x_key
+
+
+def _everywhere_app(store, *, options: bool = True) -> FastAPI:
+    """``/items/{item_id}``: GET and HEAD (404 for item 404, a 500 for item
+    500), PUT for the ``writer`` key only (403); and a plain route."""
+    app = FastAPI()
+    links = dict(
+        etag_func=store.etag,
+        schema_link_or_func=SCHEMA,
+        context_link_or_func=CONTEXT,
+        error=ERROR,
+    )
+
+    @app.get("/items/{item_id}")
+    @app.head("/items/{item_id}")
+    @scrudful(**links)
+    async def get_item(item_id: int, key: str | None = Depends(_key)):
+        if item_id == 404:
+            raise HTTPException(404, "No such item")
+        if item_id == 500:
+            raise RuntimeError("boom")
+        return {"id": item_id}
+
+    @app.put("/items/{item_id}")
+    @scrudful(**links)
+    async def put_item(item_id: int, key: str | None = Depends(_key)):
+        if key != "writer":
+            raise HTTPException(403, "Read only")
+        return {"id": item_id}
+
+    @app.get("/plain/{n}")
+    async def plain(n: int):
+        if n == 500:
+            raise RuntimeError("boom")
+        raise HTTPException(404, "Nothing here")
+
+    add_error_links(app, ERROR)
+    if options:
+        add_options(app, base_url=TEST_BASE_URL)
+    return app
+
+
+#: ``(label, method, url, headers, status)``: every kind of response of a
+#: described resource.
+EVERY_RESPONSE = [
+    ("200", "GET", "/items/1", {}, 200),
+    ("HEAD", "HEAD", "/items/1", {}, 200),
+    ("304", "GET", "/items/1", {"If-None-Match": '"v1"'}, 304),
+    ("HEAD 304", "HEAD", "/items/1", {"If-None-Match": '"v1"'}, 304),
+    ("400", "GET", "/items/1", {"If-None-Match": "v1"}, 400),
+    ("412", "PUT", "/items/1", {"If-Match": '"other"', "X-Key": "writer"}, 412),
+    ("428", "PUT", "/items/1", {"X-Key": "writer"}, 428),
+    ("raised 404", "GET", "/items/404", {}, 404),
+    ("401", "GET", "/items/1", {"X-Key": "bad"}, 401),
+    ("403", "PUT", "/items/1", {"If-Match": '"v1"', "X-Key": "reader"}, 403),
+    ("405", "POST", "/items/1", {}, 405),
+    ("422", "GET", "/items/abc", {}, 422),
+    ("500", "GET", "/items/500", {}, 500),
+]
+
+
+@pytest.mark.parametrize(
+    "label, method, url, headers, status",
+    EVERY_RESPONSE,
+    ids=[case[0] for case in EVERY_RESPONSE],
+)
+def test_every_response_carries_the_hsr_link(
+    store, label, method, url, headers, status
+):
+    client = TestClient(_everywhere_app(store), raise_server_exceptions=False)
+    response = client.request(method, url, headers=headers)
+    assert response.status_code == status
+    assert hsr_link_problems(response.headers, ITEMS_HSR) == []
+    assert {"Link", "Allow"} <= set(_exposed(response))
+    content = method != "HEAD" and status != 304
+    assert link_problems(method, status, response.headers, content) == []
+    # Once, last: after the content's (or the error's) Links.
+    assert response.headers["link"].endswith(ITEMS_HSR_LINK)
+    assert response.headers.get_list("link") == [response.headers["link"]]
+
+
+@pytest.mark.parametrize(
+    "url, status", [("/nowhere", 404), ("/plain/1", 404), ("/plain/500", 500)]
+)
+def test_an_undescribed_path_gets_no_hsr_link(store, url, status):
+    """An unrouted 404, and the errors of a path without a scrudful endpoint,
+    carry the error entity's Links but no HSR link: there is no resource
+    whose HSR they could link to."""
+    client = TestClient(_everywhere_app(store), raise_server_exceptions=False)
+    response = client.get(url)
+    assert response.status_code == status
+    assert response.headers["link"] == ERROR_LINKS
+
+
+def test_without_add_options_no_hsr_link(store):
+    """Without :func:`add_options` no HSR is served: no response links one."""
+    client = TestClient(
+        _everywhere_app(store, options=False), raise_server_exceptions=False
+    )
+    for method, url, headers, status in [
+        ("GET", "/items/1", {}, 200),
+        ("PUT", "/items/1", {"X-Key": "writer"}, 428),
+        ("GET", "/items/404", {}, 404),
+        ("GET", "/items/500", {}, 500),
+    ]:
+        response = client.request(method, url, headers=headers)
+        assert response.status_code == status
+        assert HSR_DOCUMENT_REL not in response.headers.get("link", "")
+
+
+def test_a_preflight_reaching_an_endpoint_gets_no_hsr_link(make_client, store):
+    """A CORS preflight that an OPTIONS endpoint of the app's own answers
+    carries no Links."""
+    app = FastAPI()
+
+    @app.api_route("/items/{item_id}", methods=["GET", "OPTIONS"])
+    @scrudful(etag_func=store.etag)
+    async def item(item_id: int):
+        return {}
+
+    add_options(app, base_url=TEST_BASE_URL)
+    client = make_client(app)
+    preflight = {"Origin": "https://a.example", "Access-Control-Request-Method": "GET"}
+    assert "link" not in client.options("/items/1", headers=preflight).headers
+    assert client.options("/items/1").headers["link"] == ITEMS_HSR_LINK
+
+
+def test_a_view_s_own_hsr_link_wins(make_client, store):
+    own = "https://elsewhere.example/hsr/items"
+    app = FastAPI()
+
+    @app.get("/items/{item_id}")
+    @scrudful(etag_func=store.etag, **ITEM_LINKS, error=ERROR)
+    async def get_item(item_id: int, response: Response):
+        if item_id == 404:
+            raise HTTPException(404, headers={"Link": hsr_link(own)})
+        response.headers["Link"] = hsr_link(own)
+        return {}
+
+    add_error_links(app, ERROR)
+    add_options(app, base_url=TEST_BASE_URL)
+    client = make_client(app)
+    for url, status in (("/items/1", 200), ("/items/404", 404)):
+        response = client.get(url)
+        assert response.status_code == status
+        assert hsr_link_problems(response.headers, own) == []
+
+
+def test_hsr_link_in_app_mode_under_a_prefix_and_a_mount(store):
+    """With :func:`add_options` on the app, a route of a router included
+    under a prefix (twice) or under a Mount links to the app's HSR route of
+    its full template, on every response, the raised errors and the 500
+    included."""
+    from fastapi.routing import APIRoute
+
+    router = APIRouter()
+
+    async def item(item_id: int):
+        if item_id == 404:
+            raise HTTPException(404)
+        if item_id == 500:
+            raise RuntimeError("boom")
+        return {}
+
+    endpoint = scrudful(
+        etag_func=store.etag,
+        schema_link_or_func=SCHEMA,
+        context_link_or_func=CONTEXT,
+        error=ERROR,
+    )(item)
+    router.add_api_route("/items/{item_id}", endpoint, methods=["GET"])
+    app = FastAPI()
+    app.include_router(router, prefix="/v1")
+    app.include_router(router, prefix="/v2/{org}")
+    app.router.routes.append(
+        Mount("/m/{tenant}", routes=[APIRoute("/items/{item_id}", endpoint)])
+    )
+    add_error_links(app, ERROR)
+    add_options(app, base_url=TEST_BASE_URL)
+    client = TestClient(app, raise_server_exceptions=False)
+    for prefix, name in [
+        ("/v1", "v1.items.item_id"),
+        ("/v2/acme", "v2.org.items.item_id"),
+        ("/m/t", "m.tenant.items.item_id"),
+    ]:
+        target = f"http://testserver/_hsr/{name}"
+        for method, item_id, headers, status in [
+            ("GET", 1, {}, 200),
+            ("GET", 1, {"If-None-Match": '"v1"'}, 304),
+            ("GET", 1, {"If-Match": '"no"'}, 412),
+            ("GET", 404, {}, 404),
+            ("GET", "x", {}, 422),
+            ("GET", 500, {}, 500),
+            ("DELETE", 1, {}, 405),
+        ]:
+            response = client.request(
+                method, f"{prefix}/items/{item_id}", headers=headers
+            )
+            assert response.status_code == status, (prefix, status)
+            assert hsr_link_problems(response.headers, target) == [], (prefix, status)
+        assert client.get(target).status_code == 200
+
+
+def test_hsr_link_in_router_mode(make_client, store):
+    """With :func:`add_options` on a router, its resources' responses link to
+    the router's HSR routes, under the prefix the router is included with."""
+    router = APIRouter()
+
+    @router.get("/items/{item_id}")
+    @scrudful(
+        etag_func=store.etag,
+        schema_link_or_func=SCHEMA,
+        context_link_or_func=CONTEXT,
+        error=ERROR,
+    )
+    async def get_item(item_id: int):
+        if item_id == 404:
+            raise HTTPException(404)
+        return {}
+
+    add_options(router, base_url=TEST_BASE_URL)
+    app = FastAPI()
+    app.include_router(router, prefix="/v1")
+    add_error_links(app, ERROR)
+    client = make_client(app)
+    target = "http://testserver/v1/_hsr/items.item_id"
+    for headers, status in (({}, 200), ({"If-None-Match": '"v1"'}, 304)):
+        response = client.get("/v1/items/1", headers=headers)
+        assert response.status_code == status
+        assert hsr_link_problems(response.headers, target) == []
+    response = client.get("/v1/items/404")
+    assert response.status_code == 404
+    assert hsr_link_problems(response.headers, target) == []
+    assert client.get(target).status_code == 200
+
+
+def test_dependency_link_kept_on_412(make_client, store):
+    """The early 400/412/428 keep a Link a dependency set, beside the error
+    entity's Links and the HSR link, and its cookies."""
+    author = '<http://example.com/me>; rel="author"'
+    app = FastAPI()
+
+    def set_headers(response: Response):
+        response.headers.append("Link", author)
+        response.set_cookie("session", "abc")
+
+    @app.api_route(
+        "/items/{item_id}",
+        methods=["GET", "PUT"],
+        dependencies=[Depends(set_headers)],
+    )
+    @scrudful(etag_func=store.etag, error=ERROR)
+    async def item(item_id: int):
+        return {}
+
+    add_options(app, base_url=TEST_BASE_URL)
+    client = make_client(app)
+    for method, headers, status in [
+        ("PUT", {"If-Match": '"other"'}, 412),
+        ("PUT", {}, 428),
+        ("GET", {"If-Match": "v1"}, 400),
+    ]:
+        response = client.request(method, "/items/1", headers=headers)
+        assert response.status_code == status
+        assert response.headers["link"] == (
+            f"{author}, {ERROR_LINKS}, {ITEMS_HSR_LINK}"
+        )
+        assert response.headers["set-cookie"] == ("session=abc; Path=/; SameSite=lax")
+    # A 304 keeps it too, with the HSR link.
+    response = client.get("/items/1", headers={"If-None-Match": '"v1"'})
+    assert response.status_code == 304
+    assert response.headers["link"] == f"{author}, {ITEMS_HSR_LINK}"
+
+
+def _boom_app(*, endpoint_error=None, **app_options) -> FastAPI:
+    app = FastAPI(**app_options)
+
+    @app.get("/items/{item_id}")
+    @scrudful(**ITEM_LINKS, error=endpoint_error)
+    async def item(item_id: int):
+        raise RuntimeError("boom")
+
+    return app
+
+
+PLAIN_ERROR = Entity(
+    schema_link_or_func="/schemas/error",
+    context_link_or_func="http://example.com/error.jsonld",
+)
+
+
+@pytest.mark.parametrize(
+    "error, body",
+    [(ERROR, SERVER_ERROR), (PLAIN_ERROR, {"detail": "Internal Server Error"})],
+    ids=["problem", "json"],
+)
+def test_500_is_json_with_links(error, body):
+    app = _boom_app()
+    add_error_links(app, error)
+    add_options(app, base_url=TEST_BASE_URL)
+    response = TestClient(app, raise_server_exceptions=False).get("/items/1")
+    assert response.status_code == 500
+    assert response.json() == body
+    assert response.headers["content-type"] == error.media_type
+    assert response.headers["link"] == f"{ERROR_LINKS}, {ITEMS_HSR_LINK}"
+    assert {"Link", "Allow"} <= set(_exposed(response))
+    assert link_problems("GET", 500, response.headers, True) == []
+    if error is ERROR:
+        Draft202012Validator(PROBLEM_DETAILS_SCHEMA).validate(response.json())
+
+
+def test_500_of_an_endpoint_with_its_own_error():
+    """The 500 of an endpoint with its own ``error`` gets that entity, as its
+    other raised errors do, and is problem details when it is."""
+    app = _boom_app(endpoint_error=ERROR)
+    add_error_links(app, PLAIN_ERROR)
+    response = TestClient(app, raise_server_exceptions=False).get("/items/1")
+    assert response.status_code == 500
+    assert response.json() == SERVER_ERROR
+    assert response.headers["content-type"] == "application/problem+json"
+
+
+def test_500_still_raises_in_the_test_client():
+    """Starlette's ServerErrorMiddleware sends the handler's response, then
+    raises the exception again (for the server's log)."""
+    app = _boom_app()
+    add_error_links(app, ERROR)
+    with pytest.raises(RuntimeError, match="boom"):
+        TestClient(app).get("/items/1")
+
+
+def test_500_in_debug_is_starlette_s_traceback():
+    """Documented: with ``debug=True`` ServerErrorMiddleware answers with its
+    traceback page, not the app's server error handler."""
+    app = _boom_app(debug=True)
+    add_error_links(app, ERROR)
+    response = TestClient(app, raise_server_exceptions=False).get("/items/1")
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "link" not in response.headers
+
+
+def _failing_link_app() -> FastAPI:
+    """An endpoint failing (the database is down) whose ``error`` schema
+    callable fails too, outside it: its 500's Links can't be built."""
+
+    def flaky_schema(item_id: int = 0) -> str:
+        if not item_id:  # describe mode
+            return "/schemas/item-error"
+        raise ConnectionError("database is down (link callable)")
+
+    app = FastAPI()
+
+    @app.get("/items/{item_id}")
+    @scrudful(
+        **ITEM_LINKS,
+        error=Entity(schema_link_or_func=flaky_schema, context_link_or_func=CONTEXT),
+    )
+    def get_item(item_id: int):
+        raise ConnectionError("database is down (endpoint)")
+
+    add_options(app, base_url=TEST_BASE_URL)
+    add_error_links(app, PLAIN_ERROR)
+    return app
+
+
+def test_500_whose_links_fail_keeps_the_original_exception():
+    """A link callable failing in the server error handler doesn't replace
+    the endpoint's exception, which Starlette's ServerErrorMiddleware raises
+    again (for the server's log) as it was."""
+    with pytest.raises(ConnectionError, match=r"\(endpoint\)") as raised:
+        TestClient(_failing_link_app()).get("/items/1")
+    assert raised.value.__context__ is None
+
+
+def test_500_whose_links_fail_is_sent_without_them(caplog):
+    """The JSON 500 is sent without the Links that failed (the HSR link is
+    kept), and the link callable's error is logged on ``scrudful.fastapi``."""
+    client = TestClient(_failing_link_app(), raise_server_exceptions=False)
+    with caplog.at_level(logging.ERROR, logger="scrudful.fastapi"):
+        response = client.get("/items/1")
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal Server Error"}
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["link"] == ITEMS_HSR_LINK
+    (record,) = [r for r in caplog.records if r.name == "scrudful.fastapi"]
+    assert "(link callable)" in str(record.exc_info[1])
+    assert "database is down (endpoint)" in record.getMessage()
+
+
+def test_500_whose_hsr_link_fails_is_sent_without_it(caplog):
+    """So is one whose HSR link fails (an ``hsr_url`` raising): the error
+    entity's Links are kept."""
+    calls = []
+
+    def hsr_url(path: str) -> str:
+        calls.append(path)
+        if len(calls) > 1:
+            raise LookupError("no HSR URL now")
+        return "https://docs.example/items"
+
+    app = _boom_app()
+    add_error_links(app, ERROR)
+    add_options(app, base_url=TEST_BASE_URL, hsr_url=hsr_url)
+    with caplog.at_level(logging.ERROR, logger="scrudful.fastapi"):
+        response = TestClient(app, raise_server_exceptions=False).get("/items/1")
+    assert response.status_code == 500
+    assert response.headers["link"] == ERROR_LINKS
+    (record,) = [r for r in caplog.records if r.name == "scrudful.fastapi"]
+    assert isinstance(record.exc_info[1], LookupError)
+    calls.clear()
+    with pytest.raises(RuntimeError, match="boom"):
+        TestClient(app).get("/items/1")
+
+
+def test_a_failing_link_of_another_error_is_the_500(make_client):
+    """Outside the server error handler a failing link callable is the
+    error: Starlette's server error handler answers it (with the Links it
+    can build)."""
+
+    def broken(**kwargs: Any) -> str:
+        raise ConnectionError("broken link callable")
+
+    app = FastAPI()
+
+    @app.get("/items/{item_id}")
+    @scrudful(
+        **ITEM_LINKS,
+        error=Entity(schema_link_or_func=broken, context_link_or_func=CONTEXT),
+    )
+    async def get_item(item_id: int):
+        raise HTTPException(404)
+
+    add_error_links(app, PLAIN_ERROR)
+    with pytest.raises(ConnectionError, match="broken link callable"):
+        TestClient(app).get("/items/1")
+
+
+@pytest.mark.parametrize("key", [Exception, 500])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_500_wraps_an_existing_server_error_handler(key, asynchronous):
+    app = _boom_app()
+
+    def handler(request, exc):
+        return JSONResponse({"oops": str(exc)}, status_code=500)
+
+    async def async_handler(request, exc):
+        return handler(request, exc)
+
+    original = async_handler if asynchronous else handler
+    app.add_exception_handler(key, original)
+    add_error_links(app, ERROR)
+    add_options(app, base_url=TEST_BASE_URL)
+    assert app.exception_handlers[key].__wrapped__ is original
+    # Only the app's own: none added beside it.
+    assert (500 if key is Exception else Exception) not in app.exception_handlers
+    response = TestClient(app, raise_server_exceptions=False).get("/items/1")
+    assert response.status_code == 500
+    assert response.json() == {"oops": "boom"}
+    assert response.headers["link"] == f"{ERROR_LINKS}, {ITEMS_HSR_LINK}"
+    assert response.headers["content-type"] == "application/problem+json"
+
+
+def test_500_leaves_a_non_json_server_error_handler_alone():
+    app = _boom_app()
+
+    @app.exception_handler(Exception)
+    async def text(request, exc):
+        return PlainTextResponse("oops", status_code=500)
+
+    add_error_links(app, ERROR)
+    response = TestClient(app, raise_server_exceptions=False).get("/items/1")
+    assert response.text == "oops"
+    assert "link" not in response.headers
+
+
+def test_500_handler_twice_is_wrapped_once():
+    app = _boom_app()
+    add_error_links(app, PLAIN_ERROR)
+    add_error_links(app, ERROR)
+    response = TestClient(app, raise_server_exceptions=False).get("/items/1")
+    assert response.json() == SERVER_ERROR
+    assert response.headers["link"] == ERROR_LINKS
+
+
+class _Positive(BaseModel):
+    n: int
+
+    @field_validator("n")
+    @classmethod
+    def positive(cls, value: int) -> int:
+        if value < 0:
+            # Its ValueError is in the error's ``ctx``: not JSON.
+            raise ValueError("negative")
+        return value
+
+
+def _validated_app() -> FastAPI:
+    app = FastAPI()
+
+    @app.post("/items/{item_id}")
+    @scrudful(**ITEM_LINKS)
+    async def create(item_id: int, body: _Positive):
+        return {}
+
+    return app
+
+
+@pytest.mark.parametrize(
+    "url, body", [("/items/1", {"n": -1}), ("/items/x", {"n": 1}), ("/items/1", {})]
+)
+def test_422_problem_details(make_client, url, body):
+    app = _validated_app()
+    add_error_links(app, ERROR)
+    add_options(app, base_url=TEST_BASE_URL)
+    response = make_client(app).post(url, json=body)
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "application/problem+json"
+    problem = response.json()
+    Draft202012Validator(PROBLEM_DETAILS_SCHEMA).validate(problem)
+    # FastAPI's own errors, as its default handler encodes them.
+    plain = make_client(_validated_app()).post(url, json=body).json()
+    assert problem == jsonable_encoder(
+        problem_from_errors(422, plain["detail"], "Request validation failed")
+    )
+    assert response.headers["link"] == f"{ERROR_LINKS}, {ITEMS_HSR_LINK}"
+
+
+def test_422_unchanged_without_problem_details(make_client):
+    app = _validated_app()
+    add_error_links(app, PLAIN_ERROR)
+    response = make_client(app).post("/items/1", json={"n": -1})
+    plain = make_client(_validated_app()).post("/items/1", json={"n": -1})
+    assert response.status_code == 422
+    assert response.json() == plain.json()
+    assert response.headers["content-type"] == "application/json"

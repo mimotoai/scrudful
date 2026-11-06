@@ -12,9 +12,10 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.request import Request
 from rest_framework.test import APIClient, APIRequestFactory
 
+from scrudful._hsr import hsr_link
 from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS
 from scrudful.ninja import scrudful_list
-from scrudful.rest_framework import ScrudfulPagination, scrudful_viewset
+from scrudful.rest_framework import ScrudfulPagination, hsr_urls, scrudful_viewset
 
 pytestmark = [pytest.mark.urls(__name__), pytest.mark.django_db]
 
@@ -210,13 +211,17 @@ urlpatterns = [
     path(
         "drf/p/<int:parent>/items/",
         NestedViewSet.as_view({"get": "list"}),
+        name="nested-list",
     ),
     path(
         "drf/p/<int:parent>/items/<int:pk>/",
         NestedViewSet.as_view({"get": "retrieve"}),
+        name="nested-detail",
     ),
     path("drf/", include(router.urls)),
     path("ninja/", api.urls),
+    # Every response of a scrudful view links its HTTP Schema Resource.
+    path("", include(hsr_urls())),
 ]
 
 
@@ -472,5 +477,8 @@ def test_entry_link_callbacks_get_the_list_route_kwargs(items, client):
     for item, entry in zip(items, response.json()["content"]):
         detail = client.get(f"/drf/p/7/items/{item.pk}/")
         assert detail.status_code == 200
-        assert entry["link"] == detail["Link"]
+        # The item's Links, but the link to the detail route's HTTP Schema
+        # Resource, which an item's response carries besides.
+        hsr = hsr_link("http://testserver/_hsr/nested-detail")
+        assert detail["Link"] == f"{entry['link']}, {hsr}"
         assert f"/schemas/7/{item.pk}" in entry["link"]

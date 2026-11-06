@@ -33,7 +33,9 @@ from scrudful.ninja import Entity, add_error_links, scrudful_list
 from tests.test_ninja_adapter import ItemOut
 from tests.test_ninja_list import href
 
-ERROR = Entity(schema_link_or_func="/schemas/error")
+ERROR = Entity(
+    schema_link_or_func="/schemas/error", context_link_or_func="/contexts/error"
+)
 
 #: Queries with a parameter ninja rejects (422): page parameters, the
 #: operation's own ``n``, and both.
@@ -520,7 +522,7 @@ def test_changed_ninja_checks_are_a_config_error(monkeypatch, cls):
         list_router(cls is ninja_operation.AsyncOperation, before=Recorder())
     message = str(caught.value)
     assert "needs ninja's own Operation._run_checks" in message
-    assert "ninja 1.7.0 and 1.7.1" in message
+    assert "ninja 1.7.0 to 1.7.3" in message
     assert "upgrade scrudful" in message
     assert "pin" not in message
     assert "1.6" not in message
@@ -569,6 +571,7 @@ def _different_names_run_checks(self, request):
     return self._check_permissions(request)
 
 
+@pytest.mark.filterwarnings("ignore:scrudful can't read the source:RuntimeWarning")
 def test_without_source_the_code_fingerprint_is_checked(
     monkeypatch, items, fresh_checks_cache
 ):
@@ -586,6 +589,7 @@ def test_without_source_the_code_fingerprint_is_checked(
         list_router(before=Recorder())
 
 
+@pytest.mark.filterwarnings("ignore:scrudful can't read the source:RuntimeWarning")
 @pytest.mark.parametrize(
     "error",
     [tokenize.TokenError("EOF in multi-line statement"), IndentationError("x")],
@@ -810,7 +814,9 @@ def test_checks_copy_sets_the_csrf_flag_as_ninja(asynchronous, csrf_exempt):
     flags = []
     # The path parameters, as scrudful's Operation.run decorator sets them.
     token = scrudful.ninja._RAISED.set(
-        scrudful.ninja._Raised(path_params={"parent": "7"})
+        scrudful.ninja._Raised(
+            scrudful.ninja._scrudful_config(operation), path_params={"parent": "7"}
+        )
     )
     try:
         for checks in (

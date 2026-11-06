@@ -23,6 +23,7 @@ from tests.test_ninja_adapter import (
     CONTEXT_LINK,
     LINKS,
     SCHEMA_LINK,
+    TEST_BASE_URL,
     ItemOut,
     Message,
     Store,
@@ -228,7 +229,7 @@ def test_list_headers(items):
     assert response.headers["Link"] == LIST_LINK
     assert "ETag" not in response.headers
     assert "Last-Modified" not in response.headers
-    assert expose(response) == {"Link"}
+    assert expose(response) == {"Link", "Allow"}
 
     response = TestClient(
         list_router(
@@ -240,7 +241,7 @@ def test_list_headers(items):
     assert response.headers["Link"] == LIST_LINK
     assert response.headers["ETag"] == '"n3"'
     assert "Last-Modified" in response.headers
-    assert expose(response) == {"ETag", "Link"}
+    assert expose(response) == {"ETag", "Link", "Allow"}
 
 
 def test_list_link_callables_get_queryset_and_item(items):
@@ -308,7 +309,7 @@ def test_list_validators_304(items):
 
 def test_list_trace_ignores_preconditions(items):
     """A TRACE's content is no representation of the collection."""
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     calls = []
 
     def list_etag(qs):
@@ -328,13 +329,13 @@ def test_list_trace_ignores_preconditions(items):
         assert "Last-Modified" not in response.headers
     assert calls == []
     assert client.get("/items", headers={"If-Match": '"nope"'}).status_code == 412
-    body = client.request("OPTIONS", "/items").json()
-    assert set(body["trace"]["responses"]) == {"200"}
+    body = client.get("/_hsr/items").json()
+    assert set(body["trace"]["responses"]) == {"200", "default"}
     assert "412" in body["get"]["responses"]
 
 
 def test_list_early_responses_keep_handler_headers(items):
-    """R12: the 304 keeps the handler's headers but Content-*; the 400 and 412
+    """The 304 keeps the handler's headers but Content-*; the 400 and 412
     keep only its cookies. The error entity's Links go on the error bodies."""
     router = Router()
 
@@ -356,7 +357,7 @@ def test_list_early_responses_keep_handler_headers(items):
     assert response.headers["ETag"] == '"n3"'
     assert "Content-Type" not in response.headers
     assert "Content-Language" not in response.headers
-    assert expose(response) == {"ETag"}
+    assert expose(response) == {"ETag", "Link", "Allow"}
 
     for headers, status in (({"If-Match": '"n2"'}, 412), ({"If-Match": "bad"}, 400)):
         response = client.get("/items", headers=headers)

@@ -4,8 +4,12 @@ import re
 from collections.abc import Iterable
 from urllib.parse import quote, urljoin
 
-# Response headers a browser client may need to read (CORS).
-EXPOSABLE_HEADERS = ("ETag", "Link", "Location")
+#: Response headers a browser client may need to read (CORS), in the order
+#: they are appended to Access-Control-Expose-Headers. ``Link`` and ``Allow``
+#: are always exposed; ``ETag`` and ``Location`` only when the response has
+#: them. Give it to a CORS middleware that sets its own expose list
+#: (``expose_headers=list(EXPOSE_HEADERS)``, ``CORS_EXPOSE_HEADERS``).
+EXPOSE_HEADERS = ("ETag", "Link", "Location", "Allow")
 
 # RFC 3986 reserved characters plus '%' (unreserved characters are always kept
 # by ``urllib.parse.quote``).

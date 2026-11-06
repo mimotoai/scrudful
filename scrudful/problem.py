@@ -1,4 +1,8 @@
-"""RFC 9457 problem details for scrudful's own 400, 412 and 428 responses.
+"""RFC 9457 problem details.
+
+For scrudful's own 400, 412 and 428 responses (:func:`problem_details`) and for
+framework errors (:func:`problem_from_errors`: validation errors, the 404
+and 500 bodies of the Django adapters, and FastAPI's JSON 500).
 
 Framework-free (standard library and scrudful only). Pass
 :func:`problem_details` as ``error_body_func`` and, to serve the body as
@@ -16,7 +20,7 @@ from typing import Any
 from scrudful._adapter import reason_phrase
 from scrudful.conditional import ConditionalResult
 
-__all__ = ["PROBLEM_JSON", "problem_details"]
+__all__ = ["PROBLEM_JSON", "problem_details", "problem_from_errors"]
 
 #: The media type of an RFC 9457 problem details object.
 PROBLEM_JSON = "application/problem+json"
@@ -40,4 +44,26 @@ def problem_details(request: Any, result: ConditionalResult) -> dict[str, Any]:
     if detail is not None:
         problem["detail"] = detail
     problem.update(body)
+    return problem
+
+
+def problem_from_errors(
+    status: int, errors: Any, detail: str | None = None
+) -> dict[str, Any]:
+    """RFC 9457 problem details for a framework error: a validation error
+    (``errors`` its list), or a 404 or 500 page (``errors=None``), as the
+    Django error handlers and FastAPI's JSON 500 answer.
+
+    ``type`` is ``about:blank``, ``title`` the reason phrase of ``status`` and
+    ``detail`` the given ``detail`` or that phrase. ``errors`` (the framework's
+    own error list) is an extension member, omitted when ``None``.
+    """
+    problem: dict[str, Any] = {
+        "type": "about:blank",
+        "title": reason_phrase(status),
+        "status": status,
+        "detail": detail or reason_phrase(status),
+    }
+    if errors is not None:
+        problem["errors"] = errors
     return problem

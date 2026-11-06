@@ -5,7 +5,10 @@ throttles, ``after_throttles``, then the parameters and body, ``load`` and
 the preconditions (412, 428, 304)."""
 
 import asyncio
+import contextvars
+import functools
 import json
+import threading
 import types
 import uuid
 from typing import Any
@@ -40,7 +43,9 @@ from tests.test_ninja_list_before import (
     opaque,
 )
 
-ERROR = Entity(schema_link_or_func="/schemas/error")
+ERROR = Entity(
+    schema_link_or_func="/schemas/error", context_link_or_func="/contexts/error"
+)
 ALICE = {"X-API-Key": "alice"}
 METHODS = ["GET", "PUT", "PATCH", "DELETE"]
 WRITES = ["PUT", "PATCH", "DELETE"]
@@ -674,3 +679,260 @@ def test_item_without_hooks_keeps_ninja_checks():
     for path_view in router.path_operations.values():
         for operation in path_view.operations:
             assert "_run_checks" not in vars(operation)
+
+
+def nested_router(asynchronous: bool, hook: str, caller_hooks: bool, log: list[str]):
+    """``/b/{pk}``, whose ``hook`` refuses every request (403), and ``/a/{pk}``,
+    whose function calls ``/b/{pk}``'s decorated handler directly; ``/a``'s
+    own ``before`` allows every request, when ``caller_hooks``."""
+
+    def refuse(request, **params):
+        log.append(f"b.{hook}")
+        raise HttpError(403, "b refuses")
+
+    def allow(request, **params):
+        log.append("a.before")
+
+    def load(request, pk, **params):
+        return {"id": pk, "name": "secret", "version": 1}
+
+    callee = {hook: refuse}
+    caller = {"before": allow} if caller_hooks else {}
+    router = Router()
+    if asynchronous:
+
+        @router.get("/b/{pk}", response=ItemOut)
+        @scrudful(load=load, **callee)
+        async def get_b(request, pk: int, response: HttpResponse, obj):
+            log.append("b.handler")
+            return obj
+
+        @router.get("/a/{pk}", response=ItemOut)
+        @scrudful(load=load, **caller)
+        async def get_a(request, pk: int, response: HttpResponse, obj):
+            log.append("a.handler")
+            return await get_b(request, pk=pk, response=response)
+
+    else:
+
+        @router.get("/b/{pk}", response=ItemOut)
+        @scrudful(load=load, **callee)
+        def get_b(request, pk: int, response: HttpResponse, obj):
+            log.append("b.handler")
+            return obj
+
+        @router.get("/a/{pk}", response=ItemOut)
+        @scrudful(load=load, **caller)
+        def get_a(request, pk: int, response: HttpResponse, obj):
+            log.append("a.handler")
+            return get_b(request, pk=pk, response=response)
+
+    return router
+
+
+@ASYNC
+@pytest.mark.parametrize("hook", HOOKS)
+@pytest.mark.parametrize("caller_hooks", [True, False], ids=["hooked", "hookless"])
+def test_a_handler_with_hooks_called_from_another_operation_fails_closed(
+    asynchronous, hook, caller_hooks
+):
+    """A handler whose ``before=`` or ``after_throttles=`` refuses a request
+    never runs for it when another operation's function calls the decorated
+    handler directly: those hooks didn't run for the request (only the
+    caller's did), so the call raises ``RuntimeError``, naming both
+    operations and the fix, whatever the caller's own hooks."""
+    log: list[str] = []
+    request = requester(
+        asynchronous, api_for(nested_router(asynchronous, hook, caller_hooks, log))
+    )
+    direct = request("GET", "/b/1")
+    assert direct.status_code == 403
+    assert log == [f"b.{hook}"]
+    log.clear()
+    with pytest.raises(RuntimeError, match="called directly from inside") as raised:
+        request("GET", "/a/1")
+    message = str(raised.value)
+    assert "get_b()" in message and "get_a()" in message and f"{hook}=" in message
+    assert "plain function" in message
+    assert log == (["a.before", "a.handler"] if caller_hooks else ["a.handler"])
+
+
+def reentering_router(asynchronous: bool, log: list[Any]) -> Router:
+    """``/i/{pk}``, whose ``before`` allows only pk 1, and whose handler for
+    pk 1 calls itself, the decorated handler, for pk 2 with ``?peek=1``."""
+
+    def only_one(request, pk, **params):
+        log.append(("before", pk))
+        if int(pk) != 1:
+            raise HttpError(403, "only pk 1")
+
+    def load(request, pk, **params):
+        log.append(("load", pk))
+        return {"id": pk, "name": "secret", "version": 1}
+
+    router = Router()
+    if asynchronous:
+
+        @router.get("/i/{pk}", response=ItemOut)
+        @scrudful(load=load, before=only_one)
+        async def get_item(request, pk: int, response: HttpResponse, obj):
+            if pk == 1 and request.GET.get("peek"):
+                return await get_item(request, pk=2, response=response)
+            return obj
+
+    else:
+
+        @router.get("/i/{pk}", response=ItemOut)
+        @scrudful(load=load, before=only_one)
+        def get_item(request, pk: int, response: HttpResponse, obj):
+            if pk == 1 and request.GET.get("peek"):
+                return get_item(request, pk=2, response=response)
+            return obj
+
+    return router
+
+
+@ASYNC
+def test_a_handler_with_hooks_calling_itself_fails_closed(asynchronous):
+    """A handler with hooks calling itself, the decorated handler, while its
+    operation runs (for other path values) raises the nested-call
+    ``RuntimeError``: its ``before`` ran for the request's values only."""
+    log: list[Any] = []
+    request = requester(asynchronous, api_for(reentering_router(asynchronous, log)))
+    assert request("GET", "/i/2").status_code == 403
+    assert request("GET", "/i/1").status_code == 200
+    log.clear()
+    with pytest.raises(RuntimeError, match="called directly from inside") as raised:
+        request("GET", "/i/1?peek=1")
+    message = str(raised.value)
+    assert "get_item()" in message and "before=" in message
+    assert "plain function" in message
+    assert log == [("before", "1"), ("load", 1)]
+
+
+def test_an_async_handler_calling_itself_after_its_run_fails_closed():
+    """A task the handler spawns and leaves running, calling the decorated
+    handler once the operation's run ended (its context still holds the
+    request's record), raises ``RuntimeError``: its ``before`` ran for the
+    request's path parameters, not for that call's."""
+    log: list[Any] = []
+    holder: dict[str, Any] = {}
+
+    def only_one(request, pk, **params):
+        log.append(("before", pk))
+        if int(pk) != 1:
+            raise HttpError(403, "only pk 1")
+
+    def load(request, pk, **params):
+        log.append(("load", pk))
+        return {"id": pk, "name": "secret", "version": 1}
+
+    router = Router()
+
+    @router.get("/i/{pk}", response=ItemOut)
+    @scrudful(load=load, before=only_one)
+    async def get_item(request, pk: int, response: HttpResponse, obj):
+        if pk == 1 and request.GET.get("later"):
+
+            async def later():
+                await asyncio.sleep(0.01)
+                return await get_item(request, pk=2, response=response)
+
+            holder["task"] = asyncio.create_task(later())
+        return obj
+
+    client = TestAsyncClient(api_for(router))
+
+    async def main():
+        assert (await client.get("/i/2")).status_code == 403
+        assert (await client.get("/i/1?later=1")).status_code == 200
+        await holder["task"]
+
+    log.clear()
+    with pytest.raises(RuntimeError, match="after its operation's run ended"):
+        asyncio.run(main())
+    assert ("load", 2) not in log
+
+
+def test_a_sync_handler_calling_itself_after_its_run_fails_closed():
+    """The same from a thread the handler starts in a copy of its context,
+    which calls the decorated handler once the operation's run ended."""
+    log: list[Any] = []
+    holder: dict[str, Any] = {}
+    go = threading.Event()
+
+    def only_one(request, pk, **params):
+        log.append(("before", pk))
+        if int(pk) != 1:
+            raise HttpError(403, "only pk 1")
+
+    def load(request, pk, **params):
+        log.append(("load", pk))
+        return {"id": pk, "name": "secret", "version": 1}
+
+    router = Router()
+
+    @router.get("/i/{pk}", response=ItemOut)
+    @scrudful(load=load, before=only_one)
+    def get_item(request, pk: int, response: HttpResponse, obj):
+        if pk == 1 and request.GET.get("later"):
+
+            def later():
+                go.wait(5)
+                try:
+                    holder["result"] = get_item(request, pk=2, response=response)
+                except RuntimeError as exc:
+                    holder["error"] = exc
+
+            context = contextvars.copy_context()
+            holder["thread"] = threading.Thread(target=context.run, args=(later,))
+            holder["thread"].start()
+        return obj
+
+    client = TestClient(api_for(router))
+    assert client.get("/i/2").status_code == 403
+    assert client.get("/i/1?later=1").status_code == 200
+    go.set()
+    holder["thread"].join(5)
+    assert "result" not in holder
+    assert "after its operation's run ended" in str(holder["error"])
+    assert ("load", 2) not in log
+
+
+def test_an_operation_decorator_may_run_the_handler_twice():
+    """Calling the handler again once it returned (an operation decorator
+    retrying it) isn't a nested call."""
+
+    def twice(func):
+        @functools.wraps(func)
+        def retried(request, *args, **kwargs):
+            func(request, *args, **kwargs)
+            return func(request, *args, **kwargs)
+
+        return retried
+
+    log: list[Any] = []
+    api = api_for(reentering_router(False, log), decorator=twice)
+    assert TestClient(api).get("/i/1").status_code == 200
+    assert log == [("before", "1"), ("load", 1), ("load", 1)]
+
+
+def test_a_handler_called_from_another_operation_notes_nothing_of_it():
+    """A handler without hooks may be called from inside another operation,
+    but what it raised or answered is that operation's to describe: it
+    notes nothing on the running operation's record."""
+    from scrudful.ninja import _RAISED, _Config, _note_answered, _note_raised
+    from scrudful.ninja import _Raised
+
+    running, called = _Config(kind="item"), _Config(kind="item")
+    raised = _Raised(running)
+    token = _RAISED.set(raised)
+    try:
+        _note_raised(HttpError(404, "gone"), called)
+        _note_answered(called)
+        assert not raised.raised_error and not raised.answered
+        _note_raised(HttpError(404, "gone"), running)
+        _note_answered(running)
+        assert raised.raised_error and raised.answered
+    finally:
+        _RAISED.reset(token)

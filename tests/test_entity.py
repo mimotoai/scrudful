@@ -1,6 +1,7 @@
 """The shared ``Entity`` and its media type."""
 
 import pytest
+from django.utils.safestring import SafeString
 
 from scrudful import fastapi, ninja, rest_framework
 from scrudful.entity import Entity
@@ -41,3 +42,51 @@ def test_reexported():
     for module in (ninja, rest_framework, fastapi):
         assert module.Entity is Entity
         assert "Entity" in module.__all__
+
+
+def test_entity_rejects_schema_without_context():
+    with pytest.raises(ValueError, match="x-rdf-context"):
+        Entity(schema_link_or_func="https://x/s")
+
+
+class Lazy:
+    """A lazy URL, as Django's ``reverse_lazy`` gives: evaluating it (its
+    truth, its text) is counted."""
+
+    evaluated = 0
+
+    def __bool__(self):
+        Lazy.evaluated += 1
+        return True
+
+    def __str__(self):
+        Lazy.evaluated += 1
+        return "https://x/lazy"
+
+
+def test_lazy_links_are_not_evaluated_when_made():
+    """A lazy link counts as given without being evaluated, so an entity can
+    name a URL of a URLconf not loaded yet."""
+    Lazy.evaluated = 0
+    entity = Entity(Lazy(), context_link_or_func=Lazy())
+    assert Lazy.evaluated == 0
+    # And a lazy schema link alone is refused, as a plain one is.
+    with pytest.raises(ValueError, match="context"):
+        Entity(Lazy())
+    assert Lazy.evaluated == 0
+    assert entity.context_link_or_func is not None
+
+
+class Text(str):
+    """A ``str`` of a class of the project's own."""
+
+
+@pytest.mark.parametrize(
+    "empty", [SafeString(""), Text(""), b""], ids=["SafeString", "subclass", "bytes"]
+)
+def test_an_empty_string_link_is_unset_whatever_its_class(empty):
+    """An empty ``str`` (or ``bytes``) is no link, as ``""`` is, whatever its
+    class (Django's ``SafeString`` is a ``str`` subclass): a schema link alone
+    needs no context link, and a context link alone no context type."""
+    assert Entity(empty).schema_link_or_func == empty
+    Entity(media_type="text/csv", context_link_or_func=empty)

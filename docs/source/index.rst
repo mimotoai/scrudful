@@ -9,7 +9,15 @@ django-ninja and FastAPI.
 Decorate a view or endpoint, give it validator callbacks (``etag_func``,
 ``last_modified_func``) and scrudful answers 304, 400, 412 and 428 for you, sets
 ``ETag`` and ``Last-Modified`` on the right responses, and adds ``Link`` and
-``Access-Control-Expose-Headers`` headers.
+``Access-Control-Expose-Headers`` headers. It follows `Semantic HTTP 0.1
+<https://w3id.org/semantic-http/0.1/>`_ (spec commit ``37ec1ce``): OPTIONS
+answers a 204 whose ``Allow`` lists what the requester may use, each path's
+HTTP Schema Resource is served by GET and linked from every response, and the
+framework's own error pages are JSON (Django's 404 and 500 pages unless
+``Accept`` prefers HTML).
+
+Upgrading from 0.9? See "Migrating from 0.9" in :doc:`usage` and the
+:doc:`changelog`.
 
 Install the extra for your framework::
 

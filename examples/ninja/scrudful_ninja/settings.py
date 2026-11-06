@@ -3,6 +3,7 @@
 Development settings only: the secret key is public and DEBUG is on.
 """
 
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -12,6 +13,11 @@ SECRET_KEY = "django-insecure-scrudful-ninja-example-not-for-production"
 DEBUG = True
 
 ALLOWED_HOSTS = ["localhost", "127.0.0.1", "testserver"]
+
+# The absolute URL the API is served at. scrudful resolves the relative link
+# URLs against it, in the HTTP Schema Resources (which don't depend on the
+# request) and in the Link headers.
+SCRUDFUL = {"BASE_URL": os.environ.get("SCRUDFUL_BASE_URL", "http://localhost:8000/")}
 
 INSTALLED_APPS = [
     "django.contrib.staticfiles",  # ninja's interactive docs (/api/docs)

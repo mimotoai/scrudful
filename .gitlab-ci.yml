@@ -28,6 +28,52 @@ test:
   script:
     - uv run --locked -p "$PYTHON" pytest -q
 
+# Framework releases pyproject.toml supports that the locked `test` matrix
+# never installs: each job extending `.floor` installs scrudful with the test
+# tools and the newest frameworks the extras allow, then runs one adapter's
+# test modules, pinning its framework first (floor-<framework>: the lowest
+# release) or not (latest-<framework>: the newest).
+.floor:
+  stage: test
+  image: ghcr.io/astral-sh/uv:0.9.0-python3.12-bookworm
+  before_script:
+    - uv venv -p 3.12 /tmp/floor
+    - uv pip install -p /tmp/floor/bin/python -e ".[drf,fastapi,ninja]" pytest pytest-django pytest-randomly jsonschema pyld freezegun
+
+# fastapi>=0.100: a FastAPI that copies an included router's routes. Its
+# Starlette 0.27 test client needs the pydantic, anyio and httpx of its time;
+# newer ones deprecate what it uses, which the suite's warnings-as-errors fails.
+floor-fastapi:
+  extends: .floor
+  script:
+    - uv pip install -p /tmp/floor/bin/python "fastapi==0.100.*" "pydantic==2.3.*" "anyio<4" "httpx==0.24.*"
+    - /tmp/floor/bin/python -m pytest -q -p no:cacheprovider tests/test_fastapi_adapter.py tests/test_fastapi_hsr.py tests/test_wire_fastapi.py
+
+# The ninja extra allows the releases scrudful checks ninja's internals
+# against, 1.7.0 to 1.7.3 (`_run_authentication` changed in 1.7.1,
+# `_get_bound_routers` in 1.7.2), and the locked `test` matrix installs 1.7.1
+# only: floor-ninja runs the oldest, latest-ninja the newest the extra allows
+# (the one `.floor` installs). Beside the ninja modules, some of the shared
+# ones with ninja cases (the HSR route under LoginRequiredMiddleware, the
+# Django helpers, the envelope). test_error_body.py is left out: FastAPI's
+# test client needs httpx, which `.floor` doesn't install.
+.ninja:
+  extends: .floor
+  script:
+    - if [ -n "$NINJA" ]; then uv pip install -p /tmp/floor/bin/python "$NINJA"; fi
+    - /tmp/floor/bin/python -c "import importlib.metadata as m; print('django-ninja', m.version('django-ninja'))"
+    - /tmp/floor/bin/python -m pytest -q -p no:cacheprovider tests/test_ninja_*.py tests/test_wire_ninja.py tests/test_login_required.py tests/test_django_helpers.py tests/test_rest_framework_envelope.py
+
+floor-ninja:
+  extends: .ninja
+  variables:
+    NINJA: "django-ninja==1.7.0"
+
+latest-ninja:
+  extends: .ninja
+  variables:
+    NINJA: ""
+
 # A merge request that changes the package (scrudful/, or the published parts
 # of pyproject.toml) must raise the version above the target branch's and every
 # release on PyPI.

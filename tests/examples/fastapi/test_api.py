@@ -9,10 +9,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 from examples.fastapi import api
-from scrudful._adapter import allow_header, options_links
+from scrudful._hsr import hsr_link, options_operation
+from scrudful.fastapi import add_options
+from tests import test_wire_fastapi as wire
 from tests.semantic_http import (
+    HSR_DOCUMENT_REL,
+    hsr_get_problems,
+    hsr_link_problems,
     link_problems,
+    options_204_problems,
     parse_links,
+    undescribed_problems,
     validate_http_schema_resource,
 )
 
@@ -25,6 +32,9 @@ CONTEXT_LINK = (
     'type="application/ld+json"'
 )
 LINKS = f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+#: The HSR links of /users/{user_id} and /users, on each of their responses.
+USER_HSR_LINK = hsr_link(f"{BASE}/_hsr/users.user_id")
+USERS_HSR_LINK = hsr_link(f"{BASE}/_hsr/users")
 ERROR_LINKS = (
     f'<{BASE}/schemas/error.json>; rel="describedby"; type="application/schema+json", '
     f'<{BASE}/contexts/error.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; '
@@ -42,6 +52,17 @@ JOHN = {
 }
 
 
+@pytest.fixture(autouse=True, scope="module")
+def test_base_url():
+    """The test client's URL as the base URL (the example's is localhost:8000).
+
+    Calling ``add_options`` again replaces its options: give the example's
+    ``load`` again."""
+    add_options(api.app, base_url=f"{BASE}/", load=api.load_user)
+    yield
+    add_options(api.app, base_url=api.BASE_URL, load=api.load_user)
+
+
 @pytest.fixture(autouse=True)
 def fresh_data():
     api.reset_data()
@@ -53,6 +74,25 @@ def fresh_data():
 def client():
     with TestClient(api.app) as client:
         yield client
+
+
+def hsr_of(client, path):
+    """The HTTP Schema Resource the OPTIONS of ``path`` links to: the 204's
+    HSR link, followed by a GET of the HSR route."""
+    response = client.options(path)
+    headers = dict(response.headers)
+    assert options_204_problems(response.status_code, headers, response.content) == []
+    (target,) = [
+        target
+        for target, params in parse_links(headers["link"])
+        if params.get("rel") == HSR_DOCUMENT_REL
+    ]
+    document = client.get(target)
+    assert (
+        hsr_get_problems(document.status_code, dict(document.headers), document.content)
+        == []
+    )
+    return document.json()
 
 
 def assert_unchanged(client, user_id=2):
@@ -70,8 +110,8 @@ def test_get_user(client):
     assert response.json() == JOHN
     assert response.headers["etag"] == '"user-1-v1"'
     assert response.headers["last-modified"] == SEED_MODIFIED
-    assert response.headers["link"] == LINKS
-    assert response.headers["access-control-expose-headers"] == "ETag, Link"
+    assert response.headers["link"] == f"{LINKS}, {USER_HSR_LINK}"
+    assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
 
 
 def test_links_resolve(client):
@@ -123,7 +163,7 @@ def test_head_user(client):
     assert response.status_code == 200
     assert response.content == b""
     assert response.headers["etag"] == '"user-1-v1"'
-    assert response.headers["link"] == LINKS
+    assert response.headers["link"] == f"{LINKS}, {USER_HSR_LINK}"
     response = client.head("/users/1", headers={"If-None-Match": '"user-1-v1"'})
     assert response.status_code == 304
 
@@ -138,8 +178,8 @@ def test_create_user(client):
     assert (body["id"], body["name"], body["age"]) == (4, "Lisa", 23)
     assert body["created_at"] == body["updated_at"]
     assert response.headers["location"] == f"{BASE}/users/4"
-    assert response.headers["link"] == LINKS
-    assert response.headers["access-control-expose-headers"] == "Link, Location"
+    assert response.headers["link"] == f"{LINKS}, {USERS_HSR_LINK}"
+    assert response.headers["access-control-expose-headers"] == "Link, Location, Allow"
     assert "etag" not in response.headers
     assert "last-modified" not in response.headers
 
@@ -241,8 +281,8 @@ def test_put_replaces_user_and_returns_fresh_validators(client):
     body = response.json()
     assert (body["id"], body["name"], body["age"]) == (2, "Alicia", 25)
     assert response.headers["etag"] == '"user-2-v2"'
-    assert response.headers["link"] == LINKS
-    assert response.headers["access-control-expose-headers"] == "ETag, Link"
+    assert response.headers["link"] == f"{LINKS}, {USER_HSR_LINK}"
+    assert response.headers["access-control-expose-headers"] == "ETag, Link, Allow"
     last_modified = parsedate_to_datetime(response.headers["last-modified"])
     assert before <= last_modified <= after
     assert client.get("/users/1").json() == JOHN
@@ -354,7 +394,8 @@ def test_delete_user(client):
     assert response.status_code == 204
     assert response.content == b""
     assert "etag" not in response.headers
-    assert "link" not in response.headers
+    # No content: only the HSR link.
+    assert response.headers["link"] == USER_HSR_LINK
     assert client.get("/users/2").status_code == 404
     assert client.delete("/users/2").status_code == 404
     again = client.delete("/users/2", headers={"If-Match": '"user-2-v1"'})
@@ -412,12 +453,18 @@ def test_openapi_documents_conditional_responses(client):
 
 def test_options_user(client):
     response = client.options("/users/1")
-    assert response.status_code == 200
-    body = response.json()
-    validate_http_schema_resource(body)
+    headers = dict(response.headers)
+    allow = {"GET", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"}
+    assert (
+        options_204_problems(response.status_code, headers, response.content, allow)
+        == []
+    )
+    assert response.status_code == 204
     assert response.headers["allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
-    assert response.headers["allow"] == allow_header(body)
-    assert response.headers["link"] == options_links()
+    assert hsr_link_problems(headers, f"{BASE}/_hsr/users.user_id") == []
+    body = hsr_of(client, "/users/1")
+    validate_http_schema_resource(body)
+    assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
     assert body["get"]["responses"]["200"]["content"] == {
         "application/json": {
             "schema": {"$ref": f"{BASE}/schemas/user.json"},
@@ -436,13 +483,19 @@ def test_options_user(client):
             },
         }
     }
+    assert body["options"] == options_operation()
     users = client.options("/users")
+    headers = dict(users.headers)
+    assert options_204_problems(users.status_code, headers, users.content) == []
     assert users.headers["allow"] == "POST, OPTIONS"
-    validate_http_schema_resource(users.json())
+    assert hsr_link_problems(headers, f"{BASE}/_hsr/users") == []
+    validate_http_schema_resource(hsr_of(client, "/users"))
 
 
 USER = "/users/2"
 USERS = "/users"
+#: The HSR route of the item (any /users/<id>) and of the collection.
+HSR_ROUTES = {"/users/": "/_hsr/users.user_id", USERS: "/_hsr/users"}
 IF_MATCH = {"If-Match": '"user-2-v1"'}
 IF_MATCH_STALE = {"If-Match": '"user-2-v0"'}
 NOT_MODIFIED = {"If-None-Match": "*"}
@@ -471,7 +524,7 @@ CONFORMANCE = [
     ("delete", USER, {}, 428),
     ("delete", USER, {"headers": IF_MATCH_STALE}, 412),
     ("delete", USER, {"headers": MALFORMED}, 400),
-    ("options", USER, {}, 200),
+    ("options", USER, {}, 204),
     ("get", "/users/99", {}, 404),
     ("head", "/users/99", {}, 404),
     ("get", "/users/x", {}, 422),
@@ -480,15 +533,16 @@ CONFORMANCE = [
     ("post", USER, {}, 405),
     ("post", USERS, {"json": BODY}, 201),
     ("post", USERS, {"json": INVALID}, 422),
-    ("options", USERS, {}, 200),
+    ("options", USERS, {}, 204),
     ("get", USERS, {}, 405),
     ("get", "/nowhere", {}, 404),
 ]
-# Statuses with nothing in the OPTIONS bodies to agree with: the 404 the
-# endpoints and Starlette raise, the 405 and FastAPI's 422 are not listed, and a
-# 304 (a HEAD's too) has no content, hence no entry. Their Links are still
-# checked by the rules that don't need the body.
-NO_ENTRY = {304, 404, 405, 422}
+# Statuses with nothing in the OPTIONS bodies to agree with: the 405 (of a
+# method the path doesn't serve) and a 304 (a HEAD's too), which has no
+# content, hence no entry. Their Links are still checked by the rules that
+# don't need the body. The 404 the endpoints raise and FastAPI's 422 agree with
+# the ``default`` entry (Starlette's 404 for an unknown path has no body).
+NO_ENTRY = {304, 405}
 
 
 @pytest.mark.parametrize(
@@ -498,13 +552,17 @@ NO_ENTRY = {304, 404, 405, 422}
 )
 def test_example_links_everywhere(client, method, path, arguments, status):
     """Every response, a HEAD included, follows the Semantic HTTP 0.1 Link rules
-    and agrees with the OPTIONS body of its path."""
-    options = client.options(path)
-    hsr = options.json() if options.status_code == 200 else None
+    and agrees with the HTTP Schema Resource of its path."""
+    route = HSR_ROUTES.get("/users/" if path.startswith("/users/") else path)
+    hsr = None if route is None else client.get(route).json()
     response = client.request(method.upper(), path, **arguments)
     assert response.status_code == status
     content = method != "head" and bool(response.content)
     assert content == (status not in (204, 304) and method != "head")
+    if method == "options":
+        headers = dict(response.headers)
+        assert options_204_problems(status, headers, response.content) == []
+        return
     problems = link_problems(
         method.upper(),
         status,
@@ -513,9 +571,20 @@ def test_example_links_everywhere(client, method, path, arguments, status):
         None if status in NO_ENTRY else hsr,
     )
     assert problems == []
+    # The HSR link of the path, on every response of a described one.
+    hsr_link_value = {USER: USER_HSR_LINK, USERS: USERS_HSR_LINK}.get(path)
+    if path.startswith("/users/"):
+        hsr_link_value = USER_HSR_LINK
+    if hsr_link_value is None:
+        assert HSR_DOCUMENT_REL not in response.headers.get("link", "")
+    else:
+        assert response.headers["link"].endswith(hsr_link_value)
     if status in (404, 405, 422):
         # The Links are still those of the error entity.
-        assert response.headers["link"] == ERROR_LINKS
+        expected = ERROR_LINKS
+        if hsr_link_value is not None:
+            expected = f"{ERROR_LINKS}, {hsr_link_value}"
+        assert response.headers["link"] == expected
         assert response.headers["content-type"] == "application/json"
 
 
@@ -526,3 +595,90 @@ def test_example_links_are_served_with_the_documents(client):
     links += parse_links(client.post(USERS, json=BODY).headers["link"])
     for target, _ in links:
         assert client.get(target.removeprefix(BASE)).status_code == 200
+
+
+def test_options_of_a_missing_user_is_load_users_404(client):
+    """``add_options(load=load_user)``: OPTIONS of a missing user is the 404
+    a GET gets (a non-integer id too), with the error Links and the HSR link;
+    a preflight loads nothing."""
+    for path in ("/users/99", "/users/x"):
+        response = client.options(path)
+        headers = dict(response.headers)
+        assert response.status_code == 404
+        assert "allow" not in headers
+        assert link_problems("OPTIONS", 404, headers, True) == []
+        assert response.headers["link"] == f"{ERROR_LINKS}, {USER_HSR_LINK}"
+    preflight = {"Origin": "https://a.example", "Access-Control-Request-Method": "PUT"}
+    assert client.options("/users/99", headers=preflight).status_code == 204
+
+
+# --- The wire-conformance suite, on the example --------------------------------
+#
+# The exchanges of tests/test_wire_fastapi.py with the example app, checked as
+# that suite checks them (tests/semantic_http.py).
+
+
+@pytest.mark.parametrize("exchange", wire.example_exchanges(), ids=lambda e: e.id)
+def test_wire_exchanges(client, exchange):
+    """Every response has its content Links, the HSR link of its resource
+    (none for an unknown URL) and agrees with its HSR entry."""
+    response = wire.send({"example": client}, exchange)
+    headers = wire.headers_of(response)
+    content = wire.has_content(exchange, response)
+    hsr = None
+    if exchange.kind is not None and exchange.status not in (304, 405):
+        hsr = client.get(wire.KINDS[exchange.kind].hsr).json()
+    problems = link_problems(exchange.method, exchange.status, headers, content, hsr)
+    assert problems == []
+    if exchange.kind is None:
+        assert HSR_DOCUMENT_REL not in headers.get("link", "")
+    else:
+        target = BASE + wire.KINDS[exchange.kind].hsr
+        assert hsr_link_problems(headers, target) == []
+
+
+@pytest.mark.parametrize(
+    "path, allow",
+    [
+        ("/users/1", "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"),
+        ("/users", "POST, OPTIONS"),
+    ],
+)
+def test_wire_options_and_hsr(client, path, allow):
+    """The OPTIONS 204 and its HSR, as the wire suite checks them."""
+    response = client.options(path)
+    headers = wire.headers_of(response)
+    expected = {method.strip() for method in allow.split(",")}
+    problems = options_204_problems(
+        response.status_code, headers, response.content, expected
+    )
+    assert problems == []
+    (target,) = [
+        target
+        for target, params in parse_links(headers["link"])
+        if params.get("rel") == HSR_DOCUMENT_REL
+    ]
+    document = client.get(target)
+    headers = wire.headers_of(document)
+    assert hsr_get_problems(document.status_code, headers, document.content) == []
+
+
+@pytest.mark.parametrize("accept", [None, "application/json"], ids=["absent", "json"])
+@pytest.mark.parametrize(
+    "method, path",
+    [("GET", "/nope"), ("GET", "/users/99"), ("POST", "/users/1"), ("GET", "/users/x")],
+)
+def test_wire_no_undescribed_content(accept, method, path):
+    """No error is content the HSR doesn't describe, for an absent ``Accept``
+    or ``Accept: application/json``, and each follows the Link rules."""
+    with TestClient(api.app) as client:
+        del client.headers["accept"]
+        hsr = client.get("/_hsr/users.user_id").json()
+        headers = {} if accept is None else {"Accept": accept}
+        response = client.request(method, path, headers=headers)
+    assert response.status_code >= 400
+    headers = wire.headers_of(response)
+    assert undescribed_problems(accept, headers, hsr) == []
+    content = bool(response.content)
+    status = response.status_code
+    assert link_problems(method, status, headers, content) == []

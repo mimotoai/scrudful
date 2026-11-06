@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 from django.http import Http404
-from django.urls import include, path
+from django.urls import include, path, resolve
 from rest_framework import generics, serializers, viewsets
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
@@ -17,6 +17,8 @@ from scrudful.rest_framework import (
     _NEVER_CREATES,
     Entity,
     ScrudfulViewFunc,
+    hsr_urls,
+    http_schema_resource,
     scrudful,
     scrudful_viewset,
 )
@@ -40,6 +42,13 @@ list_calls: list = []
 @pytest.fixture(autouse=True)
 def _reset():
     list_calls.clear()
+
+
+@pytest.fixture(autouse=True)
+def base_url(settings):
+    """The HTTP Schema Resource resolves relative links against the base URL,
+    never the request: APIClient's host, so the URIs are those of 0.9."""
+    settings.SCRUDFUL = {"BASE_URL": "http://testserver/"}
 
 
 def list_etag(view, request, **kwargs):
@@ -67,7 +76,11 @@ class ObjectViewSet(viewsets.ModelViewSet):
     class Meta:
         object_validators = True
         etag_func = staticmethod(lambda obj: f"v{obj.version}")
-        error = Entity(schema_link_or_func="/schemas/problem", media_type=PROBLEM_JSON)
+        error = Entity(
+            schema_link_or_func="/schemas/problem",
+            context_link_or_func="/contexts/problem",
+            media_type=PROBLEM_JSON,
+        )
         error_body_func = item_error_body
         list_etag_func = list_etag
         list_last_modified_func = list_modified
@@ -147,10 +160,12 @@ router.register("modifieds", ModifiedViewSet, basename="modified")
 router.register("nolists", NoListValidatorsViewSet, basename="nolist")
 urlpatterns = [
     path("", include(router.urls)),
-    path("explicit/", ExplicitCreateView.as_view()),
-    path("function/", collection_view),
-    path("parents/<int:parent_pk>/children/", children_view),
-    path("none/", no_validators_view),
+    path("explicit/", ExplicitCreateView.as_view(), name="explicit"),
+    path("function/", collection_view, name="function"),
+    path("parents/<int:parent_pk>/children/", children_view, name="children"),
+    path("none/", no_validators_view, name="none"),
+    # Every response of a scrudful view links its HTTP Schema Resource.
+    path("", include(hsr_urls())),
 ]
 
 
@@ -269,15 +284,15 @@ def test_without_list_validators_preconditions_are_ignored(client):
 
 
 def test_options_describes_the_412(client):
-    described = client.options("/objects/").json()["post"]
+    described = http_schema_resource(resolve("/objects/").func)["post"]
     assert {"201", "400", "412"} <= set(described["responses"])
     assert "428" not in described["responses"]
     assert "parameters" not in described
 
 
 def test_options_without_list_validators_describes_201_only(client):
-    described = client.options("/nolists/").json()["post"]
-    assert list(described["responses"]) == ["201"]
+    described = http_schema_resource(resolve("/nolists/").func)["post"]
+    assert list(described["responses"]) == ["201", "default"]
 
 
 def test_list_validators_must_be_callable():

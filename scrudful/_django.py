@@ -6,37 +6,253 @@ can be used without the other.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import math
+import sys
+import types
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal, TypedDict
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
+from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.core.paginator import UnorderedObjectListWarning
 from django.db.models import QuerySet
 from django.http import (
     HttpRequest,
     HttpResponse,
     HttpResponseBase,
+    HttpResponseNotAllowed,
     HttpResponseNotModified,
     JsonResponse,
     QueryDict,
 )
 from django.utils import timezone
+from django.utils.cache import patch_vary_headers
+from django.views import defaults
 
 from scrudful import _adapter
+from scrudful._hsr import (
+    DEFAULT_HSR_CACHE_CONTROL,
+    HsrConfigError,
+    check_base_url,
+    check_hsr_cache_control,
+    hsr_etag,
+    hsr_response_links,
+    serialize_hsr,
+)
 from scrudful.collection import InvalidPage
-from scrudful.conditional import ConditionalResult
+from scrudful.conditional import ConditionalResult, evaluate_preconditions
+from scrudful.entity import Entity, _unset
+from scrudful.problem import PROBLEM_JSON, problem_from_errors
+from scrudful.utils import join_links, link_content, resolve_uri
 
 __all__ = [
+    "SETTING_ACCESSORS",
+    "ScrudfulSettings",
     "aware",
     "conditional_response",
+    "error_handler",
+    "hsr_not_allowed",
+    "hsr_response",
     "json_response",
+    "no_content",
     "page_url",
     "precondition_headers",
+    "scrudful_setting",
+    "setting_base_url",
+    "setting_error",
+    "setting_hsr_cache_control",
+    "setting_hsr_route",
+    "setting_hsr_url",
     "slice_page",
 ]
+
+
+class ScrudfulSettings(TypedDict, total=False):
+    """The shape of the optional ``SCRUDFUL`` Django setting.
+
+    Each key's value is checked when it is read, by its accessor below
+    (``ImproperlyConfigured`` when it is invalid). The per-router and
+    per-viewset arguments override them.
+    """
+
+    #: The absolute URL relative link URLs resolve against
+    #: (:func:`setting_base_url`).
+    BASE_URL: str
+    #: The API-wide error entity, of a JSON media type
+    #: (:func:`setting_error`). DRF only: django-ninja accepts the key and
+    #: ignores it (``add_error_links`` is its API-wide entity).
+    ERROR: Entity
+    #: The ``Cache-Control`` of the HTTP Schema Resource routes
+    #: (:func:`setting_hsr_cache_control`).
+    HSR_CACHE_CONTROL: str
+    #: Whether scrudful serves the HTTP Schema Resource routes
+    #: (:func:`setting_hsr_route`).
+    HSR_ROUTE: bool
+    #: Where the HTTP Schema Resources are served instead
+    #: (:func:`setting_hsr_url`): the absolute URL of the HSR of the
+    #: request's route. Its one ``str`` argument names that route as the
+    #: adapter knows it: DRF passes the namespace-qualified URL name
+    #: (``request.resolver_match.view_name``, ``"api:item-detail"``),
+    #: django-ninja the route Django resolved, with every prefix
+    #: (``request.resolver_match.route``, ``"api/items/<pk>"``). A project
+    #: using both adapters gets both kinds from this one callable, with
+    #: nothing to tell them apart: set ``Meta.hsr_url`` (DRF) or a
+    #: ``ScrudfulRouter``'s ``hsr_url=`` (django-ninja) on one side.
+    HSR_URL: Callable[[str], str]
+
+
+logger = logging.getLogger(__name__)
+#: Marks the exception a failing handler500 raised, once it logged the error
+#: it was answering: Django's next call of it answers that exception.
+_ANSWERED_LOGGED = "_scrudful_answered_logged"
+
+#: The keys of the ``SCRUDFUL`` setting.
+SETTING_KEYS = frozenset(
+    ScrudfulSettings.__required_keys__ | ScrudfulSettings.__optional_keys__
+)
+
+
+def scrudful_setting(name: str, default: Any) -> Any:
+    """``settings.SCRUDFUL[name]``, or ``default`` when unset, unchecked.
+
+    ``SCRUDFUL`` is an optional dict of the keys :data:`SETTING_KEYS` (see
+    :class:`ScrudfulSettings`); the per-router and per-viewset arguments
+    override it. It is read on every call, so ``override_settings`` applies.
+    The accessors below (:func:`setting_base_url` ...) read one key each and
+    check its value.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If ``SCRUDFUL`` is not a dict, or has a key scrudful doesn't know.
+    """
+    values = getattr(settings, "SCRUDFUL", None)
+    if values is None:
+        return default
+    if not isinstance(values, Mapping):
+        raise ImproperlyConfigured(
+            f"SCRUDFUL must be a dict, not {type(values).__name__}"
+        )
+    unknown = sorted(str(key) for key in values.keys() - SETTING_KEYS)
+    if unknown:
+        raise ImproperlyConfigured(
+            f"SCRUDFUL has unknown keys {unknown}; its keys are "
+            f"{sorted(SETTING_KEYS)}"
+        )
+    return values.get(name, default)
+
+
+def setting_base_url() -> str | None:
+    """``SCRUDFUL["BASE_URL"]``, an absolute URL, or ``None`` when unset.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If it is not an absolute URL (a ``str`` with a scheme and a host).
+    """
+    value = scrudful_setting("BASE_URL", None)
+    if value is not None:
+        try:
+            check_base_url(value, 'SCRUDFUL["BASE_URL"]')
+        except HsrConfigError as exc:
+            raise ImproperlyConfigured(str(exc)) from exc
+    return value
+
+
+def setting_hsr_route() -> bool:
+    """``SCRUDFUL["HSR_ROUTE"]``, else ``True``.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If it is not a ``bool``.
+    """
+    value = scrudful_setting("HSR_ROUTE", True)
+    if not isinstance(value, bool):
+        raise ImproperlyConfigured(
+            f'SCRUDFUL["HSR_ROUTE"] must be a bool, not {type(value).__name__}'
+        )
+    return value
+
+
+def setting_hsr_url() -> Callable[[str], str] | None:
+    """``SCRUDFUL["HSR_URL"]``, else ``None``.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If it is not callable.
+    """
+    value = scrudful_setting("HSR_URL", None)
+    if value is not None and not callable(value):
+        raise ImproperlyConfigured(
+            'SCRUDFUL["HSR_URL"] must be a callable returning the HTTP Schema '
+            f"Resource's URL, not {type(value).__name__}"
+        )
+    return value
+
+
+def setting_hsr_cache_control() -> str:
+    """``SCRUDFUL["HSR_CACHE_CONTROL"]``, else ``public, max-age=300``.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If it is not a non-empty ``str``, or has control characters (but a
+        tab) or characters outside Latin-1, which no field can carry.
+    """
+    value = scrudful_setting("HSR_CACHE_CONTROL", DEFAULT_HSR_CACHE_CONTROL)
+    try:
+        return check_hsr_cache_control(value, 'SCRUDFUL["HSR_CACHE_CONTROL"]')
+    except HsrConfigError as exc:
+        raise ImproperlyConfigured(str(exc)) from exc
+
+
+def setting_error() -> Entity | None:
+    """``SCRUDFUL["ERROR"]``, the API-wide error entity (DRF only), or ``None``.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If it is not an :class:`~scrudful.entity.Entity` of a JSON media type.
+    """
+    value = scrudful_setting("ERROR", None)
+    if value is None:
+        return None
+    if not isinstance(value, Entity):
+        raise ImproperlyConfigured(
+            f'SCRUDFUL["ERROR"] must be an Entity, not {type(value).__name__}'
+        )
+    try:
+        _adapter.check_error_media_type(value.media_type)
+    except ValueError as exc:
+        raise ImproperlyConfigured(f'SCRUDFUL["ERROR"]: {exc}') from exc
+    return value
+
+
+#: The accessor of each key of the ``SCRUDFUL`` setting (read-only): the
+#: system check validates each key by calling its accessor.
+SETTING_ACCESSORS: Mapping[str, Callable[[], Any]] = types.MappingProxyType(
+    {
+        "BASE_URL": setting_base_url,
+        "ERROR": setting_error,
+        "HSR_CACHE_CONTROL": setting_hsr_cache_control,
+        "HSR_ROUTE": setting_hsr_route,
+        "HSR_URL": setting_hsr_url,
+    }
+)
+# A key without an accessor would be accepted but never checked: fail the
+# import instead (not an assert, which -O removes).
+if SETTING_ACCESSORS.keys() != SETTING_KEYS:
+    raise AssertionError(
+        "SETTING_ACCESSORS and ScrudfulSettings differ: "
+        f"{sorted(SETTING_ACCESSORS.keys() ^ SETTING_KEYS)}"
+    )
 
 
 def precondition_headers(request: HttpRequest) -> dict[str, str]:
@@ -85,6 +301,57 @@ def conditional_response(
     return response
 
 
+def hsr_response(
+    request: HttpRequest, document: Mapping[str, Any], cache_control: str
+) -> HttpResponseBase:
+    """The answer to a GET or HEAD of the HTTP Schema Resource ``document``.
+
+    A 200 whose body is :func:`~scrudful._hsr.serialize_hsr` of the document
+    (the bytes the strong ``ETag`` hashes), with the HSR's own Links and
+    ``cache_control`` as ``Cache-Control``; or, for an ``If-None-Match``
+    matching the ``ETag`` (weak comparison), a 304 with the ``ETag`` and
+    ``Cache-Control``. The same for every adapter and every requester.
+    """
+    body = serialize_hsr(document)
+    etag = hsr_etag(body)
+    result = evaluate_preconditions(
+        request.method or "GET",
+        precondition_headers(request),
+        etag=etag,
+        last_modified=None,
+        require_precondition=False,
+    )
+    if result is not None:
+        early = conditional_response(result)
+        if result.status == 304:
+            early["Cache-Control"] = cache_control
+        return early
+    response = HttpResponse(body, content_type="application/json")
+    response["Link"] = hsr_response_links()
+    response["ETag"] = etag
+    response["Cache-Control"] = cache_control
+    _adapter.expose_headers(response)
+    return response
+
+
+def hsr_not_allowed() -> HttpResponseBase:
+    """The 405 of an HTTP Schema Resource view to a method but GET and HEAD:
+    ``Allow: GET, HEAD``, with the expose headers, and neither content nor
+    ``Content-Type`` (Django's ``text/html`` would label empty content as
+    a media type no HTTP Schema Resource describes)."""
+    response = HttpResponseNotAllowed(["GET", "HEAD"])
+    del response["Content-Type"]
+    _adapter.expose_headers(response)
+    return response
+
+
+def no_content() -> HttpResponse:
+    """A 204 without content or ``Content-Type`` (a CORS preflight's answer)."""
+    response = HttpResponse(status=204)
+    del response["Content-Type"]
+    return response
+
+
 def json_response(
     data: Any, status: int, content_type: str, render: Render | None = None
 ) -> HttpResponse:
@@ -93,6 +360,227 @@ def json_response(
     if render is None:
         return JsonResponse(data, status=status, content_type=content_type)
     return render(data, status, content_type)
+
+
+def _plain_links(entity: Entity, request: HttpRequest | None) -> str | None:
+    """The Link field value of ``entity``'s plain schema and context links.
+
+    The same rels, types and defaults as the adapters' error Links; a
+    relative URL resolves against ``SCRUDFUL["BASE_URL"]`` when it is set,
+    as the adapters' Links and HTTP Schema Resources do, else against the
+    request (``build_absolute_uri()``, called only then: an absolute link
+    needs no host of the request's). Without a ``request``, each URL is a
+    fixed placeholder, once a plain one is parsed (a lazy URL, such as
+    ``reverse_lazy``'s, is not evaluated), and the settings are unread: a
+    check of the URLs, rels and types that depend on neither.
+
+    Raises
+    ------
+    ImproperlyConfigured
+        If ``SCRUDFUL["BASE_URL"]`` is not an absolute URL; without a
+        ``request``, if a plain URL can't be parsed (``urlsplit``'s
+        ``ValueError``).
+    django.core.exceptions.DisallowedHost
+        If a relative link needs the request's host and ``ALLOWED_HOSTS``
+        refuses it.
+    django.urls.NoReverseMatch
+        If a lazy URL (``reverse_lazy``) doesn't reverse.
+    ValueError
+        If a lazy URL evaluates to one that can't be parsed.
+    """
+    base = setting_base_url() if request is not None else None
+
+    def resolve(url: Any) -> str:
+        nonlocal base
+        if request is None:
+            if isinstance(url, str):  # a lazy URL is not evaluated
+                try:
+                    urlsplit(url)
+                except ValueError as exc:
+                    raise ImproperlyConfigured(
+                        f"the error entity's link {url!r} can't be parsed as a "
+                        f"URL ({exc})"
+                    ) from exc
+            return "about:blank"
+        if base is None:
+            if urlsplit(str(url)).scheme:
+                return str(url)
+            base = request.build_absolute_uri()
+        return resolve_uri(url, base)
+
+    candidates = [
+        (
+            entity.schema_link_or_func,
+            entity.schema_rel_or_func,
+            entity.schema_type_or_func,
+            (_adapter.DEFAULT_SCHEMA_REL, _adapter.DEFAULT_SCHEMA_TYPE),
+            None,
+        )
+    ]
+    context_defaults = _adapter.context_defaults(entity.media_type)
+    if context_defaults != (None, None):
+        candidates.append(
+            (
+                entity.context_link_or_func,
+                entity.context_rel_or_func,
+                entity.context_type_or_func,
+                context_defaults,
+                entity.media_type,
+            )
+        )
+    parts = []
+    for url, rel, content_type, defaults_, context_of in candidates:
+        if _unset(url):
+            continue
+        if request is not None:
+            # A lazy URL is evaluated only with a request (see resolve):
+            # one of nothing gives no Link, as an unset one.
+            url = url if isinstance(url, str) else str(url)
+            if _unset(url):
+                continue
+        if context_of is not None:
+            content_type = _adapter.context_link_type(context_of, content_type)
+        parts.append(
+            link_content(
+                resolve(url),
+                rel or defaults_[0],
+                content_type or defaults_[1],
+            )
+        )
+    return join_links(*parts) if parts else None
+
+
+def error_handler(
+    status: Literal[404, 500], error: Entity
+) -> Callable[..., HttpResponse]:
+    """A Django ``handler404`` / ``handler500`` that honours ``Accept``.
+
+    The view answers with Django's HTML page when the client prefers
+    ``text/html`` to the entity's media type, else with a JSON body (RFC 9457
+    problem details for ``application/problem+json``, else
+    ``{"detail": <reason phrase>}``) served as ``error.media_type`` with the
+    entity's Links. It always sends ``Vary: Accept``. It is
+    ``login_required = False``, public under Django's
+    ``LoginRequiredMiddleware`` (Django exempts its error handlers anyway).
+
+    ``error`` is checked here, when the handler is made: an
+    :class:`~scrudful.entity.Entity` of a JSON media type (its bodies are
+    JSON), with plain link values whose URLs can be parsed and whose rels and
+    types a Link can carry. A lazy URL (``reverse_lazy``) is evaluated only
+    when the handler answers.
+
+    It never raises for its Links: Django logs the error it answers only
+    once the handler returns, so a Link it can't build, whatever the cause
+    (an invalid ``SCRUDFUL["BASE_URL"]``; a relative link without a base
+    URL, on a request whose host ``ALLOWED_HOSTS`` refuses; a lazy URL that
+    doesn't reverse, can't be parsed, or raises anything else) is logged, on
+    the ``scrudful._django`` logger with the traceback and the request's
+    path, and the error is served without the entity's Links. Should it fail
+    anyway, past its Links (Django's HTML page, the JSON body), a
+    ``handler500`` first logs, on the same logger, the error it was
+    answering, which Django then doesn't log.
+
+    Raises
+    ------
+    TypeError
+        If ``error`` is not an :class:`~scrudful.entity.Entity`, or a link
+        of it is a callable.
+    ValueError
+        If ``status`` is not the ``int`` (or ``HTTPStatus``) 404 or 500 (the
+        HTML answer is Django's page of one of them); if ``error``'s media
+        type is not JSON (``application/json`` or a ``+json`` type), or a rel
+        or type of its links has characters a Link can't carry (control
+        characters, or outside Latin-1).
+    ImproperlyConfigured
+        If a plain link URL of ``error`` can't be parsed.
+    """
+    if (
+        not isinstance(status, int)
+        or isinstance(status, bool)
+        or status not in (404, 500)
+    ):
+        raise ValueError(f"status must be 404 or 500, not {status!r}")
+    status = int(status)  # an HTTPStatus answers as its number
+    if not isinstance(error, Entity):
+        raise TypeError(f"error must be an Entity, not {type(error).__name__}")
+    _adapter.check_error_media_type(error.media_type)
+    if any(
+        callable(value)
+        for value in (
+            error.schema_link_or_func,
+            error.schema_rel_or_func,
+            error.schema_type_or_func,
+            error.context_link_or_func,
+            error.context_rel_or_func,
+            error.context_type_or_func,
+        )
+    ):
+        raise TypeError("handler404/handler500 need an Entity with plain link values")
+    # Each plain URL parsed, then each Link with a URL of the same form:
+    # what depends on neither the settings, the request nor the URLconf
+    # fails now.
+    _plain_links(error, None)
+
+    def view(request: HttpRequest, exception: Exception | None = None) -> HttpResponse:
+        # A handler500 is called while Django handles the error it answers,
+        # which Django logs only once the handler returns. Django calls it
+        # again at each middleware layer, then answering what the handler500
+        # before raised, which is marked: logged once, at the first.
+        answering = sys.exc_info()[1] if status == 500 else None
+        try:
+            return answer(request, exception)
+        except Exception as exc:
+            if answering is not None:
+                if not getattr(answering, _ANSWERED_LOGGED, False):
+                    logger.error(
+                        "scrudful handler500 failed answering the error of %s; "
+                        "the error it was answering",
+                        request.path,
+                        exc_info=answering,
+                    )
+                # An exception that takes no attribute is logged again.
+                with contextlib.suppress(AttributeError, TypeError):
+                    setattr(exc, _ANSWERED_LOGGED, True)
+            raise
+
+    def answer(request: HttpRequest, exception: Exception | None) -> HttpResponse:
+        if _adapter.prefers_html(request.headers.get("Accept"), error.media_type):
+            if status == 404:
+                response = defaults.page_not_found(
+                    request, exception  # type: ignore[arg-type]
+                )
+            else:
+                response = defaults.server_error(request)
+        else:
+            if _adapter.essence(error.media_type) == PROBLEM_JSON:
+                body = problem_from_errors(status, None)
+            else:
+                body = {"detail": _adapter.reason_phrase(status)}
+            response = json_response(body, status, error.media_type)
+            try:
+                link = _plain_links(error, request)
+            except Exception:
+                # Whatever the cause (the settings, the host, the URLconf, or
+                # a bug in a lazy URL), serve the error, and keep Django's own
+                # log of what it is answering, rather than fail inside the
+                # error handler; the cause is logged, with its traceback.
+                logger.exception(
+                    "scrudful handler%s: the error entity's Links can't be "
+                    "built for %s; answering without them",
+                    status,
+                    request.path,
+                )
+                link = None
+            if link:
+                response["Link"] = link
+        patch_vary_headers(response, ["Accept"])
+        _adapter.expose_headers(response)
+        return response
+
+    # Public under LoginRequiredMiddleware (Django >= 5.1), as Django's own
+    # error handlers are.
+    view.login_required = False  # type: ignore[attr-defined]
+    return view
 
 
 def aware(value: Any) -> Any:

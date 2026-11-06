@@ -20,6 +20,7 @@ from ninja.testing import TestClient
 from ninja.utils import contribute_operation_callback
 
 from scrudful._adapter import READ_DESCRIPTIONS, WRITE_DESCRIPTIONS, resolved_signature
+from scrudful._hsr import hsr_link
 from scrudful.ninja import (
     CONDITIONAL_READ_RESPONSES,
     CONDITIONAL_WRITE_RESPONSES,
@@ -44,6 +45,11 @@ CONTEXT_LINK = (
 LINKS = dict(schema_link_or_func="/schemas/item", context_link_or_func="/contexts/item")
 METHODS = ["GET", "PUT", "PATCH", "DELETE"]
 IF_HEADERS = [{}, {"If-Match": "*"}, {"If-None-Match": "*"}, {"If-Match": '"stale"'}]
+
+#: The base URL of the test routers (``ScrudfulRouter(base_url=...)``):
+#: ninja's TestClient builds absolute URIs against it, so relative links
+#: resolve the same in the HTTP Schema Resource and on the responses.
+TEST_BASE_URL = "http://testlocation/"
 
 ALICE = {"X-API-Key": "alice"}
 MISSING = 3  # no such row
@@ -676,6 +682,17 @@ def test_future_annotations_with_an_unresolvable_hidden_annotation():
     assert response.status_code == 428
 
 
+def test_a_hidden_annotation_raising_attribute_error_is_left_a_string():
+    """An annotation whose evaluation raises something other than
+    ``NameError`` (``decimal.Nope``, an ``AttributeError``) stays a string,
+    as one naming something missing does: the handler is decorated and
+    served."""
+    client = TestClient(future_endpoints.make_missing_attribute_router())
+    response = client.put("/items/1", json={"name": "b"}, headers={"If-Match": '"v1"'})
+    assert response.status_code == 200
+    assert response.json() == {"pk": 1, "name": "b"}
+
+
 def test_resolved_signature_evaluates_each_annotation():
     signature = resolved_signature(future_endpoints.put_unchecked_item.__wrapped__)
     annotations = {
@@ -738,7 +755,9 @@ def test_handler_headers_kept_and_link_joined(store):
     assert response.headers["Link"] == (
         f'</items/2>; rel="next", {SCHEMA_LINK}, {CONTEXT_LINK}'
     )
-    assert response.headers["Access-Control-Expose-Headers"] == "X-Total, ETag, Link"
+    assert response.headers["Access-Control-Expose-Headers"] == (
+        "X-Total, ETag, Link, Allow"
+    )
     assert response.cookies["seen"].value == "1"
 
 
@@ -869,7 +888,12 @@ def test_callback_errors_use_ninja_handlers(store, failing):
     def fail(*args):
         raise HttpError(403, "Forbidden")
 
-    options = {"etag_func": etag, "schema_link_or_func": "/schemas/item", failing: fail}
+    options = {
+        "etag_func": etag,
+        "schema_link_or_func": "/schemas/item",
+        "context_link_or_func": "/contexts/item",
+        failing: fail,
+    }
     router = Router()
 
     @router.get("/items/{pk}")
@@ -1196,7 +1220,7 @@ def test_router_add_decorator_wraps_the_bound_operations(store, mode):
     def get_item(request, pk: int, obj):
         return obj
 
-    router = ScrudfulRouter()
+    router = ScrudfulRouter(base_url=TEST_BASE_URL)
     router.get("/x/{pk}", response=ItemOut)(get_item)
     router.get("/y/{pk}", response={202: ItemOut})(get_item)
     router.add_decorator(recording(seen, mode), mode=mode)
@@ -1208,7 +1232,13 @@ def test_router_add_decorator_wraps_the_bound_operations(store, mode):
         response = client.get(f"{prefix}/x/1")
         assert response.status_code == 200
         assert response.headers["ETag"] == '"v1"'
-        assert response.headers["Link"] == f"{SCHEMA_LINK}, {CONTEXT_LINK}"
+        # The entity's Links, then the HSR link: of either mount's route,
+        # which serve one document (one URL name for both, see _hsr_target).
+        assert response.headers["Link"] in {
+            f"{SCHEMA_LINK}, {CONTEXT_LINK}, "
+            f"{hsr_link(f'http://testlocation{mount}/_hsr/x.pk')}"
+            for mount in ("/one", "/two")
+        }
         response = client.get(f"{prefix}/y/1", headers={"If-None-Match": '"v1"'})
         assert response.status_code == 304
         response = client.get(f"{prefix}/y/1")

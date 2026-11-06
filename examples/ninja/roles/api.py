@@ -84,14 +84,16 @@ class Message(Schema):
 
 
 def document_link(kind: str, name: str) -> Any:
-    """A link callable: the absolute URL of a document of ``documents.py``.
+    """A link callable: the URL of a document of ``documents.py``.
 
-    Link callables get ``(request, obj)``; ``obj`` (the role, the queryset or
-    ``None``) is not needed here.
+    Link callables get ``(request, obj)`` on a response, and ``(None, None)``
+    when the HTTP Schema Resource is built, so they must return the same
+    target without either. The URL is relative: scrudful resolves it against
+    ``SCRUDFUL["BASE_URL"]`` (settings.py).
     """
 
-    def link(request: HttpRequest, obj: Any) -> str:
-        return request.build_absolute_uri(reverse(f"api:{kind}", kwargs={"name": name}))
+    def link(request: HttpRequest | None, obj: Any) -> str:
+        return reverse(f"api:{kind}", kwargs={"name": name})
 
     return link
 
@@ -165,7 +167,9 @@ def forbidden(request: HttpRequest, rbac_context: str) -> Status | None:
     return None
 
 
-#: Answers OPTIONS on every path with the path's HTTP Schema Resource.
+#: Answers OPTIONS on every path with a 204 whose Allow lists the methods
+#: this requester may use, and links to the path's HTTP Schema Resource,
+#: which it serves by GET under ``_hsr/``.
 router = ScrudfulRouter(tags=["roles"])
 
 

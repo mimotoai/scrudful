@@ -7,6 +7,7 @@ from typing import Any, NamedTuple
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient as FastAPIClient
+from jsonschema import Draft202012Validator
 from ninja import NinjaAPI, Router
 from ninja.testing import TestClient as NinjaClient
 from rest_framework.response import Response
@@ -17,7 +18,9 @@ from scrudful import ninja as sf_ninja
 from scrudful import rest_framework as sf_drf
 from scrudful.conditional import ConditionalResult
 from scrudful.entity import Entity
-from scrudful.problem import PROBLEM_JSON, problem_details
+from scrudful._adapter import reason_phrase
+from scrudful.problem import PROBLEM_JSON, problem_details, problem_from_errors
+from tests.semantic_http import PROBLEM_DETAILS_SCHEMA
 
 calls: list = []
 
@@ -298,3 +301,14 @@ def test_drf_viewset_meta_error_body_func():
     assert V.list.error_body_func is list_body_func
     # A create's 400/412 carry the item error entity: the item's body.
     assert V.create.error_body_func is body_func
+
+
+def test_problem_from_errors_is_valid_problem_details():
+    errors = [{"loc": ["body", "name"], "msg": "Field required"}]
+    body = problem_from_errors(422, errors)
+    Draft202012Validator(PROBLEM_DETAILS_SCHEMA).validate(body)
+    assert body["status"] == 422 and body["title"] == reason_phrase(422)
+    assert body["type"] == "about:blank" and body["detail"] == reason_phrase(422)
+    assert body["errors"][0]["msg"] == "Field required"
+    assert "errors" not in problem_from_errors(404, None)
+    assert problem_from_errors(400, [], detail="Bad input")["detail"] == "Bad input"

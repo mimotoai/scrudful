@@ -95,8 +95,12 @@ Validators
     the 400, 412 and 428 bodies carry that entity's Links (its link callables
     get the loaded object) and are served with its media type, which must be
     JSON content (e.g. ``application/problem+json``); the 304 has no body and
-    gets none, and without ``error`` they carry no Link and are
-    ``application/json``. Describe them in OpenAPI with
+    gets none. Without ``error`` they carry the Links and media type of the
+    entity ``responses=`` declares for their status, else of the serving
+    API's :func:`add_error_links` entity (link callables then get
+    ``obj=None``), else no entity Links, and are ``application/json`` (on a
+    :class:`ScrudfulRouter`, each carries the HTTP Schema Resource link).
+    Describe them in OpenAPI with
     ``openapi_extra={"responses": CONDITIONAL_READ_RESPONSES}`` (or
     :data:`CONDITIONAL_WRITE_RESPONSES`). They are built fresh, without the
     headers and cookies of ninja's temporal response: with ninja's stock
@@ -110,7 +114,14 @@ Validators
     requests carrying the same If-Match can both pass. Strict lost-update
     protection needs an atomic re-check in the handler's storage layer (e.g.
     ``select_for_update()`` in ``load`` inside a transaction, or
-    ``UPDATE ... WHERE version = <expected>``).
+    ``UPDATE ... WHERE version = <expected>``). OPTIONS runs a method's own
+    ``load`` too, on a copy of the request with that method: inside a
+    transaction, lock only when ``request.META.get("REQUEST_METHOD") !=
+    "OPTIONS"`` (the request line's method, which the copy keeps; on an
+    OPTIONS whose ``META`` has none, as ninja's test client builds it,
+    scrudful sets it to ``"OPTIONS"``), or the OPTIONS holds the lock until
+    it ends. Without a transaction,
+    ``select_for_update()`` fails the write itself.
 
     After the handler runs, 2xx responses to GET/HEAD get the validators
     computed for the precondition check, and 2xx responses to PUT/PATCH get
@@ -133,8 +144,9 @@ Entities and Links
     response entity, ``responses={status: Entity(...)}`` overrides it per
     status (also for non-2xx statuses the handler returns, e.g. a
     ``Status(404, ...)``), and ``request=Entity(...)`` describes the request
-    body: OPTIONS uses it, and it puts no header on the response. The Links of
-    a response the handler produces are those of, in this order: the
+    body: the HTTP Schema Resource describes it, and it puts no header on the
+    response. The Links of a response the handler produces are those of, in
+    this order: the
     ``ScrudfulResponse.entity`` the handler set; ``responses[status]``; the
     default entity, for 2xx responses other than 204 (which has no body);
     else none. Link callables are called with the request and the loaded
@@ -150,16 +162,32 @@ Error responses
     last one) propagates out of the operation's function as for any
     operation, and ninja answers it with the API's exception handler: its
     status and body are the API's. When that response has content, it gets
-    the Links of the entity the operation's OPTIONS describes for its
+    the Links of the entity the HTTP Schema Resource describes for its
     status: ``responses[status]`` (``error`` first for scrudful's own 400,
-    412 and 428 when the operation evaluates the If-* headers), else
-    ``error``, else none. Link callables get ``None``. A response with JSON
-    content (ninja's renderer's ``application/json``) is then served as that
+    412 and 428 when the operation evaluates the If-* headers); else, for a
+    status ninja answers itself too (401, 403, 422, 429) when
+    :func:`add_error_links`'s entity is set and differs from ``error``, that
+    entity; else ``error``; else (an operation without ``error``) the Links
+    of :func:`add_error_links`'s entity, which its wrapped handlers add;
+    else none. Link callables get ``obj=None``. A response with JSON content
+    (ninja's renderer's ``application/json``) is then served as that
     entity's media type when it is JSON content too, e.g.
-    ``application/problem+json``, as OPTIONS lists it. The errors ninja
-    answers before the operation runs (401, 422, 429, ...) and those of
-    operations without an entity for them get Links from
-    :func:`add_error_links`, the API-wide error entity.
+    ``application/problem+json``, as the HTTP Schema Resource lists it.
+
+    The errors ninja answers before the operation runs (401, 403, 422, 429,
+    ...) get ``responses[status]`` when the operation declares the status (a
+    problem-details 422 then reshapes ninja's validation body, as
+    :func:`add_error_links` does), else the Links of
+    :func:`add_error_links`'s entity, the API-wide error entity. Without
+    one, ninja's 401, 403, 422 and 429 of an operation with an ``error`` (its
+    authentication, an ``AuthorizationError``, its CSRF check, its request
+    validation, its throttles) get ``error``'s Links and media type, as
+    those the operation raises do (a problem-details ``error`` reshapes the
+    validation 422 as problem details). So every response of one status
+    gets the Links of the one entity the HTTP Schema Resource describes for
+    it. On a
+    :class:`ScrudfulRouter`, each also gets the HTTP Schema Resource link,
+    and a method no operation of the path routes is a JSON 405.
 
 Create
     :func:`scrudful_create` decorates a POST on a collection that creates an
@@ -291,8 +319,9 @@ Collections
     - Each entry's ``href`` is ``href_func(request, item)``; its ``etag``,
       ``last_modified`` (an HTTP-date) and ``link`` come from the item
       callbacks and links, so they equal the ``ETag``, ``Last-Modified`` and
-      ``Link`` of a detail GET given the same arguments. Each is ``null``
-      without its callbacks.
+      item entity's Links of a detail GET given the same arguments (whose
+      ``Link`` also carries its own path's HTTP Schema Resource link). Each
+      is ``null`` without its callbacks.
     - The response's Links are the collection entity's (the ``list_*`` link
       arguments; their callables get the queryset). With ``list_etag_func``
       or ``list_last_modified_func``, which are called with the queryset, the
@@ -323,21 +352,121 @@ Collections
 OPTIONS
     A :class:`ScrudfulRouter` adds an OPTIONS operation to every path that has
     a scrudful operation; an OPTIONS operation the implementer declares on the
-    path wins. It runs no ``load``, handler or validator callback, scrudful
-    runs no permission check for it, and it ignores the API's and the
-    router's ``auth``: it describes the path template, so its answer is the
-    same for every client, and for a missing item as for a hidden one. It is
-    not in the OpenAPI document. ninja still applies the decorators added with
-    the API's or a router's ``add_decorator`` and the API's and routers'
-    throttles to it, as to any operation: a permission decorator added that
-    way gates OPTIONS too. Every automatic OPTIONS operation has the URL name
-    ``scrudful_options``, so don't ``reverse()`` it.
+    path wins. It answers 204, without content or ``Content-Type``, with an
+    ``Allow`` listing the methods of the path that *this requester* may use,
+    the link to the path's HTTP Schema Resource
+    (``rel="https://w3id.org/semantic-http/ns#http-schema-resource-document"``,
+    ``type="application/json"``, see :class:`ScrudfulRouter` for its target)
+    and ``Access-Control-Expose-Headers``. It is not in the OpenAPI document,
+    and has the URL name ``scrudful_options`` on every path, so don't
+    ``reverse()`` it.
 
-    The body is the semantic-http 0.1 "HTTP Schema Resource" (an OpenAPI 3.1
-    Path Item): for each method the path serves, in the order ``get``,
+    It is answered by an ``Operation.run`` decorator of the operation, so
+    before ninja's checks and before the operation's function, which the
+    API's and routers' ``add_decorator(mode="operation")`` decorators wrap:
+    those never gate OPTIONS. The ``add_decorator(mode="view")`` decorators
+    wrap ``Operation.run`` itself, so they run first, as for any operation
+    (a CORS preflight too). In this order:
+
+    1. A CORS preflight (an OPTIONS with ``Origin`` and
+       ``Access-Control-Request-Method``) is answered 204, without content or
+       Links, before anything runs: no auth, throttle, hook or load, whatever
+       the API's and the routers'. A CORS middleware in front
+       (django-cors-headers) adds its headers, or answers it itself.
+    2. The request is throttled once, as ninja would throttle the operation:
+       with the API's throttles, or the mount's (the router's, or
+       ``add_router(..., throttle=...)``'s) when it has some. A refused one
+       is ninja's 429. Computing ``Allow`` (step 4) runs no throttle.
+    3. On an item path, the object is loaded, with the ``load`` of the GET
+       operation, else of the first :func:`scrudful` operation with one; a
+       collection has none. It is loaded as that operation would load it: on
+       a copy of the request with its method, once its ``auth=`` callbacks
+       and ``before`` allowed the requester (else there is no object), with
+       the path parameters, validated as the operation validates them (no
+       object for one it would refuse with a 422), and only them: give
+       ``load``'s other parameters defaults, or take ``**kwargs``. ``None``
+       is no object, and only ``None`` (so a hook gets ``obj=None`` both when
+       nothing was loaded and when there is no object, and can't tell them
+       apart): an ``HttpError`` or ``Http404`` it
+       raises (the 404 of a missing or hidden object) is the answer, that
+       status by the API's exception handler, with the Links of
+       :func:`add_error_links` and the HSR link (for a 204 on a missing
+       object, return ``None``). Every other :func:`scrudful` item
+       operation of the path with a ``load`` loads with it too, as a check of
+       its own method (step 4), and only for its method, unless it is the
+       very call of this step: its refusal is not the answer.
+    4. Each method the path serves is checked for this requester, on a copy
+       of the request with that method. With an ``allowed`` hook (the
+       operation's ``allowed=``, else the router's), what
+       ``allowed(request, method, obj)`` returns decides: a ``bool``, else
+       ``TypeError``; the copy is authenticated by the operation's ``auth=``
+       callbacks when they authenticate the requester, and as it came
+       otherwise. Without one, the method is allowed when the operation's
+       ``auth=`` callbacks authenticate the requester, its ``before`` (if
+       any) returns ``None``, its path parameters validate (a method whose
+       request would be a 422 is left out, and so is one whose path
+       validation raises anything, an ``HttpError``, ``Http404`` or
+       ``PermissionDenied`` silently, anything else logged once per route
+       on the ``scrudful.ninja`` logger; a path scrudful can't validate as
+       ninja does, one with a custom path model, isn't checked, with a
+       ``RuntimeWarning`` once per route, and its method is listed unless
+       its own ``load`` must run, which can't without the path parameters;
+       step 3's path follows the same rules, with no object when it fails),
+       and then, for a
+       :func:`scrudful` item operation with a ``load``, that ``load``
+       (called as in step 3, on the copy) returns, whatever it returns: so
+       authorization in a method's own ``load`` shapes ``Allow``, and
+       nothing loads for a method its ``auth=`` or ``before`` refused. Any
+       ``HttpError`` that ``load`` raises (whatever its status), ``Http404``
+       or ``PermissionDenied`` leaves only that method out: only step 3's
+       error answers the OPTIONS. A ``load`` isn't called again only for
+       the very call step 3 made (the same function, method, a HEAD
+       counting as a GET, path parameters and ``request.auth``): step 3's
+       method (and HEAD beside a GET) gets step 3's
+       answer. A ``load`` step 3's operation shares with another method runs
+       again for that method, with its method, so a ``load`` authorizing by
+       ``request.method`` is checked per method; so it does for every
+       method when step 3 loaded nothing (its operation's ``auth=`` or
+       ``before`` refused the requester). A raised
+       ``HttpError`` with status 401, 403 or
+       404 (as ninja's ``AuthenticationError`` and ``AuthorizationError``
+       are), ``Http404`` or ``PermissionDenied`` refuses the method, except
+       a 404 (``HttpError`` or ``Http404``) an ``allowed`` hook raises, which
+       answers the OPTIONS, as ``load``'s does (a 404 of ``auth=`` or
+       ``before`` refuses the method, as in FastAPI; DRF answers the OPTIONS
+       with its permission checks' 404); anything else raised is
+       answered by the API's exception handler, as ninja answers what an
+       operation raises (re-raised without a handler).
+       What an ``async def`` callback returns is awaited
+       (``asgiref.sync.async_to_sync``), never taken for an answer; an
+       awaitable returned by the ``before`` of a sync operation, which the
+       operation can't await, refuses the method. Throttles,
+       ``after_throttles`` and the handlers never run, so computing
+       ``Allow`` uses no throttle quota, and the CSRF check of a cookie
+       ``auth`` is skipped: ``Allow`` is about authorization, and the
+       request using the method is checked.
+    5. ``Allow`` lists those methods and ``OPTIONS`` always
+       (:func:`scrudful._hsr.allow_value`). ``HEAD`` is a method like the
+       others: listed only when an operation of the path lists it (e.g.
+       ``@router.api_operation(["GET", "HEAD"], ...)``), checked with that
+       operation's checks, since ninja answers an unrouted HEAD with 405.
+
+    So OPTIONS isn't gated itself: an anonymous requester on a locked path
+    gets a 204 with ``Allow: OPTIONS``, not a 401. The ``auth=`` callbacks
+    are those of the mount the request came through: a router mounted twice
+    with different ``auth`` gets each mount's ``Allow``, and the HSR link of
+    its own mount.
+
+    The semantic-http 0.1 "HTTP Schema Resource" (an OpenAPI 3.1 Path Item,
+    see :func:`http_schema_resource`) describes the path, built once per path
+    template (and API-wide error entity: each API mounting the router serves
+    the document of its own :func:`add_error_links` entity) and without a
+    request: the same document for every requester.
+    For each method the path serves, in the order ``get``,
     ``put``, ``post``, ``delete``, ``options``, ``head``, ``patch``,
-    ``trace``, an operation in the shape DRF's ``ScrudfulMetadata`` produces
-    (``scrudful.rest_framework``), which it extends:
+    ``trace``, an operation in the shape
+    :func:`scrudful.rest_framework.http_schema_resource` gives, which it
+    extends:
 
     - ``requestBody`` (POST, PUT, PATCH) with the ``content`` of the
       ``request`` entity, else of the item entity, as in DRF; left out when
@@ -351,15 +480,30 @@ OPTIONS
       evaluates the If-* headers, the early responses are added: 304, 400
       and 412 for GET/HEAD; 400, 412 and 428 for writes, only 400 and 412
       for POST. Each status with a body gets the ``content`` of its entity:
-      scrudful's own 400, 412 and 428 get ``error``'s, if declared, the
-      others ``responses[status]``, else the default entity (2xx, 201 for a
-      create, the collection for a list; never for TRACE, whose content is
-      the echoed request, not the item);
+      scrudful's own 400, 412 and 428 get ``error``'s, if declared, else
+      ``responses[status]``, else the API-wide :func:`add_error_links`
+      entity's; the others ``responses[status]``, else the default entity
+      (2xx, 201 for a create, the collection for a list; never for TRACE,
+      whose content is the echoed request, not the item);
+    - each error status ``responses=`` declares, with its entity's
+      ``content``: it describes every response with that status, ninja's
+      own (a 401 of its authentication, a 422) included;
+    - a ``default`` response, the errors: with the content of the
+      operation's ``error``, else of the API-wide error entity
+      (:func:`add_error_links`). When the operation's ``error`` differs from
+      the API-wide entity, the 401, 403, 422 and 429 are listed with the
+      API-wide entity's content, unless ``responses=`` declares the status:
+      every response of the operation with one of these statuses carries
+      that entity, whether ninja answered it (its authentication, CSRF
+      check, validation or throttles) or a hook, the operation or its
+      ``load`` raised it. Without an API-wide entity none of them is listed:
+      those of an operation with an ``error``, ninja's own included, carry
+      that ``error``, as ``default`` describes;
     - ``parameters``: the precondition headers of a conditional write.
 
     ``head`` (when an operation routes it) is described like ``get``, but
-    without ``content``: a HEAD response has none. ``options`` is this
-    operation: a 200 whose content is the HTTP Schema Resource.
+    without ``content``: a HEAD response has none. ``options`` is
+    ``{"responses": {"204": {"description": "No Content"}}}``.
 
     A ``content`` maps the entity's ``media_type`` to its Media Type Object:
     ``{"schema": {"$ref": <schema URL>}}`` for a JSON Schema (the schema
@@ -367,23 +511,27 @@ OPTIONS
     {"href": <schema URL>, "type": <schema type>}}``, and, unless the media
     type is in-band RDF, ``"x-rdf-context": {"href": <context URL>, "type":
     <context type>}`` when the entity has a context link. An entity without
-    a schema link (such as ``Entity()``) has no ``content``. The URLs are
-    resolved against the request's absolute URI, as those of the Links are,
-    so the body agrees with the Links of the responses it describes. Link
-    callables are called with the request and ``obj=None`` (there is no
-    loaded object), so they must accept ``None``; the OPTIONS view is sync,
-    so the callables of an async operation are run with
-    ``asgiref.sync.async_to_sync``, as the operation runs them (ninja runs
-    the view in a thread on a path with async operations). Methods whose
-    operation is not scrudful get no content, no ``requestBody`` and no
-    preconditions, as in DRF.
+    a schema link (such as ``Entity()``) has no ``content``. Relative URLs
+    are resolved against the router's base URL (``base_url=``, else
+    ``SCRUDFUL["BASE_URL"]``), as those of the Links are, so the body
+    agrees with the Links of the responses it describes; without one, a
+    relative URL is a ``ConfigError``. Link callables are called in
+    describe mode, ``func(None, None)``: there is neither a request nor a
+    loaded object, so they must return the same target without them, and
+    one that raises is a ``ConfigError`` naming the operation. Those of an
+    async operation may be ``async def``: they are awaited with
+    ``asgiref.sync.async_to_sync``. A plain (not scrudful) operation is
+    described with the entity :func:`described` gives it, without
+    preconditions.
 
-    The response is ``application/json``, with the Links of the HTTP Schema
-    Resource's JSON Schema
+    The router serves the document by GET, the same for every requester and
+    cacheable, at the path's HSR route ``/_hsr/<name>`` (see
+    :class:`ScrudfulRouter`), as ``application/json`` with the Links of the
+    HTTP Schema Resource's JSON Schema
     (``https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json``,
     ``rel="describedby"``) and JSON-LD context
-    (``https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld``),
-    and an ``Allow`` listing the body's methods in its order.
+    (``https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld``);
+    or :func:`http_schema_resource_view` serves it wherever it is mounted.
 
 The runtime response
     A handler parameter annotated :class:`ScrudfulResponse` receives a fresh
@@ -419,13 +567,17 @@ Headers
     it has one of those; an overridden relation is matched exactly.
     Relations are compared case-insensitively; a link with another relation
     (e.g. ``next``) replaces nothing.
-    The Link URLs are resolved against the request's absolute URI
-    (``request.build_absolute_uri()``), so a relative one such as
-    ``"/schemas/item"`` is sent absolute.
-    ``Access-Control-Expose-Headers`` is extended with whichever of ``ETag``,
-    ``Link`` and ``Location`` the response carries (django-cors-headers
-    replaces that header when ``CORS_EXPOSE_HEADERS`` is set; list the names
-    there instead).
+    The Link URLs are resolved against the base URL of the
+    :class:`ScrudfulRouter` serving the operation (``base_url=``, else
+    ``SCRUDFUL["BASE_URL"]``), as in the HTTP Schema Resource, else against
+    the request's absolute URI (``request.build_absolute_uri()``), so a
+    relative one such as ``"/schemas/item"`` is sent absolute. On a
+    :class:`ScrudfulRouter`, the link to the path's HTTP Schema Resource
+    follows them, on every response (see there).
+    ``Access-Control-Expose-Headers`` is extended with ``Link`` and
+    ``Allow``, and whichever of ``ETag`` and ``Location`` the response
+    carries (django-cors-headers replaces that header when
+    ``CORS_EXPOSE_HEADERS`` is set; list the names there instead).
 
     ninja routes HEAD only to operations that list it, e.g.
     ``@router.api_operation(["GET", "HEAD"], "/items/{pk}")``.
@@ -451,16 +603,30 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import functools
 import hashlib
 import inspect
 import io
+import itertools
+import logging
 import json
+import math
 import re
 import textwrap
 import tokenize
 import types
-from collections.abc import Callable, Generator, Iterator, Mapping
+import warnings
+import weakref
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
@@ -474,24 +640,31 @@ from typing import (
     get_origin,
 )
 
+import pydantic
 from asgiref.sync import async_to_sync, sync_to_async
+from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.core.serializers.json import DjangoJSONEncoder
+from django.core.signals import setting_changed
 from django.http import (
     Http404,
     HttpRequest,
     HttpResponse,
     HttpResponseBase,
 )
+from django.urls import NoReverseMatch, Resolver404, URLResolver, resolve, reverse
+from django.urls.resolvers import RegexPattern, RoutePattern
 from django.utils.encoding import iri_to_uri
 from ninja import NinjaAPI, Query, Router, Schema, Status
 from ninja import errors as ninja_errors
+from ninja import router as ninja_router
 from ninja.constants import NOT_SET
 from ninja.errors import ConfigError, HttpError
-from ninja.operation import AsyncOperation, Operation
+from ninja.operation import AsyncOperation, Operation, PathView
 from ninja.renderers import JSONRenderer
 from ninja.responses import NinjaJSONEncoder
 from ninja.signature.details import is_collection_type
 from ninja.signature.utils import get_path_param_names
+from ninja.throttling import BaseThrottle
 from pydantic import Field, create_model
 
 from scrudful import _adapter
@@ -500,7 +673,7 @@ from scrudful._adapter import (
     METHOD_KEYS,
     SCHEMA_REL,
     SCHEMA_TYPE,
-    allow_header,
+    HsrConfigError,
     check_error_body_func,
     check_callables,
     check_error_media_type,
@@ -508,9 +681,9 @@ from scrudful._adapter import (
     context_defaults,
     context_link_type,
     describe_content,
-    describe_options,
     describe_read,
     describe_write,
+    essence,
     evaluates_create_preconditions,
     evaluates_preconditions,
     expose_headers,
@@ -518,7 +691,7 @@ from scrudful._adapter import (
     is_json,
     is_json_syntax,
     merge_links,
-    options_links,
+    reason_phrase,
     resolve_annotation,
     resolved_signature,
     set_validator_headers,
@@ -530,10 +703,30 @@ from scrudful._django import (
     Render,
     aware,
     conditional_response,
-    json_response,
+    error_handler,
+    hsr_not_allowed,
+    hsr_response,
+    no_content,
     page_url,
     precondition_headers,
+    scrudful_setting,
+    setting_base_url,
+    setting_hsr_cache_control,
+    setting_hsr_route,
+    setting_hsr_url,
     slice_page,
+)
+from scrudful._hsr import (
+    HSR_ROUTE_SEGMENT,
+    absolute_for_hsr,
+    allow_value,
+    check_base_url,
+    check_hsr_cache_control,
+    check_hsr_url_result,
+    hsr_link,
+    hsr_route_name,
+    is_preflight,
+    options_operation,
 )
 from scrudful.collection import (
     ENVELOPE_FIELDS,
@@ -550,6 +743,7 @@ from scrudful.conditional import (
     quote_etag,
 )
 from scrudful.entity import Entity
+from scrudful.problem import PROBLEM_JSON, problem_from_errors
 from scrudful.utils import (
     join_links,
     link_content,
@@ -564,10 +758,55 @@ __all__ = [
     "ScrudfulResponse",
     "ScrudfulRouter",
     "add_error_links",
+    "described",
+    "handler404",
+    "handler500",
+    "http_schema_resource",
+    "http_schema_resource_view",
     "scrudful",
     "scrudful_create",
     "scrudful_list",
 ]
+
+
+def handler404(error: Entity) -> Callable[..., HttpResponse]:
+    """A Django ``handler404`` that answers JSON unless the client prefers HTML.
+
+    In ``urls.py``: ``handler404 = scrudful.ninja.handler404(ERROR)``, with
+    ``ERROR`` an :class:`Entity` of plain (non-callable) link values.
+
+    Raises
+    ------
+    TypeError
+        If ``error`` is not an :class:`Entity`, or a link of it is a
+        callable.
+    ValueError
+        If ``error``'s media type is not JSON, or a rel or type of its links
+        has characters a Link can't carry.
+    ImproperlyConfigured
+        If a plain link URL of ``error`` can't be parsed.
+    """
+    return error_handler(404, error)
+
+
+def handler500(error: Entity) -> Callable[..., HttpResponse]:
+    """A Django ``handler500`` that answers JSON unless the client prefers HTML.
+
+    In ``urls.py``: ``handler500 = scrudful.ninja.handler500(ERROR)``.
+
+    Raises
+    ------
+    TypeError
+        If ``error`` is not an :class:`Entity`, or a link of it is a
+        callable.
+    ValueError
+        If ``error``'s media type is not JSON, or a rel or type of its links
+        has characters a Link can't carry.
+    ImproperlyConfigured
+        If a plain link URL of ``error`` can't be parsed.
+    """
+    return error_handler(500, error)
+
 
 #: OpenAPI descriptions of the responses ``@scrudful`` can produce for GET/HEAD
 #: without calling the handler. Pass it to the operation decorator, e.g.
@@ -588,6 +827,8 @@ CONDITIONAL_WRITE_RESPONSES: dict[int, dict[str, str]] = (
 
 Handler = TypeVar("Handler", bound=Callable[..., Any])
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 #: The request flow, written once for sync and async operations: a generator
 #: that yields each call of a user callable, as ``(func, args, kwargs)``, and
@@ -701,7 +942,8 @@ class _Config:
     context_rel_or_func: Any = None
     context_type_or_func: Any = None
     media_type: str = "application/json"
-    #: The request body's entity (described by OPTIONS; no header).
+    #: The request body's entity (described by the HTTP Schema Resource; no
+    #: header).
     request: Entity | None = None
     #: The response entity of each status, overriding :attr:`entity`.
     responses: Mapping[int, Entity] = field(
@@ -733,6 +975,10 @@ class _Config:
     #: authentication, ``before`` and throttling, before any parameter is
     #: validated (see :func:`_install_hooks`).
     after_throttles: Callable[..., Any] | None = None
+    #: ``allowed(request, method, obj)``: whether the requester may use the
+    #: operation's methods, for the ``Allow`` of OPTIONS (see
+    #: :func:`_options_view`); the router's when ``None``.
+    allowed: Callable[..., Any] | None = None
 
     @functools.cached_property
     def hooks(self) -> tuple[str, ...]:
@@ -749,12 +995,7 @@ class _Config:
     @property
     def entity(self) -> Entity:
         """The item entity (see the class docstring)."""
-        return Entity(
-            **{
-                entity_field.name: getattr(self, entity_field.name)
-                for entity_field in fields(Entity)
-            }
-        )
+        return Entity(**_entity_values(self))
 
     @property
     def default_status(self) -> int | None:
@@ -840,6 +1081,7 @@ def scrudful(
     error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
     before: Callable[..., Any] | None = None,
     after_throttles: Callable[..., Any] | None = None,
+    allowed: Callable[..., Any] | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation on a single resource to make it SCRUDful.
 
@@ -925,8 +1167,8 @@ def scrudful(
     context_type_or_func : str or callable, optional
         ``type`` of the context link. Defaults to ``"application/ld+json"``.
     request : Entity, optional
-        The schema and context of the request body. Described by OPTIONS; it
-        puts no header on the response.
+        The schema and context of the request body. Described by the HTTP
+        Schema Resource; it puts no header on the response.
     responses : mapping of int to Entity, optional
         The response entity of each status, in place of the default one (the
         six arguments above) for that status, e.g. ``{404: Entity(...)}`` for
@@ -937,7 +1179,11 @@ def scrudful(
         as Links on them, and of the response to an ``HttpError`` or
         ``Http404`` the operation raises, unless ``responses`` declares its
         status (see "Error responses" in the module docstring; link
-        callables then get ``None``). Without it, they carry no Link. Its
+        callables then get ``obj=None``); a 401, 403, 422 or 429 instead
+        carries the API-wide :func:`add_error_links` entity when that is set
+        and differs (as ninja's own do), and without one, ninja's own 401,
+        403, 422 and 429 for the operation carry this entity too. Without
+        ``error``, they carry the API-wide entity, if any. Its
         ``media_type`` must be JSON content (``application/json`` or
         ``+json``, e.g. ``application/problem+json``), since scrudful's error
         bodies are JSON objects; they, and the JSON responses to the errors
@@ -966,7 +1212,10 @@ def scrudful(
         (anything else, or an awaitable in a sync operation, raises
         ``TypeError``) and
         raises to answer first (the API's exception handler answers, with the
-        operation's error Links, and the request uses none of a throttle's
+        Links of the entity the operation's HTTP Schema Resource describes
+        for the status, see "Error responses" in the module docstring: a
+        401, 403, 422 or 429 carries :func:`add_error_links`'s entity when it
+        differs from ``error``; and the request uses none of a throttle's
         quota); neither its error nor a later 422 passes through the
         ``add_decorator(mode="operation")`` decorators. It may read the body
         as the operation's parameters do: ``request.body`` for a JSON body,
@@ -985,6 +1234,16 @@ def scrudful(
         request reaching the function without the hooks having allowed it,
         as does a direct call of the decorated function: test the operation
         through ninja's ``TestClient``).
+    allowed : callable, optional
+        ``allowed(request, method, obj)``: whether the requester may use
+        ``method`` (this operation's) on ``obj``, for the ``Allow`` of the
+        path's OPTIONS (see "OPTIONS" in the module docstring). It wins over
+        the router's ``allowed``, and alone decides: without either, the
+        operation's ``auth=`` callbacks and ``before`` decide. It may be
+        ``async def`` whatever the handler is, and must return a ``bool``.
+        A 401 or 403 ``HttpError`` (``AuthenticationError``,
+        ``AuthorizationError``) or ``PermissionDenied`` it raises refuses the
+        method; a 404 it raises is the OPTIONS's answer.
 
     Raises
     ------
@@ -1005,12 +1264,17 @@ def scrudful(
         callback contributed below the decorator, or a decorator between it
         and the operation decorator (see "Placement" in the module
         docstring). Also with a hook, as for :func:`scrudful_list`.
+        Also when decorating, if a schema link has no RDF context link (for a
+        media type that isn't in-band RDF), chained to the
+        :class:`~scrudful.entity.HsrConfigError` of the entity.
     """
     check_validators(etag_func, last_modified_func)
     _check_entity("request", request)
     _check_error(error)
     check_error_body_func(error_body_func)
-    check_callables(load=load, before=before, after_throttles=after_throttles)
+    check_callables(
+        load=load, before=before, after_throttles=after_throttles, allowed=allowed
+    )
     config = _Config(
         kind="item",
         load=load,
@@ -1029,13 +1293,14 @@ def scrudful(
         error_body_func=error_body_func,
         before=before,
         after_throttles=after_throttles,
+        allowed=allowed,
     )
     if config.has_validators and load is None:
         raise TypeError(
             "etag_func and last_modified_func require load: the validators are "
             "computed from the object load returns"
         )
-
+    _link_entity("@scrudful", **_entity_values(config))
     return _decorator(config, "@scrudful")
 
 
@@ -1059,6 +1324,7 @@ def scrudful_create(
     error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
     before: Callable[..., Any] | None = None,
     after_throttles: Callable[..., Any] | None = None,
+    allowed: Callable[..., Any] | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation creating an item (POST on a collection).
 
@@ -1120,9 +1386,9 @@ def scrudful_create(
     context_type_or_func : str or callable, optional
         ``type`` of the context link. Defaults to ``"application/ld+json"``.
     request : Entity, optional
-        The schema and context of the request body, described by OPTIONS.
-        Defaults to the item entity (the body is an item, as for DRF's
-        create).
+        The schema and context of the request body, described by the HTTP
+        Schema Resource. Defaults to the item entity (the body is an item, as
+        for DRF's create).
     responses : mapping of int to Entity, optional
         The response entity of each status, e.g. ``{400: Entity(...)}`` for a
         ``Status(400, ...)`` the handler returns, or an ``HttpError(400)`` it
@@ -1155,9 +1421,11 @@ def scrudful_create(
         As for :func:`scrudful`: the schema and context of scrudful's own 400
         and 412 bodies (there is no 428), and of the response to an
         ``HttpError`` or ``Http404`` the operation raises, unless
-        ``responses`` declares its status. Link callables get the collection
-        on the 400 and 412 (``None`` if ``list_load`` returned none), else
-        ``None``.
+        ``responses`` declares its status, with the same rule for a 401, 403,
+        422 or 429 and for ninja's own 401, 403, 422 and 429. Link
+        callables get the
+        collection on the 400 and 412 (``None`` if ``list_load`` returned
+        none), else ``None``.
     error_body_func : callable, optional
         As for :func:`scrudful`: the body of scrudful's own 400 and 412. An
         ``HttpError(412)`` the handler raises gets the API's body, not this.
@@ -1171,9 +1439,10 @@ def scrudful_create(
         a raw string for a value, see :func:`scrudful_list`), it returns
         ``None`` to let the request go on (anything else, or an awaitable in a
         sync operation, raises ``TypeError``) and raises to answer first (the
-        API's exception handler answers, with the Links of
-        ``responses[status]``, if any, and the request uses none of a
-        throttle's quota); neither its error nor a later 422 passes through
+        API's exception handler answers, with the Links of the entity the
+        operation's HTTP Schema Resource describes for the status, as for
+        :func:`scrudful`, and the request uses none of a throttle's quota);
+        neither its error nor a later 422 passes through
         the ``add_decorator(mode="operation")`` decorators. It may read the
         body as the operation's parameters do: ``request.body`` for a JSON
         body, ``request.POST`` and ``request.FILES`` for a form or an upload.
@@ -1191,6 +1460,13 @@ def scrudful_create(
         request reaching the function without the hooks having allowed it,
         as does a direct call of the decorated function: test the operation
         through ninja's ``TestClient``).
+    allowed : callable, optional
+        ``allowed(request, method, obj)``: whether the requester may use
+        ``method`` (this operation's) on ``obj``, for the ``Allow`` of the
+        path's OPTIONS (see "OPTIONS" in the module docstring). It wins over
+        the router's ``allowed``, and alone decides: without either, the
+        operation's ``auth=`` callbacks and ``before`` decide. It may be
+        ``async def`` whatever the handler is, and must return a ``bool``.
 
     Raises
     ------
@@ -1214,6 +1490,9 @@ def scrudful_create(
         and the operation decorator (see "Placement" in the module
         docstring). Also with a hook, as for :func:`scrudful_list`, and with
         list validators on an operation without POST.
+        Also when decorating, if a schema link has no RDF context link (for a
+        media type that isn't in-band RDF), chained to the
+        :class:`~scrudful.entity.HsrConfigError` of the entity.
     """
     if not callable(location_func):
         raise TypeError(
@@ -1229,6 +1508,7 @@ def scrudful_create(
         list_last_modified_func=list_last_modified_func,
         before=before,
         after_throttles=after_throttles,
+        allowed=allowed,
     )
     has_list_validators = (
         list_etag_func is not None or list_last_modified_func is not None
@@ -1240,7 +1520,8 @@ def scrudful_create(
         )
     if list_load is not None and not has_list_validators:
         raise TypeError("list_load needs list_etag_func or list_last_modified_func")
-    item = Entity(
+    item = _link_entity(
+        "@scrudful_create",
         schema_link_or_func=schema_link_or_func,
         schema_rel_or_func=schema_rel_or_func,
         schema_type_or_func=schema_type_or_func,
@@ -1266,6 +1547,7 @@ def scrudful_create(
         error_body_func=error_body_func,
         before=before,
         after_throttles=after_throttles,
+        allowed=allowed,
     )
     return _decorator(config, "@scrudful_create")
 
@@ -1295,6 +1577,7 @@ def scrudful_list(
     error_body_func: Callable[[Any, ConditionalResult], dict[str, Any]] | None = None,
     before: Callable[..., Any] | None = None,
     after_throttles: Callable[..., Any] | None = None,
+    allowed: Callable[..., Any] | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorate a django-ninja operation listing a collection (GET on a list).
 
@@ -1394,7 +1677,10 @@ def scrudful_list(
         list validator set), sent as Links on them; link callables get the
         queryset. Also those of the response to an ``HttpError`` or
         ``Http404`` the operation raises, e.g. the 404 of a page past the
-        last one; link callables then get ``None``. Its ``media_type`` must
+        last one, with the rule of :func:`scrudful` for a 401, 403, 422 or
+        429 and for ninja's own 401, 403, 422 and 429; link callables then
+        get
+        ``None``. Its ``media_type`` must
         be JSON content, as for :func:`scrudful`; scrudful's 400 and 412,
         and the JSON responses to the errors the operation raises, are
         served with it.
@@ -1428,9 +1714,12 @@ def scrudful_list(
         raised, never returned. Raise ninja's ``HttpError`` (or another
         exception the API handles) to answer first, e.g. with 401 or 403 whatever the
         parameters are; the API's exception handler answers it, as ninja
-        answers its own errors, an ``HttpError`` gets the operation's error
-        Links as when the operation raises it, and the request uses none of
-        a throttle's quota. When it returns, ninja throttles and validates
+        answers its own errors, an ``HttpError`` gets the Links of the
+        entity the operation's HTTP Schema Resource describes for its status,
+        as when the operation raises it (a 401, 403, 422 or 429 carries
+        :func:`add_error_links`'s entity when it differs from ``error``; see
+        "Error responses" in the module docstring), and the request uses none
+        of a throttle's quota. When it returns, ninja throttles and validates
         every parameter as without ``before``: one 422 lists every bad one,
         ``page`` and ``page_size`` included, and the OpenAPI description is
         the same. Neither its error nor that 422 passes through the
@@ -1440,9 +1729,9 @@ def scrudful_list(
         awaitable raises ``TypeError``, and the request does not go on (a
         coroutine is closed and a future cancelled: never awaited). scrudful
         runs ``before`` in its own copy of ninja's per-operation checks,
-        verified against ninja 1.7.0 and 1.7.1, though the ``ninja`` extra
-        allows any ninja from 1.7 below 2: on a ninja whose checks, or
-        whose ``Operation.run`` calling them, differ (compared by a digest
+        verified against ninja 1.7.0 to 1.7.3, the releases the ``ninja``
+        extra allows: on a ninja whose checks, or whose ``Operation.run``
+        calling them, differ (compared by a digest
         of their source,
         comments, docstrings and blank lines aside, or, without installed
         source, only by the names, locals and arguments they use),
@@ -1457,7 +1746,7 @@ def scrudful_list(
         same raw path parameters, ``None`` to let the request go on (anything
         else, or an awaitable in a sync operation, raises ``TypeError``), an
         error raised to answer first (the API's exception handler answers
-        it, with the operation's error Links), neither that error nor the 422
+        it, with the Links ``before``'s get), neither that error nor the 422
         that follows passes through the ``add_decorator(mode="operation")``
         decorators, ``async def`` in an ``async def`` operation, and the same
         ``ConfigError`` and ``RuntimeError`` guards. A throttled request (429)
@@ -1465,6 +1754,13 @@ def scrudful_list(
         as in DRF. So an expensive check (e.g. a filter that may answer 400)
         can't be forced by a throttled client, and its error beats the 422 of
         a bad ``page``. Use it alone or with ``before``.
+    allowed : callable, optional
+        ``allowed(request, method, obj)``: whether the requester may use
+        ``method`` (this operation's) on ``obj``, for the ``Allow`` of the
+        path's OPTIONS (see "OPTIONS" in the module docstring). It wins over
+        the router's ``allowed``, and alone decides: without either, the
+        operation's ``auth=`` callbacks and ``before`` decide. It may be
+        ``async def`` whatever the handler is, and must return a ``bool``.
 
     Raises
     ------
@@ -1490,8 +1786,11 @@ def scrudful_list(
         ``Operation.run`` without ``functools.wraps`` (scrudful then can't
         install them), if the
         installed ninja's per-operation checks, or the ``Operation.run``
-        calling them, differ from ninja 1.7.0's and 1.7.1's, or if an
-        ``Operation`` subclass overrides either.
+        calling them, differ from ninja 1.7.0's to 1.7.3's, or if an
+        ``Operation`` subclass overrides either. Also when decorating, if a
+        schema link (the item's or the collection's) has no RDF context
+        link, chained to the :class:`~scrudful.entity.HsrConfigError` of
+        the entity.
     """
     if not callable(href_func):
         raise TypeError(f"href_func must be callable, not {type(href_func).__name__}")
@@ -1501,6 +1800,7 @@ def scrudful_list(
         list_last_modified_func=list_last_modified_func,
         before=before,
         after_throttles=after_throttles,
+        allowed=allowed,
     )
     for name, value in (("page_size", page_size), ("max_page_size", max_page_size)):
         if not isinstance(value, int) or isinstance(value, bool):
@@ -1528,7 +1828,8 @@ def scrudful_list(
         error_body_func=error_body_func,
         list_etag_func=list_etag_func,
         list_last_modified_func=list_last_modified_func,
-        collection=Entity(
+        collection=_link_entity(
+            "@scrudful_list",
             schema_link_or_func=list_schema_link_or_func,
             schema_rel_or_func=list_schema_rel_or_func,
             schema_type_or_func=list_schema_type_or_func,
@@ -1540,7 +1841,9 @@ def scrudful_list(
         max_page_size=max_page_size,
         before=before,
         after_throttles=after_throttles,
+        allowed=allowed,
     )
+    _link_entity("@scrudful_list", **_entity_values(config))
     return _decorator(config, "@scrudful_list")
 
 
@@ -1548,48 +1851,356 @@ class ScrudfulRouter(Router):
     """A ninja ``Router`` answering OPTIONS on every path with a scrudful operation.
 
     The first scrudful operation added to a path (one decorated with
-    :func:`scrudful`, :func:`scrudful_create` or :func:`scrudful_list`) also
-    adds an OPTIONS operation to it, unless the path already has one. It is
-    registered with ``auth=None`` and ``include_in_schema=False``, so it needs
-    no credentials whatever the API's or router's ``auth`` and is not in the
-    OpenAPI document, and it answers with the path's HTTP Schema Resource
-    (see "OPTIONS" in the module docstring). An operation the implementer
-    adds later whose methods include ``"OPTIONS"`` replaces it. The API's
-    and routers' ``add_decorator`` decorators and throttles apply to it as to
-    any operation. Its URL name is ``scrudful_options`` on every path. The
-    link callables of the operations it describes are called with
-    ``obj=None`` (there is no loaded object), so they must accept it.
+    :func:`scrudful`, :func:`scrudful_create` or :func:`scrudful_list`), or
+    :func:`described` one, also adds an OPTIONS operation to it, unless the
+    path already has one. It is
+    registered with ``auth=None``, ``throttle=[]`` and
+    ``include_in_schema=False``, and is CSRF-exempt, so it needs no
+    credentials whatever the API's or router's ``auth`` and is not in the
+    OpenAPI document; scrudful throttles a non-preflight OPTIONS once itself,
+    as ninja would. It answers a 204 whose ``Allow`` lists the methods this
+    requester may use, with the link to the path's HTTP Schema Resource (see
+    "OPTIONS" in the module docstring). An operation the implementer adds
+    later whose methods include ``"OPTIONS"`` replaces it. It is answered by
+    an ``Operation.run`` decorator, before the operation's function: the
+    API's and routers' ``add_decorator(mode="operation")`` decorators don't
+    apply to it, while their ``add_decorator(mode="view")`` decorators wrap
+    ``Operation.run`` and so run first, even for a CORS preflight. Its URL
+    name is ``scrudful_options`` on every path.
+
+    The first scrudful or :func:`described` operation of a path also adds
+    the path's HTTP Schema Resource route: GET and HEAD of
+    ``/_hsr/<name>`` under the router's prefix, ``<name>`` being the path's
+    segments joined with ``.`` (``"/{pk}"`` gives ``/_hsr/pk``,
+    ``"/{kind}/{pk}"`` gives ``/_hsr/kind.pk``, ``""`` gives
+    ``/_hsr/_root``). It answers with the document of
+    :func:`http_schema_resource` as compact JSON (``application/json``,
+    whatever the API's renderer), the HSR's own schema and context Links, a
+    strong ``ETag`` (304 for a matching ``If-None-Match``) and the router's
+    ``Cache-Control``. It is the same for every requester: it has
+    ``auth=None`` and no throttles, is CSRF-exempt and is not in the OpenAPI
+    document; the ``add_decorator`` decorators still apply. The routes come
+    before the router's other paths, so ``"/{kind}/{pk}"`` doesn't match
+    them, and ``/_hsr/`` is reserved: an operation under it, or two paths
+    with one name (``"/a/{x}"`` and ``"/a/{x}/"``), is a ``ConfigError``.
+    A path of a router mounted earlier in the API, or of the API itself
+    (ninja tries its own operations first), that would match a route first
+    (``"/{kind}/{pk}"`` beside this router's ``"/{pk}"`` at one prefix) is
+    a ``ConfigError`` when the API's URL patterns are built: mount this
+    router first, or serve the documents elsewhere.
+    Their URL names are private (unique per router and mount), so don't
+    ``reverse()`` them. With ``hsr_route=False``, serve the document elsewhere with
+    :func:`http_schema_resource_view` and say where with ``hsr_url``.
+
+    Every operation on a ``ScrudfulRouter`` is described in its path's HTTP
+    Schema Resource, so each needs an entity: a scrudful decorator's, or,
+    for a plain operation, the one :func:`described` (or ``scrudful_entity=``
+    of :meth:`add_api_operation`) gives it. Adding a plain operation without
+    one raises ``ConfigError``; one routing only OPTIONS needs none.
+
+    Every response an operation of a described path answers carries the
+    link to the path's HTTP Schema Resource (Semantic HTTP 0.1, "Finding the
+    HTTP Schema Resource"): its 2xx, 304 and HEAD responses, scrudful's
+    early 400, 412 and 428, the errors it raises and those ninja answers
+    for it (401, 422, 429, ...), with or without :func:`add_error_links`,
+    after their other Links; a link with that relation the handler set
+    replaces it. A CORS preflight gets none. ``Link`` and ``Allow`` are
+    exposed on each (``Access-Control-Expose-Headers``).
+
+    A request with a method no operation of a path routes is answered with
+    a JSON 405 instead of ninja's ``text/html`` one: the API's exception
+    handler's answer to ``HttpError(405, "Method not allowed")``, so
+    ``{"detail": "Method not allowed"}`` (``application/json``), with the
+    Links and media type of :func:`add_error_links`'s entity when it was
+    called; an ``Allow`` of the methods the path serves (RFC 9110: not per
+    requester, unlike OPTIONS'; ``HEAD`` only when an operation routes it);
+    and the HSR link. scrudful replaces ninja's ``PathView`` of each path
+    for it, relying on ninja 1.7's ``PathView.clone``, ``get_view``,
+    ``_sync_view`` and ``_async_view`` (a ``ConfigError`` when the installed
+    ninja's differ).
 
     Use it for the routers holding scrudful operations, nested or not, and
     for the API's own operations (``default_router``); scrudful operations
     on a plain ``ninja.Router`` get no OPTIONS (ninja answers 405)::
 
         api = NinjaAPI(auth=..., default_router=ScrudfulRouter())
-        items = ScrudfulRouter()
+        items = ScrudfulRouter(base_url="https://api.example/")
         api.add_router("/items", items)
 
-    The OPTIONS response is the semantic-http 0.1 HTTP Schema Resource, with
-    the Links of its published JSON Schema and JSON-LD context and an
-    ``Allow`` listing the methods of the body.
+    CORS preflight requests (an OPTIONS with ``Origin`` and
+    ``Access-Control-Request-Method``) are sent by browsers without
+    credentials and are meant to be answered by the CORS middleware (e.g.
+    django-cors-headers) before the view runs. One that reaches scrudful's
+    OPTIONS is answered 204, without content or Links, before any
+    authentication, throttle, hook or load (only ``add_decorator(mode="view")``
+    decorators run before it).
 
-    CORS preflight requests (an OPTIONS with ``Access-Control-Request-Method``)
-    are sent by browsers without credentials and are meant to be answered by
-    the CORS middleware (e.g. django-cors-headers) before the view runs.
-    scrudful's OPTIONS is the other, non-preflight, case: a request that does
-    reach it is answered with the description like any other OPTIONS.
+    It takes ``ninja.Router``'s arguments, and these, each of which
+    defaults (``None``) to the key of the ``SCRUDFUL`` Django setting, then
+    to scrudful's default:
 
-    It takes ``ninja.Router``'s arguments.
+    Parameters
+    ----------
+    base_url : str, optional
+        The absolute URL the relative link URLs of the router's operations
+        are resolved against (``SCRUDFUL["BASE_URL"]``): in the HTTP Schema
+        Resource, which never depends on the request, and in the Link headers
+        of the operations' responses. Without one, a relative link URL is a
+        ``ConfigError`` when the HTTP Schema Resource is built, and the Link
+        headers resolve it against the request.
+    hsr_route : bool, optional
+        Whether the router serves each path's HTTP Schema Resource by GET
+        (``SCRUDFUL["HSR_ROUTE"]``, default ``True``). Turning it off needs
+        an ``hsr_url``. It is read when each path's first scrudful or
+        :func:`described` operation is added, which adds the path's route
+        or not for good: the responses of a path with a route link to it,
+        whatever the setting says later.
+    hsr_url : callable, optional
+        ``hsr_url(path)``: the absolute URL of the HTTP Schema Resource of
+        ``path``, the router's path as given to the operation decorator
+        (``"/{pk}"``), for one served elsewhere; the responses link to it,
+        even when the router serves the route too. Else
+        ``SCRUDFUL["HSR_URL"](route)``, a project-wide callable, which gets
+        the route Django resolved the request to,
+        ``request.resolver_match.route``: the full path template, in
+        Django's syntax, with the prefixes of the URLconf, the API and the
+        routers mounting it (``"api/items/<pk>"``, under ninja's
+        ``TestClient`` too, unless the API isn't in the root URLconf: then
+        the route below the API's root, ``"items/<pk>"``), which tells every
+        resource, and every mount of a router, apart.
+    hsr_cache_control : str, optional
+        The ``Cache-Control`` of the HTTP Schema Resource
+        (``SCRUDFUL["HSR_CACHE_CONTROL"]``, default ``public, max-age=300``).
+    allowed : callable, optional
+        ``allowed(request, method, obj)``: whether the requester may use
+        ``method`` on ``obj`` (the object OPTIONS loaded, or ``None``), for
+        the ``Allow`` of OPTIONS on the router's paths; an operation's own
+        ``allowed=`` wins over it. It returns a ``bool`` and may be ``async
+        def``. ``request`` is a copy with ``method``, authenticated by the
+        operation's ``auth=`` callbacks when they authenticate the requester
+        (``request.auth``), else as it came. ``obj`` was loaded only once the
+        loading operation's ``auth=`` and ``before`` allowed the requester:
+        it is ``None`` both when nothing was loaded (no loader, a
+        collection, the loading operation refusing the requester, invalid
+        path parameters) and when ``load`` returned ``None``, which a hook
+        can't tell apart. Without a hook, the operations' ``auth=``
+        callbacks and ``before`` decide (see "OPTIONS" in the module
+        docstring).
+
+    Each is also an attribute of the router, checked as the argument is
+    when set (``hsr_route`` only before the router's first operation); a
+    new ``base_url`` discards the built HTTP Schema Resources, as a change
+    of ``SCRUDFUL`` (``override_settings``) does.
+
+    Raises
+    ------
+    TypeError
+        If one of these has the wrong type.
+    ConfigError
+        If ``base_url`` is not an absolute URL; ``SCRUDFUL["HSR_ROUTE"]`` or
+        ``SCRUDFUL["HSR_URL"]`` has the wrong type; or the HSR route is off
+        without an ``hsr_url``.
     """
+
+    def __init__(
+        self,
+        *args: Any,
+        base_url: str | None = None,
+        hsr_route: bool | None = None,
+        hsr_url: Callable[[str], str] | None = None,
+        hsr_cache_control: str | None = None,
+        allowed: (
+            Callable[[HttpRequest, str, Any], bool | Awaitable[bool]] | None
+        ) = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        #: The ``PathView`` of each path, as given to the operation decorator.
+        self._scrudful_paths: dict[str, Any] = {}
+        #: The HTTP Schema Resource of each path, once built.
+        #: The built HTTP Schema Resource of each path and API-wide entity
+        #: (see :meth:`_hsr`), keyed by the entity's identity (an entity may
+        #: be unhashable, e.g. with a dataclass link callable): the value
+        #: holds the entity, which keeps it alive, so its id is not reused.
+        self._scrudful_hsrs: dict[
+            tuple[str, int], tuple[Entity | None, dict[str, Any]]
+        ] = {}
+        #: The URL name of the HSR route of each path that has one, as the
+        #: router's operation has it (see :func:`_hsr_url_name`).
+        self._scrudful_hsr_url_names: dict[str, str] = {}
+        #: The path of the HSR route of each path that has one.
+        self._scrudful_hsr_routes: dict[str, str] = {}
+        #: The path of each HSR route name, to refuse two paths one name.
+        self._scrudful_hsr_names: dict[str, str] = {}
+        #: Unique for the process, so the HSR routes' URL names are too.
+        self._scrudful_serial = next(_ROUTER_SERIALS)
+        #: The ``PathView`` clones of the router's paths, one per path and
+        #: mount: their operations' ``api`` is the API of the mount.
+        self._scrudful_mounts: weakref.WeakSet[Any] = weakref.WeakSet()
+        # The options, each checked by its property's setter; hsr_route last,
+        # once hsr_url is set, since the route off needs an hsr_url.
+        self._scrudful_base_url: str | None = None
+        self._scrudful_hsr_route: bool | None = None
+        self._scrudful_hsr_url: Callable[[str], str] | None = None
+        self._scrudful_hsr_cache_control: str | None = None
+        self._scrudful_allowed: Any = None
+        _check_option_types(
+            hsr_route=hsr_route,
+            hsr_cache_control=hsr_cache_control,
+            hsr_url=hsr_url,
+            allowed=allowed,
+        )
+        self.base_url = base_url
+        self.hsr_cache_control = hsr_cache_control
+        self.allowed = allowed
+        self._scrudful_hsr_url = hsr_url
+        # Reads both settings, so that a wrong one fails here.
+        self.hsr_route = hsr_route
+        _SCRUDFUL_ROUTERS.add(self)
+
+    @property
+    def base_url(self) -> str | None:
+        """The ``base_url`` option (see the class docstring); ``None`` reads
+        ``SCRUDFUL["BASE_URL"]``. Setting it is checked as the argument is,
+        and discards the built HTTP Schema Resources."""
+        return self._scrudful_base_url
+
+    @base_url.setter
+    def base_url(self, value: str | None) -> None:
+        if value is not None:
+            _check_base_url(value, "base_url")
+        self._scrudful_base_url = value
+        self._scrudful_hsrs.clear()
+
+    @property
+    def hsr_route(self) -> bool | None:
+        """The ``hsr_route`` option; ``None`` reads ``SCRUDFUL["HSR_ROUTE"]``.
+
+        A path's HSR route is added with its first scrudful or
+        :func:`described` operation, as the option (or the setting) is then,
+        and stays: setting the option once the router has a path is a
+        ``ConfigError``, and so is turning the route off without an
+        ``hsr_url``.
+        """
+        return self._scrudful_hsr_route
+
+    @hsr_route.setter
+    def hsr_route(self, value: bool | None) -> None:
+        _check_option_types(hsr_route=value)
+        if self._scrudful_paths:
+            raise ConfigError(
+                "set a ScrudfulRouter's hsr_route before adding operations: a "
+                "path's HTTP Schema Resource route is added (or not) with its "
+                "first operation"
+            )
+        _check_route_and_url(value, self._scrudful_hsr_url)
+        self._scrudful_hsr_route = value
+
+    @property
+    def hsr_url(self) -> Callable[[str], str] | None:
+        """The ``hsr_url`` option; ``None`` reads ``SCRUDFUL["HSR_URL"]``.
+        Setting it is checked as the argument is (the route off needs one)."""
+        return self._scrudful_hsr_url
+
+    @hsr_url.setter
+    def hsr_url(self, value: Callable[[str], str] | None) -> None:
+        _check_option_types(hsr_url=value)
+        _check_route_and_url(self._scrudful_hsr_route, value)
+        self._scrudful_hsr_url = value
+
+    @property
+    def hsr_cache_control(self) -> str | None:
+        """The ``hsr_cache_control`` option; ``None`` reads
+        ``SCRUDFUL["HSR_CACHE_CONTROL"]``. Setting it is checked as the
+        argument is."""
+        return self._scrudful_hsr_cache_control
+
+    @hsr_cache_control.setter
+    def hsr_cache_control(self, value: str | None) -> None:
+        _check_option_types(hsr_cache_control=value)
+        if value is not None:
+            _check_hsr_cache_control(value, "hsr_cache_control")
+        self._scrudful_hsr_cache_control = value
+
+    @property
+    def allowed(
+        self,
+    ) -> Callable[[HttpRequest, str, Any], bool | Awaitable[bool]] | None:
+        """The ``allowed`` hook of the router's paths, or ``None``. Setting it
+        is checked as the argument is."""
+        return self._scrudful_allowed  # type: ignore[no-any-return]
+
+    @allowed.setter
+    def allowed(
+        self,
+        value: Callable[[HttpRequest, str, Any], bool | Awaitable[bool]] | None,
+    ) -> None:
+        _check_option_types(allowed=value)
+        self._scrudful_allowed = value
 
     def add_api_operation(
         self,
         path: str,
         methods: list[str],
         view_func: Callable[..., Any],
+        *,
+        scrudful_entity: Entity | None = None,
         **kwargs: Any,
     ) -> None:
+        """Add the operation, as ``ninja.Router.add_api_operation`` does.
+
+        ``scrudful_entity`` is the :class:`Entity` describing a plain
+        operation (see :func:`described`, the way to give it through
+        ``router.get(...)`` and the other operation decorators, which don't
+        pass it on).
+
+        The first scrudful or :func:`described` operation of a path also adds
+        the path's HTTP Schema Resource route (see :class:`ScrudfulRouter`).
+
+        Raises
+        ------
+        ConfigError
+            If the operation is plain (not scrudful) and has no entity, unless
+            it routes only OPTIONS, or if it is given an entity twice or is
+            scrudful and given one; if ``path`` is under ``/_hsr/``; or if
+            ``path`` would have the HTTP Schema Resource route of another
+            path of the router.
+        """
+        if ("/" + path.lstrip("/")).startswith(f"/{HSR_ROUTE_SEGMENT}/"):
+            raise ConfigError(
+                f"'/{HSR_ROUTE_SEGMENT}/' is reserved for scrudful's HTTP "
+                "Schema Resources"
+            )
+        entity = _operation_entity(path, methods, view_func, scrudful_entity)
+        is_scrudful = isinstance(getattr(view_func, "_scrudful", None), _Config)
+        is_described = is_scrudful or entity is not None
+        _check_path_view()
+        hsr_name = None
+        if (
+            is_described
+            and path not in self._scrudful_hsr_url_names
+            and self._hsr_route_on()
+        ):
+            hsr_name = hsr_route_name(path)
+            other = self._scrudful_hsr_names.get(hsr_name)
+            if other is not None:
+                raise ConfigError(
+                    f"{path!r} and {other!r} of this ScrudfulRouter have the "
+                    f"same HTTP Schema Resource route name {hsr_name!r} "
+                    f"('/{HSR_ROUTE_SEGMENT}/{hsr_name}'): use one path "
+                    "template, or put them on different routers"
+                )
         super().add_api_operation(path, methods, view_func, **kwargs)
         path_view = _path_view(self, view_func)
+        _ScrudfulPathView.adopt(path_view, self, path)
+        operation = view_func._ninja_operation
+        operation._scrudful_entity = entity
+        # ninja re-applies them to the clone of each mount, in this order.
+        if entity is not None:
+            _add_run_decorator(operation, _described_run(entity))
+        _add_run_decorator(operation, _serving_router_run(self, path))
+        self._scrudful_paths[path] = path_view
+        self._scrudful_hsrs.clear()
         # ninja routes a request to the operations listing its method as is.
         if "OPTIONS" in methods:
             # The implementer's OPTIONS replaces the automatic one.
@@ -1598,17 +2209,744 @@ class ScrudfulRouter(Router):
                 for operation in path_view.operations
                 if not _is_automatic_options(operation)
             ]
-        elif isinstance(getattr(view_func, "_scrudful", None), _Config) and not any(
+        elif is_described and not any(
             "OPTIONS" in operation.methods for operation in path_view.operations
         ):
+            options_view = _options_view(self, path, path_view)
             super().add_api_operation(
                 path,
                 ["OPTIONS"],
-                _options_view(path, path_view),
+                options_view,
                 auth=None,
+                throttle=[],
                 response=NOT_SET,
                 include_in_schema=False,
             )
+            options_operation = getattr(options_view, "_ninja_operation")
+            # ninja's clones (one per mount) get the run decorators again.
+            _check_ninja_internal(
+                type(options_operation),
+                "Operation",
+                "clone",
+                "scrudful's OPTIONS (answered in an Operation.run decorator)",
+            )
+            _check_options_internals()
+            # Inner: answers OPTIONS before ninja's checks and view_func (and
+            # the add_decorator(mode="operation") wrappers of view_func).
+            _add_run_decorator(options_operation, _options_run(self, path, path_view))
+            # Outer: the router and operation serving, for _hsr_target.
+            _add_run_decorator(options_operation, _serving_router_run(self, path))
+        if hsr_name is not None:
+            self._add_hsr_route(path, hsr_name)
+
+    def _add_hsr_route(self, path: str, name: str) -> None:
+        """Serve ``path``'s HTTP Schema Resource by GET and HEAD at
+        ``/_hsr/<name>``, ahead of every other path of the router.
+
+        Django tries a router's paths in the order of ninja's
+        ``Router.path_operations``, so the HSR routes are moved to its start:
+        a path such as ``"/{kind}/{pk}"``, added before or after, would
+        otherwise match ``/_hsr/<name>``. That order is kept by ninja's
+        ``BoundRouter._bind_operations`` (which clones the paths for each
+        mount) and ``BoundRouter.urls_paths`` (which yields their URL
+        patterns), checked to be ninja 1.7.0's to 1.7.3's. A path of an
+        earlier router of the API, or of the API itself, that matches a
+        route first is refused when the API's URL patterns are built
+        (:func:`_check_hsr_route_reachable`).
+
+        The route's operation has an explicit ``url_name``,
+        ``scrudful_hsr_<serial>_<name>`` (unique per router), which
+        ``urls_paths`` uses as is, whatever decorator wraps the operation;
+        each mount's clone gets its own (see :meth:`_ScrudfulPathView.clone`),
+        so a router mounted twice in one API has one URL name per mount
+        (:func:`_hsr_url_name`).
+
+        Raises
+        ------
+        ConfigError
+            If the installed ninja's ``BoundRouter`` or either method differs.
+        """
+        bound_router = getattr(ninja_router, "BoundRouter", None)
+        for method in ("_bind_operations", "urls_paths"):
+            _check_ninja_internal(
+                bound_router,
+                "BoundRouter",
+                method,
+                "scrudful's HTTP Schema Resource routes",
+            )
+        _check_ninja_internal(
+            Operation,
+            "Operation",
+            "clone",
+            "scrudful's HTTP Schema Resource routes (served with the API of "
+            "their mount, through an Operation.run decorator)",
+        )
+        url_name = f"scrudful_hsr_{self._scrudful_serial}_{name}"
+        route = f"/{HSR_ROUTE_SEGMENT}/{name}"
+        view = _hsr_route_view(self, path)
+        super().add_api_operation(
+            route,
+            ["GET", "HEAD"],
+            view,
+            auth=None,
+            throttle=[],
+            response=NOT_SET,
+            include_in_schema=False,
+            url_name=url_name,
+        )
+        _ScrudfulPathView.adopt(_path_view(self, view), self, route, hsr_route=True)
+        # Each mount's clone serves the document of its API.
+        _add_run_decorator(view._ninja_operation, _serving_run)
+        self._scrudful_hsr_url_names[path] = url_name
+        self._scrudful_hsr_routes[path] = route
+        self._scrudful_hsr_names[name] = path
+        hsr_routes = {f"/{HSR_ROUTE_SEGMENT}/{n}" for n in self._scrudful_hsr_names}
+        for key in list(self.path_operations):
+            if key not in hsr_routes:
+                self.path_operations[key] = self.path_operations.pop(key)
+
+    def _hsr_route_on(self) -> bool:
+        """``hsr_route``, else ``SCRUDFUL["HSR_ROUTE"]``, else ``True``."""
+        return _route_on(self._scrudful_hsr_route)
+
+    def _hsr_cache_control(self) -> str:
+        """``hsr_cache_control``, else ``SCRUDFUL["HSR_CACHE_CONTROL"]``, else
+        ``public, max-age=300``."""
+        if self._scrudful_hsr_cache_control is not None:
+            return self._scrudful_hsr_cache_control
+        return _setting(setting_hsr_cache_control)  # type: ignore[no-any-return]
+
+    def _hsr(self, path: str, api: NinjaAPI | None = None) -> dict[str, Any]:
+        """The HTTP Schema Resource of ``path`` as ``api`` serves it, built
+        once (not a copy): with ``api``'s :func:`add_error_links` entity,
+        else (no ``api``) the one of the APIs mounting the router
+        (:func:`_api_error`).
+
+        Kept per path and API-wide entity (by identity), which is looked up
+        first: an API mounting the router later (ninja's ``add_router``,
+        which clears nothing) gets the document of its own entity.
+        """
+        api_error = _api_error(self) if api is None else _API_ERRORS.get(api)
+        key = (path, id(api_error))
+        kept = self._scrudful_hsrs.get(key)
+        if kept is not None and kept[0] is api_error:
+            return kept[1]
+        path_view = self._scrudful_paths.get(path)
+        if path_view is None:
+            raise ConfigError(
+                f"{path!r} is not a path of this ScrudfulRouter (its paths "
+                f"are {sorted(self._scrudful_paths)}): give the path as "
+                "given to the operation decorator"
+            )
+        hsr = _describe_path(self, path_view, api_error)
+        self._scrudful_hsrs[key] = (api_error, hsr)
+        return hsr
+
+    def _base_url(self) -> str | None:
+        """``base_url``, else ``SCRUDFUL["BASE_URL"]``, else ``None``."""
+        if self._scrudful_base_url is not None:
+            return self._scrudful_base_url
+        return _setting_base_url()
+
+    def _describes(self, path: str) -> bool:
+        """Whether an HTTP Schema Resource describes ``path`` (a path as given
+        to the operation decorator): whether it has a scrudful or
+        :func:`described` operation. Its responses then link to it."""
+        path_view = self._scrudful_paths.get(path)
+        return path_view is not None and any(
+            _scrudful_config(operation) is not None
+            or getattr(operation, "_scrudful_entity", None) is not None
+            for operation in path_view.operations
+        )
+
+
+#: Every ``ScrudfulRouter``, whose built HTTP Schema Resources
+#: :func:`add_error_links` discards.
+_SCRUDFUL_ROUTERS: weakref.WeakSet[ScrudfulRouter] = weakref.WeakSet()
+
+
+def _forget_router_hsrs(setting: str, **kwargs: Any) -> None:
+    """Discard every router's built HTTP Schema Resources when ``SCRUDFUL``
+    changes (``override_settings``): they hold its base URL."""
+    if setting == "SCRUDFUL":
+        for router in list(_SCRUDFUL_ROUTERS):
+            router._scrudful_hsrs.clear()
+
+
+setting_changed.connect(_forget_router_hsrs)
+
+#: The serial number of each ``ScrudfulRouter``, in its HSR routes' URL names.
+_ROUTER_SERIALS = itertools.count(1)
+
+#: The serial number of each mount of an HSR route, in its URL name.
+_MOUNT_SERIALS = itertools.count(1)
+
+#: The entity :func:`add_error_links` gave each API, for the HTTP Schema
+#: Resources of the paths of the routers it mounts.
+_API_ERRORS: weakref.WeakKeyDictionary[NinjaAPI, Entity] = weakref.WeakKeyDictionary()
+
+#: The ``ScrudfulRouter`` of the operation running (see
+#: :func:`_serving_router_run`); ``None`` outside one.
+_SERVING_ROUTER: ContextVar[ScrudfulRouter | None] = ContextVar(
+    "scrudful_serving_router", default=None
+)
+
+#: That operation (ninja's ``Operation``, whose ``api`` :func:`_hsr_target`
+#: reads); ``None`` outside one, or when it can't be found (see
+#: :func:`_operation_of`).
+_SERVING_ROUTER_OPERATION: ContextVar[Any] = ContextVar(
+    "scrudful_serving_router_operation", default=None
+)
+
+#: A resolver of each API's own URL patterns (see :func:`_hsr_route_path`).
+_API_RESOLVERS: weakref.WeakKeyDictionary[NinjaAPI, URLResolver] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _check_base_url(url: Any, what: str) -> None:
+    """Raise ``ConfigError`` unless ``url`` is an absolute URL (a str)."""
+    try:
+        check_base_url(url, what)
+    except HsrConfigError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _check_hsr_cache_control(value: Any, what: str) -> str:
+    """``value`` if it is a usable ``Cache-Control`` value, else ``ConfigError``."""
+    try:
+        return check_hsr_cache_control(value, what)
+    except HsrConfigError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _setting_base_url() -> str | None:
+    """``SCRUDFUL["BASE_URL"]``, checked, or ``None``."""
+    return _setting(setting_base_url)  # type: ignore[no-any-return]
+
+
+def _setting(accessor: Callable[[], Any]) -> Any:
+    """What ``accessor``, one of :mod:`scrudful._django`'s checked accessors
+    of a ``SCRUDFUL`` key, returns.
+
+    Raises
+    ------
+    django.core.exceptions.ImproperlyConfigured
+        If ``SCRUDFUL`` itself is not a dict of scrudful's keys.
+    ConfigError
+        If the key's value is invalid (chained to the accessor's
+        ``ImproperlyConfigured``), as for the router's own arguments.
+    """
+    # The setting's shape first: that error is the setting's own, as is.
+    scrudful_setting("BASE_URL", None)
+    try:
+        return accessor()
+    except ImproperlyConfigured as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _route_on(hsr_route: bool | None) -> bool:
+    """``hsr_route``, else ``SCRUDFUL["HSR_ROUTE"]`` (default ``True``)."""
+    if hsr_route is not None:
+        return hsr_route
+    return _setting(setting_hsr_route)  # type: ignore[no-any-return]
+
+
+def _check_route_and_url(
+    hsr_route: bool | None, hsr_url: Callable[[str], str] | None
+) -> None:
+    """Raise ``ConfigError`` if the route is off (``hsr_route``, else the
+    setting) without an ``hsr_url`` (``hsr_url``, else the setting). Reads
+    both settings, so that a wrong one fails."""
+    route_on = _route_on(hsr_route)
+    url = hsr_url if hsr_url is not None else _setting(setting_hsr_url)
+    if not route_on and url is None:
+        raise ConfigError("hsr_route=False needs hsr_url=")
+
+
+#: The type of each :class:`ScrudfulRouter` option that isn't callable.
+_OPTION_TYPES = {"hsr_route": ("a bool", bool), "hsr_cache_control": ("a str", str)}
+
+
+def _check_option_types(**options: Any) -> None:
+    """Raise ``TypeError`` unless each of the :class:`ScrudfulRouter`
+    ``options`` given is ``None`` or of its type (``hsr_url`` and
+    ``allowed``: a callable)."""
+    for name, value in options.items():
+        if value is None:
+            continue
+        if name not in _OPTION_TYPES:
+            if not callable(value):
+                raise TypeError(
+                    f"{name} must be a callable or None, not {type(value).__name__}"
+                )
+            continue
+        kind, accepted = _OPTION_TYPES[name]
+        if not isinstance(value, accepted):
+            raise TypeError(
+                f"{name} must be {kind} or None, not {type(value).__name__}"
+            )
+
+
+def _operation_entity(
+    path: str,
+    methods: list[str],
+    view_func: Callable[..., Any],
+    scrudful_entity: Entity | None,
+) -> Entity | None:
+    """The entity describing a plain operation of a ``ScrudfulRouter``.
+
+    ``None`` for a scrudful operation, described by its decorator, and for
+    one routing only OPTIONS, which the HTTP Schema Resource describes
+    itself. See :meth:`ScrudfulRouter.add_api_operation`.
+    """
+    marked = getattr(view_func, "_scrudful_entity", None)
+    name = getattr(view_func, "__qualname__", repr(view_func))
+    if scrudful_entity is not None:
+        if not isinstance(scrudful_entity, Entity):
+            raise TypeError(
+                "scrudful_entity must be an Entity, not "
+                f"{type(scrudful_entity).__name__}"
+            )
+        if marked is not None:
+            raise ConfigError(
+                f"{name}() has an entity from @described already: don't also "
+                "pass scrudful_entity="
+            )
+        marked = scrudful_entity
+    if isinstance(getattr(view_func, "_scrudful", None), _Config):
+        if marked is not None:
+            raise ConfigError(
+                f"{name}() is described by its scrudful decorator: don't pass "
+                "scrudful_entity="
+            )
+        return None
+    if marked is None and any(method.upper() != "OPTIONS" for method in methods):
+        raise ConfigError(
+            f"{name}() on {path!r} of a ScrudfulRouter is described in the "
+            "path's HTTP Schema Resource, so it needs an entity: decorate it "
+            "with a scrudful decorator, or with @described(Entity(...)) below "
+            "the operation decorator (or pass scrudful_entity= to "
+            "add_api_operation)"
+        )
+    return marked
+
+
+def described(entity: Entity) -> Callable[[Handler], Handler]:
+    """Give a plain (not scrudful) operation on a :class:`ScrudfulRouter` its entity.
+
+    The HTTP Schema Resource then describes the operation's request body
+    (POST, PUT, PATCH) and its 2xx responses but 204 with ``entity``'s
+    ``content``. Those responses (and HEAD's, as GET's) get ``entity``'s
+    schema and context Links, as a scrudful operation's do, so that they
+    agree with the description; link callables get ``(request, None)`` on
+    a response (there is no loaded object), and ``(None, None)`` when the
+    HTTP Schema Resource is built, and must return the same target in both;
+    they may be ``async def`` only in an async operation. Every response of
+    the operation gets the HTTP Schema Resource link, and its path answers
+    OPTIONS (see :class:`ScrudfulRouter`). ninja's operation decorators
+    don't pass unknown arguments on, so it is a decorator, below the operation
+    decorator::
+
+        @router.get("/health")
+        @described(Entity(schema_link_or_func=..., context_link_or_func=...))
+        def health(request): ...
+
+    Raises
+    ------
+    TypeError
+        If ``entity`` isn't an :class:`Entity`, or the function is already a
+        ninja operation (the decorator sits above the operation decorator)
+        or scrudful; when the operation is added, if a value of ``entity``
+        is an ``async def`` callable and the operation is sync.
+    """
+    if not isinstance(entity, Entity):
+        raise TypeError(f"described() takes an Entity, not {type(entity).__name__}")
+
+    def decorator(view_func: Handler) -> Handler:
+        name = getattr(view_func, "__qualname__", repr(view_func))
+        if hasattr(view_func, "_ninja_operation"):
+            raise TypeError(
+                "@described must sit below the operation decorator: "
+                f"{name}() is already a ninja operation"
+            )
+        if isinstance(getattr(view_func, "_scrudful", None), _Config):
+            raise TypeError(
+                f"{name}() is described by its scrudful decorator: drop @described"
+            )
+        view_func._scrudful_entity = entity  # type: ignore[attr-defined]
+        return view_func
+
+    return decorator
+
+
+def http_schema_resource(
+    router: ScrudfulRouter, path: str, *, api: NinjaAPI | None = None
+) -> dict[str, Any]:
+    """The HTTP Schema Resource (an OpenAPI 3.1 Path Item) of ``path``.
+
+    ``path`` is the router-relative path template, as given to the
+    operation decorator (e.g. ``"/{pk}"``). The document is the same for
+    every requester: it is built without a request, once per path and
+    API-wide error entity (the first call, or GET of its route, builds it;
+    adding an operation to the router, calling :func:`add_error_links`,
+    changing ``SCRUDFUL`` or the router's ``base_url`` discards it), and a
+    copy is returned. See "OPTIONS" in the module docstring for its
+    content.
+
+    Its ``default`` and framework error entries take the
+    :func:`add_error_links` entity of ``api``, as the HSR route of a mount of
+    the router on ``api`` serves it. Without ``api``, of the APIs mounting
+    the router (those :func:`add_error_links` was called for, and those
+    whose URL patterns were built: an API without :func:`add_error_links`
+    counts only once its ``api.urls`` is built, and ninja's
+    ``TestClient(router)`` mounts the router on a temporary API that
+    counts too): pass ``api`` for any router mounted on several APIs.
+
+    Link callables are called in *describe* mode, ``func(None, None)``: with
+    neither request nor object. They must return the same target as on the
+    responses they describe, or the description disagrees with the
+    responses. Relative URLs are resolved against the router's base URL
+    (``base_url=``, else ``SCRUDFUL["BASE_URL"]``).
+
+    Raises
+    ------
+    TypeError
+        If ``router`` isn't a :class:`ScrudfulRouter`, or ``api`` (if given)
+        a ``NinjaAPI``.
+    ConfigError
+        If ``path`` is not one of the router's; a link URL is relative and
+        there is no base URL; a link callable raises when called as
+        ``func(None, None)``; or, without ``api``, the router is mounted on
+        APIs that :func:`add_error_links` gave different entities.
+    """
+    _check_hsr_arguments(router, api)
+    return copy.deepcopy(router._hsr(path, api))
+
+
+def _check_hsr_arguments(router: Any, api: Any) -> None:
+    """Raise ``TypeError`` unless ``router`` is a :class:`ScrudfulRouter` and
+    ``api`` ``None`` or a ``NinjaAPI``."""
+    if not isinstance(router, ScrudfulRouter):
+        raise TypeError(f"router must be a ScrudfulRouter, not {type(router).__name__}")
+    if api is not None and not isinstance(api, NinjaAPI):
+        raise TypeError(f"api must be a NinjaAPI or None, not {type(api).__name__}")
+
+
+def http_schema_resource_view(
+    router: ScrudfulRouter, path: str, *, api: NinjaAPI | None = None
+) -> Callable[[HttpRequest], HttpResponseBase]:
+    """A plain Django view serving the HTTP Schema Resource of ``path``.
+
+    It answers GET and HEAD as the router's own HSR route does (see
+    :class:`ScrudfulRouter`), and any other method with 405. It is for
+    serving the document elsewhere, e.g. with ``hsr_route=False`` and an
+    ``hsr_url`` naming where it is mounted::
+
+        path("schemas/items/item", http_schema_resource_view(items, "/{pk}"))
+
+    Like the route, it runs no authentication, permission check or throttle,
+    is CSRF-exempt, and is public under Django's ``LoginRequiredMiddleware``
+    (``login_required = False``). ``path`` is checked on the first request,
+    as :func:`http_schema_resource` checks it, and ``api`` is what that
+    function takes: the API whose :func:`add_error_links` entity the error
+    entries describe.
+
+    Raises
+    ------
+    TypeError
+        If ``router`` isn't a :class:`ScrudfulRouter`, or ``api`` (if given)
+        a ``NinjaAPI``.
+    """
+    _check_hsr_arguments(router, api)
+
+    def scrudful_hsr_view(
+        request: HttpRequest, *args: Any, **kwargs: Any
+    ) -> HttpResponseBase:
+        if request.method not in ("GET", "HEAD"):
+            return hsr_not_allowed()
+        return _hsr_response(request, router, path, api)
+
+    scrudful_hsr_view.csrf_exempt = True  # type: ignore[attr-defined]
+    # Public under Django's LoginRequiredMiddleware (Django >= 5.1).
+    scrudful_hsr_view.login_required = False  # type: ignore[attr-defined]
+    return scrudful_hsr_view
+
+
+def _hsr_route_view(
+    router: ScrudfulRouter, path: str
+) -> Callable[..., HttpResponseBase]:
+    """The view of ``path``'s HSR route (see :meth:`ScrudfulRouter._add_hsr_route`).
+
+    It declares no parameters, so ninja passes and validates none (a prefix
+    such as ``"/orgs/{org}/items"`` has some), and is CSRF-exempt. The view
+    ninja routes the path to is public under Django's
+    ``LoginRequiredMiddleware`` (see :meth:`_ScrudfulPathView.get_view`).
+    """
+
+    def scrudful_hsr(request: HttpRequest, **params: Any) -> HttpResponseBase:
+        # The API of the mount serving it (see ScrudfulRouter._add_hsr_route).
+        return _hsr_response(request, router, path, _SERVING_API.get())
+
+    scrudful_hsr.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        [inspect.Parameter("request", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+    )
+    scrudful_hsr.csrf_exempt = True  # type: ignore[attr-defined]
+    return scrudful_hsr
+
+
+def _hsr_response(
+    request: HttpRequest,
+    router: ScrudfulRouter,
+    path: str,
+    api: NinjaAPI | None,
+) -> HttpResponseBase:
+    """The answer to a GET or HEAD of ``path``'s HTTP Schema Resource as
+    ``api`` serves it (see :meth:`ScrudfulRouter._hsr`), with the router's
+    ``Cache-Control`` (see :func:`scrudful._django.hsr_response`)."""
+    hsr = router._hsr(path, api)
+    return hsr_response(request, hsr, router._hsr_cache_control())
+
+
+def _hsr_target(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
+    """The URL of the HTTP Schema Resource of ``router``'s ``path``: the target
+    of the HSR link of the responses (and OPTIONS) of ``path``.
+
+    Resolved in this order:
+
+    1. the router's ``hsr_url(path)``, as it returns it;
+    2. else ``SCRUDFUL["HSR_URL"](route)``, as it returns it, ``route`` being
+       the route Django resolved the request to
+       (``request.resolver_match.route``): the full path template, in
+       Django's route syntax, with the prefixes of the URLconf's includes,
+       the API's and the routers' mounts (``"api/items/<pk>"``; under ninja's
+       ``TestClient``, which resolves among the API's patterns alone, the
+       same, prefixed with the API's route in the root URLconf, see
+       :func:`_resolved_route`), so that one project-wide callable tells
+       every resource, and every mount of a router, apart;
+    3. else the path of ``path``'s HSR route (a path has one if the route was
+       on when its first scrudful or :func:`described` operation was added),
+       reversed by its URL name in the mount the request came through
+       (:func:`_hsr_url_name`), with the URL parameters the request matched
+       outside ``path`` (an API's or router's prefix, such as
+       ``"/orgs/{org}/items"``):
+
+       a. in the URL namespace the request was resolved in (Django's URL
+          resolver, so the route of the API and mount the request came
+          through);
+       b. when the request has no namespace (ninja's ``TestClient`` resolves
+          it among the API's patterns alone), among the URL patterns of the
+          API of the ``ScrudfulRouter`` operation running, relative to the
+          API's root;
+
+    4. made absolute against the router's base URL (``base_url``, else
+       ``SCRUDFUL["BASE_URL"]``) when it has one, else with
+       ``request.build_absolute_uri()``.
+
+    So a router mounted twice in one API (``url_name_prefix``) links each
+    request to the HSR route of its own mount.
+
+    Raises
+    ------
+    ConfigError
+        If ``hsr_url`` returns something else than an absolute URL; the
+        setting's callable is used for a request Django didn't resolve;
+        ``path`` has no HSR route on ``router``; the route can't be reversed
+        (3b outside a ``ScrudfulRouter`` operation, or a request not routed
+        to ``router``); or the installed ninja's ``Operation.api``,
+        ``BoundRouter.path_operations`` or, for 3b,
+        ``NinjaClientBase._resolve`` or ``NinjaAPI.urls`` isn't ninja 1.7's.
+    """
+    hsr_url, argument = router._scrudful_hsr_url, path
+    if hsr_url is None:
+        hsr_url = _setting(setting_hsr_url)
+        if hsr_url is not None:
+            argument = _resolved_route(request)
+    if hsr_url is not None:
+        what = f"hsr_url({argument!r})"
+        try:
+            return check_hsr_url_result(hsr_url(argument), what)
+        except HsrConfigError as exc:
+            raise ConfigError(str(exc)) from exc
+    route = _hsr_route_path(request, router, path)
+    base_url = router._base_url()
+    if base_url is not None:
+        return resolve_uri(route, base_url)
+    return request.build_absolute_uri(route)
+
+
+def _resolved_route(request: HttpRequest) -> str:
+    """The route Django resolved ``request`` to (``resolver_match.route``),
+    the argument of ``SCRUDFUL["HSR_URL"]``: the full path template, with the
+    prefixes of the root URLconf, the API and the routers.
+
+    A request resolved among the API's own patterns (ninja's ``TestClient``:
+    its ``resolver_match`` has no namespace) has the route below the API's
+    root, so it is prefixed with the API's own route in the root URLconf
+    (its root path, ``NinjaAPI.get_root_path``, resolved), so that it is
+    the route a request through Django's resolver gets. Without one (an API
+    that isn't in the root URLconf, or under an include with parameters or
+    a namespace of its own), the route below the API's root.
+
+    Raises
+    ------
+    ConfigError
+        If the request wasn't resolved (no ``resolver_match``).
+    """
+    match = getattr(request, "resolver_match", None)
+    route = getattr(match, "route", None)
+    if not isinstance(route, str):
+        raise ConfigError(
+            'SCRUDFUL["HSR_URL"] is called with the route Django resolved the '
+            "request to (request.resolver_match.route), and this request has "
+            "none: send it through Django's URL resolver (or ninja's "
+            "TestClient), or give the ScrudfulRouter its own hsr_url"
+        )
+    if match.namespace:
+        return route
+    operation = _SERVING_ROUTER_OPERATION.get()
+    api = getattr(operation, "api", None)
+    if not isinstance(api, NinjaAPI):
+        return route
+    try:
+        api_route = resolve(api.get_root_path({})).route
+    except (NoReverseMatch, Resolver404):
+        return route
+    return f"{api_route}{route}"
+
+
+def _hsr_url_name(router: ScrudfulRouter, path: str) -> str:
+    """The URL name of ``path``'s HSR route in the mount of ``router`` serving
+    the request: the explicit ``url_name`` of the mount's clone of the
+    route's operation (see :meth:`_ScrudfulPathView.clone`), which ninja
+    1.7's ``BoundRouter.urls_paths`` uses as is.
+
+    The mount is that of the operation running (:func:`_bound_mount`);
+    without one (it can't be found through ``Operation.run``), the router's
+    own name, which no mount has.
+
+    Raises
+    ------
+    ConfigError
+        If ``path`` has no HSR route on ``router``, or the installed ninja's
+        ``BoundRouter.path_operations`` doesn't hold the route's clone.
+    """
+    url_name = router._scrudful_hsr_url_names.get(path)
+    if url_name is None:
+        raise ConfigError(
+            f"{path!r} has no HTTP Schema Resource route on this ScrudfulRouter "
+            f"(the paths with one are {sorted(router._scrudful_hsr_url_names)}): "
+            "give the path as given to the operation decorator, of a scrudful "
+            "or @described operation added while the route was on"
+        )
+    operation = _SERVING_ROUTER_OPERATION.get()
+    if operation is None:
+        return url_name
+    bound_router, _ = _bound_mount(_operation_api(operation), operation)
+    route_view = bound_router.path_operations.get(router._scrudful_hsr_routes[path])
+    name = getattr(getattr(route_view, "operations", [None])[0], "url_name", None)
+    if not isinstance(name, str) or not name.startswith(f"{url_name}_"):
+        raise _bound_path_error()
+    return name
+
+
+def _hsr_route_path(request: HttpRequest, router: ScrudfulRouter, path: str) -> str:
+    """The absolute path of ``path``'s HSR route (steps 3a and 3b of
+    :func:`_hsr_target`)."""
+    url_name = _hsr_url_name(router, path)
+    match = getattr(request, "resolver_match", None)
+    kwargs: dict[str, Any] = {}
+    if match is not None:
+        own = get_path_param_names(path)
+        kwargs = {k: v for k, v in match.kwargs.items() if k not in own}
+        if match.namespace:
+            try:
+                return reverse(f"{match.namespace}:{url_name}", kwargs=kwargs)
+            except NoReverseMatch as exc:
+                raise _unreversed(path, exc) from exc
+    if _SERVING_ROUTER.get() is None:
+        raise ConfigError(
+            f"can't find the HTTP Schema Resource route of {path!r}: the request "
+            "was resolved without a URL namespace, outside an operation of a "
+            "ScrudfulRouter, so scrudful doesn't know its API"
+        )
+    api = _operation_api(_SERVING_ROUTER_OPERATION.get())
+    resolver = _API_RESOLVERS.get(api)
+    if resolver is None:
+        # ninja's TestClient routes a request among ``api.urls[0]`` alone and
+        # sets the namespace-less ``resolver_match`` of the pattern matched.
+        try:
+            from ninja.testing import client as ninja_client
+        except ImportError:  # pragma: no cover - ninja 1.7 has it
+            ninja_client = None
+        _check_ninja_internal(
+            getattr(ninja_client, "NinjaClientBase", None),
+            "NinjaClientBase",
+            "_resolve",
+            "scrudful's HTTP Schema Resource links under ninja's TestClient",
+        )
+        resolver = _API_RESOLVERS[api] = URLResolver(
+            RegexPattern(r"^/"), _api_patterns(api)
+        )
+    try:
+        return "/" + resolver.reverse(url_name, **kwargs)
+    except NoReverseMatch as exc:
+        raise _unreversed(path, exc) from exc
+
+
+def _operation_api(operation: Any) -> NinjaAPI:
+    """The API of ninja's ``operation`` (ninja 1.7's ``Operation.api``).
+
+    Raises
+    ------
+    ConfigError
+        If ``operation`` is ``None`` (it can't be found) or has no API.
+    """
+    if operation is None:
+        raise ConfigError(
+            "scrudful can't find the ninja operation through Operation.run, "
+            "because a decorate_view decorator wraps it without "
+            "functools.wraps, so it doesn't know the API serving the request "
+            "for its HTTP Schema Resource link. Use functools.wraps in that "
+            "decorator, or apply decorate_view above the operation decorator."
+        )
+    api = getattr(operation, "api", None)
+    if not isinstance(api, NinjaAPI):
+        raise ConfigError(
+            "scrudful reads the API serving the request from ninja's "
+            "Operation.api, which the installed ninja's "
+            f"{type(operation).__qualname__} doesn't have as ninja 1.7.0 to "
+            "1.7.3 do: upgrade scrudful, or keep ninja at one of those releases"
+        )
+    return api
+
+
+def _api_patterns(api: NinjaAPI) -> list[Any]:
+    """``api``'s URL patterns: the first item of ``NinjaAPI.urls`` (ninja 1.7's
+    ``(patterns, app_name, namespace)``).
+
+    Raises
+    ------
+    ConfigError
+        If the installed ninja's ``NinjaAPI.urls`` has another shape.
+    """
+    urls = api.urls
+    if not (isinstance(urls, tuple) and len(urls) == 3 and isinstance(urls[0], list)):
+        raise ConfigError(
+            "scrudful reverses the HTTP Schema Resource routes of an API among "
+            "its patterns, the first item of ninja's NinjaAPI.urls, which the "
+            "installed ninja doesn't give as ninja 1.7.0 to 1.7.3 do, a "
+            "(patterns, app_name, namespace) tuple: upgrade scrudful, or keep "
+            "ninja at one of those releases"
+        )
+    return urls[0]
+
+
+def _unreversed(path: str, exc: NoReverseMatch) -> ConfigError:
+    return ConfigError(
+        f"can't reverse the HTTP Schema Resource route of {path!r} (is the "
+        f"request routed to its ScrudfulRouter?): {exc}"
+    )
 
 
 def add_error_links(api: NinjaAPI, error: Entity) -> None:
@@ -1638,16 +2976,49 @@ def add_error_links(api: NinjaAPI, error: Entity) -> None:
     Content-Type, as ninja's renderer gives) is served as
     ``error.media_type``, whatever the handler chose, so the JSON bodies of
     every wrapped handler must be content that ``error`` describes. Other
-    content keeps its Content-Type.
+    content keeps its Content-Type. For an ``application/problem+json``
+    ``error``, the body of ninja's request validation 422,
+    ``{"detail": [errors]}``, whose ``detail`` problem details want a
+    string, is rewritten as RFC 9457 problem details with ninja's errors as
+    the ``errors`` member
+    (``problem_from_errors(422, errors, "Request validation failed")``,
+    :func:`scrudful.problem.problem_from_errors`), by the API's renderer; a
+    custom ``ValidationError`` handler's body without a ``detail`` list is
+    kept.
 
     An error raised inside a scrudful operation gets that operation's
     entity for the status, if it has one (``responses[status]``, else its
     ``error``), and its media type: it describes the response, as the
     OPTIONS of the operation does, and ``error`` here applies only otherwise.
+    A 401, 403, 422 or 429 is the exception: one the operation (its
+    function, ``load``, ``before`` or ``after_throttles``) raises gets
+    ``error`` here when the operation's ``error`` differs (and no
+    ``responses[status]`` is declared), as those ninja answers itself (its
+    authentication's 401, a failed CSRF check, an ``AuthorizationError``,
+    its validation's 422, its throttles' 429) get it: each response of these
+    statuses agrees with the HTTP Schema Resource's entry for it. A status the
+    operation declares in ``responses=`` gets that entity instead, on the
+    errors ninja answers for it too (its authentication's 401, its
+    validation's 422).
 
-    Not covered: ninja's 405 for a method no operation of the path routes,
-    which no exception handler makes, Django's own 404 for an unknown URL
-    and Django's 500 page.
+    ``error`` is also the API-wide error entity of the HTTP Schema Resources
+    of the paths of the :class:`ScrudfulRouter` routers ``api`` mounts (see
+    :func:`http_schema_resource`): the ``default`` response entry of an
+    operation without an ``error`` of its own, and the explicit 401, 403,
+    422 and 429 entries (ninja's own errors) of one whose ``error`` differs
+    (without ``add_error_links``, those carry the operation's ``error``,
+    under ``default``). Its
+    relative link URLs resolve against the router's base URL there and, on
+    the responses of a ``ScrudfulRouter`` operation, here too.
+
+    The JSON 405 a :class:`ScrudfulRouter` answers for a method no
+    operation of the path routes goes through the ``HttpError`` handler, so
+    it is covered too; ninja's own ``text/html`` 405 of a plain ``Router``
+    is not. Neither are Django's 404 for an unknown URL and its 500 page:
+    install :func:`handler404` and :func:`handler500` for those.
+
+    On a path of a :class:`ScrudfulRouter`, the responses also get the HTTP
+    Schema Resource link (see there).
 
     Parameters
     ----------
@@ -1655,7 +3026,8 @@ def add_error_links(api: NinjaAPI, error: Entity) -> None:
         The API whose exception handlers are wrapped.
     error : Entity
         The schema, context and media type of the error bodies. Its link
-        callables are called with the request and ``obj=None``. ninja's
+        callables are called with the request and ``obj=None``, and with
+        ``(None, None)`` when an HTTP Schema Resource is built. ninja's
         exception handlers are sync, also in an async operation, where they
         run on the event loop: the callables must be sync, and must not use
         the Django ORM there.
@@ -1691,7 +3063,12 @@ def add_error_links(api: NinjaAPI, error: Entity) -> None:
             handler = handlers[exc_class]
             # Calling this again replaces the earlier entity.
             handler = getattr(handler, "_scrudful_error_handler", handler)
-            api.add_exception_handler(exc_class, _error_handler(handler, error))
+            api.add_exception_handler(exc_class, _error_handler(handler, error, api))
+    # The HTTP Schema Resources describe it (see _api_error): built ones
+    # are rebuilt.
+    _API_ERRORS[api] = error
+    for router in list(_SCRUDFUL_ROUTERS):
+        router._scrudful_hsrs.clear()
 
 
 def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
@@ -1889,23 +3266,27 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
 
                 @functools.wraps(handler)
                 async def wrapper(request: HttpRequest, **values: Any) -> Any:
-                    _check_hooks_allowed(config, label)
                     try:
-                        return await _run_async(flow(request, values, answers))
+                        with _entered(config, label):
+                            content = await _run_async(flow(request, values, answers))
                     except Exception as exc:
-                        _note_raised(config, exc)
+                        _note_raised(exc, config)
                         raise
+                    _note_answered(config)
+                    return content
 
             else:
 
                 @functools.wraps(handler)
                 def wrapper(request: HttpRequest, **values: Any) -> Any:
-                    _check_hooks_allowed(config, label)
                     try:
-                        return _run_sync(flow(request, values, answers))
+                        with _entered(config, label):
+                            content = _run_sync(flow(request, values, answers))
                     except Exception as exc:
-                        _note_raised(config, exc)
+                        _note_raised(exc, config)
                         raise
+                    _note_answered(config)
+                    return content
 
             wrapper.__signature__ = hidden.signature  # type: ignore[attr-defined]
             wrapper._scrudful = config  # type: ignore[attr-defined]
@@ -1998,11 +3379,17 @@ def _early_response(
 ) -> _Flow[HttpResponseBase]:
     """scrudful's own response to a failed or short-circuited precondition.
 
-    The 400, 412 and 428 bodies get the Links of ``config.error``, whose link
-    callables get ``obj``, and its media type as their Content-Type. The
-    serving API's renderer writes them (see :func:`_render`).
+    The 400, 412 and 428 bodies get the Links of the entity the HTTP Schema
+    Resource describes them with (:func:`_early_entity`): ``config.error``
+    (or the status's ``responses=`` entity), whose link callables get
+    ``obj``, else the serving API's :func:`add_error_links` entity, whose
+    link callables get ``obj=None`` (as for the errors its handlers answer);
+    and its media type as their Content-Type. The serving API's renderer writes
+    them (see :func:`_render`).
     """
-    error = config.error
+    api = _SERVING_API.get()
+    api_error = _API_ERRORS.get(api) if isinstance(api, NinjaAPI) else None
+    error = _early_entity(config, result.status, api_error)
     result = with_error_body(config.error_body_func, request, result)
     early = conditional_response(
         result,
@@ -2010,7 +3397,8 @@ def _early_response(
         render=_render(request),
     )
     if result.body is not None and error is not None:
-        yield from _add_links(early, error, request, obj)
+        own = error is config.error or error is config.responses.get(result.status)
+        yield from _add_links(early, error, request, obj if own else None)
         expose_headers(early)
     return early
 
@@ -2056,18 +3444,48 @@ _ERROR_CLASSES: tuple[type[Exception], ...] = tuple(
 
 @dataclass(eq=False, slots=True)
 class _Raised:
-    """What the scrudful operation running ``Operation.run`` raised, and the
-    path parameters ``run`` got (for the hooks, see :func:`_install_hooks`)."""
+    """The scrudful operation running ``Operation.run``, whether it raised,
+    and the path parameters ``run`` got (for the hooks, see
+    :func:`_install_hooks`).
 
-    #: The operation's, once its wrapper or one of its hooks raised an
-    #: ``HttpError`` or ``Http404``.
-    config: _Config | None = None
+    One per ``run``: the operation whose ``run`` it is answers the request,
+    so its configuration describes whatever error the request raised.
+    """
+
+    #: The configuration of the operation running.
+    operation: _Config
+    #: The operation, as scrudful's errors name it.
+    label: str = ""
     #: The path parameters, as the URL gives them (strings, unless the path
     #: uses a converter).
     path_params: dict[str, Any] = field(default_factory=dict)
+    #: Whether the operation's wrapper or one of its hooks raised an
+    #: ``HttpError`` or ``Http404`` (:func:`_note_raised`): the API's answer
+    #: to it gets the Links of :attr:`operation`'s entity for its status.
+    raised_error: bool = False
     #: Whether the operation's hooks (``before``, ``after_throttles``) ran
     #: and allowed the request (see :func:`_check_hooks_allowed`).
     hooks_allowed: bool = False
+    #: Whether its wrapper is running (the handler with hooks, see
+    #: :func:`_entered`): calling it again then is a nested call.
+    running: bool = False
+    #: Whether its ``Operation.run`` ended: a call of its handler after it
+    #: (from a task or thread it left running) is refused.
+    finished: bool = False
+    #: Whether its wrapper returned: its response then has its Links, whose
+    #: callables got the loaded object, so a declared status of it is not
+    #: described again (they would get ``None``).
+    answered: bool = False
+
+    def declared(self, status: int) -> _Config | None:
+        """The operation's configuration, if ``responses=`` declares the
+        error ``status`` of a response its wrapper didn't answer (ninja's
+        authentication, throttling or validation; a decorator's): that
+        entity describes it, whatever the API-wide one."""
+        config = self.operation
+        if not self.answered and status >= 400 and status in config.responses:
+            return config
+        return None
 
 
 #: Set by :func:`_raised_links_run` while ``Operation.run`` runs. A mutable
@@ -2075,9 +3493,16 @@ class _Raised:
 _RAISED: ContextVar[_Raised | None] = ContextVar("scrudful_raised", default=None)
 
 
-#: The API serving the scrudful operation (or automatic OPTIONS) running, set
-#: by its ``Operation.run`` decorator (:func:`_raised_links_run`,
-#: :func:`_serving_api_run`); ``None`` outside one.
+def _api_error_of(operation: Any) -> Entity | None:
+    """The :func:`add_error_links` entity of the API serving ``operation``
+    (ninja's ``Operation.api``, as :func:`_serving` reads it), if any."""
+    api = getattr(operation, "api", None)
+    return _API_ERRORS.get(api) if isinstance(api, NinjaAPI) else None
+
+
+#: The API serving the scrudful operation running, set by its
+#: ``Operation.run`` decorator (:func:`_raised_links_run`); ``None`` outside
+#: one.
 _SERVING_API: ContextVar[NinjaAPI | None] = ContextVar(
     "scrudful_serving_api", default=None
 )
@@ -2104,6 +3529,19 @@ def _serving(operation: Any) -> Iterator[None]:
         _SERVING_API.reset(token)
 
 
+def _serving_run(run: Callable[..., Any]) -> Callable[..., Any]:
+    """The ``Operation.run`` decorator of a sync operation setting
+    :data:`_SERVING_API` to its API (see :func:`_serving`) while it runs."""
+    operation = _operation_of(run)
+
+    @functools.wraps(run)
+    def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
+        with _serving(operation):
+            return run(request, *args, **kw)
+
+    return scrudful_run
+
+
 def _add_run_decorator(
     operation: Any, decorator: Callable[[Callable[..., Any]], Callable[..., Any]]
 ) -> None:
@@ -2116,27 +3554,170 @@ def _add_run_decorator(
     operation._run_decorators.append(decorator)
 
 
-def _serving_api_run(run: Callable[..., Any]) -> Callable[..., Any]:
-    """The ``Operation.run`` decorator of the (sync) automatic OPTIONS operation,
-    setting :data:`_SERVING_API` while it runs."""
-    operation = _operation_of(run)
+@contextlib.contextmanager
+def _serving_router(router: ScrudfulRouter, operation: Any) -> Iterator[None]:
+    """:data:`_SERVING_ROUTER` is ``router`` and
+    :data:`_SERVING_ROUTER_OPERATION` is ``operation`` within."""
+    router_token = _SERVING_ROUTER.set(router)
+    operation_token = _SERVING_ROUTER_OPERATION.set(operation)
+    try:
+        yield
+    finally:
+        _SERVING_ROUTER_OPERATION.reset(operation_token)
+        _SERVING_ROUTER.reset(router_token)
 
-    @functools.wraps(run)
-    def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-        with _serving(operation):
-            return run(request, *args, **kw)
 
-    return scrudful_run
+def _is_async_run(run: Callable[..., Any], operation: Any) -> bool:
+    """Whether ``run``, the ``Operation.run`` of ``operation``, is async."""
+    return bool(getattr(operation, "is_async", inspect.iscoroutinefunction(run)))
 
 
-def _record_serving_api(operation: Any) -> None:
-    """Decorate ``operation.run`` with :func:`_serving_api_run`."""
-    _add_run_decorator(operation, _serving_api_run)
+def _serving_router_run(
+    router: ScrudfulRouter, path: str
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """The ``Operation.run`` decorator of each operation of ``router``'s
+    ``path``, setting :data:`_SERVING_ROUTER` (see :func:`_live_base`) and
+    :data:`_SERVING_ROUTER_OPERATION`, the operation (see
+    :func:`_hsr_target`), while it runs, and giving the response it returns
+    the HTTP Schema Resource link (:func:`_add_hsr_link`).
+
+    The link is resolved (:func:`_resolved_hsr_link`) before ``run``: a
+    misconfiguration it raises (an ``hsr_url`` raising or returning a
+    relative URL, a route that can't be reversed) fails the request before
+    ninja's checks and the operation run, so before any write, rather than
+    after one.
+
+    Outermost of scrudful's, so the API's exception handlers ninja calls in
+    ``run`` see them too, and every response the operation answers gets the
+    link: the operation's own, scrudful's early ones, and those of ninja's
+    checks and exception handlers (401, 422, 429, a raised error).
+    """
+
+    def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
+        operation = _operation_of(run)
+
+        if _is_async_run(run, operation):
+
+            @functools.wraps(run)
+            async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
+                with _serving_router(router, operation):
+                    link = _resolved_hsr_link(request, router, path)
+                    response = await run(request, *args, **kw)
+                _add_hsr_link(response, link)
+                return response
+
+        else:
+
+            @functools.wraps(run)
+            def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
+                with _serving_router(router, operation):
+                    link = _resolved_hsr_link(request, router, path)
+                    response = run(request, *args, **kw)
+                _add_hsr_link(response, link)
+                return response
+
+        return scrudful_run
+
+    return decorator
+
+
+def _resolved_hsr_link(
+    request: HttpRequest, router: ScrudfulRouter, path: str
+) -> str | None:
+    """The link to the HTTP Schema Resource of ``router``'s ``path``
+    (:func:`_hsr_target`), for ``request``'s response; ``None`` when the path
+    has no HTTP Schema Resource (no scrudful or :func:`described`
+    operation), or for a CORS preflight, whose answer carries no Links.
+    Called within :func:`_serving_router`, which :func:`_hsr_target` reads
+    under ninja's ``TestClient``."""
+    if is_preflight(request.method or "", request.headers.get):
+        return None
+    if not router._describes(path):
+        return None
+    return hsr_link(_hsr_target(request, router, path))
+
+
+def _add_hsr_link(response: HttpResponseBase, link: str | None) -> None:
+    """Give ``response`` the HTTP Schema Resource ``link``
+    (:func:`_resolved_hsr_link`) and the exposed headers; nothing when
+    ``link`` is ``None``. A Link with the HSR relation the response already
+    has (the handler's) replaces it (see
+    :func:`scrudful._adapter.merge_links`)."""
+    if link is None:
+        return
+    merged = merge_links(response.get("Link"), None, None, link)
+    if merged is not None:
+        response["Link"] = merged
+    expose_headers(response)
+
+
+def _described_run(
+    entity: Entity,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """The ``Operation.run`` decorator of a plain operation that
+    :func:`described` gives ``entity``: its responses get ``entity``'s Links
+    where the HTTP Schema Resource describes ``entity``'s content (a 2xx but
+    204, to any method but TRACE; and HEAD, as GET), as a scrudful
+    operation's do. Link callables get ``(request, None)``: there is no
+    loaded object. Inside :func:`_serving_router_run`, which adds the HSR
+    link and the exposed headers.
+
+    Raises
+    ------
+    TypeError
+        If a value of ``entity`` is an ``async def`` callable and the
+        operation is sync.
+    """
+
+    def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
+        operation = _operation_of(run)
+        if _is_async_run(run, operation):
+
+            @functools.wraps(run)
+            async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
+                response = await run(request, *args, **kw)
+                if has_default_entity(request.method or "", response.status_code):
+                    await _run_async(_add_links(response, entity, request, None))
+                return response
+
+            return scrudful_run
+
+        for entity_field in fields(Entity):
+            if _is_async_callable(getattr(entity, entity_field.name)):
+                raise TypeError(
+                    f"@described: {entity_field.name} is async, but the operation "
+                    "is not: async callables need an async def handler"
+                )
+
+        @functools.wraps(run)
+        def scrudful_sync_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
+            response = run(request, *args, **kw)
+            if has_default_entity(request.method or "", response.status_code):
+                _run_sync(_add_links(response, entity, request, None))
+            return response
+
+        return scrudful_sync_run
+
+    return decorator
+
+
+def _live_base(request: HttpRequest) -> str:
+    """The URL the relative link URLs of a response resolve against.
+
+    The base URL of the :class:`ScrudfulRouter` serving it (its
+    ``base_url``, else ``SCRUDFUL["BASE_URL"]``), as in the HTTP Schema
+    Resource; else (a scrudful operation on a plain router, or an error
+    answered outside a ``ScrudfulRouter`` operation) ``SCRUDFUL["BASE_URL"]``;
+    else the request's absolute URI.
+    """
+    router = _SERVING_ROUTER.get()
+    base = router._base_url() if router is not None else _setting_base_url()
+    return base if base is not None else request.build_absolute_uri()
 
 
 def _render(request: HttpRequest) -> Render | None:
     """How the API serving ``request`` writes a JSON body, for scrudful's own
-    responses (OPTIONS and the early 400, 412 and 428).
+    responses (the early 400, 412 and 428).
 
     Its renderer, when that writes JSON content (an ``application/json`` or
     ``+json`` ``media_type``), so these bodies have the bytes and charset of
@@ -2192,14 +3773,75 @@ def _json_values(data: Any) -> Any:
     return json.loads(json.dumps(data, cls=NinjaJSONEncoder))
 
 
-def _note_raised(config: _Config, exc: Exception) -> None:
-    """Note ``exc`` if it is an ``HttpError`` or ``Http404`` the operation of
-    ``config`` raised (its wrapper, or a hook): its response gets the
-    Links of the operation's entity for the status (see
-    :func:`_raised_links_run`)."""
+def _running(config: _Config) -> _Raised | None:
+    """The :class:`_Raised` of the operation running, if ``config`` is its
+    configuration: not for the handler of another operation called directly
+    from inside it."""
     raised = _RAISED.get()
+    return raised if raised is not None and raised.operation is config else None
+
+
+def _note_answered(config: _Config) -> None:
+    """Note that the wrapper of ``config``'s operation returned (see
+    :class:`_Raised`), if it is the operation running."""
+    raised = _running(config)
+    if raised is not None:
+        raised.answered = True
+
+
+def _note_raised(exc: Exception, config: _Config) -> None:
+    """Note ``exc`` if it is an ``HttpError`` or ``Http404`` that
+    ``config``'s operation raised (its wrapper, or a hook) while it runs: its
+    response gets the Links of the operation's entity for the status (see
+    :func:`_raised_links_run`). The handler of another operation, called
+    directly from inside it, notes nothing: what it raises is the running
+    operation's to describe, if it lets it through."""
+    raised = _running(config)
     if raised is not None and isinstance(exc, (HttpError, Http404)):
-        raised.config = config
+        raised.raised_error = True
+
+
+def _described_by(
+    raised: _Raised, request: HttpRequest, response: HttpResponseBase, operation: Any
+) -> _Config | None:
+    """The configuration whose entity describes ``response``, which the
+    operation's ``Operation.run`` returned, if it isn't the wrapper's own
+    answer: an error the operation raised (:func:`_note_raised`), or one
+    whose status its ``responses=`` declares (:meth:`_Raised.declared`),
+    such as ninja's own 401. The body of ninja's request validation 422 is
+    then problem details when that entity is (:func:`_problem_422`).
+
+    Without an API-wide entity (:func:`add_error_links`), also ninja's own
+    401, 403, 422 or 429 (its authentication, ``AuthorizationError``, CSRF
+    check, request validation, throttles) of an operation with an
+    ``error``: it carries that entity, as those the operation raises do, so
+    every one of them agrees with the HSR's ``default`` (see
+    :func:`_error_entries`). With one, the API's wrapped handler gives them
+    its Links (see :func:`_error_handler`).
+    """
+    if raised.raised_error:
+        return raised.operation
+    config = raised.operation
+    status = response.status_code
+    entity: Entity | None = None
+    described: _Config | None = None
+    if (
+        status in _FRAMEWORK_ERRORS
+        and not raised.answered
+        and config.error is not None
+        and _api_error_of(operation) is None
+        and status not in config.responses
+    ):
+        entity, described = config.error, config
+    else:
+        described = raised.declared(status)
+        if described is not None:
+            entity = described.responses[status]
+    if status == 422 and entity is not None:
+        api = getattr(operation, "api", None)
+        if essence(entity.media_type) == PROBLEM_JSON and isinstance(api, NinjaAPI):
+            _problem_422(response, request, api)
+    return described
 
 
 def _raised_links_run(
@@ -2211,7 +3853,10 @@ def _raised_links_run(
     decorators added with ``add_decorator(mode="operation")``, e.g. one
     rolling a transaction back), and ninja answers it with the API's
     exception handler. The response ``run`` returns then gets the Links of
-    the operation's entity for its status, see :func:`_raised_entity`.
+    the operation's entity for its status, see :func:`_raised_entity`; so
+    does a response the wrapper didn't answer (ninja's authentication,
+    throttling or request validation) whose error status ``responses=``
+    declares (see :func:`_described_by`).
 
     While ``run`` runs, :data:`_SERVING_API` is the operation's API, whose
     renderer writes scrudful's own bodies (see :func:`_render`). The
@@ -2229,30 +3874,40 @@ def _raised_links_run(
 
             @functools.wraps(run)
             async def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                raised = _Raised(path_params=kw)
+                raised = _Raised(config, label=label, path_params=kw)
                 token = _RAISED.set(raised)
                 try:
                     with _serving(operation):
                         response = await run(request, *args, **kw)
                 finally:
+                    raised.finished = True
                     _RAISED.reset(token)
-                if raised.config is not None:
-                    await _run_async(_raised_links(raised.config, request, response))
+                described = _described_by(raised, request, response, operation)
+                if described is not None:
+                    links = _raised_links(
+                        described, request, response, _api_error_of(operation)
+                    )
+                    await _run_async(links)
                 return response
 
         else:
 
             @functools.wraps(run)
             def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
-                raised = _Raised(path_params=kw)
+                raised = _Raised(config, label=label, path_params=kw)
                 token = _RAISED.set(raised)
                 try:
                     with _serving(operation):
                         response = run(request, *args, **kw)
                 finally:
+                    raised.finished = True
                     _RAISED.reset(token)
-                if raised.config is not None:
-                    _run_sync(_raised_links(raised.config, request, response))
+                described = _described_by(raised, request, response, operation)
+                if described is not None:
+                    links = _raised_links(
+                        described, request, response, _api_error_of(operation)
+                    )
+                    _run_sync(links)
                 return response
 
         return scrudful_run
@@ -2264,9 +3919,79 @@ def _raised_links_run(
 #: ``Operation`` and ``AsyncOperation`` that scrudful's copy of the checks
 #: (:func:`_install_hooks`) was written from: ``_run_checks``, which it
 #: copies, and ``run``, which answers the response it returns before reading
-#: any parameter. ninja 1.7.0 and 1.7.1 on Python 3.10 to 3.14 (``run``'s
-#: f-string is tokenized differently from Python 3.12 on).
+#: any parameter. ninja 1.7.0 to 1.7.3 on Python 3.10 to 3.14 (``run``'s
+#: f-string is tokenized differently from Python 3.12 on). Also those the HTTP
+#: Schema Resource routes and links rely on (:meth:`ScrudfulRouter._add_hsr_route`,
+#: :func:`_hsr_route_path`): ``BoundRouter._bind_operations`` and
+#: ``BoundRouter.urls_paths`` (the routes' order and URL names) and ninja's
+#: ``TestClient`` resolving a request (``NinjaClientBase._resolve``), each
+#: with its digest before Python 3.12 and from it on. And those the
+#: per-requester ``Allow`` of OPTIONS relies on (:func:`_served_operations`,
+#: :func:`_authenticated`, :func:`_path_values`): ``NinjaAPI._get_bound_routers``
+#: (the operations of the mount serving the request; with
+#: ``NinjaAPI._get_urls``, the order of an API's patterns, which
+#: :func:`_check_hsr_route_reachable` relies on), the
+#: ``_run_authentication`` of ``Operation`` (which differs between ninja
+#: 1.7.0 and 1.7.1) and ``AsyncOperation`` (what scrudful runs as they run
+#: the ``auth`` callbacks), ``ParamModel.resolve`` and
+#: ``PathModel.get_request_data`` (the validation of the path parameters);
+#: and ``Operation.clone`` (which re-applies the run decorator answering
+#: OPTIONS to each clone) and ``Operation._check_throttles`` (which throttles
+#: it, :func:`_options_throttled`); each tokenizes alike on Python 3.10 to
+#: 3.14.
 _NINJA_SOURCES = {
+    "Operation.clone": frozenset(
+        {"419b2415bfa634071e7df7d2e9173da511f951e68465770106c3c8175277cd70"}
+    ),
+    "Operation._check_throttles": frozenset(
+        {"12d6d65ac18a38775f1dbf350efd8b2716cd46fbc7e3f9e96ff49ac722000b39"}
+    ),
+    "NinjaAPI._get_bound_routers": frozenset(
+        {
+            # 1.7.0 and 1.7.1, then 1.7.2 and 1.7.3 (which pass a mount's
+            # auth and throttle to Router.build_routers, instead of writing
+            # them on a nested router).
+            "41498c0b58d36097dc76dc36d81d0b0bfcb177d303339a2bd53260f5962012de",
+            "060bdd987299b0a08cd70f59f363bb0a593f0712ae51ad5c9fbfe99f8a71277f",
+        }
+    ),
+    "NinjaAPI._get_urls": frozenset(
+        {"5326f1f8197ffeae637c278614d4096275d1aedfe5e26b6f0362e87f0e218f96"}
+    ),
+    "Operation._run_authentication": frozenset(
+        {
+            # 1.7.0, then 1.7.1 (which awaits a coroutine through a helper).
+            "f8f3bff9009cdc09a5e651bf23168060d084061bf2a64eca975af09b00363517",
+            "a07ef4988adebe087dd596db4df8540e67b65b55285c1667fc8cce154a49f298",
+        }
+    ),
+    "AsyncOperation._run_authentication": frozenset(
+        {"e403cc7bfd6e5e87e66aa993830a9cf40ae12eec5bb6be58a90c516826d4230b"}
+    ),
+    "ParamModel.resolve": frozenset(
+        {"febf455ac9585728764f10f251480f5d938a91e4a06a6d41486614341d60525e"}
+    ),
+    "PathModel.get_request_data": frozenset(
+        {"ff2c2a3213646b380b9ce2d8fe331b0e660015e8f0d240e98bf5b3216b8f8296"}
+    ),
+    "BoundRouter._bind_operations": frozenset(
+        {
+            "873e51ad8cace9e07c15f2819ec99ac3cf53d0659705b15bcc8621edfb052fed",
+            "27088996948fe2a5fadbec87c86f96c701f33752d4d594b94eb4ef06134d5af2",
+        }
+    ),
+    "BoundRouter.urls_paths": frozenset(
+        {
+            "85c4f63c7cd88350cc2ac5af93f0b024c66487ee4f1b5188ec6bc8c5f5f41f3b",
+            "9cacc722ce0ab6834f0c20a5de1363293c9a3d0c13050431d1ae8cdade7d24b0",
+        }
+    ),
+    "NinjaClientBase._resolve": frozenset(
+        {
+            "45f93bff824798198140d0b3311bb4bb0b2d58c6544fcd1d0860814dcbfce7bf",
+            "1067efbf84d27a64f0017013877ea6abd94bd812c36b91c68f40f770ec545901",
+        }
+    ),
     "Operation._run_checks": frozenset(
         {"1f879fdc88dd517f7ff2f3961c324160638e3de021cf294b6e4e9f9ecccfc2d4"}
     ),
@@ -2282,6 +4007,20 @@ _NINJA_SOURCES = {
     "AsyncOperation.run": frozenset(
         {"5189477ffad3b05335304fa19f3900e208d8d234ca99626b9117cf7067921fc7"}
     ),
+    # The JSON 405 (_ScrudfulPathView); each tokenizes alike on Python 3.10
+    # to 3.14, in ninja 1.7.0 to 1.7.3.
+    "PathView.clone": frozenset(
+        {"7635be8d39a8461cbdffc9c5d1352cc54f5196c1e34cccf401b8f2ee7bbc7315"}
+    ),
+    "PathView.get_view": frozenset(
+        {"b676b307a9b8b4d65c5ad4a37295d96ebe6f5345b1d433dee9ad8750ca945bdf"}
+    ),
+    "PathView._sync_view": frozenset(
+        {"2ac2decb57289da4c5ef11985668446740247a66beb700d1835ce3fe65ea476a"}
+    ),
+    "PathView._async_view": frozenset(
+        {"9fb4a1e9a18cef1d7916c95b877413ccd1ad970b965359084d75eea6e4e18ed6"}
+    ),
 }
 #: The code fingerprint of ``_run_checks``, sync and async (see :data:`_NINJA_CODE`).
 _CHECKS_CODE = (
@@ -2296,10 +4035,212 @@ _CHECKS_CODE = (
     ("self", "request", "error"),
     2,
 )
+#: The names of ``BoundRouter.urls_paths`` (see :data:`_NINJA_CODE`).
+_URLS_PATHS_NAMES = (
+    "replace_path_param_notation",
+    "path_operations",
+    "items",
+    "join",
+    "normalize_path",
+    "lstrip",
+    "operations",
+    "getattr",
+    "api",
+    "get_operation_url_name",
+    "template",
+    "url_name_prefix",
+    "django_path",
+    "get_view",
+)
+#: The locals of ``NinjaAPI._get_bound_routers`` before Python 3.12 (see
+#: :data:`_NINJA_CODE`).
+_BOUND_ROUTERS_LOCALS = (
+    "self",
+    "all_mounts",
+    "prefix",
+    "router",
+    "auth",
+    "throttle",
+    "tags",
+    "url_name_prefix",
+    "api_decorators",
+    "mounts",
+    "first_mount",
+    "mount",
+)
 #: Where the source isn't available: the names, local variables and argument
-#: count of each (the same in ninja 1.7.0 and 1.7.1 on Python 3.10 to 3.14).
-#: Weaker: a body using the same names in another order passes.
-_NINJA_CODE = {
+#: count of each (the same in ninja 1.7.0 to 1.7.3 on Python 3.10 to 3.14,
+#: but where noted), or a set of them. Weaker: a body using the same names in
+#: another order passes.
+_NINJA_CODE: dict[str, Any] = {
+    "Operation.clone": (
+        (
+            "object",
+            "__new__",
+            "__class__",
+            "is_async",
+            "path",
+            "list",
+            "methods",
+            "view_func",
+            "cast",
+            "api",
+            "csrf_exempt",
+            "hasattr",
+            "url_name",
+            "auth_param",
+            "auth_callbacks",
+            "throttle_param",
+            "throttle_objects",
+            "signature",
+            "models",
+            "stream_format",
+            "stream_item_model",
+            "dict",
+            "response_models",
+            "operation_id",
+            "summary",
+            "description",
+            "tags",
+            "deprecated",
+            "include_in_schema",
+            "openapi_extra",
+            "by_alias",
+            "exclude_unset",
+            "exclude_defaults",
+            "exclude_none",
+            "_run_decorators",
+            "run",
+            "append",
+        ),
+        ("self", "cloned", "deco"),
+        1,
+    ),
+    # Before Python 3.12, then from it on (PEP 709 inlines the comprehension).
+    "Operation._check_throttles": frozenset(
+        (
+            (
+                "throttle_objects",
+                "allow_request",
+                "append",
+                "wait",
+                "max",
+                "api",
+                "on_exception",
+                "Throttled",
+                "str",
+                "math",
+                "ceil",
+            ),
+            ("self", "request", "throttle_durations", "throttle", *names, "response"),
+            2,
+        )
+        for names in (("durations", "duration"), ("duration", "durations"))
+    ),
+    "NinjaAPI._get_urls": (
+        (
+            "get_openapi_urls",
+            "_get_bound_routers",
+            "extend",
+            "urls_paths",
+            "prefix",
+            "append",
+            "get_root_url",
+        ),
+        ("self", "result", "bound_router"),
+        1,
+    ),
+    # Before Python 3.12, then from it on, when the comprehensions' names are
+    # the function's (PEP 709).
+    "NinjaAPI._get_bound_routers": frozenset(
+        {
+            (
+                (
+                    "_bound_routers_cache",
+                    "_router_registrations",
+                    "default_router",
+                    "_decorators",
+                    "build_routers",
+                    "NOT_SET",
+                    "auth",
+                    "throttle",
+                    "tags",
+                    "url_name_prefix",
+                    "extend",
+                    "template",
+                    "_freeze",
+                    "_routers",
+                ),
+                _BOUND_ROUTERS_LOCALS,
+                1,
+            ),
+            (
+                (
+                    "_bound_routers_cache",
+                    "_router_registrations",
+                    "default_router",
+                    "_decorators",
+                    "build_routers",
+                    "NOT_SET",
+                    "auth",
+                    "throttle",
+                    "tags",
+                    "url_name_prefix",
+                    "extend",
+                    "BoundRouter",
+                    "template",
+                    "_freeze",
+                    "prefix",
+                    "_routers",
+                ),
+                _BOUND_ROUTERS_LOCALS + ("m",),
+                1,
+            ),
+        }
+    ),
+    "Operation._run_authentication": frozenset(
+        (
+            (
+                "auth_callbacks",
+                "is_async_callable",
+                "getattr",
+                "inspect",
+                "iscoroutine",
+                "async_to_sync",
+                *helper,
+                "Exception",
+                "api",
+                "on_exception",
+                "auth",
+                "AuthenticationError",
+            ),
+            ("self", "request", "callback", "result", "exc"),
+            2,
+        )
+        # 1.7.0, then 1.7.1.
+        for helper in ((), ("_await_coroutine",))
+    ),
+    "AsyncOperation._run_authentication": (
+        (
+            "auth_callbacks",
+            "is_async_callable",
+            "getattr",
+            "sync_to_async",
+            "Exception",
+            "api",
+            "on_exception",
+            "auth",
+            "AuthenticationError",
+        ),
+        ("self", "request", "callback", "cor", "result", "exc"),
+        2,
+    ),
+    "ParamModel.resolve": (
+        ("get_request_data", "_map_data_paths", "model_validate"),
+        ("cls", "request", "api", "path_params", "data"),
+        4,
+    ),
+    "PathModel.get_request_data": ((), ("cls", "request", "api", "path_params"), 4),
     "Operation._run_checks": _CHECKS_CODE,
     "Operation.run": (
         (
@@ -2357,6 +4298,117 @@ _NINJA_CODE = {
         ),
         2,
     ),
+    "BoundRouter._bind_operations": (
+        (
+            "mount",
+            "inherited_decorators",
+            "template",
+            "_decorators",
+            "path_operations",
+            "items",
+            "clone",
+            "operations",
+            "api",
+            "auth_param",
+            "NOT_SET",
+            "auth",
+            "_set_auth",
+            "throttle_param",
+            "throttle",
+            "isinstance",
+            "BaseThrottle",
+            "throttle_objects",
+            "tags",
+            "run",
+            "view_func",
+            "ValueError",
+        ),
+        (
+            "self",
+            "effective_decorators",
+            "path",
+            "path_view",
+            "cloned_view",
+            "operation",
+            "throttle",
+            "decorator",
+            "mode",
+        ),
+        1,
+    ),
+    # Several fingerprints: from Python 3.12 on, the comprehension's ``i`` is
+    # a local variable of the function (PEP 709).
+    "BoundRouter.urls_paths": frozenset(
+        (
+            _URLS_PATHS_NAMES,
+            ("self", "prefix", "path", "path_view", *comprehension, "route")
+            + ("operation", "url_name"),
+            2,
+        )
+        for comprehension in ((), ("i",))
+    ),
+    "NinjaClientBase._resolve": (
+        (
+            "split",
+            "lstrip",
+            "urls",
+            "resolve",
+            "_build_request",
+            "resolver_match",
+            "func",
+            "kwargs",
+            "Exception",
+        ),
+        (
+            "self",
+            "method",
+            "path",
+            "data",
+            "request_params",
+            "url_path",
+            "url",
+            "match",
+            "request",
+        ),
+        5,
+    ),
+    # Before Python 3.12, then from it on (PEP 709 inlines the comprehension).
+    "PathView.clone": frozenset(
+        {
+            (("PathView", "is_async", "url_name", "operations"), ("self", "cloned"), 1),
+            (
+                ("PathView", "is_async", "url_name", "operations", "clone"),
+                ("self", "cloned", "op"),
+                1,
+            ),
+        }
+    ),
+    # Before Python 3.14, then from it on (PEP 649 defers the annotations).
+    "PathView.get_view": frozenset(
+        (names, ("self", "async_view_wrapper", "sync_view_wrapper"), 1)
+        for names in (
+            ("is_async", "HttpRequest", "Any", "HttpResponseBase", "csrf_exempt"),
+            ("is_async", "csrf_exempt"),
+        )
+    ),
+    "PathView._sync_view": (
+        ("_find_operation", "_not_allowed", "run"),
+        ("self", "request", "a", "kw", "operation"),
+        2,
+    ),
+    "PathView._async_view": (
+        (
+            "_find_operation",
+            "_not_allowed",
+            "is_async",
+            "cast",
+            "AsyncOperation",
+            "run",
+            "sync_to_async",
+        ),
+        ("self", "request", "a", "kw", "operation"),
+        2,
+    ),
 }
 #: Tokens that don't change the code: comments and blank lines.
 _IGNORED_TOKENS = frozenset({tokenize.COMMENT, tokenize.NL})
@@ -2409,21 +4461,58 @@ def _without_docstring(tokens: list[tokenize.TokenInfo]) -> list[tokenize.TokenI
     return tokens[:body] + tokens[end + 1 :]
 
 
+#: Whether :func:`_is_ninja_code` warned of a ninja without source (once).
+_sourceless_warned = False
+
+
 @functools.cache
 def _is_ninja_code(func: Any, name: str) -> bool:
     """Whether ``func`` is the code of ninja's method ``name`` (e.g.
-    ``"Operation.run"``) scrudful's copy of the checks was written from: by
-    the digest of its source, else (no source) by its names, locals and
-    arguments. Memoized: each function is read once, whatever the number of
+    ``"Operation.run"``) scrudful was written against: by the digest of its
+    source, else (no source: compiled without the ``.py`` files, frozen,
+    zipped) by its names, locals and arguments, a weaker check that a
+    changed release keeping them passes, of which a ``RuntimeWarning`` warns
+    once. Memoized: each function is read once, whatever the number of
     operations and mounts."""
+    global _sourceless_warned
     digest = _source_digest(func)
     if digest is not None:
         return digest in _NINJA_SOURCES[name]
+    if not _sourceless_warned:
+        # No stacklevel: the check runs deep in scrudful, where an
+        # operation, a router or a request reaches it, never at one frame of
+        # the app's own code.
+        warnings.warn(
+            f"scrudful can't read the source of ninja's {name} (nor, likely, of "
+            "its other internals scrudful relies on): it checks only their "
+            "names, locals and arguments, which a ninja release changing their "
+            "code can keep. Install ninja with its source to check it fully.",
+            RuntimeWarning,
+        )
+        # Recorded once warned: a warning raised as an error leaves it
+        # unrecorded, so the next check warns (or fails) again.
+        _sourceless_warned = True
     code = getattr(func, "__code__", None)
-    return (
-        code is not None
-        and (code.co_names, code.co_varnames, code.co_argcount) == _NINJA_CODE[name]
-    )
+    if code is None:
+        return False
+    expected = _NINJA_CODE[name]
+    fingerprints = expected if isinstance(expected, frozenset) else {expected}
+    return (code.co_names, code.co_varnames, code.co_argcount) in fingerprints
+
+
+def _check_ninja_internal(owner: Any, owner_name: str, method: str, use: str) -> None:
+    """Raise ``ConfigError`` unless ``owner`` (ninja's class ``owner_name``,
+    ``None`` when the installed ninja has none) has ninja 1.7.0's to
+    1.7.3's ``method``, which ``use`` relies on."""
+    name = f"{owner_name}.{method}"
+    func = getattr(owner, method, None) if owner is not None else None
+    if func is None or not _is_ninja_code(func, name):
+        raise ConfigError(
+            f"{use}: scrudful relies on ninja's {name} here, and the installed "
+            "ninja's differs from ninja 1.7.0's to 1.7.3's, which scrudful is "
+            "verified against: upgrade scrudful, or keep ninja at one of those "
+            "releases"
+        )
 
 
 def _check_ninja_checks(
@@ -2465,7 +4554,7 @@ def _check_ninja_checks(
                 label,
                 config,
                 f"the installed ninja's {ninja_class.__name__}.{method} differs "
-                f"from ninja 1.7.0's and 1.7.1's, which scrudful's {hooks} "
+                f"from ninja 1.7.0's to 1.7.3's, which scrudful's {hooks} "
                 f"{_verb(config, 'is', 'are')} verified against: upgrade "
                 "scrudful, or keep ninja at one of those releases",
             )
@@ -2482,7 +4571,7 @@ def _checks_error(label: str, config: _Config, reason: str) -> ConfigError:
     return ConfigError(
         f"{label}: {config.hooks_label} {_verb(config, 'needs', 'need')} ninja's "
         "own Operation._run_checks and the Operation.run calling it (as in "
-        f"ninja 1.7.0 and 1.7.1), as scrudful runs {where}; {reason}."
+        f"ninja 1.7.0 to 1.7.3), as scrudful runs {where}; {reason}."
     )
 
 
@@ -2495,7 +4584,7 @@ def _install_hooks(
     throttling).
 
     ``Operation.run`` answers a response its ``_run_checks`` returns before it
-    reads any parameter. These checks are ninja 1.7.0's and 1.7.1's (CSRF
+    reads any parameter. These checks are ninja 1.7.0's to 1.7.3's (CSRF
     exemption flag, authentication, throttles) with ``before`` called between
     authentication and throttling, so a request it refuses uses none of a
     throttle's quota, and ``after_throttles`` after throttling, so a
@@ -2532,7 +4621,7 @@ def _install_hooks(
 
     def answer(request: HttpRequest, exc: Exception) -> HttpResponseBase:
         """The API's answer to what a hook raised."""
-        _note_raised(config, exc)
+        _note_raised(exc, config)
         return operation.api.on_exception(request, exc)  # type: ignore[no-any-return]
 
     def allowed(hook: str, result: Any) -> None:
@@ -2631,16 +4720,66 @@ def _check_hooks_allowed(config: _Config, label: str) -> None:
     So a request never reaches the function without them: if ninja served an
     operation without scrudful's checks (e.g. a copy it made without
     re-applying ``Operation.run``'s decorators), the request fails instead
-    of going on unchecked.
+    of going on unchecked. So does a call of the decorated handler from
+    inside another operation (its function calling it directly): that
+    operation's hooks ran for the request, not this one's; and so does a
+    call of it from inside itself, while it runs (see :func:`_entered`): its
+    hooks ran for the request's path parameters, not for that call's; and so
+    does a call once its operation's run ended (from a task or thread the
+    handler left running, whose context still holds the run's record).
     """
     if not config.hooks:
         return
     raised = _RAISED.get()
+    if raised is not None and raised.operation is not config:
+        raise RuntimeError(
+            f"{label} was called directly from inside another operation, "
+            f"{raised.label or 'a scrudful one'}, so its {config.hooks_label} "
+            "didn't run for this request (only that operation's checks did). "
+            "Refusing the request: move the code both need into a plain "
+            "function and call that, not the decorated handler."
+        )
+    if raised is not None and raised.finished:
+        raise RuntimeError(
+            f"{label} was called after its operation's run ended (from a task "
+            "or thread the handler left running), so its "
+            f"{config.hooks_label} didn't run for this call. Refusing the "
+            "request: move the code both need into a plain function and call "
+            "that, not the decorated handler."
+        )
+    if raised is not None and raised.running:
+        raise RuntimeError(
+            f"{label} was called directly from inside itself, while its "
+            f"operation runs, so its {config.hooks_label} ran for the "
+            "request's path parameters, not for this call's. Refusing the "
+            "request: move the code both need into a "
+            "plain function and call that, not the decorated handler."
+        )
     if raised is None or not raised.hooks_allowed:
         raise RuntimeError(
             f"{label}: {config.hooks_label} didn't run for this request: the operation "
             "ninja served lacks scrudful's checks. Refusing the request."
         )
+
+
+@contextlib.contextmanager
+def _entered(config: _Config, label: str) -> Iterator[None]:
+    """Run the wrapper of ``config``'s operation within, once
+    :func:`_check_hooks_allowed` allowed it; with hooks, marked running in
+    the request's :class:`_Raised` meanwhile, so that the handler calling
+    itself (for other path values, say) is refused as a nested call, while
+    calling it again once it returned (an operation decorator retrying it)
+    isn't."""
+    _check_hooks_allowed(config, label)
+    raised = _running(config) if config.hooks else None
+    if raised is None:
+        yield
+        return
+    raised.running = True
+    try:
+        yield
+    finally:
+        raised.running = False
 
 
 def _refuse_hook_result(name: str, result: Any, asynchronous: bool) -> NoReturn:
@@ -2666,58 +4805,98 @@ def _refuse_hook_result(name: str, result: Any, asynchronous: bool) -> NoReturn:
 
 
 def _raised_links(
-    config: _Config, request: HttpRequest, response: HttpResponseBase
+    config: _Config,
+    request: HttpRequest,
+    response: HttpResponseBase,
+    api_error: Entity | None,
 ) -> _Flow[None]:
     """Add the Links of an error the operation raised to ``response``.
 
     ``response`` is the API's answer to it; when it has content, it gets
-    the entity :func:`_raised_entity` picks for its status, whose link
-    callables get ``None``, and its media type (see :func:`_error_links`).
+    the entity :func:`_raised_entity` picks for its status (``api_error``
+    is the serving API's :func:`add_error_links` entity), whose link
+    callables get ``obj=None``, and its media type (see :func:`_error_links`).
+    It exposes ``Link`` and ``Allow`` either way.
     """
+    expose_headers(response)
     if not _carries_body(response):
         return
-    entity = _raised_entity(config, request.method.lower(), response.status_code)
+    entity = _raised_entity(
+        config, request.method.lower(), response.status_code, api_error
+    )
     if entity is not None:
         yield from _error_links(response, entity, request)
 
 
-def _raised_entity(config: _Config, method: str, status: int) -> Entity | None:
+def _raised_entity(
+    config: _Config, method: str, status: int, api_error: Entity | None
+) -> Entity | None:
     """The entity of the response to an error the operation raised.
 
-    The one the operation's OPTIONS describes for ``status`` (see
+    The one the HTTP Schema Resource describes for ``status`` (see
     :func:`_described_entity`: ``responses[status]``, but ``error`` first
-    for scrudful's own early statuses), else ``error``. None below 400: an
-    operation decorator turned the error into another response, which is
-    its own to describe (a link callable of the default entity would get
-    ``None``, not the object).
+    for scrudful's own early statuses); else, for a status ninja answers
+    itself too (401, 403, 422, 429: :data:`_FRAMEWORK_ERRORS`) when the
+    API-wide entity ``api_error`` (:func:`add_error_links`) is set and
+    differs from ``error``, ``api_error``, as ninja's own carry it, so that
+    every response of the status agrees with its one entry; else ``error``.
+    None below 400: an operation decorator turned the error into another
+    response, which is its own to describe (a link callable of the default
+    entity would get ``None``, not the object).
     """
     if status < 400:
         return None
-    entity = _described_entity(config, method, status, _is_conditional(config, method))
-    return config.error if entity is None else entity
+    conditional = _is_conditional(config, method)
+    entity = _described_entity(config, method, status, conditional, api_error)
+    if entity is not None:
+        return entity
+    if (
+        status in _FRAMEWORK_ERRORS
+        and api_error is not None
+        and config.error is not None
+        and api_error != config.error
+    ):
+        return api_error
+    return config.error
 
 
 def _error_handler(
-    handler: Callable[[HttpRequest, Exception], HttpResponseBase], error: Entity
+    handler: Callable[[HttpRequest, Exception], HttpResponseBase],
+    error: Entity,
+    api: NinjaAPI,
 ) -> Callable[[HttpRequest, Exception], HttpResponseBase]:
-    """``handler``, an exception handler of the API, adding ``error``'s Links."""
+    """``handler``, an exception handler of ``api``, adding ``error``'s Links.
+
+    With a problem-details ``error``, ninja's request validation 422 is
+    reshaped as problem details (:func:`_problem_422`).
+    """
 
     @functools.wraps(handler)
     def scrudful_handler(request: HttpRequest, exc: Exception) -> HttpResponseBase:
         response = handler(request, exc)
         raised = _RAISED.get()
-        if (
-            raised is not None
-            and raised.config is not None
-            and _raised_entity(
-                raised.config, request.method.lower(), response.status_code
+        if raised is not None and (
+            (
+                raised.raised_error
+                and _raised_entity(
+                    raised.operation,
+                    request.method.lower(),
+                    response.status_code,
+                    error,
+                )
+                is not None
             )
-            is not None
+            or (not raised.raised_error and raised.declared(response.status_code))
         ):
-            # A scrudful operation raised it: its entity describes the
-            # response, and :func:`_raised_links_run` adds it.
+            # A scrudful operation raised it, or declares its status: its
+            # entity describes the response, and :func:`_raised_links_run`
+            # adds it.
             return response
         if _carries_body(response):
+            if isinstance(exc, ninja_errors.ValidationError) and (
+                essence(error.media_type) == PROBLEM_JSON
+            ):
+                _problem_422(response, request, api)
             _run_sync(_error_links(response, error, request))
         return response
 
@@ -2725,12 +4904,46 @@ def _error_handler(
     return scrudful_handler
 
 
+def _problem_422(
+    response: HttpResponseBase, request: HttpRequest, api: NinjaAPI
+) -> None:
+    """Rewrite ninja's request validation body, ``{"detail": [errors]}``, as
+    RFC 9457 problem details (:func:`scrudful.problem.problem_from_errors`,
+    the errors as the ``errors`` extension member), written by ``api``'s
+    renderer, so that it is the content the problem-details entity
+    describes (``detail`` is a string there).
+
+    Only that body: JSON content (ninja's renderer's) whose ``detail`` is a
+    list. A custom handler's body is its own, and kept.
+    """
+    content_type = response.get("Content-Type")
+    if not (
+        content_type
+        and is_json_syntax(content_type)
+        and isinstance(response, HttpResponse)
+    ):
+        return
+    try:
+        body = json.loads(response.content)
+    except ValueError:
+        return
+    if not (isinstance(body, dict) and isinstance(body.get("detail"), list)):
+        return
+    status = response.status_code
+    problem = problem_from_errors(status, body["detail"], "Request validation failed")
+    renderer = api.renderer
+    if is_json_syntax(getattr(renderer, "media_type", None) or ""):
+        response.content = renderer.render(request, problem, response_status=status)
+    else:  # JSON content, though the API renders another media type
+        response.content = json.dumps(problem)
+
+
 def _error_links(
     response: HttpResponseBase, entity: Entity, request: HttpRequest
 ) -> _Flow[None]:
     """Give the error ``response`` the Links and media type of ``entity``.
 
-    Its link callables get ``None``. A response with JSON content, as
+    Its link callables get ``obj=None``. A response with JSON content, as
     ninja's renderer makes, is served as ``entity.media_type`` when that is
     JSON content too (an ``error`` entity's always is), with the charset its
     bytes are in, as scrudful's own error bodies are; other content keeps
@@ -3082,6 +5295,33 @@ def _check_entity(name: str, entity: Any) -> None:
         raise TypeError(f"{name} must be an Entity, not {type(entity).__name__}")
 
 
+def _link_entity(name: str, **values: Any) -> Entity:
+    """The :class:`Entity` of a decorator's link arguments.
+
+    Built when decorating, so that a schema link without an RDF context link
+    (the HTTP Schema Resource's ``x-rdf-context`` would be missing) is
+    refused before the operation is built.
+
+    Raises
+    ------
+    ConfigError
+        Chained to the :class:`~scrudful.entity.HsrConfigError` the entity
+        raises; ``name`` is the decorator's.
+    """
+    try:
+        return Entity(**values)
+    except HsrConfigError as exc:
+        raise ConfigError(f"{name}: {exc}") from exc
+
+
+def _entity_values(config: _Config) -> dict[str, Any]:
+    """The item entity's values of ``config`` (see :attr:`_Config.entity`)."""
+    return {
+        entity_field.name: getattr(config, entity_field.name)
+        for entity_field in fields(Entity)
+    }
+
+
 def _check_error(error: Any) -> None:
     """:func:`_check_entity` for ``error``, whose media type must be JSON."""
     _check_entity("error", error)
@@ -3207,10 +5447,11 @@ def _link(
 ) -> _Flow[str | None]:
     """Build one link-value from (url, rel, type) values or callables.
 
-    The URL is resolved against the request's absolute URI, as in the OPTIONS
-    body (see :func:`_media`). The context link of ``context_of`` content
+    The URL is resolved against :func:`_live_base`: the base URL of the
+    HTTP Schema Resource (see :func:`_media`) when there is one, else the
+    request's absolute URI. The context link of ``context_of`` content
     takes its type from :func:`scrudful._adapter.context_link_type`, as the
-    OPTIONS body does.
+    HTTP Schema Resource does.
     """
     url_or_func, rel_or_func, type_or_func = values_or_funcs
     url = yield from _value(url_or_func, request, obj)
@@ -3221,9 +5462,7 @@ def _link(
     if context_of is not None:
         content_type = context_link_type(context_of, content_type)
     content_type = content_type or defaults[1]
-    return link_content(
-        resolve_uri(url, request.build_absolute_uri()), rel, content_type
-    )
+    return link_content(resolve_uri(url, _live_base(request)), rel, content_type)
 
 
 def _has_status(content: Any) -> bool:
@@ -3356,27 +5595,466 @@ def _path_view(router: Router, view_func: Callable[..., Any]) -> Any:
     raise LookupError(f"{view_func!r} is not an operation of {router!r}")
 
 
-def _options_view(path: str, path_view: Any) -> Callable[..., HttpResponseBase]:
-    """The view of the automatic OPTIONS operation of ``path``.
+# --- The JSON 405 --------------------------------------------------------------
 
-    It reads ``path_view``, the router's own (template) ``PathView``, when a
-    request comes, so it describes the operations of the path as declared,
-    whichever API, prefix or mount the request came through (ninja serves
-    clones of them). It declares the path parameters, as ``Any`` (a
-    converter such as ``{int:pk}`` passes an ``int``), so that ninja passes
-    them and validates nothing. The response carries the HTTP Schema
-    Resource's own Links and an ``Allow`` listing the body's methods. The
-    body is written by the serving API's renderer (see :func:`_render`), and
-    is ``application/json``.
+#: The methods of ninja's ``PathView`` that :class:`_ScrudfulPathView` relies
+#: on: ``clone`` (one per mount, whose class it keeps), ``get_view`` (whose
+#: wrappers call the two others, and whose view an HSR route marks
+#: ``login_required = False``) and ``_sync_view`` / ``_async_view`` (which
+#: it overrides with ninja 1.7's code but for the 405).
+_PATH_VIEW_METHODS = ("clone", "get_view", "_sync_view", "_async_view")
+
+
+def _check_path_view() -> None:
+    """Raise ``ConfigError`` unless ninja's ``PathView`` has ninja 1.7.0's
+    to 1.7.3's :data:`_PATH_VIEW_METHODS` (memoized, see
+    :func:`_is_ninja_code`)."""
+    for method in _PATH_VIEW_METHODS:
+        _check_ninja_internal(
+            PathView,
+            "PathView",
+            method,
+            "scrudful's JSON 405 (a method no operation of a ScrudfulRouter "
+            "path routes) and its Allow",
+        )
+
+
+class _ScrudfulPathView(PathView):
+    """A path of a :class:`ScrudfulRouter`: ninja's ``PathView``, but a
+    request with a method none of its operations routes is answered by
+    :func:`_method_not_allowed` (JSON), not by ninja's ``text/html``
+    ``PathView._not_allowed``.
+
+    ``_sync_view`` and ``_async_view`` are ninja 1.7's but for that answer;
+    ``clone`` keeps the class, so that the ``PathView`` of each mount
+    (``BoundRouter._bind_operations`` clones the router's), whose
+    ``get_view`` serves the URL pattern, is one too. All four are
+    version-guarded (:func:`_check_path_view`).
+    """
+
+    #: The router and the path (as given to the operation decorator).
+    _scrudful_router: ScrudfulRouter
+    _scrudful_path: str
+    #: Whether the path is an HTTP Schema Resource route
+    #: (:meth:`ScrudfulRouter._add_hsr_route`).
+    _scrudful_hsr_route: bool = False
+    #: What :meth:`adopt` sets, and :meth:`clone` copies.
+    _SCRUDFUL_ATTRIBUTES = ("_scrudful_router", "_scrudful_path", "_scrudful_hsr_route")
+
+    @classmethod
+    def adopt(
+        cls,
+        path_view: Any,
+        router: ScrudfulRouter,
+        path: str,
+        *,
+        hsr_route: bool = False,
+    ) -> None:
+        """Make ``path_view``, the ``PathView`` ninja made for ``router``'s
+        ``path``, one of these (once); ``hsr_route`` marks an HTTP Schema
+        Resource route's.
+
+        Raises
+        ------
+        ConfigError
+            If ninja made something else than its own ``PathView``.
+        """
+        if isinstance(path_view, cls):
+            return
+        if type(path_view) is not PathView:
+            raise ConfigError(
+                "scrudful's JSON 405 replaces ninja's PathView of each path of a "
+                "ScrudfulRouter, but the installed ninja made a "
+                f"{type(path_view).__qualname__}, where ninja 1.7.0 to 1.7.3 "
+                "make a PathView: upgrade scrudful, or keep ninja at one of "
+                "those releases"
+            )
+        path_view.__class__ = cls
+        values = (router, path, hsr_route)
+        for name, value in zip(cls._SCRUDFUL_ATTRIBUTES, values, strict=True):
+            setattr(path_view, name, value)
+
+    def clone(self) -> PathView:
+        """ninja's clone (one per mount), of this class and with scrudful's
+        state; an HSR route's operation gets a URL name of its own (its
+        explicit ``url_name`` and a serial), which ninja's
+        ``BoundRouter.urls_paths`` uses as is and :func:`_hsr_url_name`
+        reads back: two mounts in one API never share one, whatever
+        decorator wraps the operation."""
+        cloned = super().clone()
+        cloned.__class__ = type(self)
+        for name in self._SCRUDFUL_ATTRIBUTES:
+            setattr(cloned, name, getattr(self, name))
+        if self._scrudful_hsr_route:
+            serial = next(_MOUNT_SERIALS)
+            for operation in cloned.operations:
+                operation.url_name = f"{operation.url_name}_{serial}"
+        # A mount's: its operations get the API mounting it (see _api_error).
+        self._scrudful_router._scrudful_mounts.add(cloned)
+        return cloned
+
+    def get_view(self) -> Callable[..., Any]:
+        """ninja's view of the path, the one its URL pattern routes to
+        (``BoundRouter.urls_paths``); an HSR route's is public under
+        Django's ``LoginRequiredMiddleware`` (Django >= 5.1), which reads
+        ``login_required`` from it, and is checked to be reachable
+        (:func:`_check_hsr_route_reachable`).
+
+        Raises
+        ------
+        ninja.errors.ConfigError
+            See :func:`_check_hsr_route_reachable`.
+        """
+        view = super().get_view()
+        if self._scrudful_hsr_route:
+            _check_hsr_route_reachable(self)
+            view.login_required = False  # type: ignore[attr-defined]
+        return view  # type: ignore[no-any-return]
+
+    def _sync_view(self, request: HttpRequest, *a: Any, **kw: Any) -> HttpResponseBase:
+        operation = self._find_operation(request)
+        if operation is None:
+            return _method_not_allowed(self, request)
+        return operation.run(request, *a, **kw)  # type: ignore[no-any-return]
+
+    async def _async_view(
+        self, request: HttpRequest, *a: Any, **kw: Any
+    ) -> HttpResponseBase:
+        operation = self._find_operation(request)
+        if operation is None:
+            return _method_not_allowed(self, request)
+        run: Any = operation.run
+        if operation.is_async:
+            return await run(request, *a, **kw)  # type: ignore[no-any-return]
+        response = await sync_to_async(run)(request, *a, **kw)
+        return response  # type: ignore[no-any-return]
+
+
+#: The values tried for a parameter of an HSR route's prefix, to build the
+#: URLs the route serves (:func:`_sample_urls`): each one its converter
+#: accepts (its regex and its ``to_python``) is used, one per class of value
+#: Django's converters tell apart (a word, a number, a UUID); the word is
+#: unlikely to be a literal segment of another route.
+_SAMPLE_VALUES = ("scrudful-sample", "0", "00000000-0000-0000-0000-000000000000")
+#: Tried, in order, for a converter (a custom one) accepting none of
+#: :data:`_SAMPLE_VALUES`: the first one it accepts is used.
+_FALLBACK_SAMPLES = tuple(char * size for size in range(1, 9) for char in "0aA-_")
+#: The most combinations of sample values checked per HSR route: every one
+#: for a prefix of up to 5 parameters (3**5); past it, each parameter's
+#: values with the others at their first, then the first combinations up to
+#: it (see :func:`_sample_urls`). Each
+#: URL is matched against every path before the route in its API, once, when
+#: the API's URL patterns are built.
+_MAX_SAMPLE_URLS = 3**5
+#: The HSR routes already warned about (see :func:`_check_hsr_route_reachable`).
+_UNCHECKED_ROUTES: set[tuple[int, str]] = set()
+
+
+def _route(prefix: str, path: str) -> str:
+    """The Django route of ``path`` mounted at ``prefix``, as ninja 1.7's
+    ``BoundRouter.urls_paths`` builds it (version-guarded where the HSR
+    routes are added, :meth:`ScrudfulRouter._add_hsr_route`)."""
+    prefix = ninja_router.replace_path_param_notation(prefix)
+    path = ninja_router.replace_path_param_notation(path)
+    route = "/".join([part for part in (prefix, path) if part])
+    return ninja_router.normalize_path(route).lstrip("/")  # type: ignore[no-any-return]
+
+
+def _converter_samples(converter: Any) -> tuple[list[str], str | None]:
+    """The sample values ``converter`` accepts, by its regex and by its
+    ``to_python`` (as Django's resolver does, a ``ValueError`` refuses), and
+    the first one its ``to_python`` refused by raising anything else (a
+    lookup's ``ObjectDoesNotExist``), described (``None`` without one):
+    that refuses it too, as building the URLconf mustn't fail on it."""
+    raised: str | None = None
+
+    def accepted(value: str) -> bool:
+        nonlocal raised
+        if not re.fullmatch(converter.regex, value):
+            return False
+        try:
+            converter.to_python(value)
+        except ValueError:
+            return False
+        except Exception as exc:
+            if raised is None:
+                raised = f"{type(exc).__name__}, not ValueError, for {value!r}"
+            return False
+        return True
+
+    values = [value for value in _SAMPLE_VALUES if accepted(value)]
+    if not values:
+        values = [value for value in _FALLBACK_SAMPLES if accepted(value)][:1]
+    return values, raised
+
+
+class _Samples(NamedTuple):
+    """The URL paths :func:`_sample_urls` built for an HSR route."""
+
+    #: The URLs the route matches (none: nothing is checked).
+    urls: list[str]
+    #: Why they don't cover every combination of sample values, as the
+    #: warning gives it (``None``: they do, the check is complete).
+    unchecked_reason: str | None
+
+
+def _sample_urls(route: str) -> _Samples:
+    """URL paths that the Django ``route`` matches, and why they don't cover
+    every combination of sample values (``None`` when they do).
+
+    Each parameter takes every :data:`_SAMPLE_VALUES` its converter accepts
+    (:func:`_converter_samples`), else the first :data:`_FALLBACK_SAMPLES`
+    one. The URLs are their product when it has at most
+    :data:`_MAX_SAMPLE_URLS` combinations; past that, each value of each
+    parameter with the others at their first value (at most 1 + 2k for k
+    parameters), then the product's first combinations up to the cap: every
+    parameter's values are still tried, not every combination of them. So a
+    shadow of some values of a parameter only (an ``int`` segment where the
+    prefix takes any ``str``) is found; a shadow of one literal value
+    (``"/orgs/acme/{a}/{b}"``) isn't. Without a value for a parameter there
+    is no URL. A value whose ``to_python`` raised something else than a
+    ``ValueError`` is left out, and named in the reason.
+    """
+    pattern = RoutePattern(route, is_endpoint=True)
+    names: list[str] = []
+    choices: list[list[str]] = []
+    reasons: list[str] = []
+    for name, converter in pattern.converters.items():
+        values, raised = _converter_samples(converter)
+        if not values:
+            return _Samples(
+                [],
+                "no sample value fits the converter of its prefix's "
+                f"{name!r} (its regex, or its to_python, refuses them"
+                + (f"; its to_python raised {raised}" if raised else "")
+                + ")",
+            )
+        if raised is not None:
+            reasons.append(
+                f"the to_python of the converter of its prefix's {name!r} "
+                f"raised {raised}, so that value wasn't tried"
+            )
+        names.append(name)
+        choices.append(values)
+    total = math.prod(len(values) for values in choices)
+    combinations: Iterable[tuple[str, ...]] = itertools.product(*choices)
+    if total > _MAX_SAMPLE_URLS:
+        first = tuple(values[0] for values in choices)
+        covering = [first] + [
+            first[:index] + (value,) + first[index + 1 :]
+            for index, values in enumerate(choices)
+            for value in values[1:]
+        ]
+        rest = itertools.islice(
+            itertools.product(*choices), max(_MAX_SAMPLE_URLS - len(covering), 0)
+        )
+        combinations = dict.fromkeys([*covering, *rest])
+        reasons.append(
+            f"the {len(names)} parameters of its prefix give {total} combinations "
+            f"of sample values, over the {_MAX_SAMPLE_URLS} checked, so each "
+            "parameter's values were tried but not every combination of them"
+        )
+    urls = []
+    for combination in combinations:
+        values = dict(zip(names, combination, strict=True))
+        url = re.sub(
+            r"<(?:[^>:]+:)?([^>]+)>", lambda match: values[match.group(1)], route
+        )
+        if pattern.match(url) is not None:
+            urls.append(url)
+    if not urls:
+        return _Samples([], "no URL built from the sample values matches it")
+    return _Samples(urls, "; ".join(reasons) or None)
+
+
+def _check_hsr_route_reachable(path_view: _ScrudfulPathView) -> None:
+    """Refuse an HSR route that a URL pattern before it in its API would
+    shadow.
+
+    Django tries an API's patterns in ninja's order: the API's own operations
+    (its default router), then each router mounted, in the order mounted
+    (``NinjaAPI._get_urls``, ninja 1.7). The router's HSR routes come first
+    among its own paths (:meth:`ScrudfulRouter._add_hsr_route`), but an
+    earlier router's path (or the API's), e.g. ``"/{kind}/{pk}"`` beside a
+    router's ``"/{pk}"`` at the same prefix, matches ``/_hsr/pk`` before the
+    route does: the HSR link would target something that isn't the HSR.
+    ninja gives scrudful no way to place its routes ahead of the API's other
+    patterns, so the route is checked when the API's URL patterns are built,
+    by matching the URLs it serves (:func:`_sample_urls`) against each
+    earlier path of the API's mounts: at most :data:`_MAX_SAMPLE_URLS` URLs
+    (past the cap, every parameter's values first, then the first
+    combinations up to it) times the number of earlier paths, once per route
+    and mount. Nothing is checked for a clone
+    without an API (not bound yet). When the URLs don't cover every
+    combination of sample values (past the cap), or there are none (a prefix
+    parameter whose converter accepts no sample value), a ``RuntimeWarning``
+    says so, once per route, naming the route and the reason; the URLs there
+    are still checked.
+
+    Raises
+    ------
+    ninja.errors.ConfigError
+        If an earlier path of the API matches the route; or if the installed
+        ninja's ``NinjaAPI._get_urls`` (the order of the patterns) or
+        ``NinjaAPI._get_bound_routers`` differs from ninja 1.7.0's to
+        1.7.3's, or its bound routers don't hold the route.
+    """
+    api = getattr(next(iter(path_view.operations), None), "api", None)
+    if not isinstance(api, NinjaAPI):
+        return
+    for method in ("_get_urls", "_get_bound_routers"):
+        _check_ninja_internal(
+            type(api),
+            "NinjaAPI",
+            method,
+            "scrudful's check of the HTTP Schema Resource routes",
+        )
+    earlier: list[tuple[str, Any]] = []
+    route = None
+    for bound_router in api._get_bound_routers():
+        path_operations = getattr(bound_router, "path_operations", None)
+        if not isinstance(path_operations, dict):
+            raise _bound_path_error()
+        for path, view in path_operations.items():
+            if view is path_view:
+                route = _route(bound_router.prefix, path)
+                break
+            earlier.append((_route(bound_router.prefix, path), view))
+        if route is not None:
+            break
+    if route is None:
+        raise _bound_path_error()
+    samples = _sample_urls(route)
+    if samples.unchecked_reason is not None:
+        key = (path_view._scrudful_router._scrudful_serial, route)
+        if key not in _UNCHECKED_ROUTES:
+            warnings.warn(
+                "scrudful can't check every URL of the HTTP Schema Resource "
+                f"route {route!r} of {_described_path(path_view)!r} against "
+                "the earlier paths of the API: "
+                f"{samples.unchecked_reason}. Make sure no router "
+                "added to the API before this ScrudfulRouter (nor the API "
+                "itself) has a path matching it.",
+                RuntimeWarning,
+            )
+            # Recorded once warned: a warning raised as an error leaves it
+            # unrecorded, so a retried build warns (or fails) again.
+            _UNCHECKED_ROUTES.add(key)
+    for other, view in earlier:
+        pattern = RoutePattern(other, is_endpoint=True)
+        url = next(
+            (url for url in samples.urls if pattern.match(url) is not None), None
+        )
+        if url is None:
+            continue
+        label = _route_label(other, view, path_view._scrudful_router)
+        raise ConfigError(
+            f"the HTTP Schema Resource route {route!r} of "
+            f"{_described_path(path_view)!r} "
+            f"(a ScrudfulRouter's) is shadowed by {label}, "
+            "which an earlier router of the API (or the API itself) mounts "
+            f"and which Django tries first, so a GET of {url!r} (below the "
+            "API's root) wouldn't reach "
+            "the HTTP Schema Resource its responses link to. Mount the "
+            "ScrudfulRouter before that router (the API's own operations "
+            "always come first: move them to a router mounted after it), or "
+            "give it hsr_route=False and hsr_url= to serve the HTTP Schema "
+            "Resources elsewhere (see http_schema_resource_view)"
+        )
+
+
+def _described_path(path_view: _ScrudfulPathView) -> str:
+    """The path (as given to the operation decorator) whose HTTP Schema
+    Resource the HSR route ``path_view`` serves."""
+    router = path_view._scrudful_router
+    return next(
+        (
+            path
+            for path, route in router._scrudful_hsr_routes.items()
+            if route == path_view._scrudful_path
+        ),
+        path_view._scrudful_path,
+    )
+
+
+def _route_label(route: str, path_view: Any, router: ScrudfulRouter) -> str:
+    """``path_view``'s operations at ``route``, for an error about an HSR
+    route of ``router``."""
+    if getattr(path_view, "_scrudful_hsr_route", False):
+        owner = (
+            "an earlier mount of this ScrudfulRouter"
+            if path_view._scrudful_router is router
+            else "another ScrudfulRouter"
+        )
+        return (
+            f"the HTTP Schema Resource route {route!r} of "
+            f"{_described_path(path_view)!r} of {owner}"
+        )
+    labels = []
+    for operation in getattr(path_view, "operations", ()):
+        if _is_automatic_options(operation):
+            continue
+        func = inspect.unwrap(operation.view_func)
+        name = getattr(func, "__qualname__", repr(func))
+        labels.append(f"{'/'.join(operation.methods)} {route!r} ({name}())")
+    return ", ".join(labels) or repr(route)
+
+
+def _method_not_allowed(
+    path_view: _ScrudfulPathView, request: HttpRequest
+) -> HttpResponseBase:
+    """The answer to a method none of the operations of ``path_view`` (a
+    mount's) routes: the API's answer to ``HttpError(405, "Method not
+    allowed")``, by its exception handler, so ``{"detail": "Method not
+    allowed"}`` as JSON with ninja's, and the API-wide error entity's Links
+    and media type with :func:`add_error_links`; with an ``Allow`` of the
+    methods the path serves (RFC 9110 §15.5.6: not per requester, unlike
+    OPTIONS), the HSR link of a described path and the exposed headers.
+
+    It runs outside any operation, so the router and the API (of the
+    mount's operations, ninja's ``Operation.api``) are set as an operation's
+    are (:func:`_serving_router`), for the Links and :func:`_hsr_target`.
+    """
+    router = path_view._scrudful_router
+    operation = path_view.operations[0]
+    api = _operation_api(operation)
+    with _serving_router(router, operation):
+        link = _resolved_hsr_link(request, router, path_view._scrudful_path)
+        response = api.on_exception(request, HttpError(405, "Method not allowed"))
+    _add_hsr_link(response, link)
+    served = {
+        method.upper()
+        for operation in path_view.operations
+        for method in operation.methods
+    }
+    # allow_value's order; OPTIONS only when served (an HSR route doesn't).
+    response["Allow"] = ", ".join(
+        method for method in allow_value(served).split(", ") if method in served
+    )
+    expose_headers(response)
+    return response  # type: ignore[no-any-return]
+
+
+def _options_view(
+    router: ScrudfulRouter, path: str, path_view: Any
+) -> Callable[..., HttpResponseBase]:
+    """The view of the automatic OPTIONS operation of ``path``, which never
+    answers: :func:`_options_run`, its ``Operation.run`` decorator, does,
+    before ninja's checks and ``view_func`` (and so before the
+    ``add_decorator(mode="operation")`` wrappers of ``view_func``).
+
+    It declares the path parameters, as ``Any``, as ninja expects, is marked
+    CSRF-exempt and :func:`_is_automatic_options`. Reaching it means the run
+    decorator was lost (ninja served an operation without it): it raises
+    ``RuntimeError`` instead of answering without the checks.
     """
 
     def scrudful_options(request: HttpRequest, **params: Any) -> HttpResponseBase:
-        body = _describe_path(request, path_view)
-        response = json_response(body, 200, "application/json", _render(request))
-        response["Link"] = options_links()
-        response["Allow"] = allow_header(body)
-        expose_headers(response)
-        return response
+        raise RuntimeError(
+            f"scrudful's OPTIONS of {path!r} reached its view: ninja served the "
+            "operation without scrudful's Operation.run decorator, which answers "
+            "it. Refusing the request."
+        )
 
     parameters = [
         inspect.Parameter(name, inspect.Parameter.KEYWORD_ONLY, annotation=Any)
@@ -3389,19 +6067,852 @@ def _options_view(path: str, path_view: Any) -> Callable[..., HttpResponseBase]:
         ]
     )
     scrudful_options._scrudful_options = True  # type: ignore[attr-defined]
-    # The API's renderer writes the body (see _render).
-    scrudful_options._ninja_contribute_to_operation = [  # type: ignore[attr-defined]
-        _record_serving_api
-    ]
+    scrudful_options.csrf_exempt = True  # type: ignore[attr-defined]
     return scrudful_options
 
 
-def _describe_path(request: HttpRequest, path_view: Any) -> dict[str, Any]:
-    """The HTTP Schema Resource of the path: each method it serves.
+def _options_run(
+    router: ScrudfulRouter, path: str, path_view: Any
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """The ``Operation.run`` decorator of the automatic OPTIONS operation of
+    ``path`` (``path_view`` is the router's own, template, ``PathView``).
 
-    In the order of :data:`~scrudful._adapter.METHOD_KEYS`, ``options`` (this
-    operation) among them, so ``Allow`` follows it too.
+    It answers the request (:func:`_options_answer`) without calling ``run``:
+    so before ninja's ``_run_checks`` and the operation's ``view_func``,
+    which the API's and routers' ``add_decorator(mode="operation")``
+    decorators wrap, and OPTIONS is not gated by them. The
+    ``add_decorator(mode="view")`` decorators wrap ``run`` itself, so they
+    still run first. ninja re-applies it to each clone of the operation
+    (``Operation.clone``, version-guarded where it is added).
     """
+
+    def decorator(run: Callable[..., Any]) -> Callable[..., Any]:
+        operation = _operation_of(run)
+
+        @functools.wraps(run)
+        def scrudful_run(request: HttpRequest, *args: Any, **kw: Any) -> Any:
+            return _options_answer(request, router, path, path_view, operation)
+
+        return scrudful_run
+
+    return decorator
+
+
+def _options_answer(
+    request: HttpRequest,
+    router: ScrudfulRouter,
+    path: str,
+    path_view: Any,
+    operation: Any,
+) -> HttpResponseBase:
+    """The answer to an OPTIONS of ``path``, served by ``operation`` (ninja's
+    clone of the automatic OPTIONS operation, in the mount the request came
+    through). In the order of "OPTIONS" in the module docstring:
+
+    1. a CORS preflight (:func:`scrudful._hsr.is_preflight`) is answered 204,
+       with no content and no Links, before anything else;
+    2. the request is throttled once, with the throttles ninja would bind to
+       the operation (:func:`_options_throttled`): a 429 is ninja's;
+    3. the object is loaded (:func:`_options_object`); an ``HttpError`` or
+       ``Http404`` the loader raises is answered by the API's exception
+       handler;
+    4. each method of the path is checked for this requester
+       (:func:`_may_use`, with its own ``load`` unless the loader ran that
+       same call), with the operations of the mount the request came through
+       (:func:`_served_operations`), ninja's clones of the template's;
+    5. the answer is a 204 with no content and no ``Content-Type``, and the
+       ``Allow`` of the methods allowed (:func:`scrudful._hsr.allow_value`).
+
+    Anything else raised is answered by the API's exception handler, as
+    ninja's ``Operation.run`` answers it (re-raised without a handler).
+    Every answer but the preflight's gets the HSR link and the exposed
+    headers from the operation's outer run decorator
+    (:func:`_serving_router_run`), which resolved the link before.
+    """
+    if is_preflight(request.method or "", request.headers.get):
+        return no_content()
+    api = _operation_api(operation)
+    # As ninja's _run_checks marks the request of a CSRF-exempt operation.
+    request._ninja_csrf_exempt = True  # type: ignore[attr-defined]
+    meta = getattr(request, "META", None)
+    if isinstance(meta, dict) and "REQUEST_METHOD" not in meta:
+        # ninja's test clients build a request without the request line's
+        # method: the per-method checks get copies whose ``method`` is
+        # theirs, so this is how they tell an OPTIONS (as documented). Only
+        # the automatic OPTIONS operation gets here: it is an OPTIONS.
+        meta["REQUEST_METHOD"] = "OPTIONS"
+    try:
+        bound_router, bound_view = _bound_mount(api, operation)
+        throttled = _options_throttled(api, operation, bound_router, request)
+        if throttled is not None:
+            return throttled
+        served = _served_operations(bound_view, path_view)
+        # The URL's parameters, as the operations' hooks get them (also those
+        # of a prefix).
+        match = getattr(request, "resolver_match", None)
+        url_params = dict(match.kwargs) if match is not None else {}
+        try:
+            obj, loaded = _options_object(request, api, served, url_params, path)
+        except (HttpError, Http404) as exc:
+            return api.on_exception(request, exc)  # type: ignore[no-any-return]
+        allowed = [
+            method
+            for method, template, bound in served
+            if _may_use(
+                request,
+                router,
+                method,
+                template,
+                bound,
+                obj,
+                url_params,
+                api,
+                loaded,
+                path,
+            )
+        ]
+    except Exception as exc:
+        return api.on_exception(request, exc)  # type: ignore[no-any-return]
+    response = no_content()
+    response["Allow"] = allow_value(allowed)
+    return response
+
+
+def _options_throttled(
+    api: NinjaAPI, operation: Any, bound_router: Any, request: HttpRequest
+) -> HttpResponseBase | None:
+    """ninja's 429 if the throttles ninja would bind to ``operation`` refuse
+    ``request``, else ``None``.
+
+    The automatic OPTIONS operation is registered with ``throttle=[]``, so
+    that a preflight runs none; a non-preflight OPTIONS is throttled once
+    here, as ninja would throttle the operation without its own
+    ``throttle``: ``BoundRouter._bind_operations`` gives it the API's
+    throttles, replaced by the mount's (``BoundRouter.throttle``) when it has
+    some. They are evaluated by ninja's ``Operation._check_throttles``, on
+    ``operation``'s ``throttle_objects``, set once: ninja's own checks of the
+    operation never run (:func:`_options_run`).
+
+    Raises
+    ------
+    ConfigError
+        If the installed ninja's ``Operation._check_throttles`` differs from
+        ninja 1.7.0's to 1.7.3's, or its ``BoundRouter`` has no ``throttle``.
+    """
+    _check_ninja_internal(
+        type(operation),
+        "Operation",
+        "_check_throttles",
+        "scrudful's throttling of OPTIONS",
+    )
+    if not getattr(operation, "_scrudful_throttles_bound", False):
+        if not hasattr(bound_router, "throttle"):
+            raise ConfigError(
+                "scrudful throttles OPTIONS with ninja's BoundRouter.throttle, "
+                "which the installed ninja's BoundRouter doesn't have as ninja "
+                "1.7.0 to 1.7.3 do: upgrade scrudful, or keep ninja at one of "
+                "those releases"
+            )
+        throttle: Any = NOT_SET
+        if api.throttle != NOT_SET:
+            throttle = api.throttle
+        if bound_router.throttle != NOT_SET:
+            throttle = bound_router.throttle
+        if throttle == NOT_SET:
+            throttle = []
+        elif isinstance(throttle, BaseThrottle):
+            throttle = [throttle]
+        operation.throttle_objects = list(throttle)
+        operation._scrudful_throttles_bound = True
+    if operation.throttle_objects:
+        return operation._check_throttles(request)  # type: ignore[no-any-return]
+    return None
+
+
+#: What the per-method checks of OPTIONS (:func:`_may_use`) and loading
+#: (:func:`_options_object`) take for "not allowed": an ``HttpError`` (as
+#: ninja's ``AuthenticationError`` and ``AuthorizationError`` are) with one
+#: of these statuses, ``Http404`` or ``PermissionDenied``.
+_DENIAL_STATUSES = frozenset({401, 403, 404})
+
+
+def _is_denial(exc: Exception) -> bool:
+    if isinstance(exc, HttpError):
+        return exc.status_code in _DENIAL_STATUSES
+    return isinstance(exc, (Http404, PermissionDenied))
+
+
+def _is_hook_denial(exc: Exception) -> bool:
+    """Whether ``exc``, raised by an ``allowed`` hook, means "not allowed"
+    (as with DRF's and FastAPI's hooks): a 401 or 403 ``HttpError`` (as
+    ninja's ``AuthenticationError`` and ``AuthorizationError`` are) or
+    ``PermissionDenied``. A 404 (``HttpError`` or ``Http404``) is the hook's
+    answer to the OPTIONS, as ``load``'s is."""
+    if isinstance(exc, HttpError):
+        return exc.status_code in (401, 403)
+    return isinstance(exc, PermissionDenied)
+
+
+def _settled(result: Any) -> Any:
+    """``result``, awaited (``async_to_sync``) when it is awaitable: an
+    ``async def`` check's coroutine is truthy, never its answer."""
+    if inspect.isawaitable(result):
+        return async_to_sync(_await)(result)
+    return result
+
+
+def _discard(awaitable: Any) -> None:
+    """Close a coroutine or cancel a future, so neither runs on unawaited."""
+    if inspect.iscoroutine(awaitable):
+        awaitable.close()
+    elif asyncio.isfuture(awaitable):
+        awaitable.cancel()
+
+
+def _served_operations(bound_view: Any, template: Any) -> list[tuple[str, Any, Any]]:
+    """``(method, template operation, bound operation)`` of each method the
+    path serves, OPTIONS aside: the first operation listing it, as ninja
+    routes it.
+
+    The template operation (the router's) carries the scrudful
+    configuration; the bound one, ninja's clone of it in ``bound_view``, the
+    ``PathView`` of the mount the request came through (:func:`_bound_mount`),
+    the ``auth`` callbacks that mount gives it. The clones are in the
+    template's order (ninja's ``PathView.clone``).
+
+    Raises
+    ------
+    ConfigError
+        If the clones don't match the template's operations.
+    """
+    operations = getattr(bound_view, "operations", None)
+    if not isinstance(operations, list) or len(operations) != len(template.operations):
+        raise _bound_path_error()
+    served: list[tuple[str, Any, Any]] = []
+    for template_operation, bound in zip(template.operations, operations):
+        if getattr(bound, "methods", None) != template_operation.methods:
+            raise _bound_path_error()
+        if _is_automatic_options(template_operation):
+            continue
+        for method in template_operation.methods:
+            method = method.upper()
+            if method != "OPTIONS" and all(method != m for m, _, _ in served):
+                served.append((method, template_operation, bound))
+    return served
+
+
+def _bound_mount(api: NinjaAPI, running: Any) -> tuple[Any, Any]:
+    """The ``BoundRouter`` of ``api`` holding ``running``, and its ``PathView``
+    holding it (ninja 1.7's ``NinjaAPI._get_bound_routers`` and the
+    ``BoundRouter.path_operations`` that ``BoundRouter._bind_operations``
+    fills), found once per operation.
+
+    Raises
+    ------
+    ConfigError
+        If the installed ninja's ``NinjaAPI._get_bound_routers`` or
+        ``BoundRouter._bind_operations`` differ from ninja 1.7.0's to
+        1.7.3's, or ``BoundRouter.path_operations`` doesn't hold ``running``.
+    """
+    _check_ninja_internal(
+        type(api),
+        "NinjaAPI",
+        "_get_bound_routers",
+        "scrudful's per-requester Allow of OPTIONS",
+    )
+    _check_ninja_internal(
+        getattr(ninja_router, "BoundRouter", None),
+        "BoundRouter",
+        "_bind_operations",
+        "scrudful's per-requester Allow of OPTIONS",
+    )
+    found = getattr(running, "_scrudful_bound", None)
+    if found is not None:
+        return found  # type: ignore[no-any-return]
+    for bound_router in api._get_bound_routers():
+        path_operations = getattr(bound_router, "path_operations", None)
+        if not isinstance(path_operations, dict):
+            raise _bound_path_error()
+        for path_view in path_operations.values():
+            if any(op is running for op in getattr(path_view, "operations", ())):
+                running._scrudful_bound = bound_router, path_view
+                return bound_router, path_view
+    raise _bound_path_error()
+
+
+def _check_options_internals() -> None:
+    """Check, once a path gets its OPTIONS (when the app starts), every ninja
+    internal its answer relies on: the per-request checks
+    (:func:`_options_throttled`, :func:`_bound_mount`,
+    :func:`_authenticated`, :func:`_path_values`) then only find them
+    checked (memoized, see :func:`_is_ninja_code`), unless an API or
+    operation class of the app's own overrides one.
+
+    Raises
+    ------
+    ConfigError
+        If the installed ninja's differ from ninja 1.7.0's to 1.7.3's.
+    """
+    try:
+        from ninja.params import models as ninja_params
+    except ImportError:  # pragma: no cover - ninja 1.7 has it
+        ninja_params = None  # type: ignore[assignment]
+    use = "scrudful's OPTIONS"
+    for owner, owner_name, method in (
+        (Operation, "Operation", "_check_throttles"),
+        (Operation, "Operation", "_run_authentication"),
+        (AsyncOperation, "AsyncOperation", "_run_authentication"),
+        (NinjaAPI, "NinjaAPI", "_get_bound_routers"),
+        (getattr(ninja_router, "BoundRouter", None), "BoundRouter", "_bind_operations"),
+        (getattr(ninja_params, "ParamModel", None), "ParamModel", "resolve"),
+        (getattr(ninja_params, "PathModel", None), "PathModel", "get_request_data"),
+    ):
+        _check_ninja_internal(owner, owner_name, method, use)
+
+
+def _bound_path_error() -> ConfigError:
+    return ConfigError(
+        "scrudful's per-requester Allow of OPTIONS finds the operations of the "
+        "mount serving the request through ninja's BoundRouter.path_operations "
+        "(PathView clones of the router's, in its order), which the installed "
+        "ninja doesn't have as ninja 1.7.0 to 1.7.3 do: upgrade scrudful, or "
+        "keep ninja at one of those releases"
+    )
+
+
+def _scrudful_config(operation: Any) -> _Config | None:
+    """The scrudful decorator's configuration of a template operation."""
+    config = getattr(operation.view_func, "_scrudful", None)
+    return config if isinstance(config, _Config) else None
+
+
+class _Loaded(NamedTuple):
+    """The call :func:`_options_object` made: the ``load`` it called, the
+    method of the request it called it with (the loading operation's), the
+    path parameters and the requester's ``auth``."""
+
+    load: Callable[..., Any]
+    method: str
+    values: dict[str, Any]
+    auth: Any
+
+
+def _options_object(
+    request: HttpRequest,
+    api: NinjaAPI,
+    served: list[tuple[str, Any, Any]],
+    url_params: dict[str, Any],
+    path: str,
+) -> tuple[Any, _Loaded | None]:
+    """The object of OPTIONS of ``path``: what the loading operation's
+    ``load`` returns, and the call that loaded it (:class:`_Loaded`),
+    ``None`` when nothing loaded (without a loading operation, or when it
+    refused the requester or the path).
+
+    The loading operation is the GET operation, if it has a ``load``, else
+    the first item operation (:func:`scrudful`) with one; ``None`` (no
+    object) without one, as for a collection. It loads as it would: on a
+    copy of the request with its method, once its ``auth`` callbacks and
+    ``before`` allowed the requester (else there is no object: a requester
+    who may not use it isn't shown it), with the path parameters validated
+    as it validates them. Their validation follows :func:`_may_use`'s rules,
+    and there is no object when it fails: for a 422; for a denial it raises
+    (an ``HttpError``, ``Http404`` or ``PermissionDenied``); for a custom
+    path model, which scrudful can't validate as ninja does (with a
+    ``RuntimeWarning``, once per route); for anything else it raises
+    (logged once per route). The loader gets only those: give its other
+    parameters defaults, or take ``**kwargs``.
+
+    Raises
+    ------
+    HttpError, Http404
+        What the loader raises: the caller answers it.
+    ConfigError
+        If the installed ninja's internals differ (see :func:`_path_values`).
+    """
+    loading = None
+    candidates = [entry for entry in served if entry[0] == "GET"] + [
+        entry for entry in served if entry[0] != "GET"
+    ]
+    for method, template, bound in candidates:
+        config = _scrudful_config(template)
+        if (
+            config is not None
+            and config.load is not None
+            and (method == "GET" or config.kind == "item")
+        ):
+            loading = method, template, config, bound
+            break
+    if loading is None:
+        return None, None
+    method, template, config, bound = loading
+    requester, authenticated = _authenticated(request, bound, method)
+    if not authenticated or not _before_allows(config, bound, requester, url_params):
+        return None, None
+    try:
+        values = _path_values(requester, api, bound, url_params)
+    except _UnvalidatedPath as exc:
+        _unchecked_path(
+            template, method, path, exc.model, "OPTIONS loads no object with it."
+        )
+        return None, None
+    except (HttpError, Http404, PermissionDenied):
+        return None, None
+    except ConfigError:
+        raise
+    except Exception as exc:
+        _path_error(
+            exc, request, template, method, path, "loads no object with {route}"
+        )
+        return None, None
+    if values is None:
+        return None, None
+    loaded = _Loaded(config.load, method, values, getattr(requester, "auth", None))
+    return _settled(config.load(requester, **values)), loaded
+
+
+def _path_values(
+    request: HttpRequest, api: NinjaAPI, operation: Any, url_params: dict[str, Any]
+) -> dict[str, Any] | None:
+    """``operation``'s path parameters, validated by its path models as
+    ninja's ``Operation._get_values`` validates them (ninja 1.7's
+    ``Operation.models``, ``ParamModel.resolve`` and
+    ``PathModel.get_request_data``); ``None`` if they are invalid. Anything
+    else a validator raises propagates.
+
+    Raises
+    ------
+    ConfigError
+        If the installed ninja's differ.
+    _UnvalidatedPath
+        If a path model of ``operation`` is a custom one, which scrudful
+        can't validate as ninja does (before any is validated).
+    """
+    try:
+        from ninja.params import models as ninja_params
+    except ImportError:  # pragma: no cover - ninja 1.7 has it
+        ninja_params = None  # type: ignore[assignment]
+    use = "scrudful's loading for OPTIONS"
+    param_model = getattr(ninja_params, "ParamModel", None)
+    path_model = getattr(ninja_params, "PathModel", None)
+    _check_ninja_internal(param_model, "ParamModel", "resolve", use)
+    _check_ninja_internal(path_model, "PathModel", "get_request_data", use)
+    models = getattr(operation, "models", None)
+    if not isinstance(models, list) or not all(
+        isinstance(model, type) and issubclass(model, param_model) for model in models
+    ):
+        raise ConfigError(
+            f"{use} validates the path parameters with ninja's Operation.models, "
+            "which the installed ninja doesn't have as ninja 1.7.0 to 1.7.3 do "
+            "(a list of ParamModel classes): upgrade scrudful, or keep ninja at "
+            "one of those releases"
+        )
+    path_models = [
+        model
+        for model in models
+        if getattr(model, "__ninja_param_source__", None) == "path"
+    ]
+    for model in path_models:
+        if not issubclass(model, path_model):
+            raise _UnvalidatedPath(model)
+        for name, owner in (("resolve", param_model), ("get_request_data", path_model)):
+            if _class_function(model, name) is not _class_function(owner, name):
+                # The class overriding it (ninja's model of the operation's
+                # parameters subclasses the app's).
+                raise _UnvalidatedPath(
+                    next(cls for cls in model.__mro__ if name in vars(cls))
+                )
+    values: dict[str, Any] = {}
+    for model in path_models:
+        try:
+            values.update(model.resolve(request, api, url_params))
+        except pydantic.ValidationError:
+            return None
+    return values
+
+
+class _UnvalidatedPath(Exception):
+    """Raised by :func:`_path_values` for a path model scrudful can't
+    validate as ninja does (a custom one): ``model``."""
+
+    def __init__(self, model: type) -> None:
+        super().__init__(model)
+        self.model = model
+
+
+#: The routes OPTIONS has warned of (or logged) a path it can't check, per
+#: template operation: ``(method, case)``, so each is given once.
+_PATH_UNCHECKED: weakref.WeakKeyDictionary[Any, set[tuple[str, str]]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _route_name(method: str, path: str, template: Any) -> str:
+    """``method`` of ``path``, served by the template operation ``template``,
+    as OPTIONS' warnings name it."""
+    func = inspect.unwrap(template.view_func)
+    return f"{method} {path!r} ({getattr(func, '__qualname__', repr(func))}())"
+
+
+def _unchecked_path(
+    template: Any, method: str, path: str, model: type, consequence: str
+) -> None:
+    """Warn, once per route, that OPTIONS can't validate the path parameters
+    of ``method`` (its path model ``model`` is a custom one): so
+    ``consequence``."""
+    key = (method, consequence)
+    if key in _PATH_UNCHECKED.get(template, ()):
+        return
+    # No stacklevel: OPTIONS runs deep in scrudful, never at one frame of the
+    # app's own code.
+    warnings.warn(
+        "scrudful can't validate the path parameters of "
+        f"{_route_name(method, path, template)} for the Allow of OPTIONS: its "
+        f"path model {model.__qualname__} doesn't resolve them as ninja 1.7's "
+        f"PathModel does. {consequence}",
+        RuntimeWarning,
+    )
+    # Recorded once warned: a warning raised as an error leaves it
+    # unrecorded, so the next OPTIONS warns (or fails) again.
+    _PATH_UNCHECKED.setdefault(template, set()).add(key)
+
+
+def _path_error(
+    exc: Exception,
+    request: HttpRequest,
+    template: Any,
+    method: str,
+    path: str,
+    outcome: str,
+) -> None:
+    """Log ``exc``, which ``method``'s path validation raised for the
+    OPTIONS ``request``, once per route, with its traceback, on the
+    ``scrudful.ninja`` logger: what OPTIONS did about it is ``outcome``,
+    with ``{route}`` naming the route; the URL requested names the mount."""
+    key = (method, outcome)
+    if key in _PATH_UNCHECKED.get(template, ()):
+        return
+    _PATH_UNCHECKED.setdefault(template, set()).add(key)
+    logger.warning(
+        "scrudful's OPTIONS of %r %s: validating its path parameters raised %s",
+        request.path,
+        outcome.format(route=_route_name(method, path, template)),
+        type(exc).__name__,
+        exc_info=exc,
+    )
+
+
+def _class_function(cls: type, name: str) -> Any:
+    """The function of the classmethod ``cls.<name>``."""
+    return getattr(getattr(cls, name, None), "__func__", None)
+
+
+def _authenticated(
+    request: HttpRequest, operation: Any, method: str
+) -> tuple[HttpRequest, bool]:
+    """A copy of ``request`` with ``method``, and whether ``operation``'s
+    ``auth`` callbacks authenticate it (always, without any).
+
+    The callbacks run as ninja 1.7's ``Operation._run_authentication`` runs
+    them (the first one returning a truthy value authenticates, and its
+    value is the copy's ``auth``), on the copy, which is CSRF-exempt: ``Allow``
+    is about authorization, and the method itself checks CSRF. An
+    ``async def`` callback is awaited. A denial (:func:`_is_denial`) is not
+    authenticated; anything else a callback raises propagates.
+
+    Raises
+    ------
+    ConfigError
+        If the installed ninja's ``_run_authentication`` (of the operation's
+        class, ``Operation`` or ``AsyncOperation``) differs from ninja
+        1.7.0's to 1.7.3's, or its ``Operation.auth_callbacks`` isn't a
+        sequence of callables.
+    """
+    ninja_class = AsyncOperation if getattr(operation, "is_async", False) else Operation
+    _check_ninja_internal(
+        type(operation),
+        ninja_class.__name__,
+        "_run_authentication",
+        "scrudful's per-requester Allow of OPTIONS",
+    )
+    callbacks = getattr(operation, "auth_callbacks", None)
+    if not isinstance(callbacks, Sequence) or not all(map(callable, callbacks)):
+        raise ConfigError(
+            "scrudful's per-requester Allow of OPTIONS runs the auth callbacks "
+            "of ninja's Operation.auth_callbacks, which the installed ninja "
+            "doesn't have as ninja 1.7.0 to 1.7.3 do (a sequence of "
+            "callables): upgrade scrudful, or keep ninja at one of those releases"
+        )
+    # A copy of the OPTIONS request, which _options_answer marked CSRF-exempt.
+    requester = copy.copy(request)
+    requester.method = method
+    if not callbacks:
+        return requester, True
+    for callback in callbacks:
+        try:
+            result = _settled(callback(requester))
+        except Exception as exc:
+            if _is_denial(exc):
+                return requester, False
+            raise
+        if result:
+            requester.auth = result  # type: ignore[attr-defined]
+            return requester, True
+    return requester, False
+
+
+def _before_allows(
+    config: _Config | None,
+    operation: Any,
+    requester: HttpRequest,
+    url_params: dict[str, Any],
+) -> bool:
+    """Whether the operation's ``before`` (if any) allows ``requester``.
+
+    It allows by returning ``None``: anything else, or a denial
+    (:func:`_is_denial`), doesn't; anything else it raises propagates. An
+    awaitable it returns is awaited in an async operation; in a sync one,
+    which can't await it (the operation raises ``TypeError``), it is
+    discarded and doesn't allow.
+    """
+    if config is None or config.before is None:
+        return True
+    try:
+        result = config.before(requester, **url_params)
+        if inspect.isawaitable(result):
+            if not getattr(operation, "is_async", False):
+                _discard(result)
+                return False
+            result = _settled(result)
+    except Exception as exc:
+        if _is_denial(exc):
+            return False
+        raise
+    return result is None
+
+
+def _may_use(
+    request: HttpRequest,
+    router: ScrudfulRouter,
+    method: str,
+    template: Any,
+    bound: Any,
+    obj: Any,
+    url_params: dict[str, Any],
+    api: NinjaAPI,
+    loaded: _Loaded | None,
+    path: str,
+) -> bool:
+    """Whether the requester of the OPTIONS ``request`` may use ``method``,
+    which the template operation ``template`` serves (``bound`` is its clone
+    serving the request), on ``obj``, which the call ``loaded`` loaded (see
+    :func:`_options_object`).
+
+    With an ``allowed`` hook (the operation's, else ``router``'s), what it
+    returns, on a copy of the request with ``method``, authenticated by the
+    operation's ``auth`` callbacks when they authenticate it (else as is:
+    the hook alone decides); a denial it raises (:func:`_is_hook_denial`)
+    is not allowed, and anything else it raises (a 404 included)
+    propagates. Otherwise, whether those callbacks authenticate it, the
+    operation's ``before`` allows it (see :func:`_authenticated` and
+    :func:`_before_allows`), its path parameters validate (else its request
+    is a 422: see :func:`_path_values`) and then its own ``load`` allows it
+    (:func:`_own_load_allows`). A denial its path validation raises (an
+    ``HttpError``, ``Http404`` or ``PermissionDenied``) refuses the method,
+    and so does anything else it raises (logged once per route, with its
+    traceback, on the ``scrudful.ninja`` logger): its request would raise
+    it too. A custom path model, which scrudful can't validate as ninja
+    does, is warned of (a ``RuntimeWarning``, once per route), and the
+    method decided without that check, unless its own ``load`` must run
+    (see :func:`_load_must_run`): that ``load`` can't be called without the
+    path parameters, so the method is refused. ``path`` names the route.
+    Neither throttles nor ``after_throttles`` run.
+
+    Raises
+    ------
+    TypeError
+        If the hook returns something else than a ``bool``.
+    ConfigError
+        If the installed ninja's internals differ (see :func:`_path_values`).
+    """
+    config = _scrudful_config(template)
+    hook = config.allowed if config is not None else None
+    if hook is None:
+        hook = router.allowed
+    requester, authenticated = _authenticated(request, bound, method)
+    if hook is not None:
+        try:
+            result = _settled(hook(requester, method, obj))
+        except Exception as exc:
+            if _is_hook_denial(exc):
+                return False
+            raise
+        if not isinstance(result, bool):
+            raise TypeError(
+                f"allowed returned {result!r} for {method}: it must return a bool"
+            )
+        return result
+    if not authenticated or not _before_allows(config, bound, requester, url_params):
+        return False
+    try:
+        values = _path_values(requester, api, bound, url_params)
+    except _UnvalidatedPath as exc:
+        # Can't be checked: listed as its request decides, unless its own
+        # load must run, which needs those values (when in doubt, out).
+        if _load_must_run(config, loaded, method):
+            consequence = (
+                f"{method} is left out of Allow: its own load can't be called "
+                "without them."
+            )
+        else:
+            consequence = f"{method} is listed without that check."
+        _unchecked_path(template, method, path, exc.model, consequence)
+        return not _load_must_run(config, loaded, method)
+    except (HttpError, Http404, PermissionDenied):
+        # Refused by its path validation (a lookup validator's 404, say):
+        # that method only, as by its own load.
+        return False
+    except ConfigError:
+        raise
+    except Exception as exc:
+        # Its request raises it too: when in doubt, out.
+        _path_error(exc, request, template, method, path, "leaves {route} out of Allow")
+        return False
+    if values is None:
+        return False
+    return _own_load_allows(config, requester, values, loaded, path, method)
+
+
+def _load_must_run(config: _Config | None, loaded: _Loaded | None, method: str) -> bool:
+    """Whether an item operation's own ``load`` is to run on OPTIONS for
+    ``method``, before its path parameters are known: it has one, and it
+    isn't the function ``loaded`` called for that same method."""
+    if config is None or config.kind != "item" or config.load is None:
+        return False
+    return (
+        loaded is None
+        or config.load != loaded.load
+        or _load_method(method) != _load_method(loaded.method)
+    )
+
+
+def _load_method(method: str) -> str:
+    """``method`` as a ``load`` sees it, for the identity of its call: a
+    HEAD is GET's (Django serves a HEAD as a GET)."""
+    return "GET" if method == "HEAD" else method
+
+
+def _own_load_allows(
+    config: _Config | None,
+    requester: HttpRequest,
+    values: dict[str, Any],
+    loaded: _Loaded | None,
+    path: str,
+    method: str,
+) -> bool:
+    """Whether the item operation's own ``load`` lets ``requester`` (a copy of
+    the OPTIONS request with the method, authenticated and allowed by
+    ``before``) use the method: it is called as the operation calls it, with
+    its validated path parameters ``values``, unless ``loaded`` (the call
+    :func:`_options_object` made, whose answer is the OPTIONS') is that same
+    call: the same function, method (``method``, the one checked; a HEAD is
+    a GET), path parameters and ``auth``. So a
+    ``load`` shared with the loader runs again for each other method, with
+    that method (one that authorizes by ``request.method`` is checked per
+    method), and for the loader's own method when the loader didn't run (it
+    refused the requester) or ran with other arguments. Any
+    ``HttpError`` (whatever its status), ``Http404`` or ``PermissionDenied``
+    it raises refuses that method only: the loader's error alone answers the
+    OPTIONS, and a method whose load fails is left out, as when in doubt.
+    An ``HttpError`` that isn't a denial (:func:`_is_denial`) is logged, with
+    its traceback, on the ``scrudful.ninja`` logger (``path`` names the
+    route): as an error for a 5xx, else as a warning; nothing else tells the
+    method was left out. What it returns, ``None`` included, allows it: the
+    method's own flow answers that. An ``async def`` load is awaited. Any
+    other exception (a bug) propagates.
+    """
+    if config is None or config.kind != "item" or config.load is None:
+        return True
+    if loaded is not None and _same_call(
+        loaded,
+        config.load,
+        method,
+        values,
+        getattr(requester, "auth", None),
+    ):
+        return True
+    try:
+        _settled(config.load(requester, **values))
+    except (Http404, PermissionDenied):
+        return False
+    except HttpError as exc:
+        if not _is_denial(exc):
+            # Not a refusal (a 5xx, an outage, above all): the method is out,
+            # which only this log tells.
+            logger.log(
+                logging.ERROR if exc.status_code >= 500 else logging.WARNING,
+                "scrudful's OPTIONS of %r (the path %r) leaves %s out of Allow: "
+                "its own load raised HttpError %s",
+                requester.path,
+                path,
+                method,
+                exc.status_code,
+                exc_info=exc,
+            )
+        return False
+    return True
+
+
+def _same_call(
+    loaded: _Loaded,
+    load: Callable[..., Any],
+    method: str,
+    values: dict[str, Any],
+    auth: Any,
+) -> bool:
+    """Whether calling ``load`` with ``values`` for a ``method`` request of a
+    requester with ``auth`` is the call ``loaded`` made, so that its object
+    is the one being checked. A HEAD's call is a GET's (:func:`_load_method`).
+    """
+    return (
+        load == loaded.load
+        and _load_method(method) == _load_method(loaded.method)
+        and values == loaded.values
+        and (auth is loaded.auth or auth == loaded.auth)
+    )
+
+
+#: The description of each method's ``default`` response entry: the errors.
+_DEFAULT_ERROR = "Error."
+#: The errors ninja answers before an operation runs (authentication, its
+#: CSRF check and ``AuthorizationError``, request validation, throttling),
+#: whose bodies get the API-wide error entity (:func:`add_error_links`),
+#: whatever the operation's ``error``. So do those of these statuses the
+#: operation raises (its function, ``load``, ``before=``,
+#: ``after_throttles=``; see :func:`_raised_entity`): an operation answers
+#: each of them alike, whoever raised it. Without an API-wide entity, those
+#: of an operation with an ``error`` carry it (see :func:`_described_by`).
+_FRAMEWORK_ERRORS = {
+    401: "Unauthorized: the request lacks valid authentication credentials.",
+    403: "Forbidden: the requester may not perform this request.",
+    422: "Unprocessable Content: the request's parameters or body are invalid.",
+    429: "Too Many Requests: the request was throttled.",
+}
+
+
+def _describe_path(
+    router: ScrudfulRouter, path_view: Any, api_error: Entity | None
+) -> dict[str, Any]:
+    """The HTTP Schema Resource of the path of ``path_view``: each method it
+    serves, described without a request (see :func:`http_schema_resource`).
+
+    In the order of :data:`~scrudful._adapter.METHOD_KEYS`, with ``options``
+    (:func:`scrudful._hsr.options_operation`) among them. Relative link URLs
+    are resolved against ``router``'s base
+    URL, and the ``default`` error entries take the API-wide entity
+    ``api_error`` (see :meth:`ScrudfulRouter._hsr`).
+    """
+    base_url = router._base_url()
     operations = [
         operation
         for operation in path_view.operations
@@ -3410,7 +6921,7 @@ def _describe_path(request: HttpRequest, path_view: Any) -> dict[str, Any]:
     body = {}
     for method in METHOD_KEYS:
         if method == "options":
-            body[method] = describe_options()
+            body[method] = options_operation()
             continue
         # The operation ninja routes the method to: the first that lists it.
         operation = next(
@@ -3418,30 +6929,167 @@ def _describe_path(request: HttpRequest, path_view: Any) -> dict[str, Any]:
         )
         if operation is None:
             continue
-        flow = _describe_operation(method, operation, request)
-        if getattr(operation, "is_async", False):
-            # Its link callables may be async def; this view is sync, and
-            # ninja runs it in a thread (sync_to_async) on an async path.
-            body[method] = async_to_sync(_run_async)(flow)
-        else:
-            body[method] = _run_sync(flow)
+        name = f"{getattr(operation.view_func, '__qualname__', 'operation')}()"
+        flow = _describe_operation(
+            method, operation, _described_config(operation), base_url, api_error, name
+        )
+        body[method] = _run_describing(flow, name)
     return body
 
 
+def _described_config(operation: Any) -> _Config | None:
+    """The configuration describing ``operation``: its scrudful decorator's,
+    else, for a plain operation given an entity (:func:`described`), an item
+    configuration of that entity alone (no validators, no ``error``);
+    ``None`` for a plain operation without one."""
+    config = getattr(operation.view_func, "_scrudful", None)
+    if isinstance(config, _Config):
+        return config
+    entity = getattr(operation, "_scrudful_entity", None)
+    if entity is None:
+        return None
+    return _Config(
+        kind="item",
+        **{
+            entity_field.name: getattr(entity, entity_field.name)
+            for entity_field in fields(Entity)
+        },
+    )
+
+
+def _run_describing(flow: _Flow[T], name: str) -> T:
+    """Run a describe-mode ``flow`` (:func:`_describe_operation`).
+
+    Each callable is called directly, and an awaitable it returns (an
+    ``async def`` link callable's) is awaited with
+    ``asgiref.sync.async_to_sync``. An exception a callable raises is
+    re-raised as ``ConfigError``, naming the operation ``name``, and so is
+    a :class:`~scrudful._adapter.HsrConfigError` of the description.
+    """
+    result = None
+    while True:
+        try:
+            func, args, kwargs = flow.send(result)
+        except StopIteration as stop:
+            return stop.value
+        except HsrConfigError as exc:
+            raise ConfigError(str(exc)) from exc
+        try:
+            result = func(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = async_to_sync(_await)(result)
+        except Exception as exc:
+            raise ConfigError(
+                f"{name}: link callables must work without a request or object "
+                f"when describing (called as func(None, None)): {exc}"
+            ) from exc
+
+
+def _api_error(router: ScrudfulRouter) -> Entity | None:
+    """The API-wide error entity of ``router``'s paths: the one
+    :func:`add_error_links` gave the APIs mounting it, if any.
+
+    Those APIs are the ones :func:`add_error_links` was called for that
+    mount the router (nested or not, see :func:`_mounted_routers`), and
+    those whose URL patterns were built with it (ninja binds a router to an
+    API then, cloning its paths), whose entity is ``None`` without
+    :func:`add_error_links`. ninja keeps no list of its APIs, so one
+    without :func:`add_error_links` is seen only once bound, and the
+    temporary API of ``TestClient(router)`` is seen too.
+
+    Raises
+    ------
+    ConfigError
+        If APIs mounting ``router`` were given different entities (or one
+        was and another wasn't): its HTTP Schema Resources differ between
+        them.
+    """
+    apis = [
+        api
+        for api in list(_API_ERRORS.keys())
+        if any(mounted is router for mounted in _mounted_routers(api))
+    ]
+    for mount in list(router._scrudful_mounts):
+        for operation in mount.operations:
+            api = getattr(operation, "api", None)
+            if isinstance(api, NinjaAPI) and all(api is not seen for seen in apis):
+                apis.append(api)
+    errors: list[Entity | None] = []
+    for api in apis:
+        error = _API_ERRORS.get(api)
+        if error not in errors:
+            errors.append(error)
+    if len(errors) > 1:
+        raise ConfigError(
+            "a ScrudfulRouter is mounted on APIs that add_error_links gave "
+            "different error entities, so its HTTP Schema Resources differ "
+            "between them: pass api= for the one to describe"
+        )
+    return errors[0] if errors else None
+
+
+def _mounted_routers(api: NinjaAPI) -> list[Router]:
+    """The routers ``api`` mounts, nested ones too, read from ninja's
+    ``NinjaAPI._router_registrations`` and ``Router._routers`` (ninja 1.7):
+    lists of tuples whose second item is the router, filled by
+    ``add_router``, before the API is bound.
+
+    Raises
+    ------
+    ConfigError
+        If the installed ninja has either of them in another shape.
+    """
+    pending = _routers_in(api, "_router_registrations", "NinjaAPI")
+    routers: list[Router] = []
+    while pending:
+        router = pending.pop()
+        if any(router is seen for seen in routers):
+            continue
+        routers.append(router)
+        pending.extend(_routers_in(router, "_routers", "Router"))
+    return routers
+
+
+def _routers_in(owner: Any, attribute: str, owner_name: str) -> list[Router]:
+    """The routers of ``owner.<attribute>``, see :func:`_mounted_routers`."""
+    entries = getattr(owner, attribute, None)
+    if isinstance(entries, list) and all(
+        isinstance(entry, tuple) and len(entry) >= 2 and isinstance(entry[1], Router)
+        for entry in entries
+    ):
+        return [entry[1] for entry in entries]
+    raise _internal_error(f"{owner_name}.{attribute}")
+
+
+def _internal_error(internal: str) -> ConfigError:
+    return ConfigError(
+        "scrudful finds the APIs mounting a ScrudfulRouter (for the error "
+        f"entity of add_error_links) through ninja's {internal}, which the "
+        "installed ninja doesn't have as ninja 1.7 does: upgrade scrudful, or "
+        "keep ninja at 1.7"
+    )
+
+
 def _describe_operation(
-    method: str, operation: Any, request: HttpRequest
+    method: str,
+    operation: Any,
+    config: _Config | None,
+    base_url: str | None,
+    api_error: Entity | None,
+    name: str,
 ) -> _Flow[dict[str, Any]]:
     """Describe ``operation`` as ``method``; each link callable is a ``yield``.
 
     The description of :func:`scrudful._adapter.describe_read` /
     :func:`~scrudful._adapter.describe_write` (DRF's), with the statuses the
-    operation answers (see :func:`_answered_statuses`) and the response
-    content of each status's entity, but for HEAD, whose responses have no
-    content. Link callables are called with ``(request, None)``.
+    operation answers (see :func:`_answered_statuses`), an entry for each
+    error status ``responses=`` declares, and the response content of each
+    status's entity, but for HEAD, whose responses have no content, and the
+    error entries (see :func:`_error_entries`). ``config``
+    is :func:`_described_config`'s. Link callables are called with
+    ``(None, None)``, and the URLs resolved against ``base_url`` (``name``
+    is the operation's, for errors).
     """
-    config = getattr(operation.view_func, "_scrudful", None)
-    if not isinstance(config, _Config):
-        config = None
     read = method in ("get", "head")
     conditional = config is not None and _is_conditional(config, method)
     statuses = _answered_statuses(operation, config)
@@ -3456,7 +7104,7 @@ def _describe_operation(
         if config is not None and method != "delete":
             # As DRF's: the item's unless declared (a create's is the item's).
             entity = config.entity if config.request is None else config.request
-            content = yield from _media(entity, request)
+            content = yield from _media(entity, base_url, f"{name}'s request body")
         description = describe_write(
             method,
             content,
@@ -3471,11 +7119,79 @@ def _describe_operation(
         for key, response in responses.items():
             if key in ("204", "304"):
                 continue  # no content
-            entity = _described_entity(config, method, int(key), conditional)
-            content = yield from _media(entity, request)
+            entity = _described_entity(config, method, int(key), conditional, api_error)
+            content = yield from _media(entity, base_url, f"{name}'s {key} response")
             if content:
                 response["content"] = content
+    if config is not None:
+        # The error statuses declared in ``responses=``: an entry each, which
+        # Agreement picks before ``default`` and the framework's entries.
+        for status in sorted(config.responses):
+            key = str(status)
+            if status < 400 or key in responses:
+                continue
+            entry: dict[str, Any] = {"description": reason_phrase(status)}
+            if method != "head":
+                entity = _described_entity(
+                    config, method, status, conditional, api_error
+                )
+                where = f"{name}'s {key} response"
+                content = yield from _media(entity, base_url, where)
+                if content:
+                    entry["content"] = content
+            responses[key] = entry
+    yield from _error_entries(
+        responses,
+        None if config is None else config.error,
+        api_error,
+        base_url,
+        name,
+        with_content=method != "head",
+    )
     return description
+
+
+def _error_entries(
+    responses: dict[str, Any],
+    error: Entity | None,
+    api_error: Entity | None,
+    base_url: str | None,
+    name: str,
+    with_content: bool,
+) -> _Flow[None]:
+    """Add the error entries to ``responses``.
+
+    The ``default`` entry has the content of the entity the operation's own
+    errors get: its ``error``, else ``api_error`` (:func:`add_error_links`).
+    When ``api_error`` is set and ``error`` is set and differs from it, the
+    statuses ninja answers itself (:data:`_FRAMEWORK_ERRORS`: 401, 403, 422,
+    429) have explicit entries with ``api_error``'s content (Agreement picks
+    an exact status before ``default``): every one answered for the
+    operation carries it, whoever raised it (see :func:`_raised_entity`),
+    unless the operation declares them (in ``response=`` or ``responses=``,
+    whose entries ``responses`` already has). Without ``api_error``, every
+    one of them carries ``error`` (see :func:`_described_by`), which
+    ``default`` describes: no explicit entry.
+
+    Without ``with_content`` (HEAD), the same entries without content.
+    """
+
+    def entry(description: str, entity: Entity | None, key: str) -> _Flow[Any]:
+        described: dict[str, Any] = {"description": description}
+        if with_content:
+            content = yield from _media(entity, base_url, f"{name}'s {key} response")
+            if content:
+                described["content"] = content
+        return described
+
+    if error is not None and api_error is not None and error != api_error:
+        for status, description in _FRAMEWORK_ERRORS.items():
+            key = str(status)
+            if key not in responses:
+                responses[key] = yield from entry(description, api_error, key)
+    responses["default"] = yield from entry(
+        _DEFAULT_ERROR, api_error if error is None else error, "default"
+    )
 
 
 def _is_conditional(config: _Config, method: str) -> bool:
@@ -3492,7 +7208,7 @@ def _is_conditional(config: _Config, method: str) -> bool:
 
 
 def _answered_statuses(operation: Any, config: _Config | None) -> list[int]:
-    """The statuses ``operation`` answers with, for OPTIONS.
+    """The statuses ``operation`` answers with, for the HTTP Schema Resource.
 
     Those it declares in ``response=`` (with a 201 first for a create, whose
     plain return value is a 201), else ninja's default, 200.
@@ -3508,48 +7224,86 @@ def _answered_statuses(operation: Any, config: _Config | None) -> list[int]:
 
 
 def _described_entity(
-    config: _Config, method: str, status: int, conditional: bool
+    config: _Config,
+    method: str,
+    status: int,
+    conditional: bool,
+    api_error: Entity | None,
 ) -> Any:
-    """The entity of the ``method`` responses with ``status``, for OPTIONS.
+    """The entity of the ``method`` responses with ``status``, for the HSR.
 
-    scrudful's own early responses (listed when ``conditional``) get the
-    ``error`` entity, if declared; the others the declared entity.
+    scrudful's own early responses (listed when ``conditional``) get
+    :func:`_early_entity`'s (``error``, else ``responses[status]``, else the
+    API-wide ``api_error``); the others the declared entity.
     """
     if conditional and status in _EARLY_STATUSES:
-        return (
-            config.error if config.error is not None else config.responses.get(status)
-        )
+        return _early_entity(config, status, api_error)
     return config.response_entity(method, status)
 
 
-def _media(entity: Entity | None, request: HttpRequest) -> _Flow[Any]:
+def _early_entity(
+    config: _Config, status: int, api_error: Entity | None
+) -> Entity | None:
+    """The entity of scrudful's own 400, 412 or 428 (``status``) response.
+
+    The operation's ``error``, else the entity ``responses=`` declares for
+    ``status``, else the API-wide entity ``api_error``
+    (:func:`add_error_links`), as the errors its handlers answer carry.
+    """
+    if config.error is not None:
+        return config.error
+    declared = config.responses.get(status)
+    return declared if declared is not None else api_error
+
+
+def _media(entity: Entity | None, base_url: str | None, where: str) -> _Flow[Any]:
     """The ``content`` of ``entity``: its Media Type Object, or ``None``.
 
     Built by :func:`scrudful._adapter.describe_content` from the entity's
-    schema and context URLs and types, which are evaluated as for its Links
-    (the context only when its media type takes one), and with the URLs
-    resolved the same way, so that the entry agrees with the Links of the
-    responses it describes. ``None`` without a schema URL (e.g. ``Entity()``).
+    schema and context URLs and types, which are evaluated as for its Links,
+    in describe mode (each callable called with ``(None, None)``; the
+    context only when its media type takes one), with relative URLs
+    resolved against ``base_url`` (:func:`scrudful._hsr.absolute_for_hsr`),
+    as the Links of the responses it describes are (see :func:`_live_base`).
+    ``None`` without a schema URL (e.g. ``Entity()``). ``where`` names the
+    entry, for errors.
+
+    Raises
+    ------
+    HsrConfigError
+        If a URL is relative and there is no ``base_url``, a schema has no
+        RDF context, or a context of a media type that isn't JSON has no
+        type (its callable returned none).
     """
     if entity is None:
         return None
-    schema = yield from _value(entity.schema_link_or_func, request, None)
+    schema = yield from _value(entity.schema_link_or_func, None, None)
     if not schema:
         return None
-    schema_type = yield from _value(entity.schema_type_or_func, request, None)
+    schema_type = yield from _value(entity.schema_type_or_func, None, None)
     context = context_type = None
     rel, default_type = context_defaults(entity.media_type)
     if rel is not None:  # not in-band RDF
-        context = yield from _value(entity.context_link_or_func, request, None)
+        context = yield from _value(entity.context_link_or_func, None, None)
     if context:
         context_type = (
-            yield from _value(entity.context_type_or_func, request, None)
+            yield from _value(entity.context_type_or_func, None, None)
         ) or default_type
-    base = request.build_absolute_uri()
-    return describe_content(
-        entity.media_type,
-        resolve_uri(schema, base),
-        str(schema_type or SCHEMA_TYPE),
-        resolve_uri(context, base) if context else None,
-        None if context_type is None else str(context_type),
+    schema_url = absolute_for_hsr(str(schema), base_url, f"{where} schema link")
+    context_url = (
+        absolute_for_hsr(str(context), base_url, f"{where} context link")
+        if context
+        else None
     )
+    try:
+        return describe_content(
+            entity.media_type,
+            schema_url,
+            str(schema_type or SCHEMA_TYPE),
+            context_url,
+            None if context_type is None else str(context_type),
+        )
+    except ValueError as exc:
+        # Also the ValueError of a context without a type, whose callable
+        # couldn't be checked when decorating.
+        raise HsrConfigError(f"{where}: {exc}") from exc

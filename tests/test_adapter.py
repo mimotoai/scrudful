@@ -8,17 +8,13 @@ import pytest
 from scrudful import _adapter
 from scrudful._adapter import (
     CONTEXT_TYPE,
-    HSR_CONTEXT_URL,
-    HSR_SCHEMA_URL,
     JSON_LD_CONTEXT_REL,
     RDF_CONTEXT_REL,
     SCHEMA_TYPE,
-    allow_header,
     check_validators,
     context_defaults,
     context_link_type,
     describe_content,
-    describe_options,
     describe_read,
     describe_write,
     essence,
@@ -27,13 +23,11 @@ from scrudful._adapter import (
     is_json,
     media_type_key,
     merge_links,
-    options_links,
     precondition_headers,
     set_validator_headers,
     validator_policy,
 )
 from scrudful.utils import link_content
-from tests.semantic_http import validate_http_schema_resource
 
 # --- framework independence ------------------------------------------------
 
@@ -168,22 +162,22 @@ def test_set_validator_headers_without_validators():
 def test_expose_headers_lists_present_headers():
     headers = {"ETag": '"v1"', "Location": "/x", "Content-Type": "text/plain"}
     expose_headers(headers)
-    assert headers["Access-Control-Expose-Headers"] == "ETag, Location"
+    assert headers["Access-Control-Expose-Headers"] == "ETag, Link, Location, Allow"
 
 
 def test_expose_headers_merges_existing_value():
     headers = {"Link": "<x>", "Access-Control-Expose-Headers": "X-Custom, etag"}
     expose_headers(headers)
-    assert headers["Access-Control-Expose-Headers"] == "X-Custom, etag, Link"
+    assert headers["Access-Control-Expose-Headers"] == "X-Custom, etag, Link, Allow"
 
 
-def test_expose_headers_nothing_to_expose():
-    headers = {"Access-Control-Expose-Headers": "X-Custom"}
-    expose_headers(headers)
-    assert headers == {"Access-Control-Expose-Headers": "X-Custom"}
+def test_expose_headers_always_link_and_allow():
     headers = {}
     expose_headers(headers)
-    assert headers == {}
+    assert headers["Access-Control-Expose-Headers"] == "Link, Allow"
+    headers = {"ETag": '"1"', "Access-Control-Expose-Headers": "X-Total"}
+    expose_headers(headers)
+    assert headers["Access-Control-Expose-Headers"] == "X-Total, ETag, Link, Allow"
 
 
 # --- response descriptions ---------------------------------------------------
@@ -515,10 +509,17 @@ def test_describe_content_x_schema():
 
 def test_describe_content_keeps_parameters():
     content = describe_content(
-        "Application/JSON; charset=UTF-8", "https://h/s", SCHEMA_TYPE, None, None
+        "Application/JSON; charset=UTF-8",
+        "https://h/s",
+        SCHEMA_TYPE,
+        "https://h/c",
+        None,
     )
     assert content == {
-        "application/json; charset=UTF-8": {"schema": {"$ref": "https://h/s"}}
+        "application/json; charset=UTF-8": {
+            "schema": {"$ref": "https://h/s"},
+            "x-rdf-context": {"href": "https://h/c", "type": "application/ld+json"},
+        }
     }
 
 
@@ -577,36 +578,6 @@ def test_describe_error_content_not_shared_between_calls():
     first = describe_read(None, True, error_content=ERRORS)
     first["responses"]["400"]["content"].clear()
     assert ERRORS
-
-
-def test_describe_options_valid():
-    body = {"options": describe_options()}
-    validate_http_schema_resource(body)
-    assert body["options"]["responses"]["200"]["content"] == {
-        "application/json": {
-            "schema": {"$ref": HSR_SCHEMA_URL},
-            "x-rdf-context": {"href": HSR_CONTEXT_URL, "type": CONTEXT_TYPE},
-        }
-    }
-
-
-def test_describe_options_is_fresh():
-    describe_options()["responses"].clear()
-    assert describe_options()["responses"]
-
-
-def test_allow_header():
-    body = {"get": {}, "head": {}, "options": {}, "x-a": 1}
-    assert allow_header(body) == "GET, HEAD, OPTIONS"
-
-
-def test_options_links():
-    assert options_links() == (
-        "<https://w3id.org/semantic-http/0.1/http-schema-resource.schema.json>;"
-        ' rel="describedby"; type="application/schema+json", '
-        "<https://w3id.org/semantic-http/0.1/http-schema-resource.context.jsonld>;"
-        ' rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
-    )
 
 
 def test_context_link_type():

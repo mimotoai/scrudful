@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import jsonschema
 import pytest
 from asgiref.sync import async_to_sync
-from django.test import AsyncClient
+from django.test import AsyncClient, Client
 from django.utils.http import http_date
 from referencing import Registry, Resource
 from ninja.errors import HttpError
@@ -21,12 +21,27 @@ from referencing.jsonschema import DRAFT202012
 from roles.api import save_role
 from roles.models import Role
 
-from scrudful._adapter import allow_header, describe_options, options_links
+from scrudful._hsr import hsr_link, options_operation
 from scrudful.collection import ENVELOPE_FIELDS, PAGE_FIELDS
 from scrudful_ninja.api import api
-from tests.semantic_http import link_problems, validate_http_schema_resource
+from tests import test_wire_ninja as wire
+from tests.semantic_http import (
+    hsr_get_problems,
+    hsr_link_problems,
+    link_problems,
+    options_204_problems,
+    undescribed_problems,
+    validate_http_schema_resource,
+)
 
 pytestmark = pytest.mark.django_db
+
+
+@pytest.fixture(autouse=True)
+def base_url(settings):
+    """The links' base URL: Django's test client serves testserver."""
+    settings.SCRUDFUL = {"BASE_URL": "http://testserver/"}
+
 
 BASE = "http://testserver"
 API = f"{BASE}/api"
@@ -43,17 +58,19 @@ PRECONDITION_FAILED = {"detail": "Precondition failed."}
 MISSING = 999_999
 
 
-def links(name):
-    """The Link header value of the documents ``name``."""
-    return (
+def links(name, kind=None):
+    """The Link header value of the documents ``name``, followed by the HTTP
+    Schema Resource link of the ``kind`` path (see ``HSR_ROUTES``)."""
+    value = (
         f'<{API}/schemas/{name}>; rel="describedby"; type="application/schema+json", '
         f'<{API}/contexts/{name}>; rel="http://www.w3.org/ns/json-ld#context"; '
         'type="application/ld+json"'
     )
+    return value if kind is None else f"{value}, {hsr_link(BASE + HSR_ROUTES[kind])}"
 
 
 def content(name):
-    """The OPTIONS ``content`` of the documents ``name``."""
+    """The HTTP Schema Resource ``content`` of the documents ``name``."""
     return {
         "application/json": {
             "schema": {"$ref": f"{API}/schemas/{name}"},
@@ -113,7 +130,7 @@ def test_get(client, role):
     assert response.json() == {"id": role.pk, "name": "admin", "rbac_context": "acme"}
     assert response.headers["ETag"] == f'"{role.etag}"'
     assert response.headers["Last-Modified"] == MODIFIED_HTTP
-    assert response.headers["Link"] == links("role")
+    assert response.headers["Link"] == links("role", "item")
     assert {"ETag", "Link"} <= exposed(response)
 
 
@@ -191,14 +208,14 @@ def test_write_requires_a_precondition(client, role, write):
     response = write(client, role.pk, {"name": "x", "rbac_context": "acme"})
     assert response.status_code == 428
     assert response.json() == PRECONDITION_REQUIRED
-    assert response.headers["Link"] == links("error")
+    assert response.headers["Link"] == links("error", "item")
     assert "Link" in exposed(response)
 
 
 def test_delete_requires_a_precondition(client, role):
     response = client.delete(detail(role.pk), headers=ACME)
     assert response.status_code == 428
-    assert response.headers["Link"] == links("error")
+    assert response.headers["Link"] == links("error", "item")
     assert Role.objects.filter(pk=role.pk).exists()
 
 
@@ -208,7 +225,7 @@ def test_stale_write_is_412(client, role):
     )
     assert response.status_code == 412
     assert response.json() == PRECONDITION_FAILED
-    assert response.headers["Link"] == links("error")
+    assert response.headers["Link"] == links("error", "item")
     role.refresh_from_db()
     assert role.name == "admin"
 
@@ -218,7 +235,7 @@ def test_malformed_if_match_is_400(client, role):
         client, role.pk, {"name": "x", "rbac_context": "acme"}, **{"If-Match": "nope"}
     )
     assert response.status_code == 400
-    assert response.headers["Link"] == links("error")
+    assert response.headers["Link"] == links("error", "item")
 
 
 def test_put(client, role):
@@ -237,7 +254,7 @@ def test_put(client, role):
     assert response.headers["Last-Modified"] == http_date(
         updated.modified_at.timestamp()
     )
-    assert response.headers["Link"] == links("role")
+    assert response.headers["Link"] == links("role", "item")
 
 
 def test_put_with_if_unmodified_since(client, role):
@@ -260,7 +277,7 @@ def test_put_into_another_context_is_403(client, role):
     )
     assert response.status_code == 403
     assert "ETag" not in response.headers
-    assert response.headers["Link"] == links("error")
+    assert response.headers["Link"] == links("error", "item")
     role.refresh_from_db()
     assert role.rbac_context == "acme"
 
@@ -286,7 +303,8 @@ def test_delete(client, role):
     )
     assert response.status_code == 204
     assert "ETag" not in response.headers
-    assert "Link" not in response.headers  # no body, no Links
+    # No body, no entity Links: the HTTP Schema Resource link alone.
+    assert response.headers["Link"] == hsr_link(BASE + HSR_ROUTES["item"])
     assert not Role.objects.filter(pk=role.pk).exists()
 
 
@@ -322,7 +340,7 @@ def test_create(client):
     assert response.headers["Last-Modified"] == http_date(
         created.modified_at.timestamp()
     )
-    assert response.headers["Link"] == links("role")
+    assert response.headers["Link"] == links("role", "collection")
     assert {"ETag", "Link", "Location"} <= exposed(response)
 
     # The 201's validators let the client edit right away, without a GET.
@@ -347,7 +365,7 @@ def test_create_checks_the_preconditions_of_the_collection(client, role):
         headers={**ACME, "If-Match": '"stale"'},
     )
     assert stale.status_code == 412
-    assert stale.headers["Link"] == links("error")
+    assert stale.headers["Link"] == links("error", "collection")
     assert not Role.objects.filter(name="viewer").exists()
     current = client.post(
         "/api/roles",
@@ -398,7 +416,7 @@ def test_search(client, role, hidden):
     )
     assert response.status_code == 200
     assert [found["name"] for found in response.json()] == ["admin", "administrator"]
-    assert response.headers["Link"] == links("role-search-result")
+    assert response.headers["Link"] == links("role-search-result", "search")
     assert "ETag" not in response.headers
     assert "Location" not in response.headers
 
@@ -416,7 +434,7 @@ def test_search_with_the_async_client(role, hidden):
     response = search()
     assert response.status_code == 200
     assert [found["id"] for found in response.json()] == [role.pk]
-    assert response.headers["Link"] == links("role-search-result")
+    assert response.headers["Link"] == links("role-search-result", "search")
 
 
 def test_search_unauthenticated(client):
@@ -433,7 +451,7 @@ def test_list(client, role, hidden):
     other = make_role("viewer")
     response = client.get("/api/roles", headers=ACME)
     assert response.status_code == 200
-    assert response.headers["Link"] == links("roles")
+    assert response.headers["Link"] == links("roles", "collection")
     body = response.json()
     assert list(body) == list(PAGE_FIELDS)
     # Only the authorized roles are counted and listed.
@@ -452,7 +470,10 @@ def test_list(client, role, hidden):
         item = client.get(entry["href"], headers=ACME)
         assert entry["etag"] == item.headers["ETag"]
         assert entry["last_modified"] == item.headers["Last-Modified"]
-        assert entry["link"] == item.headers["Link"]
+        # The item's Links; the GET adds its path's HTTP Schema Resource link.
+        assert item.headers["Link"] == (
+            f"{entry['link']}, {hsr_link(BASE + HSR_ROUTES['item'])}"
+        )
 
 
 def test_list_pagination(client):
@@ -498,19 +519,50 @@ def options(client, path, **headers):
     return client.options(path, headers=headers)
 
 
+#: The HTTP Schema Resource route of each path of the role router.
+HSR_ROUTES = {
+    "item": "/api/roles/_hsr/pk",
+    "collection": "/api/roles/_hsr/_root",
+    "search": "/api/roles/_hsr/search",
+}
+#: Every method of the item and of the collection.
+ITEM_ALLOW = "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
+COLLECTION_ALLOW = "GET, POST, OPTIONS, HEAD"
+
+
+def hsr(client, kind):
+    """The HTTP Schema Resource of the ``kind`` path, by a GET of its route
+    (no credentials: it is the same for every requester)."""
+    response = client.get(HSR_ROUTES[kind])
+    assert (
+        hsr_get_problems(response.status_code, response.headers, response.content) == []
+    )
+    return response.json()
+
+
+def assert_options_204(response, allow, kind):
+    """A 204 with this ``Allow`` (in its order) and the ``kind`` path's HSR link."""
+    expected = {method.strip() for method in allow.split(",")}
+    assert (
+        options_204_problems(
+            response.status_code, response.headers, response.content, expected
+        )
+        == []
+    )
+    assert response.headers["Allow"] == allow
+    assert hsr_link_problems(response.headers, BASE + HSR_ROUTES[kind]) == []
+
+
 def test_options_item(client, role):
-    response = options(client, detail(role.pk))
-    assert response.status_code == 200
-    assert response.headers["Content-Type"] == "application/json; charset=utf-8"
-    assert response.headers["Link"] == options_links()
-    body = response.json()
+    assert_options_204(options(client, detail(role.pk), **ACME), ITEM_ALLOW, "item")
+    body = hsr(client, "item")
     validate_http_schema_resource(body)
     assert list(body) == ["get", "put", "delete", "options", "head", "patch"]
-    assert response.headers["Allow"] == "GET, PUT, DELETE, OPTIONS, HEAD, PATCH"
-    assert response.headers["Allow"] == allow_header(body)
-    assert body["options"] == describe_options()
+    assert body["options"] == options_operation()
     assert body["get"]["responses"]["200"]["content"] == content("role")
-    assert set(body["get"]["responses"]) == {"200", "304", "400", "412"}
+    assert set(body["get"]["responses"]) == {"200", "304", "400", "412", "default"}
+    # The errors get the error entity (add_error_links' and the operations').
+    assert body["get"]["responses"]["default"]["content"] == content("error")
     # HEAD is described like GET, without content: its responses have none.
     assert set(body["head"]["responses"]) == set(body["get"]["responses"])
     for response_ in body["head"]["responses"].values():
@@ -533,20 +585,32 @@ def test_options_item(client, role):
         ]
 
 
-def test_options_is_the_same_for_everyone(client, role, hidden):
-    """No auth, no load: a missing role and a hidden one are described alike."""
-    expected = options(client, detail(role.pk)).json()
-    assert options(client, detail(role.pk), **ACME).json() == expected
-    assert options(client, detail(hidden.pk)).json() == expected
-    assert options(client, detail(MISSING)).json() == expected
+def test_the_description_is_the_same_for_everyone(client, role, hidden):
+    """The HTTP Schema Resource doesn't depend on the requester; the Allow of
+    OPTIONS does, and a missing role and a hidden one are answered alike."""
+    expected = hsr(client, "item")
+    response = client.get(HSR_ROUTES["item"], headers=ACME)
+    assert response.json() == expected
+    # Without credentials, only OPTIONS; with them, every method on the role.
+    assert_options_204(options(client, detail(role.pk)), "OPTIONS", "item")
+    assert_options_204(options(client, detail(role.pk), **ACME), ITEM_ALLOW, "item")
+    # The loader (authorized_role) answers both 404, through the API's handler.
+    hidden_response = options(client, detail(hidden.pk), **ACME)
+    missing = options(client, detail(MISSING), **ACME)
+    assert hidden_response.status_code == missing.status_code == 404
+    assert hidden_response.content == missing.content
+    assert dict(hidden_response.headers) == dict(missing.headers)
+    assert link_problems("OPTIONS", 404, missing.headers, True) == []
+    assert hsr_link_problems(missing.headers, BASE + HSR_ROUTES["item"]) == []
 
 
 def test_options_collection(client):
-    response = options(client, "/api/roles")
-    body = response.json()
+    response = options(client, "/api/roles", **ACME)
+    assert_options_204(response, COLLECTION_ALLOW, "collection")
+    assert_options_204(options(client, "/api/roles"), "OPTIONS", "collection")
+    body = hsr(client, "collection")
     validate_http_schema_resource(body)
     assert list(body) == ["get", "post", "options", "head"]
-    assert response.headers["Allow"] == "GET, POST, OPTIONS, HEAD"
     assert body["get"]["responses"]["200"]["content"] == content("roles")
     assert "304" in body["get"]["responses"]
     assert body["post"]["requestBody"]["content"] == content("role")
@@ -559,19 +623,21 @@ def test_options_collection(client):
 
 
 def test_options_search(client):
-    body = options(client, "/api/roles/search").json()
+    response = options(client, "/api/roles/search", **ACME)
+    assert_options_204(response, "POST, OPTIONS", "search")
+    body = hsr(client, "search")
     validate_http_schema_resource(body)
     assert list(body) == ["post", "options"]
     assert body["post"]["requestBody"]["content"] == content("role-search")
     assert body["post"]["responses"]["200"]["content"] == content("role-search-result")
     # A search answers 200, not a create's 201.
-    assert set(body["post"]["responses"]) == {"200"}
+    assert set(body["post"]["responses"]) == {"200", "default"}
 
 
-def test_responses_agree_with_options(client, role):
+def test_responses_agree_with_the_hsr(client, role):
     """Every response's Links are the entry of the HTTP Schema Resource."""
-    item = options(client, detail(role.pk)).json()
-    collection = options(client, "/api/roles").json()
+    item = hsr(client, "item")
+    collection = hsr(client, "collection")
     data = {"name": "owner", "rbac_context": "acme"}
     current = {"If-Match": f'"{role.etag}"'}
     stale = {"If-Match": '"stale"'}
@@ -602,11 +668,11 @@ def test_responses_agree_with_options(client, role):
     ]
     statuses = [response.status_code for _, response, _ in responses]
     assert statuses == [200, 200, 200, 412, 428, 400, 403, 200, 200, 201]
-    for method, response, hsr in responses:
+    for method, response, description in responses:
         has_content = bool(response.content)
         assert has_content == (method != "HEAD")
         problems = link_problems(
-            method, response.status_code, response.headers, has_content, hsr=hsr
+            method, response.status_code, response.headers, has_content, hsr=description
         )
         assert problems == [], (method, response.status_code)
 
@@ -651,7 +717,9 @@ CONFORMANCE = [
     ("delete", ITEM, {"headers": STALE}, 412),
     ("delete", ITEM, {"headers": MALFORMED}, 400),
     ("delete", ITEM, {"headers": {}}, 401),
-    ("options", ITEM, {}, 200),
+    ("options", ITEM, {"headers": ACME}, 204),
+    ("options", ITEM, {"headers": {}}, 204),
+    ("options", "/api/roles/999999", {"headers": ACME}, 404),
     ("get", LIST, {"headers": ACME}, 200),
     ("get", LIST, {"headers": {}}, 401),
     ("get", LIST, {"headers": {"If-None-Match": "nope", **ACME}}, 400),
@@ -661,13 +729,20 @@ CONFORMANCE = [
     ("post", LIST, {"data": FOREIGN_BODY, "headers": ACME}, 403),
     ("post", LIST, {"data": {"name": 1}, "headers": ACME}, 422),
     ("post", LIST, {"data": ROLE_BODY, "headers": {}}, 401),
-    ("options", LIST, {}, 200),
+    ("options", LIST, {"headers": ACME}, 204),
     ("post", SEARCH, {"data": {"name": "adm"}, "headers": ACME}, 200),
     ("post", SEARCH, {"data": {"name": 1}, "headers": ACME}, 422),
     ("post", SEARCH, {"data": {"name": "adm"}, "headers": {}}, 401),
-    ("options", SEARCH, {}, 200),
+    ("options", SEARCH, {"headers": ACME}, 204),
 ]
-# Statuses the OPTIONS bodies don't list, so there is no entry to agree with:
+#: The HTTP Schema Resource route of each path of CONFORMANCE.
+CONFORMANCE_HSR = {
+    ITEM: "item",
+    "/api/roles/999999": "item",
+    LIST: "collection",
+    SEARCH: "search",
+}
+# Statuses the HTTP Schema Resources don't list, so there is no entry to agree with:
 # a 304 (a HEAD's too) has no content, and ninja's 404, 422 and 401 are not
 # described. Their Links are still checked by the rules that don't need the
 # body (and are those of the error entity: see below).
@@ -681,8 +756,9 @@ NO_ENTRY = {304, 404, 422, 401}
 )
 def test_example_links_everywhere(client, role, method, path, arguments, status):
     """Every response with content, and every HEAD, follows the Semantic HTTP
-    0.1 Link rules and agrees with the OPTIONS body of its path."""
-    path = path.format(pk=role.pk)
+    0.1 Link rules and agrees with the HTTP Schema Resource of its path; every
+    OPTIONS is a 204 with the HSR link (or, for a missing role, the loader's
+    error)."""
     etag = f'"{role.etag}"'
     arguments = {
         **arguments,
@@ -694,9 +770,29 @@ def test_example_links_everywhere(client, role, method, path, arguments, status)
     if "data" in arguments:
         arguments["content_type"] = "application/json"
         arguments["data"] = json.dumps(arguments["data"])
-    hsr = client.options(path).json()
+    kind = CONFORMANCE_HSR[path]
+    description = hsr(client, kind)
+    path = path.format(pk=role.pk)
     response = getattr(client, method)(path, **arguments)
     assert response.status_code == status
+    if method == "options" and status == 204:
+        # Every method with credentials (the role is acme's), else OPTIONS.
+        allow = (
+            {"item": ITEM_ALLOW, "collection": COLLECTION_ALLOW}.get(
+                kind, "POST, OPTIONS"
+            )
+            if arguments["headers"]
+            else "OPTIONS"
+        )
+        assert_options_204(response, allow, kind)
+        return
+    if method == "options":
+        # The loader's error, with the HSR link too (Task 9 adds it to every
+        # error answered on a path scrudful describes).
+        assert hsr_link_problems(response.headers, BASE + HSR_ROUTES[kind]) == []
+        assert response.headers["Link"].startswith(links("error"))
+        assert link_problems("OPTIONS", status, response.headers, True) == []
+        return
     has_content = (
         method != "head" and status not in (204, 304) and bool(response.content)
     )
@@ -706,24 +802,27 @@ def test_example_links_everywhere(client, role, method, path, arguments, status)
         status,
         response.headers,
         has_content,
-        None if status in NO_ENTRY else hsr,
+        None if status in NO_ENTRY else description,
     )
     assert problems == []
     if status in NO_ENTRY - {304}:
-        assert response.headers["Link"] == links("error")
+        assert response.headers["Link"] == links("error", kind)
 
 
 def test_cors_preflight_is_not_broken(client, role):
-    """A preflight that reaches the view (no CORS middleware here) gets the
-    description; django-cors-headers would answer it before the view."""
+    """A preflight that reaches the view (no CORS middleware here) is a 204
+    without content or Links, answered before authentication and loading;
+    django-cors-headers would answer it before the view."""
     response = options(
         client,
         detail(role.pk),
         Origin="https://app.example.com",
         **{"Access-Control-Request-Method": "PUT"},
     )
-    assert response.status_code == 200
-    assert response.json() == options(client, detail(role.pk)).json()
+    assert response.status_code == 204
+    assert response.content == b""
+    assert "Link" not in response.headers
+    assert "Content-Type" not in response.headers
 
 
 # --- The documents the Links point to --------------------------------------------
@@ -784,3 +883,99 @@ def test_openapi():
         assert [p["name"] for p in operation["parameters"]] == ["pk"]
     # OPTIONS is not in the OpenAPI document.
     assert all("options" not in path for path in paths.values())
+
+
+# --- The wire-conformance suite, on the example ----------------------------------
+#
+# The exchanges of tests/test_wire_ninja.py with the example's API, through the
+# example's own URLconf (its handler404 / handler500), with DEBUG off, checked
+# as that suite checks them (tests/semantic_http.py).
+
+
+@pytest.fixture
+def wire_client(settings):
+    settings.DEBUG = False
+    return Client(raise_request_exception=False)
+
+
+@pytest.mark.parametrize("exchange", wire.example_exchanges(), ids=lambda e: e.id)
+def test_wire_exchanges(wire_client, exchange):
+    """Every response has its content Links and the HSR link of its path, and
+    agrees with its HSR entry."""
+    world = wire.World(wire_client)
+    response = wire.send(wire_client, world, exchange)
+    headers = wire.headers_of(response)
+    content = wire.has_content(exchange, response)
+    hsr = None
+    if exchange.status not in (304, 405):
+        hsr = wire.hsr_of(wire_client, exchange.kind)
+    problems = link_problems(exchange.method, exchange.status, headers, content, hsr)
+    assert problems == []
+    assert hsr_link_problems(headers, wire.target(exchange.kind)) == []
+
+
+@pytest.mark.parametrize(
+    "kind, url, headers, allow",
+    [
+        ("item", "/api/roles/{pk}", {}, {"OPTIONS"}),
+        ("item", "/api/roles/{pk}", ACME, set(ITEM_ALLOW.split(", "))),
+        ("collection", "/api/roles", ACME, set(COLLECTION_ALLOW.split(", "))),
+        ("search", "/api/roles/search", ACME, {"POST", "OPTIONS"}),
+    ],
+)
+def test_wire_options_and_hsr(wire_client, kind, url, headers, allow):
+    """The OPTIONS 204 (its ``Allow`` and HSR link) and the HSR route."""
+    url = wire.World(wire_client).format(url)
+    response = wire_client.options(url, headers=headers)
+    response_headers = wire.headers_of(response)
+    problems = options_204_problems(
+        response.status_code, response_headers, response.content, allow
+    )
+    assert problems == []
+    assert hsr_link_problems(response_headers, wire.target(kind)) == []
+    document = wire_client.get(wire.HSR_ROUTES[kind])
+    document_headers = wire.headers_of(document)
+    problems = hsr_get_problems(
+        document.status_code, document_headers, document.content
+    )
+    assert problems == []
+
+
+@pytest.mark.parametrize("accept", [None, "application/json"], ids=["absent", "json"])
+@pytest.mark.parametrize(
+    "method, url, headers",
+    [
+        ("GET", "/nope", {}),
+        ("GET", "/api/nope", ACME),
+        ("TRACE", "/api/roles/{pk}", ACME),
+        ("POST", "/api/roles/_hsr/pk", {}),
+    ],
+)
+def test_wire_no_undescribed_content(wire_client, accept, method, url, headers):
+    """No error is content the HSR doesn't describe, for an absent ``Accept``
+    or ``Accept: application/json``: the example's handler404 answers a URL
+    no pattern matches with JSON, and the router a method no operation of
+    the path routes with a JSON 405."""
+    hsr = wire.hsr_of(wire_client, "item")
+    extra = {} if accept is None else {"Accept": accept}
+    url = wire.World(wire_client).format(url)
+    response = wire_client.generic(method, url, headers={**headers, **extra})
+    assert response.status_code >= 400
+    response_headers = wire.headers_of(response)
+    assert undescribed_problems(accept, response_headers, hsr) == []
+    content = bool(response.content)
+    status = response.status_code
+    assert link_problems(method, status, response_headers, content) == []
+
+
+def test_wire_django_404_is_html_only_when_preferred(wire_client):
+    """The example's handler404: Django's HTML page for a browser, with
+    ``Vary: Accept``; JSON with the error Links otherwise."""
+    accept = "text/html,application/xhtml+xml,*/*;q=0.8"
+    response = wire_client.get("/nope", headers={"Accept": accept})
+    assert response["Content-Type"].startswith("text/html")
+    assert "Accept" in response["Vary"]
+    response = wire_client.get("/nope")
+    assert response["Content-Type"] == "application/json"
+    assert "Accept" in response["Vary"]
+    assert link_problems("GET", 404, wire.headers_of(response), True) == []

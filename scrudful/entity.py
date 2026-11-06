@@ -8,9 +8,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from scrudful._adapter import is_in_band, is_json, media_type_key
+from scrudful._adapter import (
+    SCHEMA_WITHOUT_CONTEXT,
+    HsrConfigError,
+    is_in_band,
+    is_json,
+    media_type_key,
+)
 
-__all__ = ["Entity"]
+__all__ = ["Entity", "HsrConfigError"]
+
+
+def _unset(value: Any) -> bool:
+    """Whether a link option is unset: ``None``, an empty ``str`` or
+    ``bytes`` of any class (Django's ``SafeString`` included), or another
+    empty built-in value (``False``, ``0`` ...). Any other object, a lazy URL
+    such as Django's ``reverse_lazy`` included (it is no ``str``), counts as
+    set without being evaluated, so an entity may name a URL of a URLconf
+    that isn't loaded yet."""
+    if value is None or (isinstance(value, (str, bytes)) and not value):
+        return True
+    return type(value).__module__ == "builtins" and not value
 
 
 @dataclass(frozen=True)
@@ -25,7 +43,11 @@ class Entity:
     the calling convention of its adapter: ``func(request, obj)`` for
     django-ninja (``obj`` is the object the operation has at that point, the
     loaded object or ``None``), ``func(view, request, **url_kwargs)`` for DRF
-    and ``func(**endpoint_kwargs)`` for FastAPI.
+    and ``func(**endpoint_kwargs)`` for FastAPI. When the HTTP Schema
+    Resource is built, it is also called in *describe* mode, without a
+    request: ``func(None, None)`` (django-ninja), ``func(view, None)`` (DRF)
+    and ``func()`` (FastAPI). It must return the same target in both modes;
+    one that raises then is a configuration error.
 
     Attributes
     ----------
@@ -49,18 +71,19 @@ class Entity:
           of the lifting description must be given. A
           ``context_type_or_func`` callable that returns nothing for it is a
           programming error: building the response's Links raises
-          ``ValueError``, as building its OPTIONS description does, rather
-          than send a context Link without a type.
+          ``ValueError``, and building the HTTP Schema Resource raises the
+          adapter's configuration error, rather than send a context Link
+          without a type.
 
         An explicit ``context_rel_or_func`` or ``context_type_or_func`` wins
         over these defaults.
 
-        It is declarative: it decides the Links and the OPTIONS body, but
-        scrudful sets a response's Content-Type to it only for error
-        responses (its own 400, 412 and 428, those of the error helpers and,
-        with django-ninja, the JSON responses to errors an operation raises),
-        never for a success response. The operation must serve the media
-        type its entities declare.
+        It is declarative: it decides the Links and the HTTP Schema
+        Resource's ``content``, but scrudful sets a response's Content-Type
+        to it only for error responses (its own 400, 412 and 428, those of
+        the error helpers and, with django-ninja, the JSON responses to
+        errors an operation raises), never for a success response. The
+        operation must serve the media type its entities declare.
 
     Raises
     ------
@@ -68,7 +91,11 @@ class Entity:
         If ``media_type`` is not a media type; if it is in-band and
         ``context_link_or_func`` is set; or if it is neither JSON nor
         in-band, ``context_link_or_func`` is set and ``context_type_or_func``
-        is not.
+        is not; or if it is not in-band and ``schema_link_or_func`` is a
+        value but ``context_link_or_func`` is not set (the HTTP Schema
+        Resource would lack its ``x-rdf-context``; ``HsrConfigError``, a
+        ``ValueError``). A callable schema link is checked when the HTTP
+        Schema Resource is built.
     """
 
     schema_link_or_func: Any = None
@@ -82,13 +109,22 @@ class Entity:
     def __post_init__(self) -> None:
         media_type = media_type_key(self.media_type)
         object.__setattr__(self, "media_type", media_type)
-        if not self.context_link_or_func:
+        if _unset(self.context_link_or_func):
+            schema = self.schema_link_or_func
+            if (
+                not _unset(schema)
+                and not callable(schema)
+                and not is_in_band(media_type)
+            ):
+                raise HsrConfigError(
+                    SCHEMA_WITHOUT_CONTEXT.format(media_type=media_type)
+                )
             return
         if is_in_band(media_type):
             raise ValueError(
                 f"{media_type} content carries its own RDF; it takes no context " "link"
             )
-        if not is_json(media_type) and not self.context_type_or_func:
+        if not is_json(media_type) and _unset(self.context_type_or_func):
             raise ValueError(
                 f"{media_type} content needs a context type: give "
                 "context_type_or_func, the media type of the lifting description"
