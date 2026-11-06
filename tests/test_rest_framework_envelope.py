@@ -10,6 +10,7 @@ from rest_framework import serializers, viewsets
 from rest_framework.routers import SimpleRouter
 from rest_framework.exceptions import ValidationError
 from rest_framework.request import Request
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.test import APIClient, APIRequestFactory
 
 from scrudful._hsr import hsr_link
@@ -170,8 +171,90 @@ class NestedViewSet(viewsets.ReadOnlyModelViewSet):
         schema_link_or_func = nested_schema
 
 
+def listed_etag(view, request):
+    return f"n{Item.objects.count()}"
+
+
+@scrudful_viewset
+class ListValidatedViewSet(viewsets.ReadOnlyModelViewSet):
+    """A list with validators, one item a page."""
+
+    queryset = Item.objects.order_by("pk")
+    serializer_class = ItemSerializer
+    pagination_class = SmallPagination
+
+    class Meta:
+        href_func = drf_href
+        list_etag_func = listed_etag
+
+
+class FirstOnly:
+    """A filter backend keeping the first item: the page checked is the
+    filtered list's."""
+
+    def filter_queryset(self, request, queryset, view):
+        return queryset.filter(pk=queryset.order_by("pk").values("pk")[:1])
+
+
+class FilteredListViewSet(ListValidatedViewSet):
+    filter_backends = [FirstOnly]
+
+
+class OnePerPageNumber(PageNumberPagination):
+    page_size = 1
+
+
+class OtherPaginatorViewSet(ListValidatedViewSet):
+    """A paginator without check_page: its page errors lose to a precondition,
+    as before 0.10.1."""
+
+    pagination_class = OnePerPageNumber
+
+
+class OwnPagesPagination(SmallPagination):
+    """Overrides paginate_queryset (its own idea of a page, say one past the
+    last clamped to the last), not check_page."""
+
+    def paginate_queryset(self, queryset, request, view=None):
+        return super().paginate_queryset(queryset, request, view)
+
+
+class OwnPagesViewSet(ListValidatedViewSet):
+    pagination_class = OwnPagesPagination
+
+
+class LastPageListViewSet(ListValidatedViewSet):
+    """Parsing of its own (``page=last``), scrudful's idea of a page."""
+
+    pagination_class = LastPagePagination
+
+
+class LastPageParseListViewSet(ListValidatedViewSet):
+    pagination_class = LastPageParsePagination
+
+
+def listed_modified(view, request):
+    return max(item.updated_at for item in Item.objects.all())
+
+
+@scrudful_viewset
+class LastModifiedOnlyViewSet(ListValidatedViewSet):
+    # Decorated itself: scrudful_viewset reads the Meta of the class it
+    # decorates.
+    class Meta:
+        href_func = drf_href
+        list_last_modified_func = listed_modified
+
+
 router = SimpleRouter()
 router.register("nonemod", NoneModifiedViewSet, basename="nonemod")
+router.register("listed", ListValidatedViewSet, basename="listed")
+router.register("filtered", FilteredListViewSet, basename="filtered")
+router.register("other-pages", OtherPaginatorViewSet, basename="other-pages")
+router.register("own-pages", OwnPagesViewSet, basename="own-pages")
+router.register("last-list", LastPageListViewSet, basename="last-list")
+router.register("last-parse-list", LastPageParseListViewSet, basename="last-parse-list")
+router.register("modified-only", LastModifiedOnlyViewSet, basename="modified-only")
 router.register("items", ItemViewSet, basename="item")
 router.register("bare", BareViewSet, basename="bare")
 router.register("nohref", NoHrefViewSet, basename="nohref")
@@ -482,3 +565,110 @@ def test_entry_link_callbacks_get_the_list_route_kwargs(items, client):
         hsr = hsr_link("http://testserver/_hsr/nested-detail")
         assert detail["Link"] == f"{entry['link']}, {hsr}"
         assert f"/schemas/7/{item.pk}" in entry["link"]
+
+
+# A list's page comes before its preconditions (RFC 9110 13.2.1): a request
+# whose page is a 400 or 404 is answered so, its preconditions ignored.
+
+
+@pytest.mark.parametrize("method", ["get", "head"])
+@pytest.mark.parametrize(
+    "query, status", [("?page=99", 404), ("?page=x", 400), ("?page_size=0", 400)]
+)
+@pytest.mark.parametrize("headers", [{"If-None-Match": "*"}, {"If-Match": '"no"'}])
+def test_a_list_page_that_is_an_error_ignores_the_preconditions(
+    method, query, status, headers
+):
+    for name in "abc":
+        Item.objects.create(name=name)
+
+    response = getattr(APIClient(), method)("/drf/listed/" + query, headers=headers)
+
+    assert response.status_code == status
+
+
+def test_a_list_page_that_exists_answers_its_preconditions():
+    for name in "abc":
+        Item.objects.create(name=name)
+    client = APIClient()
+
+    page_1 = client.get("/drf/listed/", headers={"If-None-Match": '"n3"'})
+    page_3 = client.get("/drf/listed/?page=3", headers={"If-None-Match": '"n3"'})
+    stale = client.get("/drf/listed/?page=2", headers={"If-Match": '"n2"'})
+
+    assert page_1.status_code == page_3.status_code == 304
+    assert stale.status_code == 412
+
+
+def test_the_page_checked_is_the_filtered_lists():
+    # Three items, one after the filter: page 2 doesn't exist.
+    for name in "abc":
+        Item.objects.create(name=name)
+
+    response = APIClient().get(
+        "/drf/filtered/?page=2", headers={"If-None-Match": '"n3"'}
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("query, status", [("", 304), ("?page=2", 404)])
+def test_an_empty_list_has_its_first_page_only(query, status):
+    response = APIClient().get("/drf/listed/" + query, headers={"If-None-Match": "*"})
+
+    assert response.status_code == status
+
+
+@pytest.mark.parametrize("prefix", ["other-pages", "own-pages"])
+def test_a_paginator_of_its_own_still_loses_to_the_preconditions(prefix):
+    # Without check_page, or overriding paginate_queryset without it: as
+    # before 0.10.1, never asked.
+    for name in "abc":
+        Item.objects.create(name=name)
+
+    response = APIClient().get(
+        f"/drf/{prefix}/?page=99", headers={"If-None-Match": '"n3"'}
+    )
+
+    assert response.status_code == 304
+
+
+def test_a_list_with_last_modified_only_checks_its_page():
+    for name in "abc":
+        Item.objects.create(name=name)
+    client = APIClient()
+    since = {"If-Modified-Since": client.get("/drf/modified-only/")["Last-Modified"]}
+
+    assert client.get("/drf/modified-only/?page=99", headers=since).status_code == 404
+    assert client.get("/drf/modified-only/?page=3", headers=since).status_code == 304
+
+
+def test_an_unconditional_list_checks_no_page():
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    for name in "abc":
+        Item.objects.create(name=name)
+    client = APIClient()
+
+    def queries(url):
+        with CaptureQueriesContext(connection) as captured:
+            assert client.get(url).status_code == 200
+        return len(captured.captured_queries)
+
+    assert queries("/drf/listed/?page=2") == queries("/drf/listed/")
+
+
+@pytest.mark.parametrize("prefix", ["last-list", "last-parse-list"])
+@pytest.mark.parametrize("query, status", [("?page=last", 304), ("?page=99", 404)])
+def test_a_paginator_parsing_its_own_way_still_checks_its_page(prefix, query, status):
+    # Overriding _integer or _parse_parameter (not paginate_queryset): asked,
+    # with its own parsing.
+    for name in "abc":
+        Item.objects.create(name=name)
+
+    response = APIClient().get(
+        f"/drf/{prefix}/{query}", headers={"If-None-Match": '"n3"'}
+    )
+
+    assert response.status_code == status

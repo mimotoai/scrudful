@@ -368,6 +368,7 @@ from scrudful._adapter import (
 from scrudful._django import (
     SETTING_ACCESSORS,
     aware,
+    check_page,
     error_handler,
     hsr_not_allowed,
     hsr_response,
@@ -833,6 +834,7 @@ class ScrudfulViewFunc:
         self.allowed_func = allowed_func
         self.base_url = base_url
         self._from_viewset = False
+        self._checks_page = False
 
     def __get__(self, obj: Any, objtype: type | None = None) -> Any:
         if obj is None:
@@ -929,6 +931,8 @@ class ScrudfulViewFunc:
         elif (
             self.has_validators and not self.creates and evaluates_preconditions(method)
         ):
+            if self._checks_page and view is not None:
+                _check_list_page(view, request)
             exists = None
             if self.object_validators:
                 # Authorization comes first: an exception propagates as the
@@ -1382,7 +1386,16 @@ def scrudful_viewset(cls: type) -> type:
     list_etag_func, list_last_modified_func : callable, optional
         Validators of the ``list`` response, against which the preconditions
         of ``create`` are evaluated too (a 400 or 412, never a 428; see
-        :class:`ScrudfulViewFunc`).
+        :class:`ScrudfulViewFunc`). For a GET or HEAD carrying a
+        precondition, a paginator with ``check_page``
+        (:class:`ScrudfulPagination`) answers bad page parameters with its
+        400 and a page past the last with its 404, the preconditions ignored
+        (RFC 9110 §13.2.1), unless a subclass overrides ``paginate_queryset``
+        without ``check_page``; another paginator's page errors still lose to
+        a 304 or 412. The check assumes ``list`` pages
+        ``filter_queryset(get_queryset())`` with ``view.paginator``, as
+        DRF's does: a ``list`` paging another queryset should paginate with a
+        paginator whose ``check_page`` agrees (or none).
     list_schema_link_or_func, list_schema_rel_or_func, list_schema_type_or_func
         Schema link of the ``list`` response.
     list_context_link_or_func, list_context_rel_or_func, list_context_type_or_func
@@ -1523,6 +1536,8 @@ def scrudful_viewset(cls: type) -> type:
                 continue
         wrapper = ScrudfulViewFunc(method, **config)
         wrapper._from_viewset = True
+        # A list's page comes before its preconditions (_check_list_page).
+        wrapper._checks_page = name == "list"
         setattr(cls, name, wrapper)
     _install_metadata(cls)
     return cls
@@ -3541,6 +3556,33 @@ def _check_sync(view: Callable[..., Any]) -> None:
         raise TypeError(f"@scrudful does not support async views ({name})")
 
 
+def _check_list_page(view: Any, request: Request) -> None:
+    """Before a list's GET or HEAD preconditions are evaluated, raise what its
+    page would (the paginator's ``check_page``, as :class:`ScrudfulPagination`
+    has: 400, 404), so that a request whose page is an error ignores them (RFC
+    9110 §13.2.1). Only for a request carrying a precondition, and a paginator
+    with ``check_page`` (not a ``ScrudfulPagination`` subclass overriding
+    ``paginate_queryset`` without it); the queryset, assumed to be what
+    ``list`` pages (``filter_queryset(get_queryset())``), is filtered only for
+    a page after the first."""
+    if not django_precondition_headers(request):
+        return
+    paginator = getattr(view, "paginator", None)
+    check = getattr(paginator, "check_page", None)
+    if check is None:
+        return
+    if isinstance(paginator, ScrudfulPagination):
+        cls = type(paginator)
+        if (
+            cls.paginate_queryset is not ScrudfulPagination.paginate_queryset
+            and cls.check_page is ScrudfulPagination.check_page
+        ):
+            # Its own pagination decides what a page is: check_page, which
+            # knows scrudful's, can't tell (override it too to be asked).
+            return
+    check(lambda: view.filter_queryset(view.get_queryset()), request, view)
+
+
 def _check_list_validators(
     etag_func: Any,
     last_modified_func: Any,
@@ -4135,6 +4177,40 @@ class ScrudfulPagination(BasePagination):
                 f"{type(view).__name__} uses ScrudfulPagination: it needs "
                 "Meta.href_func(view, request, obj), returning an item's URL"
             )
+        number, size = self._page_parameters(request)
+        try:
+            # The unordered-queryset warning points at this method's caller.
+            self.count, self.objects = slice_page(queryset, number, size)
+        except InvalidPage:
+            raise NotFound("Invalid page.") from None
+        self.request, self.view, self.number, self.size = request, view, number, size
+        self.href_func = href_func
+        return self.objects
+
+    def check_page(self, queryset: Any, request: Request, view: Any = None) -> None:
+        """Raise the page errors :meth:`paginate_queryset` would for the
+        request: ``ValidationError`` (400) for bad ``page`` / ``page_size``
+        parameters, ``NotFound`` (404) for a page past the last. ``queryset``
+        may be a callable returning it, called (and counted) only for a page
+        after the first (page 1 always exists).
+
+        :func:`scrudful_viewset`'s ``list`` calls it before evaluating the
+        preconditions of a GET or HEAD carrying one, so a request whose page
+        is an error is answered with it, its preconditions ignored (RFC 9110
+        §13.2.1), never a 304 or 412. A subclass overriding
+        ``paginate_queryset`` (its own idea of a page) is not called unless
+        it overrides this too.
+        """
+        number, size = self._page_parameters(request)
+        if number > 1:
+            items = queryset() if callable(queryset) else queryset
+            try:
+                check_page(items, number, size)
+            except InvalidPage:
+                raise NotFound("Invalid page.") from None
+
+    def _page_parameters(self, request: Request) -> tuple[int, int]:
+        """The requested page number and size (``ValidationError`` for bad ones)."""
         # Each parameter goes through _integer. With scrudful's own, their
         # errors are merged, so one 400 names both; an overridden one stops at
         # the first error, as in 0.6.0 (it is not called for page_size once
@@ -4158,14 +4234,7 @@ class ScrudfulPagination(BasePagination):
         if errors:
             raise ValidationError(errors)
         number, size = values
-        try:
-            # The unordered-queryset warning points at this method's caller.
-            self.count, self.objects = slice_page(queryset, number, size)
-        except InvalidPage:
-            raise NotFound("Invalid page.") from None
-        self.request, self.view, self.number, self.size = request, view, number, size
-        self.href_func = href_func
-        return self.objects
+        return number, size
 
     def get_paginated_response(self, data: Any) -> Response:
         """The envelope of the page, ``data`` being the serialized objects."""

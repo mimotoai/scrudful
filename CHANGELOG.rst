@@ -2,6 +2,54 @@
 Changelog
 =========
 
+0.10.1 (since 0.10.0)
+=====================
+
+A list's GET or HEAD preconditions are evaluated once its requested page is
+known to exist (RFC 9110 §13.2.1: preconditions are ignored when the request
+without them would not be a 2xx or 412). A page past the last was the
+precondition's answer (a 304 for ``If-None-Match`` or ``If-Modified-Since``, a
+412 for a failed ``If-Match`` or ``If-Unmodified-Since``, a 400 for a malformed
+one), where it is the 404 ``Invalid page.``; with DRF, bad ``page`` /
+``page_size`` parameters were the precondition's answer too, where they are the
+400.
+
+Behaviour change (ninja)
+------------------------
+
+* ``scrudful_list`` with list validators checks, for a GET or HEAD carrying a
+  precondition, that a page after the first exists (one more ``count()`` of
+  the queryset; page 1 always exists, at no cost) before evaluating the
+  preconditions. The page is still built only for a 2xx, so a 304 or 412
+  builds no entry. A request without a precondition is unchanged.
+
+Behaviour change (DRF)
+----------------------
+
+* ``scrudful_viewset``'s ``list`` calls its paginator's ``check_page`` before
+  evaluating the preconditions of a GET or HEAD carrying one: with
+  ``ScrudfulPagination``, its parameters' 400 and a page past the last's 404.
+  The queryset (``filter_queryset(get_queryset())``) is given as a callable,
+  filtered only for a page after the first. A request without a precondition,
+  a paginator without ``check_page``, a ``ScrudfulPagination`` subclass that
+  overrides ``paginate_queryset`` without overriding ``check_page``, and an
+  explicit ``@scrudful`` list handler are unchanged. The check assumes the
+  viewset's ``list`` pages ``filter_queryset(get_queryset())`` with its
+  paginator, as DRF's does: a ``list`` of its own paging another queryset
+  should use a paginator whose ``check_page`` agrees.
+
+New
+---
+
+* ``ScrudfulPagination.check_page(queryset, request, view=None)``: the page
+  errors ``paginate_queryset`` would raise for the request.
+
+Internal
+--------
+
+* ``scrudful._django.check_page(items, number, size)``, which ``slice_page``
+  now uses.
+
 0.10.0 (since 0.9.0)
 ====================
 

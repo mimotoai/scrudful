@@ -916,3 +916,116 @@ def test_list_without_validator_values_exists(db):
     assert client.get("/items", headers={"If-Match": "*"}).status_code == 200
     assert client.get("/items", headers={"If-Match": '"n1"'}).status_code == 412
     assert client.get("/items").status_code == 200
+
+
+# A list's page comes before its preconditions (RFC 9110 13.2.1).
+
+
+@pytest.mark.parametrize("headers", [{"If-None-Match": "*"}, {"If-Match": '"no"'}])
+def test_a_list_page_past_the_last_ignores_the_preconditions(items, headers):
+    router = list_router(list_etag_func=lambda qs: f"n{qs.count()}", page_size=1)
+
+    response = TestClient(router).get("/items?page=99", headers=headers)
+
+    assert response.status_code == 404
+
+
+def test_a_later_list_page_answers_its_preconditions_building_nothing(items):
+    calls = []
+
+    def list_etag(qs):
+        calls.append("list_etag")
+        return f"n{qs.count()}"
+
+    def item_href(request, item):
+        calls.append("href")
+        return href(request, item)
+
+    router = list_router(href_func=item_href, list_etag_func=list_etag, page_size=1)
+    client = TestClient(router)
+
+    not_modified = client.get("/items?page=3", headers={"If-None-Match": '"n3"'})
+    stale = client.get("/items?page=2", headers={"If-Match": '"n2"'})
+
+    assert not_modified.status_code == 304
+    assert stale.status_code == 412
+    # The page's existence is checked (a count), its entries never built.
+    assert calls == ["list_etag", "list_etag"]
+
+
+def test_an_unconditional_later_page_costs_what_the_first_does(items):
+    # The page check is for a request carrying a precondition: without one, a
+    # later page makes the queries the first does; with one, one count more.
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    router = list_router(list_etag_func=lambda qs: f"n{qs.count()}", page_size=1)
+    client = TestClient(router)
+
+    def queries(url, **headers):
+        with CaptureQueriesContext(connection) as captured:
+            client.get(url, headers=headers)
+        return len(captured.captured_queries)
+
+    assert queries("/items?page=2") == queries("/items")
+    conditional = {"If-None-Match": '"n3"'}
+    assert queries("/items?page=2", **conditional) == (
+        queries("/items", **conditional) + 1
+    )
+
+
+@pytest.mark.parametrize(
+    "query, status", [("?page=2&page_size=3", 404), ("?page=1&page_size=3", 304)]
+)
+def test_the_page_checked_is_the_requests_page_size(items, query, status):
+    router = list_router(list_etag_func=lambda qs: f"n{qs.count()}", page_size=1)
+
+    response = TestClient(router).get("/items" + query, headers={"If-None-Match": "*"})
+
+    assert response.status_code == status
+
+
+@pytest.mark.parametrize("query, status", [("", 304), ("?page=2", 404)])
+def test_an_empty_list_has_its_first_page_only(db, query, status):
+    router = list_router(list_etag_func=lambda qs: f"n{qs.count()}", page_size=1)
+
+    response = TestClient(router).get("/items" + query, headers={"If-None-Match": "*"})
+
+    assert response.status_code == status
+
+
+def test_a_list_with_last_modified_only_checks_its_page(items):
+    router = list_router(
+        list_last_modified_func=lambda qs: max(i.updated_at for i in qs), page_size=1
+    )
+    since = {
+        "If-Modified-Since": TestClient(router).get("/items").headers["Last-Modified"]
+    }
+
+    past = TestClient(router).get("/items?page=99", headers=since)
+    later = TestClient(router).get("/items?page=3", headers=since)
+
+    assert past.status_code == 404
+    assert later.status_code == 304
+
+
+@pytest.mark.parametrize("query, status", [("?page=99", 404), ("?page=3", 304)])
+def test_an_async_list_checks_its_page(items, query, status):
+    router = Router()
+
+    @router.get("/items", response=list[ItemOut])
+    @scrudful_list(
+        href_func=href,
+        list_etag_func=lambda qs: f"n{qs.count()}",
+        page_size=1,
+        **ITEM_OPTIONS,
+        **LIST_LINKS,
+    )
+    async def list_items(request):
+        return Item.objects.all()
+
+    response = async_to_sync(TestAsyncClient(router).get)(
+        "/items" + query, headers={"If-None-Match": '"n3"'}
+    )
+
+    assert response.status_code == status
