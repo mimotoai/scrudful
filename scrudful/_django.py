@@ -68,6 +68,7 @@ __all__ = [
     "setting_hsr_cache_control",
     "setting_hsr_route",
     "setting_hsr_url",
+    "check_page",
     "slice_page",
 ]
 
@@ -590,6 +591,21 @@ def aware(value: Any) -> Any:
     return value
 
 
+def check_page(items: Any, number: int, size: int) -> int:
+    """The item count of ``items`` (``count()`` for a ``QuerySet``, else
+    ``len()``), once page ``number`` of ``size`` items is known to exist.
+
+    Raises
+    ------
+    InvalidPage
+        For a page past the last one (page 1 always exists).
+    """
+    count = items.count() if isinstance(items, QuerySet) else len(items)
+    if number > max(math.ceil(count / size), 1):
+        raise InvalidPage("Invalid page.")
+    return count
+
+
 def slice_page(items: Any, number: int, size: int) -> tuple[int, list[Any]]:
     """The item count of ``items`` and the items of page ``number``.
 
@@ -614,11 +630,7 @@ def slice_page(items: Any, number: int, size: int) -> tuple[int, list[Any]]:
                 UnorderedObjectListWarning,
                 stacklevel=3,
             )
-        count = items.count()
-    else:
-        count = len(items)
-    if number > max(math.ceil(count / size), 1):
-        raise InvalidPage("Invalid page.")
+    count = check_page(items, number, size)
     start = (number - 1) * size
     return count, list(items[start : start + size])
 

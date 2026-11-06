@@ -591,7 +591,9 @@ Each entry's ``etag``, ``last_modified`` and ``link`` come from the same item
 callbacks as the detail GET. ``page`` and ``page_size`` (default 100, at most
 1000) are query parameters; bad values are ninja's 422 validation error,
 listing every bad parameter. The optional list validators are called with the
-queryset, and then a list can answer 304.
+queryset, and then a list can answer 304, once the page is known to exist: a
+page past the last is a 404 whatever the request's preconditions (RFC 9110
+§13.2.1).
 
 .. _ninja-hooks:
 

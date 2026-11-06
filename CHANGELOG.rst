@@ -2,6 +2,38 @@
 Changelog
 =========
 
+0.10.1 (since 0.10.0)
+=====================
+
+Fixed
+-----
+
+* A list's GET or HEAD preconditions are evaluated once its requested page is
+  known to exist (RFC 9110 §13.2.1: preconditions are ignored when the request
+  without them would not be a 2xx or 412). A page past the last was a 304
+  with ``If-None-Match`` (or a 412 with a failed ``If-Match``) where it is
+  the 404 ``Invalid page.``; with DRF, bad ``page`` / ``page_size`` parameters
+  were a 304 too, where they are the 400.
+
+  - ninja: ``scrudful_list`` checks that the page exists before evaluating
+    the list validators' preconditions: a page after the first (page 1
+    always exists) costs one ``count()`` of the queryset; the page itself is
+    still built only for a 2xx, so a 304 builds no entry.
+  - DRF: ``scrudful_viewset``'s ``list`` calls its paginator's
+    ``check_page(queryset, request, view)`` (new on ``ScrudfulPagination``:
+    its parameters' 400, a page past the last's 404) before evaluating a
+    GET's or HEAD's preconditions, for a request carrying one. The queryset
+    (``filter_queryset(get_queryset())``) is passed as a callable, filtered
+    only for a page after the first. A paginator without ``check_page`` is
+    left as it was, as is an explicit ``@scrudful`` list handler.
+
+New
+---
+
+* ``ScrudfulPagination.check_page(queryset, request, view=None)`` and
+  ``scrudful._django.check_page(items, number, size)`` (what ``slice_page``
+  raises ``InvalidPage`` by).
+
 0.10.0 (since 0.9.0)
 ====================
 

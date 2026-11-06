@@ -326,7 +326,11 @@ Collections
       arguments; their callables get the queryset). With ``list_etag_func``
       or ``list_last_modified_func``, which are called with the queryset, the
       preconditions are evaluated after the handler returns it, since it is
-      the authorized object: a matching GET is answered with 304, a failed
+      the authorized object, and once the requested page is known to exist
+      (a page past the last is the 404 the request would be without them,
+      its preconditions ignored: RFC 9110 §13.2.1; checking a page after the
+      first counts the queryset, the page itself is built only for a 2xx):
+      a matching GET is answered with 304, a failed
       If-Match with 412, a malformed one with 400 (with ``error``'s Links),
       and 2xx responses carry the collection's validators. The collection
       exists even if they return ``None`` (``If-None-Match: *`` gives 304,
@@ -714,6 +718,7 @@ from scrudful._django import (
     setting_hsr_cache_control,
     setting_hsr_route,
     setting_hsr_url,
+    check_page,
     slice_page,
 )
 from scrudful._hsr import (
@@ -1646,8 +1651,9 @@ def scrudful_list(
         ``list_etag_func(queryset)``: the entity-tag of the collection, called
         with what the handler returned (the whole queryset, not the page). With
         either list validator, the preconditions are evaluated after the
-        handler returns (304, 400, 412) and 2xx responses carry the
-        validators.
+        handler returns, once the page is known to exist (304, 400, 412; a
+        page past the last is a 404 whatever the preconditions), and 2xx
+        responses carry the validators.
     list_last_modified_func : callable, optional
         ``list_last_modified_func(queryset)``: the modification time of the
         collection.
@@ -3176,9 +3182,20 @@ def _decorator(config: _Config, name: str) -> Callable[[Handler], Handler]:
                 and answers.collection.includes(status)
             ):
                 # The queryset is the authorized object: the collection's
-                # preconditions are evaluated now, then the page is built.
+                # preconditions are evaluated now, then the page is built. A
+                # page past the last is the 404 the request would be without
+                # them, which are then ignored (RFC 9110 §13.2.1): checked first
+                # (one count, for a page after the first, which always exists).
                 obj = _body(content)
                 if config.has_list_validators and evaluates_preconditions(method):
+                    number = 1 if pagination is None else pagination.page
+                    if number > 1:
+                        size = (
+                            config.page_size
+                            if pagination is None
+                            else pagination.page_size
+                        )
+                        yield _check_page, (obj, number, size), {}
                     list_etag, list_last_modified = yield from _validators(
                         config.list_etag_func, config.list_last_modified_func, obj
                     )
@@ -5123,6 +5140,14 @@ def _has_async_item_callables(config: _Config) -> bool:
         getattr(config.entity, entity_field.name) for entity_field in fields(Entity)
     ]
     return any(_is_async_callable(func) for func in item_callables)
+
+
+def _check_page(queryset: Any, number: int, size: int) -> None:
+    """:func:`scrudful._django.check_page`, with ninja's 404 for a bad page."""
+    try:
+        check_page(queryset, number, size)
+    except InvalidPage:
+        raise HttpError(404, "Invalid page.") from None
 
 
 def _slice(queryset: Any, number: int, size: int) -> tuple[int, list[Any]]:

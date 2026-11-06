@@ -170,8 +170,26 @@ class NestedViewSet(viewsets.ReadOnlyModelViewSet):
         schema_link_or_func = nested_schema
 
 
+def listed_etag(view, request):
+    return f"n{Item.objects.count()}"
+
+
+@scrudful_viewset
+class ListValidatedViewSet(viewsets.ReadOnlyModelViewSet):
+    """A list with validators, one item a page."""
+
+    queryset = Item.objects.order_by("pk")
+    serializer_class = ItemSerializer
+    pagination_class = SmallPagination
+
+    class Meta:
+        href_func = drf_href
+        list_etag_func = listed_etag
+
+
 router = SimpleRouter()
 router.register("nonemod", NoneModifiedViewSet, basename="nonemod")
+router.register("listed", ListValidatedViewSet, basename="listed")
 router.register("items", ItemViewSet, basename="item")
 router.register("bare", BareViewSet, basename="bare")
 router.register("nohref", NoHrefViewSet, basename="nohref")
@@ -482,3 +500,47 @@ def test_entry_link_callbacks_get_the_list_route_kwargs(items, client):
         hsr = hsr_link("http://testserver/_hsr/nested-detail")
         assert detail["Link"] == f"{entry['link']}, {hsr}"
         assert f"/schemas/7/{item.pk}" in entry["link"]
+
+
+# A list's page comes before its preconditions (RFC 9110 13.2.1): a request
+# whose page is a 400 or 404 is answered so, its preconditions ignored.
+
+
+@pytest.mark.parametrize("method", ["get", "head"])
+@pytest.mark.parametrize(
+    "query, status", [("?page=99", 404), ("?page=x", 400), ("?page_size=0", 400)]
+)
+@pytest.mark.parametrize("headers", [{"If-None-Match": "*"}, {"If-Match": '"no"'}])
+def test_a_list_page_that_is_an_error_ignores_the_preconditions(
+    method, query, status, headers
+):
+    for name in "abc":
+        Item.objects.create(name=name)
+
+    response = getattr(APIClient(), method)("/drf/listed/" + query, headers=headers)
+
+    assert response.status_code == status
+
+
+def test_a_list_page_that_exists_answers_its_preconditions(monkeypatch):
+    for name in "abc":
+        Item.objects.create(name=name)
+    filtered = []
+    filter_queryset = ListValidatedViewSet.filter_queryset
+
+    def counting(self, queryset):
+        filtered.append(self.request.query_params.get("page"))
+        return filter_queryset(self, queryset)
+
+    monkeypatch.setattr(ListValidatedViewSet, "filter_queryset", counting)
+    client = APIClient()
+
+    page_1 = client.get("/drf/listed/", headers={"If-None-Match": '"n3"'})
+    page_3 = client.get("/drf/listed/?page=3", headers={"If-None-Match": '"n3"'})
+    stale = client.get("/drf/listed/?page=2", headers={"If-Match": '"n2"'})
+
+    assert page_1.status_code == page_3.status_code == 304
+    assert stale.status_code == 412
+    # A 304 or 412 runs no view: the list is filtered only to check that a
+    # page after the first (page 1 always exists) exists.
+    assert filtered == ["3", "2"]

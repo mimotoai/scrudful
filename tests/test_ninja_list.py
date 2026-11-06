@@ -916,3 +916,38 @@ def test_list_without_validator_values_exists(db):
     assert client.get("/items", headers={"If-Match": "*"}).status_code == 200
     assert client.get("/items", headers={"If-Match": '"n1"'}).status_code == 412
     assert client.get("/items").status_code == 200
+
+
+# A list's page comes before its preconditions (RFC 9110 13.2.1).
+
+
+@pytest.mark.parametrize("headers", [{"If-None-Match": "*"}, {"If-Match": '"no"'}])
+def test_a_list_page_past_the_last_ignores_the_preconditions(items, headers):
+    router = list_router(list_etag_func=lambda qs: f"n{qs.count()}", page_size=1)
+
+    response = TestClient(router).get("/items?page=99", headers=headers)
+
+    assert response.status_code == 404
+
+
+def test_a_later_list_page_answers_its_preconditions_building_nothing(items):
+    calls = []
+
+    def list_etag(qs):
+        calls.append("list_etag")
+        return f"n{qs.count()}"
+
+    def item_href(request, item):
+        calls.append("href")
+        return href(request, item)
+
+    router = list_router(href_func=item_href, list_etag_func=list_etag, page_size=1)
+    client = TestClient(router)
+
+    not_modified = client.get("/items?page=3", headers={"If-None-Match": '"n3"'})
+    stale = client.get("/items?page=2", headers={"If-Match": '"n2"'})
+
+    assert not_modified.status_code == 304
+    assert stale.status_code == 412
+    # The page's existence is checked (a count), its entries never built.
+    assert calls == ["list_etag", "list_etag"]
